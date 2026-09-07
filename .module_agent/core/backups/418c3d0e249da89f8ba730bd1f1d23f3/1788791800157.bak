@@ -175,12 +175,6 @@ def check_layout() -> None:
     assert c2.wheel_l == DEFAULT_CFG.wheel_l
     # dtype constants
     assert np.dtype(F8) == np.float64 and np.dtype(I8) == np.int64
-    # pool_learn default compatibility (all construction paths default True)
-    assert DEFAULT_CFG.pool_learn is True
-    assert NetConfig().pool_learn is True
-    assert NetConfig(pool_learn=False).with_derived().pool_learn is False
-    assert cfg_from_mapping({"pool_learn": False}).pool_learn is False
-    assert cfg_from_mapping({"pool_learn": True}).pool_learn is True
     _ok("constants & ID conversion/domain contracts")
 
 
@@ -500,70 +494,6 @@ def check_dynamics(bundle: NetworkBundle) -> None:
 
 
 # ---------------------------------------------------------------------------
-# frozen-pool plasticity (pool_learn=False; exp-g / Diehl-Cook regression)
-# ---------------------------------------------------------------------------
-
-
-def check_pool_freeze(bundle_default: NetworkBundle) -> None:
-    print("pool_learn frozen mode (intra-pool plasticity off):")
-    # --- (c) default True path is the regression anchor ---
-    cfg0 = bundle_default.cfg
-    assert cfg0.pool_learn is True
-    src0 = bundle_default.csr_src
-    cls_in0 = src0 < cfg0.n_in
-    cls_E0 = (~cls_in0) & bundle_default.pool_is_E[
-        (src0 - cfg0.n_in).astype(np.intp)]
-    assert np.array_equal(
-        bundle_default.csr_learn, cls_in0 | cls_E0
-    ), "pool_learn=True must keep learn == input | E-source (no regression)"
-    # --- frozen build on a small config ---
-    cfg_f = NetConfig(n_in=64, n_pool=500, n_input_cols=8,
-                      pool_learn=False).with_derived()
-    bf = build_network(cfg_f)
-    assert bf.cfg.pool_learn is False
-    src = bf.csr_src
-    n_in = cfg_f.n_in
-    cls_in = src < n_in
-    cls_E = (~cls_in) & bf.pool_is_E[(src - n_in).astype(np.intp)]
-    cls_I = ~(cls_in | cls_E)
-    # a) pool-to-pool E edges are not learnable but keep their initial weights
-    assert not bf.csr_learn[cls_E].any(), "E-pool edges must be frozen"
-    wE = bf.csr_w[cls_E]
-    lo = cfg_f.w_ee_lo * cfg_f.theta0
-    hi = cfg_f.w_ee_hi * cfg_f.theta0
-    assert float(wE.min()) >= lo - 1e-12 and float(wE.max()) <= hi + 1e-12
-    assert np.isclose(float(wE.mean()), 0.30 * cfg_f.theta0, atol=0.02)
-    assert bool(bf.csr_learn[cls_in].all())      # input edges always learn
-    assert not bf.csr_learn[cls_I].any()          # I edges never learn
-    # b) in_learn rows contain input edges only; in_sum0 = input weight sums
-    assert np.all(bf.csr_src[bf.in_learn_idx] < n_in)
-    assert bf.in_learn_idx.size == bf.n_edges_in
-    inp = np.flatnonzero(cls_in)
-    inp_dst = bf.csr_dst_local[inp]
-    per = np.diff(bf.in_learn_ptr)
-    cnt_in = np.bincount(inp_dst, minlength=cfg_f.n_pool)
-    assert np.array_equal(per, cnt_in)
-    assert int(per.min()) >= 1                    # structure check still holds
-    s0 = np.bincount(inp_dst, weights=bf.csr_w[inp], minlength=cfg_f.n_pool)
-    assert np.allclose(s0, bf.in_sum0, atol=1e-12)
-    # plasticity smoke: STDP/homeo/norm leave frozen E weights untouched
-    wE_before = bf.csr_w[cls_E].copy()
-    rng = np.random.default_rng(3)
-    for _ in range(4):
-        fr = np.clip(rng.normal(0.5, 0.25, size=(64,)), 0.0, 1.0)
-        bks = encoder.latency_encode(fr, cfg=bf.cfg)
-        run_sample(bf, bks, T=60, stdp_on=True, homeo_on=True, norm_on=True)
-    assert np.array_equal(bf.csr_w[cls_E], wE_before), \
-        "frozen E-pool weights must not move under plasticity"
-    assert np.all(bf.csr_w[bf.csr_learn] >= bf.cfg.w_lo - 1e-9)
-    assert np.all(bf.csr_w[bf.csr_learn] <= bf.cfg.w_hi + 1e-9)
-    assert np.all(bf.theta >= bf.cfg.theta_lo - 1e-9)
-    assert np.all(bf.theta <= bf.cfg.theta_hi + 1e-9)
-    _ok("frozen mode: E edges learn=False with initial weights; in_learn/"
-        "in_sum0 = input edges only; default True path unchanged")
-
-
-# ---------------------------------------------------------------------------
 # M5 features / readout and M6 scheduler smoke (D5, G1 first run)
 # ---------------------------------------------------------------------------
 
@@ -701,7 +631,6 @@ def main() -> int:
     check_shapes()
     check_spatial_hash()
     bundle = check_network()
-    check_pool_freeze(bundle)
     check_kernel_basic()
     check_kernel_refractory()
     check_kernel_wheel_far_delay()

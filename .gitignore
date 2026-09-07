@@ -43,3 +43,6 @@ Thumbs.db
 /exp/runs/
 /exp/outputs/
 *.log
+
+# ---- Lizhu test env (local generated, not committed) ----
+.lizhu_env/

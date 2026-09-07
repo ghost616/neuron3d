@@ -8,20 +8,9 @@ D11/D13 layout decisions:
 - 80/20 E/I tags on pools (D11);
 - input->pool: per pool the k=16 nearest inputs within R_IN=0.4 (3-D);
 - pool->pool: per source the k=12 nearest pools within R_POOL (self excluded);
-  E-source weights ~U(0.18,0.42)*theta0 (learnable iff cfg.pool_learn; see
-  the frozen-pool plasticity mode below); I-source weights
+  E-source weights ~U(0.18,0.42)*theta0 (learnable); I-source weights
   -1.2*exp(-d/0.12) (non-learnable, |w| >= E and frozen);
 - delay = clip(round(dist/VEL), 1, 15); time wheel L = delay_max + 1 = 16.
-
-Frozen-pool plasticity mode (cfg.pool_learn=False; exp-g ablation /
-Diehl-Cook regression structure, doc Sec.3 M1/M4): pool-to-pool E-source
-synapses keep their wiring, delays and initial U(0.18,0.42)*theta0 weights
-but the learn mask excludes them -- only input->pool synapses are learnable
-(``csr_learn`` False for every pool edge), so STDP/LTP/LTD and the per-pool
-competitive budget (``in_learn_idx`` / ``in_sum0``) structurally contain
-input edges only and intra-pool activity cannot hijack the budget.  I-source
-edges never learn in either mode.  Default pool_learn=True preserves the
-previous behaviour bit-for-bit.
 
 Memory layout (design doc Sec.2.2/2.3): SoA states + CSR (per-source rows,
 sorted stably by source then destination global id) + CSC (per-target rows,
@@ -292,9 +281,8 @@ def _build_csr(cfg: NetConfig, src_g: np.ndarray, dst_local: np.ndarray,
     source lies in [0, N_TOTAL); every destination is a pool (>= N_IN).
 
     Weight classes (per edge):
-        - input source: U(w_in_lo, w_in_hi) * theta0          (always learnable)
-        - E-pool source: U(w_ee_lo, w_ee_hi) * theta0         (learnable iff
-          cfg.pool_learn -- frozen mode keeps weights but drops learnability)
+        - input source: U(w_in_lo, w_in_hi) * theta0          (learnable)
+        - E-pool source: U(w_ee_lo, w_ee_hi) * theta0         (learnable)
         - I-pool source: -w_i_amp * exp(-dist / w_i_tau)      (frozen)
     delay = clip(round(dist / VEL), delay_min, delay_max).
 
@@ -338,14 +326,7 @@ def _build_csr(cfg: NetConfig, src_g: np.ndarray, dst_local: np.ndarray,
     delay = np.clip(
         np.rint(dist / cfg.vel).astype(I8), cfg.delay_min, cfg.delay_max
     )
-    # Learnability mask (D11 + pool_learn frozen mode): input edges always
-    # learn; pool-to-pool E edges learn only when cfg.pool_learn; I-source
-    # synapses never learn.  With pool_learn=False the E-source weights are
-    # still sampled (U(0.18,0.42)*theta0 above) and the wiring/delays are
-    # unchanged -- only csr_learn drops to False, so STDP/LTP/LTD and the
-    # per-pool competitive rows (in_learn_ptr/in_learn_idx/in_sum0, built
-    # from csr_learn downstream) structurally contain input edges only.
-    learn = w_class_in | (w_class_e & cfg.pool_learn)
+    learn = w_class_in | w_class_e  # I-source synapses never learn (D11)
 
     csr_dst_local = dst_local[order]
     counts = np.bincount(csr_src, minlength=cfg.n_total).astype(I8)

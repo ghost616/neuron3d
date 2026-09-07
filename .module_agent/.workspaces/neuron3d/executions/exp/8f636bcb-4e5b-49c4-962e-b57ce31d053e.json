@@ -22,5 +22,16 @@
     ],
     "summary": "执行总结：G1 配套四项交付完成，未越权修改 core/main。(1) 新增 hstdn/exp/ablation.py：R1 随机储备池消融——实验组（stdp/homeo/norm 三开关开，经 core.scheduler.run_g1_protocol ADAPT）vs 对照组（三开关全关随机固定储备池 + CALIBRATE + READOUT 经典 LSM），两组同种子同数据、唯一差异即三开关（对照组以 n_adapt_epochs=0 等价表达）；Spec/LIGHT_SPEC(4类双种子池200 机制验证)/FULL_SPEC(10类≥3种子池150 官方判据)/run_ablation（多种子 mean±std+组间对比）/evaluate_full_criterion（官方判据：exp 均值≥60% 且显著高于对照=均值差≥5pp 且逐配种子 exp>ctrl）/report_lines/CLI。(2) gates.py 登记 G1 门禁 run_g1（G1_SPECS id=101；--g1 轻量快速验证+提示 / --g1 --full 完整官方判据；G0 清单/退出码协议不变）。(3) diagnostics.py 扩展 multi_seed_summary/compare_groups/format_g1_ablation（纯函数）。测试总结：(a) G0 十五项保持全绿——python -m hstdn.exp.gates 多轮 15/15 exit 0（gate11 计时改 gc.collect+3 预热+7 计时中位数，包络空≤50ms/突发≤200ms 实时上限，隔离实测 ~4ms/~60-80ms；文档注明负载敏感与 L1 动机）；(b) G1 轻量（--g1）机制验证 PASS（G0 15/15 + G1 light exit 0）；(c) G1 完整（--g1 --full）机制正确执行但官方判据未满足（如实 FAIL、exit 1）：10 类池150 noise0.16 三种子 exp=56.7±15.9% vs ctrl=90.3±4.9%（exp_mean<60%、diff=-33.7pp、无逐种子优势）；4 类池200 双种子 exp=45.8±23.6 vs ctrl=64.6±26.5。实证诊断：对照校准后 8Hz/零沉默近饱和（0.87-0.98）；实验组适应后部分种子 θ 饱和/静默 12-51%、个别种子率 173Hz，V0 计数特征可分离性被削弱；已探测无效方向（V1 分箱经 scheduler 不可用、extra_loops 回环、更高 train/噪声）如实记录。结论：G1 官方判据转绿需 core/scheduler 或数据侧后续改进（时序特征喂入、θ/静默治理、利于 STDP 的任务族），本计划如实呈现 FAIL 并给出建议；门禁机制、模式与判据均已实现并验证可执行。",
     "errors": []
+  },
+  {
+    "plan_id": "plan_ef071281-3e13-4c28-937d-a2070fce6005",
+    "plan": "exp-g 判定实验（冻结池内可塑性 → Diehl-Cook；default.yaml/configs 桥/ablation exp-g 入口/自测）",
+    "modified_files": [
+      "hstdn/configs/default.yaml",
+      "hstdn/configs/__init__.py",
+      "hstdn/exp/ablation.py"
+    ],
+    "summary": "执行总结：exp-g 判定配套三项交付完成，未越权修改 core/main。(1) hstdn/configs/default.yaml：network 节新增 k_pool_learn: true（默认 True=现状，G1 冻结纪律默认不变；False=exp-g 冻结池内 E→E 可塑性开关，含文档注释）；(2) hstdn/configs/__init__.py：_NET_MAP 增 k_pool_learn→NetConfig.pool_learn（严格键校验放行、桥接冒烟通过，load_config().network['k_pool_learn']→to_core_cfg().pool_learn=True）；(3) hstdn/exp/ablation.py：Spec 增 pool_learn（默认 True，to_dict/默认规格/LIGHT·FULL 含 True），_net_cfg build_network 前 replace 透传，SeedResult 增 calib_ok+w_ratio（E 源池→池权重末/初比，冻结=1）归因诊断；run_expg_comparison（light/full：唯一变更 pool_learn=False 且协议三开关全开=exp 协议）输出判据表（evaluate_expg：silence<5%/CALIBRATE 全种子 ok/w_ratio≈1/acc≥80%）与 exp/ctrl 对比；CLI --expg/--freeze-pool（可组合 --full）。测试总结：(a) G0 默认路径无回归——python -m hstdn.exp.gates 15/15 exit 0（k_pool_learn 默认 True）；(b) exp-g light 冒烟可运行并输出判据表（见下）；(c) exp-g full 3 种子已跑并如实记录。exp-g 结果（FULL，10 类/noise0.16/池150/adapt2/3 种子）：expg=89.7±4.2%、silence 0.0%、CALIBRATE 3/3 ok、w_ratio dev max=0.00e+00 → healthy=True（四项判据全过，acc≥80%）；对照 exp（池内可塑性开）=56.7±15.9%（silence 34%）、ctrl(随机 LSM)=90.3±4.9%（silence 0）。light（4 类池200 双种子）：expg=72.9±20.6（silence 0.8%、calib 2/2、w_ratio dev 0；acc<80% → light 判据 False，判据按 FULL 定义）、exp=45.8±23.6、ctrl=64.6±26.5。冻结语义独立验证：pool_learn=False 构建 learn 边==输入边（2377/2377）且 STDP 样本后池→池 E 权重逐位不变。结论：exp-g 健康 → 支持 H6 方向定案依据——冻结池内 E→E 可塑性消除 exp 组 θ 饱和/高沉默（34%→0），输入→池（Diehl-Cook 前馈）路径可学习且稳定，性能≈LSM（89.7 vs 90.3，±4-5% 内不显著）；上一轮 G1 exp<ctrl 的退化归因指向池内可塑性动态。剩余开放：exp-g 是否额外超越 LSM 需更难任务族/更大规模确认（light 下 expg 72.9 > ctrl 64.6 为正向提示）。",
+    "errors": []
   }
 ]

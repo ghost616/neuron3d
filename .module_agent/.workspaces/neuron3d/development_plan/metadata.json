@@ -1,63 +1,15 @@
 [
   {
-    "plan_id": "plan_9e2c6f61-a9f7-48dd-b049-7f19562221fd",
-    "plan_summary": "搭建 H-STDN 项目根级地基（pyproject/requirements/README/.gitignore、hstdn 公共包与断言辅助）",
+    "plan_id": "plan_cfd268b6-f4a7-48fa-974a-a0f297d5e143",
+    "plan_summary": "core 增加 pool_learn 冻结池内可塑性支持（layout/network/selfcheck），默认路径不变",
     "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
     "code_reviewed": true,
     "plan_completed": true,
     "test_passed": true
   },
   {
-    "plan_id": "plan_35a2bea3-7b23-4adf-ab14-918d73cfb183",
-    "plan_summary": "实现 H-STDN 核心模拟栈：layout/spatial_hash/network/kernel/encoder/plasticity，L0 NumPy 实现并自检",
-    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
-    "code_reviewed": true,
-    "plan_completed": true,
-    "test_passed": true
-  },
-  {
-    "plan_id": "plan_06bb9ccd-e967-4bcf-9420-9a49709f8e56",
-    "plan_summary": "实现 H-STDN 数据模块：synthetic 合成数据生成器 + mnist/dvs/bridge 合规占位",
-    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
-    "code_reviewed": true,
-    "plan_completed": true,
-    "test_passed": true
-  },
-  {
-    "plan_id": "plan_c59eebf7-1d0a-4b27-b8c5-92e454c3a883",
-    "plan_summary": "实现 H-STDN 实验验证模块：default.yaml 超参 + G0 十五项门禁 gates + diagnostics 诊断面板",
-    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
-    "code_reviewed": true,
-    "plan_completed": true,
-    "test_passed": true
-  },
-  {
-    "plan_id": "plan_34577b41-dd0b-4416-871b-fed27ec56074",
-    "plan_summary": "实现 H-STDN 训练与评估入口：train.py + eval.py 打通 config→build_network→run_sample 链路并冒烟自测",
-    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
-    "code_reviewed": true,
-    "plan_completed": true,
-    "test_passed": true
-  },
-  {
-    "plan_id": "plan_c7950b62-1026-446c-b6ed-2b12e011553e",
-    "plan_summary": "新增 core M5/M6 组件：features.py + readout.py + scheduler.py，扩展 selfcheck 并保持 G0 全绿",
-    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
-    "code_reviewed": true,
-    "plan_completed": true,
-    "test_passed": true
-  },
-  {
-    "plan_id": "plan_816d97e2-0f06-4bc5-9832-690bf9ca58ab",
-    "plan_summary": "实现 exp G1 配套：ablation.py 储备池对照 + gates run_g1 + diagnostics 扩展，保持 G0 不回归",
-    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
-    "code_reviewed": true,
-    "plan_completed": true,
-    "test_passed": true
-  },
-  {
-    "plan_id": "plan_4ef43285-387d-415f-b631-8c6e10910cb7",
-    "plan_summary": "扩展 train/eval 消费 core.scheduler M6 协议：--g1 模式 + G1 评估 + 冒烟自测",
+    "plan_id": "plan_ef071281-3e13-4c28-937d-a2070fce6005",
+    "plan_summary": "exp-g 判定实验：default.yaml k_pool_learn 键 + configs 桥 + ablation pool_learn/exp-g 入口，G0 不回归",
     "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
     "code_reviewed": true,
     "plan_completed": true,

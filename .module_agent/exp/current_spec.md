@@ -17,3 +17,12 @@ G1 随机储备池消融与首跑门禁（R1，exp 模块 G1 配套；文档 §6
 - diagnostics.py 新增 G1 评估纯函数：multi_seed_summary / compare_groups / format_g1_ablation。
 
 实证现状（诚实记录，本机 2026-09 测量）：10 类池150 noise0.16 三种子 run_g1_protocol 下 exp=56.7±15.9% vs ctrl(随机LSM)=90.3±4.9%（--full 判据未满足，FAIL）；4 类池200 noise0.18 双种子 exp=45.8±23.6 vs ctrl=64.6±26.5。即当前 core scheduler + V0 计数特征 + 本合成任务族（互不重叠字形掩码）下，冻结校准储备池已近饱和（0.87-0.98），STDP+homeo+norm 适应后部分池 θ 饱和/高沉默（exp 静默 12-51%）反而削弱计数可分离性。G1 完整判据要转绿需后续研究：时序敏感特征（v1 分箱喂入 COLLECT）、homeo/θ 饱和治理、或更利于 STDP 的任务族 —— 属 core/scheduler 与数据侧范畴（exp 不越权）。
+## exp-g 判定
+
+exp-g 判定（冻结池内可塑性 → Diehl-Cook 结构；归因 Wave 1b / §3 M4，H6 相关）：
+
+- default.yaml network 节新增 `k_pool_learn: true`（默认 True=现状；False 触发 exp-g 冻结池内 E→E 可塑性，仅输入→池可学习、池间连接固定）。G1 冻结纪律下默认保持 True；注释说明该键为 exp-g 判定/Diehl-Cook 回归开关。
+- configs/__init__.py `_NET_MAP` 增加 `k_pool_learn -> NetConfig.pool_learn`（core 字段 pool_learn，默认 True；False 时 core network 的 learn = input | (E-source & pool_learn)）。
+- ablation.py：Spec 新增 `pool_learn: bool = True`（含 to_dict/默认规格处理），`_net_cfg` build_network 前 replace 透传；SeedResult 新增 calib_ok 与 w_ratio（E 源池→池权重均值 末/初 比，冻结=1，结构+STDP 冒烟验证通过）；exp-g 入口 `run_expg_comparison(light/full)`（唯一变更 pool_learn=False 且协议三开关全开=exp 协议），判据 evaluate_expg：silence<5%、CALIBRATE 全种子 ok、w_ratio≈1（1e-6）、acc≥80%；CLI `--expg`/`--freeze-pool`（--full 组合）。
+
+实测结果（本机 2026-09，如实记录）：FULL（10 类 noise0.16 池150 adapt2 3 种子）expg=89.7±4.2%、silence 0.0%、calib 3/3 ok、w_ratio dev=0 → **healthy=True（四项全过，≥80% 达成）**；对照 exp（池内可塑性开）=56.7±15.9%（silence 34%）、ctrl(随机LSM)=90.3±4.9%（silence 0%）。light（4 类池200 双种子）：expg=72.9±20.6（silence 0.8%、calib 2/2、w_ratio dev 0，仅 acc<80% 故 light 判据 False——判据按 FULL 规模定义）。解读：冻结池内 E→E 可塑性消除了 exp 组的 θ 饱和/高沉默（34%→0%），输入→池（Diehl-Cook 前馈）路径可学习且稳定，性能≈LSM（89.7 vs 90.3，±4-5% 内不显著）；该结果将上一轮 G1 exp<ctrl 的退化归因指向池内可塑性动态，支持 H6 方向的定案依据，exp-g 是否额外超越 LSM 需更难任务族区分。

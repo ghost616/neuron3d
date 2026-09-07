@@ -7,7 +7,7 @@
     },
     {
       "path": "hstdn/core/layout.py",
-      "description": "ID 契约与超参/形状规格集中定义（M1 数据布局基础）：NetConfig（§4 超参 frozen dataclass，with_derived 派生 wheel_l/decay_v/decay_t/n_total/n_e_pool 等）、cfg_from_mapping、模块级常量 N_IN/N_POOL/N_TOTAL/REFR/ETA_LTP/ETA_LTD/W_LO/W_HI/THETA0/WHEEL_L/R_IN/R_POOL/K_IN/K_POOL/DECAY_V/DECAY_T、dtype 常量 F8/I8；全局/局部 ID 域校验与唯一转换（assert_input_gids/assert_pool_gids/assert_pool_local_ids/pool_local_of/pool_gid_of）以及形状/dtype 断言助手（assert_pool_local_shape1/assert_global_trace_shape/assert_ring_shape/assert_f8/assert_i8），供 G0 #4/#10/#13 使用。"
+      "description": "ID 契约与超参/形状规格集中定义（M1 数据布局基础）：NetConfig（§4 超参 frozen dataclass；含 e_frac 80/20 E/I（D11）与 pool_learn 开关——True=默认池内 E 突触可学习，False=冻结池内可塑性（exp-g/Diehl-Cook 回归结构，仅输入边入学习与归一化预算）；with_derived 派生 wheel_l/decay_v/decay_t/n_total/n_e_pool/n_i_pool）、cfg_from_mapping、模块级常量 N_IN/N_POOL/N_TOTAL/REFR/ETA_LTP/ETA_LTD/W_LO/W_HI/THETA0/WHEEL_L/R_IN/R_POOL/K_IN/K_POOL/DECAY_V/DECAY_T、dtype 常量 F8/I8；全局/局部 ID 域校验与唯一转换（assert_input_gids/assert_pool_gids/assert_pool_local_ids/pool_local_of/pool_gid_of）以及形状/dtype 断言助手（assert_pool_local_shape1/assert_global_trace_shape/assert_ring_shape/assert_f8/assert_i8），供 G0 #4/#10/#13 使用。"
     },
     {
       "path": "hstdn/core/spatial_hash.py",
@@ -15,7 +15,7 @@
     },
     {
       "path": "hstdn/core/network.py",
-      "description": "M1 网络构建 build_network(cfg)->NetworkBundle（SoA 状态 + CSR/CSC 双索引 + in_learn 行 + ring 时间轮）：输入 z=0 网格+抖动、池均匀采样 [0,1]x[0,1]x[0,0.3] 平板域（D13）、80/20 E/I 标记（D11）、per-source 最近 k（输入 16/池 12，排除自身）、权重分类（E 源 learn=True、I 源 -1.2exp(-d/0.12) learn=False、输入 U(0.9,1.3)*θ0）、delay=clip(round(dist/VEL),1,15)、CSR 稳定排序、CSC B3 修正构建、in_learn_idx/in_sum0、自检报告（孤立=0、零入度=0、E 源出度≤12、延迟直方图、增益标定）与结构断言；NetworkBundle dataclass 集中字段规格；供 G0 #12/#13 使用。"
+      "description": "M1 网络构建 build_network(cfg)->NetworkBundle（SoA 状态 + CSR/CSC 双索引 + in_learn 行 + ring 时间轮）：输入 z=0 网格+抖动、池均匀采样 [0,1]x[0,1]x[0,0.3] 平板域（D13）、80/20 E/I 标记（D11）、per-source 最近 k（输入 16/池 12，排除自身）、权重分类（输入 U(0.9,1.3)*θ0 恒 learn；E 源 U(0.18,0.42)*θ0 learn=cls_in|(cls_e&pool_learn)；I 源 -1.2exp(-d/0.12) 恒 learn=False——pool_learn=False 冻结池内可塑性时 E 源边保留连接/延迟/初始权重但 csr_learn=False，in_learn/in_sum0 自动只剩输入边）、delay=clip(round(dist/VEL),1,15)、CSR 稳定排序、CSC B3 修正构建、in_learn_ptr/in_learn_idx/in_sum0、自检报告（孤立=0、零入度=0、E 源出度≤12、延迟直方图、增益标定）与结构断言（每池 learnable 入突触≥1 由输入边保证）；NetworkBundle dataclass 集中字段规格；供 G0 #12/#13 与 exp ablation（pool_learn）使用。"
     },
     {
       "path": "hstdn/core/kernel.py",
@@ -31,7 +31,7 @@
     },
     {
       "path": "hstdn/core/selfcheck.py",
-      "description": "core 最小自检脚本（exp/gates.py 就绪前的过渡断言，标注 G0 编号 #1-#15 家族对应，D1–D5 范围）：layout ID/形状断言、SpatialHash3D 与暴力对照、默认配置 build_network 布线不变量与 CSR/CSC/B3/in_learn 一致性、kernel 时序/不应期/时间轮/STDP 顺序微测试（手工构造确定性 toy 网络）、plasticity 各原语与归一化单元断言、encoder 桶/MNIST 映射断言、默认配置动态冒烟（确定性、stdp/homeo/norm 边界）、M5 features（V0 sqrt+L2/掩码/零行、V1 分 bin 展平、V2 接口）与 readout（线性可分收敛 >95%、早停、L1/L2 接口）冒烟、M6 scheduler 全流程（小规模 3 类×8 训练样本可跑通、Report 结构完整）；python -m hstdn.core.selfcheck 运行。"
+      "description": "core 最小自检脚本（exp/gates.py 就绪前的过渡断言，标注 G0 编号 #1-#15 家族对应，D1–D5 范围）：layout ID/形状/常量断言（含 pool_learn 默认 True 与 cfg 覆盖路径）、SpatialHash3D 与暴力对照、默认配置 build_network 布线不变量与 CSR/CSC/B3/in_learn 一致性、pool_learn 冻结模式组（小配置 False：E 源边 learn=False 且权重仍初始 U(0.18,0.42)*θ0 分布、in_learn_idx 只含输入边、in_sum0=输入权重和、每池 learn≥1、STDP/homeo/norm 冒烟后冻结边不动、默认 True 路径无回归）、kernel 时序/不应期/时间轮/STDP 顺序微测试（手工构造确定性 toy 网络）、plasticity 各原语与归一化单元断言、encoder 桶/MNIST 映射断言、默认配置动态冒烟（确定性、stdp/homeo/norm 边界）、M5 features/readout 冒烟、M6 scheduler 全流程（小规模可跑通、Report 结构完整）；python -m hstdn.core.selfcheck 运行。"
     },
     {
       "description": "M5 特征抽取（D9/G1）：FeaturesConfig（mode=v0 默认/V1 时间分 bin n_bins=5 实现默认关闭/V2 代理梯度仅接口）+ features_from_cfg + build_features 纯函数（V0: sqrt(counts[:,mask]) 后行 L2 归一化，feature_mask 默认全体池，输出 [n_samples, feat_dim]；V1: (n,n_bins,N_POOL) 逐 bin sqrt 展平 [n, n_bins*N_POOL]；V2 显式 raise NotImplementedError）+ l2_row_normalize（零行保持零向量，无 NaN）。供 readout/scheduler 消费。",

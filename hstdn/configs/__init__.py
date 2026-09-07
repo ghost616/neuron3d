@@ -152,6 +152,7 @@ _NET_MAP = {
     "n_in": "n_in", "n_pool": "n_pool", "e_ratio": "e_frac",
     "radius_in": "r_in", "radius_pool": "r_pool", "velocity": "vel",
     "k_in": "k_in", "k_pool": "k_pool", "max_delay": "delay_max",
+    "k_pool_learn": "pool_learn",   # exp-g / Diehl-Cook 冻结开关（默认 True）
 }
 _LIF_MAP = {
     "tau_mem": "tau_m", "theta0": "theta0", "refractory": "refr",

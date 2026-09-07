@@ -3,11 +3,11 @@
   "files": [
     {
       "path": "hstdn/configs/default.yaml",
-      "description": "§4 超参唯一契约（G1 前冻结）：network/lif/stdp/homeo/protocol/readout_l0/features/readout_l1/encoder 九节，命名沿用设计文档 §4 记号（tau_mem/radius_in/velocity/e_ratio/extent/T/dt 等）。全部实验超参的唯一来源，禁止散落魔法数字；core 就绪后升格为 core.layout.NetConfig 唯一来源。"
+      "description": "§4 超参唯一契约（G1 前冻结）：network/lif/stdp/homeo/protocol/readout_l0/features/readout_l1/encoder 九节，命名沿用设计文档 §4 记号（tau_mem/radius_in/velocity/e_ratio/extent/T/dt 等）。全部实验超参的唯一来源，禁止散落魔法数字；core 就绪后升格为 core.layout.NetConfig 唯一来源。network 节另含 k_pool_learn: true（默认 True=现状；False=exp-g 判定/Diehl-Cook 回归开关，冻结池内 E→E 可塑性），注释说明该键语义与默认冻结纪律。"
     },
     {
       "path": "hstdn/configs/__init__.py",
-      "description": "配置加载辅助：default_path/resolve_path（路径解析）、load_config（pyyaml→dict + 顶层结构契约校验）、validate_config_dict（已知节/必含节/防漂移）；to_core_cfg 为过渡期桥：把 network/lif/stdp/homeo 四节严格映射为 core.layout.NetConfig（含 n_input_cols=√n_in、extent→pool_z_hi、T→window_s、dt=1 校验），未知键显式报错。"
+      "description": "配置加载辅助：default_path/resolve_path（路径解析）、load_config（pyyaml→dict + 顶层结构契约校验）、validate_config_dict（已知节/必含节/防漂移）；to_core_cfg 为过渡期桥：把 network/lif/stdp/homeo 四节严格映射为 core.layout.NetConfig（含 n_input_cols=√n_in、extent→pool_z_hi、T→window_s、dt=1 校验，未知键显式报错）。_NET_MAP 含 k_pool_learn→pool_learn（exp-g/Diehl-Cook 冻结开关，默认 True）映射，保证 yaml 严格键校验放行且正确桥接。"
     },
     {
       "path": "hstdn/exp/__init__.py",
@@ -22,8 +22,8 @@
       "description": "诊断面板函数（G1 与 gates 调试复用，core 惰性导入）：firing_rates_hz/silence_ratio/rate_summary（率与沉默）、cos_similarity/class_cosine_matrix（类间余弦）、feature_transform/feature_cos_similarity（sqrt+L2 特征可比性，mode='sqrt_l2'，支持列掩码）、capped_synapse_ratio（顶界突触占比）、input_to_pool_w_mean（输入→池 w 均值）、delay_histogram、plasticity_panel/network_panel/sample_panel/print_panel 汇总面板；G1 评估辅助（纯函数无断言）：multi_seed_summary（多种子 mean±std）、compare_groups（组间均值差/保守分离界）、format_g1_ablation（消融报告格式化）。"
     },
     {
-      "description": "G1 随机储备池消融（R1；exp 模块，文档 §6 G1 / §8 / §11 冻结条件）。实验组（stdp/homeo/norm 三开关开，经 run_g1_protocol ADAPT 适应）vs 对照组（三开关全关随机固定储备池 + CALIBRATE + READOUT 经典 LSM）；两组复用 core.scheduler.run_g1_protocol 唯一协议入口、同数据同种子，唯一差异即三开关（对照组以 n_adapt_epochs=0 表达全关）。提供 Spec/default_spec（LIGHT_SPEC 4 类双种子池200 机制验证 / FULL_SPEC 10 类≥3 种子池150 官方判据）、make_protocol/make_data_fns/run_one_seed/run_group/run_ablation（返回 exp/ctrl 多种子 mean±std 汇总 + 组间对比）、evaluate_full_criterion（官方判据：实验组均值≥60% 且显著高于对照 = 均值差≥5pp 且逐配种子 exp>ctrl）、report_lines 与 CLI（python -m hstdn.exp.ablation [--full/--classes/--pool/--seeds/.../--json]）。规模诚实注明：L0 内核在 §4 800 池逐样本数百 ms 量级，gate/默认消融运行在门禁规模（--pool 可调回 800）。",
-      "path": "hstdn/exp/ablation.py"
+      "path": "hstdn/exp/ablation.py",
+      "description": "G1 随机储备池消融（R1；exp 模块，文档 §6 G1 / §8 / §11 冻结条件）+ exp-g 判定（归因 Wave 1b / §3 M4，Diehl-Cook 回归）。实验组（stdp/homeo/norm 三开关开，run_g1_protocol ADAPT）vs 对照组（三开关全关随机固定储备池 + CALIBRATE + READOUT 经典 LSM）；两组同数据同种子唯一差异即三开关。Spec 新增 pool_learn: bool=True（默认 True=现状；False=冻结池内 E→E 可塑性，Diehl-Cook 结构），经 _net_cfg 透传 NetConfig（build_network 前 replace）。提供 Spec/default_spec（LIGHT 4 类双种子池200 机制 / FULL 10 类≥3 种子池150 官方判据）、make_protocol/make_data_fns/run_one_seed（含 calib_ok 与 w_ratio=E 源池→池权重末/初比 归因诊断）/run_group/run_ablation/evaluate_full_criterion/report_lines；exp-g 入口 run_expg_comparison（light/full，pool_learn=False+三开关全开）：判据表 silence<5% / CALIBRATE 全种子 ok / w_ratio≈1 / acc≥80%（evaluate_expg/expg_metrics/expg_report_lines/print_expg_comparison）并打印与 exp/ctrl 对比；CLI 支持 --expg/--freeze-pool（可与 --full 组合）与 --json。"
     }
   ]
 }

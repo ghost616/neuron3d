@@ -49,6 +49,8 @@ __all__ = [
     "AblationResult", "default_spec", "make_protocol", "make_data_fns",
     "run_one_seed", "run_group", "run_ablation", "evaluate_full_criterion",
     "report_lines", "main",
+    "EXPG_CRITERIA", "expg_metrics", "evaluate_expg", "expg_report_lines",
+    "run_expg_comparison", "print_expg_comparison",
 ]
 
 # ---------------------------------------------------------------------------
@@ -71,6 +73,7 @@ LIGHT_SPEC: Dict[str, Any] = dict(
     calibrate_samples=5,
     calibrate_max_iter=2,
     t_ms=200,
+    pool_learn=True,
 )
 
 #: 完整 G1：10 类、≥3 种子 —— 官方判据（§6）：实验组 ≥60% 且显著高于对照组。
@@ -88,6 +91,7 @@ FULL_SPEC: Dict[str, Any] = dict(
     calibrate_samples=5,
     calibrate_max_iter=2,
     t_ms=200,
+    pool_learn=True,
 )
 
 # ---------------------------------------------------------------------------
@@ -97,13 +101,17 @@ FULL_SPEC: Dict[str, Any] = dict(
 _SPEC_KEYS = frozenset({
     "mode", "n_pool", "n_classes", "train_per_class", "test_per_class",
     "noise", "seeds", "adapt_epochs", "extra_loops", "adapt_gate_extra_max",
-    "calibrate_samples", "calibrate_max_iter", "t_ms",
+    "calibrate_samples", "calibrate_max_iter", "t_ms", "pool_learn",
 })
 
 
 @dataclass(frozen=True)
 class Spec:
-    """一次消融运行的完整规格（mode: light/full 或自定义）。"""
+    """一次消融运行的完整规格（mode: light/full 或自定义）。
+
+    pool_learn: True=池内 E→E 可塑性开启（默认，§4 现状）；False=冻结池内
+        可塑性（exp-g / Diehl-Cook 回归，仅输入→池可学习，池间连接固定）。
+    """
 
     n_pool: int
     n_classes: int
@@ -117,6 +125,7 @@ class Spec:
     calibrate_samples: int
     calibrate_max_iter: int
     t_ms: int
+    pool_learn: bool = True
     mode: str = "custom"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -161,12 +170,13 @@ def default_spec(spec: Optional[Mapping[str, Any]] = None) -> Spec:
         calibrate_samples=int(base["calibrate_samples"]),
         calibrate_max_iter=int(base["calibrate_max_iter"]),
         t_ms=int(base["t_ms"]),
+        pool_learn=bool(base.get("pool_learn", True)),
     )
 
 
 @dataclass
 class SeedResult:
-    """单种子单组结果（acc + 健康度 + 报告摘要）。"""
+    """单种子单组结果（acc + 健康度 + 校准/w_ratio 归因诊断）。"""
 
     seed: int
     switches_on: bool
@@ -177,6 +187,8 @@ class SeedResult:
     eval_rate_hz: float
     silence_frac: float
     capped_ratio: float
+    calib_ok: bool = False
+    w_ratio: float = 1.0          # E 源（池→池）权重 末/初 均值比（冻结=1）
     notes: List[str] = field(default_factory=list)
 
 
@@ -220,10 +232,15 @@ class AblationResult:
 
 
 def _net_cfg(spec: Spec, seed: int) -> NetConfig:
-    """§4 契约网络（default.yaml）按规格改池规模/种子（两组共用同一 cfg）。"""
+    """§4 契约网络（default.yaml）按规格改池规模/种子/pool_learn。
+
+    pool_learn=False（exp-g / Diehl-Cook 回归）会冻结池内 E→E 可塑性
+    （core 布局：learn = input | (E-source & pool_learn)）。
+    """
     from dataclasses import replace
     base = to_core_cfg(load_config())
-    return replace(base, n_pool=spec.n_pool, seed=seed).with_derived()
+    return replace(base, n_pool=spec.n_pool, seed=seed,
+                   pool_learn=spec.pool_learn).with_derived()
 
 
 def make_protocol(spec: Spec, seed: int, switches_on: bool) -> ProtocolConfig:
@@ -273,6 +290,16 @@ def make_data_fns(spec: Spec, seed: int):
     return train_fn, test_fn
 
 
+def _e_source_mask(bundle) -> np.ndarray:
+    """池→池 E 源边掩码（归因 w_ratio 用：冻结模式下这些边权重不动）。"""
+    cfg = bundle.cfg
+    src = bundle.csr_src.astype(np.intp)
+    is_pool_src = src >= cfg.n_in
+    e_mask = np.zeros(bundle.csr_w.size, dtype=bool)
+    e_mask[is_pool_src] = bundle.pool_is_E[src[is_pool_src] - cfg.n_in]
+    return e_mask
+
+
 def run_one_seed(spec: Spec, seed: int, switches_on: bool) -> SeedResult:
     """单组单种子：建网（seed 确定性）→ run_g1_protocol（唯一协议入口）。
 
@@ -280,15 +307,23 @@ def run_one_seed(spec: Spec, seed: int, switches_on: bool) -> SeedResult:
         spec: 规格。
         seed: 种子（网络、数据、读出共用）。
         switches_on: True=实验组（ADAPT 三开关开）；False=对照组（全关）。
+
+    归因诊断：calib_ok（最后 CALIBRATE 轮是否落带）、w_ratio（池→池 E 源
+    权重均值 末/初 比——exp-g 冻结模式下应 ≈1）。
     """
     cfg = _net_cfg(spec, seed)
     bundle = build_network(cfg)
+    w_e0 = float(bundle.csr_w[_e_source_mask(bundle)].mean())
     train_fn, test_fn = make_data_fns(spec, seed)
     pc = make_protocol(spec, seed, switches_on)
     t0 = time.perf_counter()
     rep: G1Report = run_g1_protocol(bundle, train_fn, test_fn, pc, seed=seed)
     wall = time.perf_counter() - t0
     ev = rep.eval_rounds[-1] if rep.eval_rounds else {}
+    w_e1 = float(bundle.csr_w[_e_source_mask(bundle)].mean())
+    w_ratio = float(w_e1 / w_e0) if w_e0 > 0.0 else 1.0
+    calib_ok = bool(rep.calibrate_rounds
+                    and rep.calibrate_rounds[-1].get("ok", False))
     return SeedResult(
         seed=seed,
         switches_on=switches_on,
@@ -299,6 +334,8 @@ def run_one_seed(spec: Spec, seed: int, switches_on: bool) -> SeedResult:
         eval_rate_hz=float(ev.get("mean_rate_hz", 0.0)),
         silence_frac=float(ev.get("silence_frac", 1.0)),
         capped_ratio=float(ev.get("capped_ratio", 0.0)),
+        calib_ok=calib_ok,
+        w_ratio=float(w_ratio),
         notes=list(rep.notes),
     )
 
@@ -424,6 +461,163 @@ def report_lines(result: AblationResult) -> List[str]:
     return lines
 
 
+# ---------------------------------------------------------------------------
+# exp-g 判定（冻结池内可塑性 → Diehl-Cook 结构；归因 Wave 1b / §3 M4）
+# ---------------------------------------------------------------------------
+
+#: exp-g 健康判据阈值：acc>=80%、静默<5%、CALIBRATE 全种子 ok、w_ratio≈1
+EXPG_CRITERIA = dict(acc_min=0.80, silence_max=0.05, w_ratio_tol=1e-6)
+
+
+def expg_metrics(grp: GroupResult) -> Dict[str, Any]:
+    """exp-g 组汇总指标（acc/静默/校准/w_ratio 的多种子统计）。"""
+    accs = [r.acc for r in grp.seed_results]
+    sils = [r.silence_frac for r in grp.seed_results]
+    ratios = [r.w_ratio for r in grp.seed_results]
+    calib = [bool(r.calib_ok) for r in grp.seed_results]
+    return {
+        "acc_mean": float(np.mean(accs)),
+        "accs": [float(a) for a in accs],
+        "silence_mean": float(np.mean(sils)),
+        "silence_max": float(np.max(sils)) if sils else 0.0,
+        "sils": [float(s) for s in sils],
+        "calib_ok": calib,
+        "calib_all_ok": bool(calib) and all(calib),
+        "w_ratios": [float(x) for x in ratios],
+        "w_ratio_dev_max": float(np.max(np.abs(np.asarray(ratios) - 1.0)))
+        if ratios else 0.0,
+    }
+
+
+def evaluate_expg(metrics: Mapping[str, Any],
+                  criteria: Optional[Mapping[str, float]] = None
+                  ) -> Dict[str, Any]:
+    """exp-g 健康判据（纯函数，不 assert）：
+    acc 均值 >=80%、静默均值 <5%、CALIBRATE 全种子 ok（3/3）、
+    w_ratio（池→池 E 源权重 末/初）≈1（冻结生效，容差 1e-6）。
+    """
+    c = dict(EXPG_CRITERIA)
+    if criteria:
+        c.update(criteria)
+    acc_ok = bool(metrics["acc_mean"] >= c["acc_min"])
+    sil_ok = bool(metrics["silence_mean"] < c["silence_max"])
+    cal_ok = bool(metrics["calib_all_ok"])
+    wr_ok = bool(metrics["w_ratio_dev_max"] <= c["w_ratio_tol"])
+    out: Dict[str, Any] = {
+        "acc_ok": acc_ok,
+        "silence_ok": sil_ok,
+        "calib_ok": cal_ok,
+        "w_ratio_ok": wr_ok,
+        "healthy": bool(acc_ok and sil_ok and cal_ok and wr_ok),
+        "explain": (
+            f"acc_mean={metrics['acc_mean'] * 100:.1f}% "
+            f"({'ok' if acc_ok else '<'} {c['acc_min'] * 100:.0f}%); "
+            f"silence_mean={metrics['silence_mean'] * 100:.1f}% "
+            f"({'ok' if sil_ok else '>='} {c['silence_max'] * 100:.0f}%); "
+            f"calib {sum(metrics['calib_ok'])}/{len(metrics['calib_ok'])} "
+            f"({'ok' if cal_ok else 'FAIL'}); "
+            f"w_ratio dev max={metrics['w_ratio_dev_max']:.2e} "
+            f"({'ok' if wr_ok else 'FAIL'})"
+        ),
+    }
+    return out
+
+
+def expg_report_lines(expg: GroupResult, metrics: Mapping[str, Any],
+                      verdict: Mapping[str, Any], wall_s: float) -> List[str]:
+    """exp-g 判定表（per-seed + 判据 + 健康结论）。"""
+    lines = [
+        "=== exp-g（Diehl-Cook 回归：pool_learn=False 冻结池内 E→E 可塑性，"
+        "协议三开关全开 ===",
+        f"seeds={[r.seed for r in expg.seed_results]}",
+    ]
+    for r in expg.seed_results:
+        lines.append(
+            f"    seed {r.seed}: acc={r.acc * 100:.1f}% "
+            f"rate={r.eval_rate_hz:.1f}Hz silence={r.silence_frac * 100:.1f}% "
+            f"calib_ok={r.calib_ok} w_ratio={r.w_ratio:.9f} "
+            f"wall={r.wall_s:.0f}s"
+        )
+    lines.append(
+        f"metrics: acc_mean={metrics['acc_mean'] * 100:.1f}% | "
+        f"silence_mean={metrics['silence_mean'] * 100:.1f}% | "
+        f"calib {sum(metrics['calib_ok'])}/{len(metrics['calib_ok'])} ok | "
+        f"w_ratio dev max={metrics['w_ratio_dev_max']:.2e}"
+    )
+    lines.append(f"criterion: healthy={verdict['healthy']} — {verdict['explain']}")
+    lines.append(f"total wall: {wall_s:.0f}s")
+    return lines
+
+
+def run_expg_comparison(full: bool = False) -> Dict[str, Any]:
+    """exp-g 判定入口（light/full 两模式）：
+
+    - 唯一变更：``pool_learn=False``（冻结池内可塑性 → Diehl-Cook 结构）；
+      协议三开关全开（等同 exp 组协议），种子/数据与 exp/ctrl 完全一致。
+    - 输出：expg 判据表（silence<5% / CALIBRATE 全 ok / w_ratio≈1 /
+      acc>=80%）+ 与 exp/ctrl 的 acc/静默对比汇总。
+
+    Args:
+        full: True=FULL 规模（10 类/noise0.16/池150/adapt2/3 种子）；
+            False=light 规模（4 类/池200 双种子，冒烟）。
+
+    Returns:
+        dict：expg（GroupResult）、metrics、verdict、exp/ctrl 对比摘要、wall。
+    """
+    mode = "full" if full else "light"
+    t0 = time.perf_counter()
+    exp_spec = default_spec(mode)                       # pool_learn=True
+    expg_spec = default_spec({"mode": mode, "pool_learn": False})
+    exp = run_group("exp", True, exp_spec)
+    expg = run_group("expg", True, expg_spec)
+    ctrl = run_group("ctrl", False, exp_spec)
+    metrics = expg_metrics(expg)
+    verdict = evaluate_expg(metrics)
+    wall = time.perf_counter() - t0
+    out = {
+        "mode": mode,
+        "spec": dict(exp_spec.to_dict()),
+        "expg": {"seed_results": [vars(r) for r in expg.seed_results]},
+        "metrics": metrics,
+        "verdict": verdict,
+        "compare": {
+            "exp": {"acc_mean": exp.summary["mean"],
+                    "acc_std": exp.summary["std"],
+                    "silence_mean": float(np.mean(
+                        [r.silence_frac for r in exp.seed_results]))},
+            "expg": {"acc_mean": metrics["acc_mean"],
+                     "acc_std": expg.summary["std"],
+                     "silence_mean": metrics["silence_mean"]},
+            "ctrl": {"acc_mean": ctrl.summary["mean"],
+                     "acc_std": ctrl.summary["std"],
+                     "silence_mean": float(np.mean(
+                         [r.silence_frac for r in ctrl.seed_results]))},
+        },
+        "wall_s": wall,
+    }
+    return out
+
+
+def print_expg_comparison(out: Dict[str, Any]) -> None:
+    """打印 exp-g 判定结果 + 与 exp/ctrl 的对比汇总。"""
+    print("=" * 78)
+    print(f"exp-g comparison (mode={out['mode']}, pool_learn=False)")
+    spec = out["spec"]
+    print(f"spec: n_pool={spec['n_pool']} classes={spec['n_classes']} "
+          f"train/class={spec['train_per_class']} "
+          f"test/class={spec['test_per_class']} noise={spec['noise']} "
+          f"seeds={spec['seeds']} adapt_epochs={spec['adapt_epochs']}")
+    c = out["compare"]
+    for name in ("exp", "expg", "ctrl"):
+        cc = c[name]
+        print(f"  {name:5s}: acc={cc['acc_mean'] * 100:.1f}% ± "
+              f"{cc['acc_std'] * 100:.1f}%   "
+              f"silence={cc['silence_mean'] * 100:.1f}%")
+    v = out["verdict"]
+    print(f"exp-g criterion: healthy={v['healthy']} — {v['explain']}")
+    print(f"total wall: {out['wall_s']:.0f}s")
+
+
 def _parse_seeds(text: str) -> List[int]:
     parts = [p for p in text.replace(";", ",").split(",") if p.strip()]
     if not parts:
@@ -440,10 +634,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 pass
     ap = argparse.ArgumentParser(
         prog="python -m hstdn.exp.ablation",
-        description="G1 随机储备池消融（exp vs 经典 LSM 对照；R1）",
+        description="G1 随机储备池消融（exp vs 经典 LSM 对照；R1）"
+                    "+ exp-g 判定（冻结池内可塑性，Diehl-Cook 回归）",
     )
     ap.add_argument("--full", action="store_true",
-                    help="完整 G1（10 类、≥3 种子，官方判据）")
+                    help="完整规模（10 类、≥3 种子，官方判据）")
+    ap.add_argument("--expg", "--freeze-pool", dest="expg",
+                    action="store_true",
+                    help="exp-g 判定：pool_learn=False 冻结池内 E→E 可塑性"
+                         "（Diehl-Cook 结构），协议三开关全开；输出判据表"
+                         "（silence<5%/CALIBRATE 全 ok/w_ratio≈1/acc>=80%）"
+                         "及与 exp/ctrl 对比（默认 light，--full 组合）")
     ap.add_argument("--classes", type=int, default=None)
     ap.add_argument("--train", type=int, default=None,
                     help="每类训练样本数")
@@ -456,6 +657,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--adapt-epochs", type=int, default=None)
     ap.add_argument("--json", action="store_true", help="附加 JSON 汇总")
     args = ap.parse_args(list(argv) if argv is not None else None)
+
+    if args.expg:
+        out = run_expg_comparison(full=args.full)
+        print_expg_comparison(out)
+        if args.json:
+            print(json.dumps(out, indent=2, ensure_ascii=False,
+                             default=float))
+        return 0
 
     overrides = {
         k: v for k, v in {

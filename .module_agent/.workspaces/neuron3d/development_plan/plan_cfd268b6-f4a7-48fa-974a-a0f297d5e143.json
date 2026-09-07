@@ -1,0 +1,11 @@
+{
+  "plan_id": "plan_cfd268b6-f4a7-48fa-974a-a0f297d5e143",
+  "module_name": "core",
+  "development_plan": "为 H-STDN 增加\"冻结池内可塑性\"支持（exp-g 判定实验 / Diehl-Cook 回归结构，文档 §3 M1/M4），供 exp 模块 ablation 扩展使用。池→池 E 突触在冻结模式下保留连接与初始权重但不参与学习；归一化预算（in_learn_idx/in_sum0）自动只剩输入→池突触，从结构上移除\"池内活动竞争劫持预算\"源。\n1. layout.py：NetConfig 新增字段 pool_learn: bool = True（默认保持现状=池内可学习；False=池内 E 突触冻结）。需确保 dataclass 冻结默认值、with_derived 不受影响、DEFAULT_CFG 等引用兼容（新增字段须在所有构造路径默认 True，禁止破坏既有调用）。同步更新模块级导出/文档注释（D11 相关说明补充 pool_learn 语义）。\n2. network.py：_build_csr（或等价权重/学习掩码构造处）将 learn 掩码改为 learn = cls_in | (cls_e & cfg.pool_learn)——冻结模式下输入边与 E 源边的权重仍按原分布采样、延迟/结构不变，仅 csr_learn 为 False；I 源恒不学习。确认 _build_learn_rows/in_sum0 自动只收 learn=True 的入突触（即只剩输入→池），并核对现有结构断言（每池 learnable 入突触 >= 1 等在 k_in=16 输入下仍满足；若实现把池内边也算入 learn 预算的部分需同步适配）。\n3. 自检与回归：hstdn/core/selfcheck.py 增加或调整断言组验证：a) pool_learn=False 构建后池内 E 边 learn=False 且权重分布仍为初始 U(0.18,0.42)（不学习不动）；b) in_learn_idx 只含输入边、in_sum0 对应输入权重和；c) 既有 G0 十五项（exp.gates）在默认 pool_learn=True 下 15/15 无回归。默认路径行为完全不变。\n遵守代码规范与三件套纪律；不越权修改其他模块（exp 侧配置桥由 exp 计划处理）；selfcheck 全绿后提交。",
+  "session_id": "97ed5687-2468-42e1-bac3-ed426322002c",
+  "modified_files": [
+    "hstdn/core/layout.py",
+    "hstdn/core/network.py",
+    "hstdn/core/selfcheck.py"
+  ]
+}
