@@ -1,0 +1,10 @@
+{
+  "plan_id": "plan_4ef43285-387d-415f-b631-8c6e10910cb7",
+  "module_name": "main",
+  "development_plan": "扩展 hstdn/train.py 与 hstdn/eval.py（main 模块）以消费 core.scheduler M6 协议（文档 §9 D5、§3 M6、§6 G1），G1 首跑编排：\n1. train.py：新增 M6 协议运行模式——现有 config→build_network→单样本冒烟保留；新增 --g1（或 --protocol）子命令/模式：调 core.scheduler.run_g1_protocol 走完整 ADAPT→CALIBRATE→COLLECT→READOUT→EVAL 分阶段协议（synthetic 10 类，protocol 节超参），输出各阶段率/沉默/精度报告；每轮 checkpoint 落盘（含 meta 指纹：seed、协议参数、config 指纹、阶段、是否回滚）。复用 exp/ablation 的种子/对照约定。\n2. eval.py：支持 G1 评估模式——加载协议 checkpoint，独立测试集（固定 test_seed 派生）全 off 冻结推理 → 输出测试精度 + 率/沉默/cos（复用 exp.diagnostics），报告格式与 G1 门禁/ablation 对齐。\n3. 冒烟自测：--g1 轻量参数（如 --classes 4 --train-samples 60 --test-samples 20 --seeds 1）端到端跑通 exit 0；若因运行时长无法在冒烟内完成完整协议，则打印明确的继续指引。\n4. M6 调度器接入点注释更新为已实现状态（train._training_epochs 处），协议超参唯一来源仍为 default.yaml。\n遵守代码规范与三件套纪律；不越权修改 core/exp 文件。",
+  "session_id": "bd3f7659-a40a-4633-b294-28eb9acbf5b7",
+  "modified_files": [
+    "hstdn/train.py",
+    "hstdn/eval.py"
+  ]
+}

@@ -8,3 +8,12 @@ G0 十五项断言门禁 `hstdn/exp/gates.py` 为项目门槛权威实现（首�
 ## 诊断面板
 
 诊断面板 `hstdn/exp/diagnostics.py`（首期已交付，供 G1 与 gates 调试）：纯函数诊断量——发放率/沉默比例（firing_rates_hz/silence_ratio/rate_summary）、类间余弦（cos_similarity/class_cosine_matrix）、sqrt+L2 特征可比性（feature_transform(mode='sqrt_l2')/feature_cos_similarity，支持列掩码，对应 configs features 节 v0/feature_mask=pool 的读出预处理）；bundle 级（core 惰性导入）：顶界突触占比/输入→池 w 均值/可塑性面板（委托 core plasticity 原语）、延迟直方图、网络结构面板、样本级 rate+塑性汇总面板与打印助手。职责边界：只读数不承载业务断言；core 接口变更仅需同步内联调用点。
+## G1 消融与首跑门禁
+
+G1 随机储备池消融与首跑门禁（R1，exp 模块 G1 配套；文档 §6 G1、§8 ablation、§11 冻结条件）：
+
+- `hstdn/exp/ablation.py`：实验组（stdp/homeo/norm 三开关开，run_g1_protocol ADAPT 适应）vs 对照组（三开关全关随机固定储备池 + CALIBRATE + READOUT，经典 LSM）。两组唯一差异 = 三开关（对照组以 n_adapt_epochs=0 等价表达全关），同数据同种子。提供 Spec/LIGHT_SPEC(4类双种子池200 机制)/FULL_SPEC(10类≥3种子池150 官方判据)、run_ablation（多种子 mean±std + 组间对比 + evaluate_full_criterion：实验组均值≥60% 且显著高于对照=均值差≥5pp 且逐配种子 exp>ctrl）、CLI。规模注明：L0 内核 800 池逐样本数百 ms，默认消融跑门禁规模（--pool 可回 800）。
+- gates.py `run_g1`（G1_SPECS id=101 登记）：--g1 轻量（快速机制验证 + 打印组间对比与提示，不断言官方判据）；--g1 --full 完整官方判据断言 PASS/FAIL；退出码/清单协议与 G0 语义一致。
+- diagnostics.py 新增 G1 评估纯函数：multi_seed_summary / compare_groups / format_g1_ablation。
+
+实证现状（诚实记录，本机 2026-09 测量）：10 类池150 noise0.16 三种子 run_g1_protocol 下 exp=56.7±15.9% vs ctrl(随机LSM)=90.3±4.9%（--full 判据未满足，FAIL）；4 类池200 noise0.18 双种子 exp=45.8±23.6 vs ctrl=64.6±26.5。即当前 core scheduler + V0 计数特征 + 本合成任务族（互不重叠字形掩码）下，冻结校准储备池已近饱和（0.87-0.98），STDP+homeo+norm 适应后部分池 θ 饱和/高沉默（exp 静默 12-51%）反而削弱计数可分离性。G1 完整判据要转绿需后续研究：时序敏感特征（v1 分箱喂入 COLLECT）、homeo/θ 饱和治理、或更利于 STDP 的任务族 —— 属 core/scheduler 与数据侧范畴（exp 不越权）。

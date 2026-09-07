@@ -1,0 +1,11 @@
+{
+  "plan_id": "plan_816d97e2-0f06-4bc5-9832-690bf9ca58ab",
+  "module_name": "exp",
+  "development_plan": "实现 H-STDN exp 模块的 G1 配套（文档 §6 G1、§8 exp/ablation.py、§3 M5/M6 消费），依赖 core 新增的 features/readout/scheduler：\n1. ablation.py（新增）：实现 G1 随机储备池对照（R1 消融）——实验组（stdp_on/homeo_on/norm_on=True 全开）vs 对照组（随机储备池：三开关全 False，仅 CALIBRATE 校准 + READOUT，即经典 LSM 范式，设计文档 §6 G1/G1 回退方案）。每组跑 ≥3 种子，报告精度均值±std。复用 core.scheduler.run_g1_protocol 或等价协议入口，通过参数化开关唯一区分两组（设计文档 §11 冻结条件：对照组与实验组唯一差异变量是三个开关）。\n2. gates.py（扩展）：登记 G1 门禁检查函数 run_g1（在 ablation/协议之上）——通过标准：合成 10 类实验组 ≥60% 且显著高于对照组（设计文档 §6 G1）。G1 全量跑耗时较长（合成 10 类多种子），默认以轻量模式（如 4-6 类、单/双种子快速验证 + 打印提示）提供，提供 --full 参数跑完整 G1（≥3 种子 10 类）；gates 退出码/清单协议保持既有。\n3. 保持 G0 十五项不回归（gates 15/15 仍全绿，exit 0）。\n4. diagnostics.py 如需补充 G1 评估辅助（如报告格式化、多种子汇总）可小幅扩展，保持纯函数、不承载断言。\n遵守代码规范与三件套纪律；不越权修改 core/main 模块文件。",
+  "session_id": "8f636bcb-4e5b-49c4-962e-b57ce31d053e",
+  "modified_files": [
+    "hstdn/exp/ablation.py",
+    "hstdn/exp/gates.py",
+    "hstdn/exp/diagnostics.py"
+  ]
+}

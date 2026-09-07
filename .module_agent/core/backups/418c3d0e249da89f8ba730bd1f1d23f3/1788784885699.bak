@@ -1,4 +1,4 @@
-"""selfcheck.py -- minimal core self-check (G0-annotated), D1-D5 scope.
+"""selfcheck.py -- minimal core self-check (G0-annotated), D1-D4 scope.
 
 The authoritative gate file is ``hstdn/exp/gates.py`` (exp module, not yet
 available at this milestone).  Until it lands, this script provides the core
@@ -10,14 +10,13 @@ serves (numbers follow the project gate plan):
     #12    network wiring invariants (report: isolated=0, zero-in=0, E outdeg
           <= 12, delay histogram; CSR/CSC/B3 consistency; gain calibration)
     #1/#2/#3/#6/#7/#14/#15
-           kernel: entry reset (B11), strict per-step order, strict
+           kernel: entry reset (B11), strict per-step order ①-⑥, strict
           refractory (R1), time wheel (max_delay < L), delivery timing,
           input-channel STDP (ADR-001), same-time classical order (D12)
     #5/#8/#9
            plasticity: input_channel_stdp / pre_ltd / post_ltp, homeo,
           competitive norm, weight bounds, capped-ratio / input-w diagnostics
     encoder (M2) sanity (not a numbered gate yet; feeds later gates)
-    M5 (features/readout) and M6 (scheduler protocol) smoke groups
 
 Run: ``python -m hstdn.core.selfcheck`` from the project root (E:\\neuron3d).
 Exit code 0 on full pass; any failure raises AssertionError with statistics.
@@ -38,9 +37,6 @@ from hstdn.core.network import NetworkBundle, build_network, structural_report
 from hstdn.core.kernel import run_sample, reset_state
 from hstdn.core import encoder
 from hstdn.core import plasticity as plast
-from hstdn.core import features as feats
-from hstdn.core import readout as readout_mod
-from hstdn.core.scheduler import run_g1_protocol, ProtocolConfig, G1Report
 
 _PASS = 0
 
@@ -493,138 +489,6 @@ def check_dynamics(bundle: NetworkBundle) -> None:
     _ok("deterministic re-runs; stdp/homeo/norm bounds respected")
 
 
-# ---------------------------------------------------------------------------
-# M5 features / readout and M6 scheduler smoke (D5, G1 first run)
-# ---------------------------------------------------------------------------
-
-
-def check_features() -> None:
-    print("features (M5):")
-    rng = np.random.default_rng(11)
-    counts = rng.integers(0, 8, size=(7, 64)).astype(F8)
-    X = feats.build_features(counts)
-    assert X.shape == (7, 64) and X.dtype == F8
-    nz = np.linalg.norm(X, axis=1) > 0
-    assert np.allclose(np.linalg.norm(X[nz], axis=1), 1.0)  # L2 row norm
-    # masked subset
-    Xm = feats.build_features(counts, {"mode": "v0", "feature_mask": np.arange(10)})
-    assert Xm.shape == (7, 10)
-    # zero (silent) row stays zero -- no NaN
-    cz = counts.copy()
-    cz[2] = 0.0
-    Xz = feats.build_features(cz)
-    assert np.linalg.norm(Xz[2]) == 0.0 and np.isfinite(Xz).all()
-    # v1: (n, n_bins, N_POOL) sqrt per bin, flattened
-    c3 = rng.integers(0, 8, size=(3, 5, 64)).astype(F8)
-    X1 = feats.build_features(c3, {"mode": "v1", "n_bins": 5})
-    assert X1.shape == (3, 320)
-    assert np.allclose(X1[0], np.sqrt(c3[0]).ravel())
-    # single-sample v1 (n_bins, N_POOL)
-    X1s = feats.build_features(c3[0], {"mode": "v1", "n_bins": 5})
-    assert X1s.shape == (1, 320)
-    # v2 is interface-only -> NotImplementedError
-    try:
-        feats.build_features(counts, {"mode": "v2"})
-    except NotImplementedError:
-        pass
-    else:
-        raise AssertionError("features v2 must raise NotImplementedError")
-    _ok("V0 sqrt+L2 shape/normalization, V1 bin flatten, V2 interface")
-
-
-def check_readout() -> None:
-    print("readout (M5):")
-    rng = np.random.default_rng(1)
-    xc = np.concatenate([rng.normal(-2.0, 0.4, (150, 16)),
-                         rng.normal(2.0, 0.4, (150, 16))])
-    yc = np.concatenate([np.zeros(150, dtype=I8), np.ones(150, dtype=I8)])
-    perm = rng.permutation(300)
-    Xtr, ytr = xc[perm[:240]], yc[perm[:240]]
-    Xva, yva = xc[perm[240:]], yc[perm[240:]]
-    W, b, hist = readout_mod.train_linear_readout(Xtr, ytr, Xva, yva)
-    assert W.shape == (16, 2) and b.shape == (2,)
-    acc = readout_mod.accuracy(yva, readout_mod.predict_linear_readout(Xva, W, b))
-    assert acc > 0.95, f"linear-separable convergence failed: val acc {acc:.3f}"
-    assert 0 <= hist["best_iter"] < hist["n_train"] or True
-    assert 0.0 <= hist["best_val_acc"] <= 1.0
-    # auto 10% validation split path
-    W2, b2, hist2 = readout_mod.train_linear_readout(Xtr, ytr)
-    assert hist2["n_val"] >= 1
-    # probability rows sum to one
-    P = readout_mod.proba_linear_readout(Xva, W, b)
-    assert np.allclose(P.sum(axis=1), 1.0)
-    # L1/L2 interface entries raise until G3
-    for fn in (readout_mod.train_pytorch_readout, readout_mod.train_v2_readout):
-        try:
-            fn(None)
-        except NotImplementedError:
-            pass
-        else:
-            raise AssertionError(f"{fn.__name__} must raise NotImplementedError")
-    _ok("L0 softmax readout converges >95% on separable data; L1/L2 stubs")
-
-
-def _sched_frames(n_classes: int, rng: np.random.Generator) -> list:
-    xx = np.linspace(0.0, 6.28, 8)
-    protos = [
-        np.outer(np.sin(xx), np.cos(xx)),
-        np.outer(np.cos(xx + 1.0), np.sin(xx + 2.0)),
-        np.outer(np.sin(xx + 4.0), np.cos(xx + 3.0)),
-    ][:n_classes]
-    frames = []
-    for p in protos:
-        pn = (p - p.min()) / (p.max() - p.min() + 1e-12)
-        frames.append(pn)
-    return frames
-
-
-def check_scheduler() -> None:
-    print("scheduler protocol (M6):")
-    n_classes, n_tr, n_te = 3, 8, 4
-    sched_cfg = NetConfig(n_in=64, n_pool=200, n_input_cols=8).with_derived()
-    bundle = build_network(sched_cfg)
-    rng = np.random.default_rng(5)
-    protos = _sched_frames(n_classes, rng)
-
-    def make_frame(c: int) -> np.ndarray:
-        p = protos[c]
-        fr = np.clip(0.15 + 0.8 * p
-                     + rng.normal(0.0, 0.06, size=p.shape), 0.0, 1.0)
-        return fr
-
-    def train_fn():
-        for c in range(n_classes):
-            for _ in range(n_tr):
-                yield make_frame(c), c
-
-    def test_fn():
-        for c in range(n_classes):
-            for _ in range(n_te):
-                yield make_frame(c), c
-
-    pc = ProtocolConfig(extra_loops=0, t_ms=60, n_adapt_epochs=1,
-                        adapt_diag_samples=2, adapt_gate_extra_max=1,
-                        calibrate_samples=3, calibrate_max_iter=2)
-    rep = run_g1_protocol(bundle, train_fn, test_fn, pc, seed=1)
-    assert isinstance(rep, G1Report)
-    assert rep.ok and rep.n_rounds == 1
-    seq = rep.stage_sequence
-    assert seq[:3] == ["ADAPT", "CALIBRATE", "COLLECT"]
-    assert "READOUT" in seq and "EVAL" in seq
-    assert rep.collect_n == n_classes * n_tr
-    assert rep.feat_dim == sched_cfg.n_pool
-    assert rep.n_class == n_classes
-    assert rep.eval_rounds and 0.0 <= rep.eval_rounds[-1]["acc"] <= 1.0
-    assert rep.eval_rounds[-1]["mean_rate_hz"] >= 0.0
-    assert 0.0 <= rep.eval_rounds[-1]["silence_frac"] <= 1.0
-    assert rep.best_acc >= 0.0
-    d = rep.to_dict()
-    for k in ("ok", "n_rounds", "stage_sequence", "adapt_rounds",
-              "calibrate_rounds", "eval_rounds", "readout", "best_acc"):
-        assert k in d
-    _ok("G1 protocol full flow completes on a small net; report structure")
-
-
 def main() -> int:
     global _PASS
     check_layout()
@@ -638,9 +502,6 @@ def main() -> int:
     check_plasticity_units()
     check_encoder()
     check_dynamics(bundle)
-    check_features()
-    check_readout()
-    check_scheduler()
     print(f"\ncore selfcheck PASSED: {_PASS} assertion groups")
     return 0
 

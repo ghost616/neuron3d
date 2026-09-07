@@ -38,5 +38,29 @@
     "code_reviewed": true,
     "plan_completed": true,
     "test_passed": true
+  },
+  {
+    "plan_id": "plan_c7950b62-1026-446c-b6ed-2b12e011553e",
+    "plan_summary": "新增 core M5/M6 组件：features.py + readout.py + scheduler.py，扩展 selfcheck 并保持 G0 全绿",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_816d97e2-0f06-4bc5-9832-690bf9ca58ab",
+    "plan_summary": "实现 exp G1 配套：ablation.py 储备池对照 + gates run_g1 + diagnostics 扩展，保持 G0 不回归",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_4ef43285-387d-415f-b631-8c6e10910cb7",
+    "plan_summary": "扩展 train/eval 消费 core.scheduler M6 协议：--g1 模式 + G1 评估 + 冒烟自测",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
   }
 ]

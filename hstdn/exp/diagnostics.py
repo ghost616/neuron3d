@@ -1,4 +1,4 @@
-﻿"""diagnostics.py -- 诊断面板函数（G1 与 gates 调试共用；exp 模块交付）。
+"""diagnostics.py -- 诊断面板函数（G1 与 gates 调试共用；exp 模块交付）。
 
 定位：不承载业务断言，只做**读数/汇总**，供 G1 实验评估与 G0 门禁调试复用。
 core 依赖一律惰性导入（本模块自身保持轻量、可独立 import）。
@@ -30,6 +30,7 @@ __all__ = [
     "capped_synapse_ratio", "input_to_pool_w_mean",
     "plasticity_panel", "delay_histogram", "network_panel",
     "sample_panel", "print_panel",
+    "multi_seed_summary", "compare_groups", "format_g1_ablation",
 ]
 
 
@@ -251,3 +252,87 @@ def print_panel(panel: Dict[str, Any], title: str = "diagnostics") -> None:
             print(f"  {k:24s}: {v:.6g}")
         else:
             print(f"  {k:24s}: {v}")
+
+
+# ---------------------------------------------------------------------------
+# G1 评估辅助（多种子汇总 / 组间比较 / 报告格式化 —— 纯函数，不承载断言）
+# ---------------------------------------------------------------------------
+
+
+def multi_seed_summary(accuracies: Sequence[float],
+                       ddof: Optional[int] = None) -> Dict[str, float]:
+    """多种子精度汇总：mean ± std（选择 ddof）。
+
+    Args:
+        accuracies: 各种子测试精度（∈ [0,1]）。
+        ddof: 标准差自由度；None 时 n>=2 用样本 std（ddof=1）、n==1 用 0。
+
+    Returns:
+        dict：mean/std/min/max/n/mean_pct/std_pct（百分比视图）。
+    """
+    a = np.asarray(accuracies, dtype=np.float64)
+    if a.ndim != 1 or a.size == 0:
+        raise ValueError(f"accuracies must be a non-empty 1-D sequence, got {a}")
+    if ddof is None:
+        ddof = 1 if a.size >= 2 else 0
+    if a.size <= ddof:
+        ddof = 0
+    std = float(a.std(ddof=ddof))
+    return {
+        "n": float(a.size),
+        "mean": float(a.mean()),
+        "std": float(std),
+        "min": float(a.min()),
+        "max": float(a.max()),
+        "mean_pct": float(a.mean()) * 100.0,
+        "std_pct": float(std) * 100.0,
+    }
+
+
+def compare_groups(exp_summary: Mapping[str, Any],
+                   ctrl_summary: Mapping[str, Any]) -> Dict[str, float]:
+    """实验组 vs 对照组均值/逐种子差汇总（纯统计，不含断言）。
+
+    Args:
+        exp_summary / ctrl_summary: multi_seed_summary 输出。
+
+    Returns:
+        dict：mean_diff / mean_diff_pct / 以及最大单种子对照差 max_seed_gap
+        （= min(exp)-max(ctrl) 视差保守界，种子数相同时有效）。
+    """
+    mean_diff = float(exp_summary["mean"]) - float(ctrl_summary["mean"])
+    out: Dict[str, float] = {
+        "mean_diff": mean_diff,
+        "mean_diff_pct": mean_diff * 100.0,
+        "exp_mean_pct": float(exp_summary["mean_pct"]),
+        "ctrl_mean_pct": float(ctrl_summary["mean_pct"]),
+    }
+    if int(exp_summary["n"]) >= 1 and int(ctrl_summary["n"]) >= 1:
+        # 保守分离界：实验组最差种子仍优于对照组最好种子
+        out["min_exp_gt_max_ctrl"] = float(exp_summary["min"]) - \
+            float(ctrl_summary["max"])
+    return out
+
+
+def format_g1_ablation(exp_summary: Mapping[str, Any],
+                       ctrl_summary: Mapping[str, Any],
+                       compare: Mapping[str, float],
+                       *, group_labels=("exp(STDP+homeo+norm)", "ctrl(random)")) -> str:
+    """格式化 G1 消融对比表（纯格式化；mean±std 百分比视图）。"""
+    e, c = group_labels
+    lines = [
+        f"G1 ablation ({e} vs {c}):",
+        f"  {e:26s}: {exp_summary['mean_pct']:.1f}% ± "
+        f"{exp_summary['std_pct']:.1f}%  (n={int(exp_summary['n'])}, "
+        f"min {exp_summary['min'] * 100:.1f}% / max {exp_summary['max'] * 100:.1f}%)",
+        f"  {c:26s}: {ctrl_summary['mean_pct']:.1f}% ± "
+        f"{ctrl_summary['std_pct']:.1f}%  (n={int(ctrl_summary['n'])}, "
+        f"min {ctrl_summary['min'] * 100:.1f}% / max {ctrl_summary['max'] * 100:.1f}%)",
+        f"  mean diff                : {compare['mean_diff_pct']:+.1f} pp",
+    ]
+    if "min_exp_gt_max_ctrl" in compare:
+        lines.append(
+            f"  min(exp) - max(ctrl)    : "
+            f"{compare['min_exp_gt_max_ctrl'] * 100:+.1f} pp"
+        )
+    return "\n".join(lines)

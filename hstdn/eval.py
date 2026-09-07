@@ -18,8 +18,19 @@
 hstdn.core / hstdn.exp 接口。cos 仅为「类均值特征可分离性」骨架读数，
 G1 的读出/特征可比性统计由 exp/data 模块按里程碑补充。
 
+G1 协议评估模式（--g1）
+----------------------
+加载 train.py --g1 产出的协议 checkpoint（meta.mode="g1"，含读出权重 W/b），
+在**独立测试集**（固定派生 test_seed = 5000 + 训练 seed + --seed 附加）上
+全 off 冻结推理：core.features.build_features → core.readout 预测 → 输出
+测试精度 + 率/沉默/cos；报告格式与 G1 门禁/ablation（exp.gates --g1 /
+exp.ablation）对齐。协议训练阶段的 EVAL 精度（2000+seed 数据流）记录于
+checkpoint meta（best_acc / eval_rounds）；独立评估使用不同数据流，精度
+可能与之不同（两者都打印）。
+
 命令行（项目根 E:\\neuron3d）
     python -m hstdn.eval --checkpoint checkpoints/train_<fp>.npz --samples 10
+    python -m hstdn.eval --g1 --checkpoint checkpoints/g1_train_s0_<fp>.npz --samples 20
     python -m hstdn.eval --help
 退出码：0 = 成功；1 = 运行期失败（异常上抛并打印）；2 = 参数错误。
 """
@@ -43,10 +54,12 @@ from hstdn.exp import diagnostics as diag
 from hstdn.train import (
     config_fingerprint,
     load_checkpoint,
+    load_g1_checkpoint,
     sample_aggregate_panel,
 )
 
-__all__ = ["build_parser", "class_mean_features", "run_evaluation", "main"]
+__all__ = ["build_parser", "class_mean_features", "run_evaluation",
+           "run_g1_evaluation", "main"]
 
 #: 测试集派生 seed 偏移（素数；与训练数据流错开，保证评估集独立）
 _TEST_SEED_OFFSET = 1000003
@@ -78,6 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=_DEF_SEED,
                    help="测试派生种子基准（实际 = 1000003 + seed，默认 0）")
     p.add_argument("--quiet", action="store_true", help="仅打印汇总面板")
+    g = p.add_argument_group("G1 protocol eval (--g1)")
+    g.add_argument("--g1", action="store_true",
+                   help="G1 模式：加载 train --g1 的协议 checkpoint，独立测试"
+                        "集冻结推理输出测试精度（缺省为 D4 率/沉默/cos 模式）")
     return p
 
 
@@ -221,12 +238,133 @@ def run_evaluation(args: argparse.Namespace) -> Dict[str, Any]:
     return summary
 
 
+#: 独立评估测试 seed 偏移（素数；与训练协议 EVAL 的 2000+seed 及 D4 评估的
+#: 1000003+seed 均错开 —— 独立测试集固定派生，见模块 docstring）
+_G1_INDEP_TEST_OFFSET = 5000
+#: 训练协议 EVAL 阶段测试 seed 基准 = train._G1_TEST_SEED_OFFSET（仅供报告；
+#: 权威值在 hstdn/train.py，此处不复算数据流）
+_G1_TRAIN_EVAL_SEED_BASE = 2000
+
+
+def run_g1_evaluation(args: argparse.Namespace) -> Dict[str, Any]:
+    """G1 评估编排：协议 checkpoint → 独立测试集冻结推理 → 精度/率/沉默/cos。
+
+    数据流：test_seed = 5000 + checkpoint 训练 seed + args.seed；类别数/噪声/
+    graded/样本时长取 checkpoint meta（train --g1 落盘的 run_args / protocol），
+    与训练协议 EVAL（2000+seed）数据流独立。读出参数 W/b 取自 checkpoint。
+
+    Raises:
+        ValueError/AssertionError: 参数非法、非 G1 checkpoint 或契约违反。
+    """
+    ckpt = Path(args.checkpoint)
+    if not ckpt.is_file():
+        raise FileNotFoundError(f"checkpoint 不存在：{ckpt}")
+    bundle, meta, extra = load_g1_checkpoint(ckpt)      # 非 g1 会给出指引
+    _verify_config(meta, args.config)
+    W = extra["W"]
+    b = extra["b"]
+    netcfg = bundle.cfg
+    run_args = meta.get("run_args") or {}
+    if run_args.get("mode") != "g1":
+        raise AssertionError(f"{ckpt.name} meta.run_args.mode != 'g1'")
+    seed = int(run_args.get("seed", 0))
+    n_classes = int(run_args.get("classes", N_CLASSES))
+    noise = float(run_args.get("noise", _DEF_NOISE))
+    graded = bool(run_args.get("graded", True))
+
+    test_total = int(args.samples or run_args.get("test_total", 100))
+    if test_total < n_classes:
+        raise ValueError(
+            f"--samples 需保证每类 >= 1 个测试样本（>= {n_classes}），"
+            f"got {test_total}"
+        )
+    test_seed = _G1_INDEP_TEST_OFFSET + seed + int(args.seed)
+    n_per_class = int((test_total + n_classes - 1) // n_classes)
+    batch = synthetic_batch(n_per_class, noise=noise, graded=graded,
+                            seed=test_seed)
+    n_use = min(test_total, len(batch))
+    frames = batch.frames[:n_use]
+    labels = batch.labels[:n_use]
+
+    t0 = time.perf_counter()
+    win = float(netcfg.window_s)
+    T = int(round(win * 1000.0))
+    counts_mat = np.zeros((n_use, netcfg.n_pool), dtype=I8)
+    if not args.quiet:
+        print(f"--- G1 eval (independent test; seed={test_seed}, "
+              f"samples={n_use}, frozen all-OFF) ---")
+    for i in range(n_use):
+        buckets = latency_encode(np.asarray(frames[i], dtype=F8).ravel(),
+                                 cfg=netcfg)
+        st = run_sample(bundle, buckets, T=T,
+                        stdp_on=False, homeo_on=False, norm_on=False)
+        counts_mat[i] = st["spike_counts"]
+        if not args.quiet:
+            print(f"  test {i + 1:>3}/{n_use} class {int(labels[i])} "
+                  f"spikes {int(st['n_spikes_total']):>5}")
+
+    # ---- 读出推理（checkpoint 内 W/b；features 与训练协议同口径 v0）----
+    from hstdn.core.features import FeaturesConfig, build_features
+    from hstdn.core.readout import accuracy, predict_linear_readout
+    X = build_features(counts_mat, FeaturesConfig())
+    pred = predict_linear_readout(X, W, b)
+    acc = accuracy(np.asarray(labels, dtype=I8), pred)
+
+    # ---- 率/沉默 + 类间 cos（与 D4 模式同源面板）----
+    agg = sample_aggregate_panel(counts_mat, window_s=win)
+    class_means, n_seen = class_mean_features(counts_mat, labels,
+                                              n_classes=n_classes)
+    seen = np.flatnonzero(n_seen > 0)
+    cos: Dict[str, float] = {"n_classes_seen": float(seen.size)}
+    if seen.size >= 2:
+        m = diag.class_cosine_matrix(class_means[seen])
+        off = m[np.triu_indices(seen.size, k=1)]
+        cos["cos_mean_offdiag"] = float(off.mean()) if off.size else 0.0
+        cos["cos_max_offdiag"] = float(off.max()) if off.size else 0.0
+        cos["cos_min_offdiag"] = float(off.min()) if off.size else 0.0
+
+    # ---- 报告（格式与 ablation/gates 种子行口径对齐）----
+    best_acc = float(meta.get("best_acc", 0.0))
+    lines = [
+        f"G1 eval: checkpoint={ckpt.name}",
+        f"  seed {seed} (independent test_seed={test_seed}): "
+        f"acc={acc * 100:.1f}% n={n_use}",
+        f"  rate={agg['mean_rate_hz']:.2f}Hz silence="
+        f"{agg['silence_ratio'] * 100:.1f}% cos_offdiag_mean="
+        f"{cos.get('cos_mean_offdiag', 0.0):.3f}",
+        f"  protocol-train best_acc={best_acc * 100:.1f}% "
+        f"(test_seed={_G1_TRAIN_EVAL_SEED_BASE + seed}); "
+        f"stages={' -> '.join(meta.get('stage_sequence') or [])}; "
+        f"rolled_back={meta.get('rolled_back', False)}",
+    ]
+    print("\n".join(lines))
+
+    summary: Dict[str, Any] = {
+        "checkpoint": str(ckpt),
+        "seed": seed,
+        "test_seed": test_seed,
+        "n_test_samples": float(n_use),
+        "acc": float(acc),
+        "protocol_best_acc": best_acc,
+        "aggregate": agg,
+        "class_cos": cos,
+        "rolled_back": bool(meta.get("rolled_back", False)),
+        "elapsed_s": float(time.perf_counter() - t0),
+    }
+    print(f"g1 eval done in {summary['elapsed_s']:.2f} s")
+    return summary
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI 入口（退出码：0 成功 / 1 运行期失败 / 2 参数错误）。"""
     args = build_parser().parse_args(argv)
     try:
-        run_evaluation(args)
-    except (ValueError, AssertionError, FileNotFoundError) as exc:
+        if args.g1:
+            run_g1_evaluation(args)
+        else:
+            run_evaluation(args)
+    except (ValueError, AssertionError, FileNotFoundError,
+            NotImplementedError, RuntimeError) as exc:
         print(f"[hstdn.eval] FAILED: {exc}", file=sys.stderr)
         return 1
     return 0

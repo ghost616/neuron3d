@@ -1,0 +1,13 @@
+{
+  "plan_id": "plan_c7950b62-1026-446c-b6ed-2b12e011553e",
+  "module_name": "core",
+  "development_plan": "在 hstdn/core/ 下新增 M5/M6 三个组件（文档 §3 M5/M6、§9 阶段 D5、§4 readout_l0/features/protocol 节），供 G1 首跑使用：\n1. features.py（M5 特征抽取）：V0（默认，features.mode=v0）——X = sqrt(counts[feature_mask]) 后 L2 行归一化，feature_mask 默认全体池（D9，config features.feature_mask=pool）；V1 时间分 bin（n_bins=5，逐 bin sqrt 展平，维度 N_POOL×5）实现但默认关闭（G2 后启用）；V2 代理梯度仅留接口注释。公开 build_features(counts2d_or_mask, cfg) 或等价纯函数，输出形状 [n_samples, feat_dim]，供 readout 消费。禁止 pass 占位（未实现项显式 raise NotImplementedError）。\n2. readout.py（M5 L0 读出，G1 用）：NumPy 线性层（softmax+交叉熵），训练超参读 configs readout_l0 节（lr=0.5, iters=300, l2_lambda=1e-4），batch=64；以 10% 验证集选择迭代数防过拟合（800 维特征 + 1k 样本过拟合风险，设计文档 §3 M5 评审发现）；返回权重与测试/验证精度。L1（PyTorch 128 隐层）与 L2（V2 代理梯度）留合规接口（NotImplementedError，G3 后实现），不允许 pass。公开：train_linear_readout(X_train, y_train, X_val, y_val, cfg)->(W, b, history) 与 predict_linear_readout。\n3. scheduler.py（M6 训练调度状态机）：严格按文档 §3 M6 状态图实现 ADAPT→CALIBRATE→COLLECT→READOUT→EVAL（→可选循环 ≤2 轮）。\n   - ADAPT：stdp_on/homeo_on/norm_on=True 跑 adapt_epochs 轮（默认 2），诊断门：沉默率<5% 且 率∈[3,15]Hz 才进入 CALIBRATE，不满足则继续 1 epoch（自限 ≤ 若干轮后强制推进并告警）。\n   - CALIBRATE：all off，跑 calibrate_samples（10）样本测 mean rate；统一负反馈公式【FIX-B2】：factor = clip(measured_rate/8, 1/3, 3)，theta = clip(theta*factor, 0.5, 20)，rate 落带 [3,12]Hz 才通过；最多 calibrate_max_iter（2）次，仍失败回 ADAPT 且 eta_stdp/eta_homeo 减半（记录）。\n   - COLLECT：全 off 纯推理全训练集 → X_train, y（经 features.build_features）。\n   - READOUT：全 off，train_linear_readout。\n   - EVAL：全 off 测试集 + 率/沉默/cos/顶界突触诊断（复用 exp.diagnostics 若可用，否则 core 内联最小统计）。\n   - 循环：≤extra_loops（2）轮回 ADAPT，η_stdp×0.5、η_homeo×0.5，每轮强制 CALIBRATE 门禁；第 2 轮精度不升反降 → 回滚 checkpoint（保留每轮 checkpoint）。\n   - 提供协议运行入口：run_g1_protocol(bundle, train_data_fn, test_data_fn, cfg, seed)->Report（含各阶段率/沉默/精度/是否回滚），数据用可迭代分批 yield（合成数据规模可控，逐样本编码喂入，避免一次性大矩阵）；样本时序编码调 core.encoder.latency_encode。\n   - scheduler 负责在 run_sample 各样本间正确开关 stdp_on/homeo_on/norm_on 与调用 homeo_update/competitive_norm 的时机（按文档：homeo/norm 每样本末在内核内由开关控制——遵循现有 kernel 约定即可，不重复造）。\n4. 同步更新 hstdn/core/__init__.py 导出新模块公开接口（features/readout/scheduler）。\n5. 自检：扩展 hstdn/core/selfcheck.py 增加 M5/M6 冒烟组——features V0 形状/L2 归一化、readout 小规模线性可分数据收敛 >95%、scheduler 全流程小规模（如 4 类×30 样本）可跑通且返回报告结构完整。既有组保持全绿。\n遵守代码规范与三件套纪律；G0 十五项保持全绿不得回归；不越权修改其他模块。",
+  "session_id": "97ed5687-2468-42e1-bac3-ed426322002c",
+  "modified_files": [
+    "hstdn/core/features.py",
+    "hstdn/core/readout.py",
+    "hstdn/core/scheduler.py",
+    "hstdn/core/__init__.py",
+    "hstdn/core/selfcheck.py"
+  ]
+}

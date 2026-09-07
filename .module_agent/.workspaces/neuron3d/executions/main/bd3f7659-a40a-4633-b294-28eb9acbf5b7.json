@@ -8,5 +8,15 @@
     ],
     "summary": "执行总结：新建 hstdn/train.py（CLI 编排：load_config/to_core_cfg → build_network → data.synthetic 逐样本 latency 编码 → run_sample（stdp/homeo/norm 开关）→ exp.diagnostics 面板 → npz checkpoint 落盘，含 config/run 指纹；固定 seed 可复现；M6 protocol 调度仅注释预留；--selfcheck 编解码自检）与 hstdn/eval.py（load_checkpoint + --config 指纹比对 → 全 off 冻结测试集 run_sample → 率/沉默聚合 + 类均值余弦汇总）。修正 final 面板 mean_rate_hz 分母 bug。测试总结：自测通过 —— py_compile 双文件通过；train --selfcheck 2 项 PASS；train --epochs 1 --samples 10 冒烟成功（build ~1s，10 样本 ~12s，checkpoint 落盘 checkpoints/train_e75e8b197980b9a4.npz，exit 0）；同参两次运行面板逐行一致（可复现验证）；eval --checkpoint ... --config default.yaml --samples 10 成功（指纹对齐，冻结评估 0.27s，exit 0）。未改动其他模块文件；皋陶审查/离朱正式回归由风后编排。",
     "errors": []
+  },
+  {
+    "plan_id": "plan_4ef43285-387d-415f-b631-8c6e10910cb7",
+    "plan": "G1 首跑编排：train/eval 消费 core.scheduler M6 协议（ADAPT→CALIBRATE→COLLECT→READOUT→EVAL），阶段报告 + 每 seed checkpoint + 独立评估",
+    "modified_files": [
+      "hstdn/train.py",
+      "hstdn/eval.py"
+    ],
+    "summary": "执行总结：main 模块 train.py/eval.py 扩展完成（仅改这两个文件，未触碰 core/exp）。train.py 新增 --g1（run_g1_training）：protocol 节严格翻译 → 逐 seed build_network + run_g1_protocol → 阶段率/沉默/精度报告（_g1_seed_report_lines）→ _derive_readout 公开 core API 确定性重放得 W/b（scheduler 不暴露轮次权重）→ 每 seed 落盘 g1_train_s{seed}_*.npz（meta：seed/协议参数/config 指纹/stage_sequence/rolled_back/best_acc/各阶段读数/derived；codec 增 save_checkpoint(extra=)/load_g1_checkpoint，load_checkpoint 签名不变）；M6 注释由 TODO 更新为已实现；修复 _g1_data_fns 整批 10 类喂入 bug。eval.py 新增 --g1（run_g1_evaluation）：load_g1_checkpoint + 独立测试集（5000+seed）全 off 冻结推理 → build_features + predict → 测试精度/率/沉默/cos，对照打印协议 best_acc/stage/rolled_back，非 g1 ckpt 给明确指引。测试总结：全部自测通过 —— py_compile 两文件 OK；train --selfcheck PASS；D4 双模式回归 OK；train --g1 --classes 4 --train-samples 60 --test-samples 20 --seeds 1 exit 0（~48s/seed；rounds=3、阶段/notes 报告完整、derived acc 与 protocol best 一致=100%）；同参两次运行除 wall 外逐行一致（可复现）；eval --g1 --checkpoint g1_train_s1_*.npz --config default.yaml --samples 20 exit 0（独立 seed=5001，acc 与协议 best 对照打印）；错误路径（eval --g1 加载 D4 ckpt）给指引 exit 1。观测：小规模/低噪声下 ADAPT 门出现沉默/洪泛振荡、theta 触界，协议按设计 force-advance 并记录 notes——属 G1 校准范畴非入口缺陷（正式 G1 判据由 exp.gates/ablation 全规模口径评估）。",
+    "errors": []
   }
 ]

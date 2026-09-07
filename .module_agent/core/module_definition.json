@@ -3,7 +3,7 @@
   "files": [
     {
       "path": "hstdn/core/__init__.py",
-      "description": "hstdn.core 包入口：极轻量（不引入 numpy 依赖），仅声明 __version__ 与子模块清单（layout/spatial_hash/network/kernel/encoder/plasticity），保持导入轻量供 exp/gates 按需显式导入。"
+      "description": "hstdn.core 包入口：轻量（不主动导入 numpy 子模块），PEP 562 __getattr__ 延迟导出子模块（layout/spatial_hash/network/kernel/encoder/plasticity/features/readout/scheduler），__dir__/__all__ 同步，供 exp/gates 按需 from hstdn.core import xxx。"
     },
     {
       "path": "hstdn/core/layout.py",
@@ -31,7 +31,19 @@
     },
     {
       "path": "hstdn/core/selfcheck.py",
-      "description": "core 最小自检脚本（exp/gates.py 就绪前的过渡断言，标注 G0 编号 #1-#15 家族对应）：layout ID/形状断言、SpatialHash3D 与暴力对照、默认配置 build_network 布线不变量与 CSR/CSC/B3/in_learn 一致性、kernel 时序/不应期/时间轮/STDP 顺序微测试（手工构造确定性 toy 网络）、plasticity 各原语与归一化单元断言、encoder 桶/MNIST 映射断言、默认配置动态冒烟（确定性、stdp/homeo/norm 边界）；python -m hstdn.core.selfcheck 运行。"
+      "description": "core 最小自检脚本（exp/gates.py 就绪前的过渡断言，标注 G0 编号 #1-#15 家族对应，D1–D5 范围）：layout ID/形状断言、SpatialHash3D 与暴力对照、默认配置 build_network 布线不变量与 CSR/CSC/B3/in_learn 一致性、kernel 时序/不应期/时间轮/STDP 顺序微测试（手工构造确定性 toy 网络）、plasticity 各原语与归一化单元断言、encoder 桶/MNIST 映射断言、默认配置动态冒烟（确定性、stdp/homeo/norm 边界）、M5 features（V0 sqrt+L2/掩码/零行、V1 分 bin 展平、V2 接口）与 readout（线性可分收敛 >95%、早停、L1/L2 接口）冒烟、M6 scheduler 全流程（小规模 3 类×8 训练样本可跑通、Report 结构完整）；python -m hstdn.core.selfcheck 运行。"
+    },
+    {
+      "description": "M5 特征抽取（D9/G1）：FeaturesConfig（mode=v0 默认/V1 时间分 bin n_bins=5 实现默认关闭/V2 代理梯度仅接口）+ features_from_cfg + build_features 纯函数（V0: sqrt(counts[:,mask]) 后行 L2 归一化，feature_mask 默认全体池，输出 [n_samples, feat_dim]；V1: (n,n_bins,N_POOL) 逐 bin sqrt 展平 [n, n_bins*N_POOL]；V2 显式 raise NotImplementedError）+ l2_row_normalize（零行保持零向量，无 NaN）。供 readout/scheduler 消费。",
+      "path": "hstdn/core/features.py"
+    },
+    {
+      "description": "M5 L0 线性读出（G1）：ReadoutConfig（readout_l0 节：lr=0.5、iters=300、l2_lambda=1e-4、batch=64、val_frac=0.1）+ train_linear_readout（NumPy softmax+交叉熵+L2 正则，mini-batch SGD，10% 验证集早停选代并返回最优验证权重 (W,b,history)）+ predict_linear_readout/proba_linear_readout/accuracy；L1（PyTorch 128 隐层）与 L2（V2 代理梯度）合规接口显式 raise NotImplementedError（G3 后，无 pass 占位）。",
+      "path": "hstdn/core/readout.py"
+    },
+    {
+      "description": "M6 G1 训练调度状态机：ProtocolConfig（protocol 节：t_ms/n_adapt_epochs/adapt 诊断门（率[3,15]Hz、沉默<5%）/calibrate_samples/calibrate_max_iter=2/FIX-B2 负反馈带 [3,12]Hz/extra_loops=2/eta_scale=0.5）+ run_g1_protocol(bundle, train_data_fn, test_data_fn, cfg, seed) -> G1Report；状态流 ADAPT→CALIBRATE→COLLECT→READOUT→EVAL（≤extra_loops 轮，每轮回 ADAPT η_stdp/η_homeo ×0.5）；ADAPT 全开关（stdp/homeo/norm=True）自适应，诊断不满足继续 1 epoch（自限强制推进告警）；CALIBRATE all off 按池统一负反馈 theta*=clip(rate/8,1/3,3)（FIX-B2），失败回 ADAPT 且 η 减半（记录），预算耗尽强制推进；COLLECT all off 全训练集经 core.features.build_features；READOUT all off 10% 验证早停；EVAL all off 测试集精度+率/沉默/capped_ratio/train-test cos 诊断（exp.diagnostics 可用前内联统计）；逐样本 encoder.latency_encode 分批喂入；每轮 checkpoint，精度不升反降回滚并保留最佳；逐样本末 homeo/norm 由 run_sample 开关控制（沿用内核约定）。",
+      "path": "hstdn/core/scheduler.py"
     }
   ]
 }

@@ -15,11 +15,15 @@
     },
     {
       "path": "hstdn/exp/gates.py",
-      "description": "G0 十五项断言门禁权威实现（python -m hstdn.exp.gates，全绿方可进入 G1）。每项独立可执行/独立通过：①LIF 单神经元解析解对照<2% ②传导延迟 d/v<1ms（几何公式+内核实测 t+1/t+15）③时间轮同槽累加 ④CSR/CSC 回指一致 ⑤STDP 方向性（pre→post LTP/post→pre LTD 符号+量值）⑥输入通道活性（单事件→输入→池 w 必变化）⑦同刻对净更新≈+eta_ltp（D12）⑧homeostasis 闭环收敛（稳定带判据）⑨competitive_norm 守恒 Σw=in_sum0（幂等/I 冻结）⑩ID 规范回归（全局/局部域+唯一转换入口）⑪内核性能（900 神经元 200ms：空样本+单事件突发均值<0.1s）⑫度分布（E 源出度≤12、零入度=0）⑬延迟上界 max_delay<L ⑭不应期严格封锁（截窗+放行边界双证）⑮状态重置回归（B11）。自备确定性 micro 网络夹具（显式边表→CSR/CSC/B3/in_learn，与 core 布局同构）；§4 规模网络由 default.yaml 经 to_core_cfg 构建并按门禁克隆复用。"
+      "description": "G0 十五项断言门禁权威实现 + G1 消融门禁（run_g1）登记。G0（python -m hstdn.exp.gates，全绿方可进入 G1；每项独立可执行）：①LIF 单神经元解析解对照<2% ②传导延迟 d/v<1ms ③时间轮同槽累加 ④CSR/CSC 回指一致 ⑤STDP 方向性 ⑥输入通道活性 ⑦同刻对净更新≈+eta_ltp ⑧homeostasis 闭环收敛 ⑨norm 守恒 Σw=in_sum0 ⑩ID 规范回归 ⑪内核性能（千神经元 200ms：空样本中位≤50ms、单事件突发中位≤150ms 预算包络，隔离实测 ~4ms/~60-80ms）⑫度分布 ⑬延迟上界 max_delay<L ⑭不应期严格封锁 ⑮状态重置回归（B11）。G1（--g1 轻量默认 / --g1 --full 官方判据）：run_g1 惰性调用 exp/ablation 消融并评估——轻量（4 类双种子池200）只验机制跑通+打印组间对比与提示；完整（10 类 ≥3 种子池150）按官方判据（实验组均值 ≥60% 且显著高于对照 = 均值差≥5pp 且逐配种子 exp>ctrl）断言 PASS/FAIL；退出码/清单协议与 G0 既有语义保持一致。自备确定性 micro 网络夹具（显式边表→CSR/CSC/B3/in_learn，与 core 布局同构）；§4 规模网络由 default.yaml 经 to_core_cfg 构建并按门禁克隆复用。"
     },
     {
       "path": "hstdn/exp/diagnostics.py",
-      "description": "诊断面板函数（G1 与 gates 调试复用，core 惰性导入）：firing_rates_hz/silence_ratio/rate_summary（率与沉默）、cos_similarity/class_cosine_matrix（类间余弦）、feature_transform/feature_cos_similarity（sqrt+L2 特征可比性，mode='sqrt_l2'，支持列掩码）、capped_synapse_ratio（顶界突触占比）、input_to_pool_w_mean（输入→池 w 均值）、delay_histogram、plasticity_panel/network_panel/sample_panel/print_panel 汇总面板。"
+      "description": "诊断面板函数（G1 与 gates 调试复用，core 惰性导入）：firing_rates_hz/silence_ratio/rate_summary（率与沉默）、cos_similarity/class_cosine_matrix（类间余弦）、feature_transform/feature_cos_similarity（sqrt+L2 特征可比性，mode='sqrt_l2'，支持列掩码）、capped_synapse_ratio（顶界突触占比）、input_to_pool_w_mean（输入→池 w 均值）、delay_histogram、plasticity_panel/network_panel/sample_panel/print_panel 汇总面板；G1 评估辅助（纯函数无断言）：multi_seed_summary（多种子 mean±std）、compare_groups（组间均值差/保守分离界）、format_g1_ablation（消融报告格式化）。"
+    },
+    {
+      "description": "G1 随机储备池消融（R1；exp 模块，文档 §6 G1 / §8 / §11 冻结条件）。实验组（stdp/homeo/norm 三开关开，经 run_g1_protocol ADAPT 适应）vs 对照组（三开关全关随机固定储备池 + CALIBRATE + READOUT 经典 LSM）；两组复用 core.scheduler.run_g1_protocol 唯一协议入口、同数据同种子，唯一差异即三开关（对照组以 n_adapt_epochs=0 表达全关）。提供 Spec/default_spec（LIGHT_SPEC 4 类双种子池200 机制验证 / FULL_SPEC 10 类≥3 种子池150 官方判据）、make_protocol/make_data_fns/run_one_seed/run_group/run_ablation（返回 exp/ctrl 多种子 mean±std 汇总 + 组间对比）、evaluate_full_criterion（官方判据：实验组均值≥60% 且显著高于对照 = 均值差≥5pp 且逐配种子 exp>ctrl）、report_lines 与 CLI（python -m hstdn.exp.ablation [--full/--classes/--pool/--seeds/.../--json]）。规模诚实注明：L0 内核在 §4 800 池逐样本数百 ms 量级，gate/默认消融运行在门禁规模（--pool 可调回 800）。",
+      "path": "hstdn/exp/ablation.py"
     }
   ]
 }
