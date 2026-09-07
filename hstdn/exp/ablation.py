@@ -1,21 +1,35 @@
 """ablation.py -- G1 随机储备池对照消融（R1；exp 模块，文档 §6 G1 / §8）。
 
-对比设计（文档 §11 冻结条件：两组唯一差异变量 = stdp_on/homeo_on/norm_on
-三开关）：
-    实验组  : 三开关全开 —— 经 core.scheduler.run_g1_protocol 的 ADAPT 阶段
-              （stdp/homeo/norm 逐样本开）适应储备池，再 CALIBRATE+READOUT；
-    对照组  : 三开关全关 —— 随机**固定**储备池（不学习），仅 CALIBRATE 校准 +
-              READOUT，即经典 LSM（液体状态机）范式（文档 §6 G1 回退方案）。
-实现上两组都复用 core.scheduler.run_g1_protocol 作为唯一协议入口；实验组以
-``n_adapt_epochs>=1`` 表达"ADAPT 阶段开启三开关"，对照组以
-``n_adapt_epochs=0``（任何阶段都不开三开关、不触发 eta 衰减回环）表达——协议
-其余旋钮（calibrate/collect/readout/eval 阈值与样本数）完全一致，数据与种子
-也一致，故唯一差异即为三开关（对照组的 n_adapt_epochs=0 仅是把三开关置 False
-的等价表述，见 run_g1_protocol 内部：ADAPT 是唯一开启开关的阶段）。
+对比设计（文档 §11 冻结条件：两组唯一差异 = 三开关；v3.3 起由
+``core.scheduler.ProtocolConfig.adapt_enabled`` 承载：False = LSM 臂（无
+ADAPT 阶段 / #2 门禁），True = 实验臂（ADAPT 阶段三开关逐样本开）；其余
+协议旋钮、数据与种子完全一致）：
+    实验组（exp/expg 臂）: adapt_enabled=True —— ADAPT 三开关全开适应储备
+        池，再 CALIBRATE+READOUT；网络档位由 Spec.pool_learn 决定：默认
+        False（v3.3 FIX-A 冻结池内 E→E 可塑性，stdp_min 档），True 为已退役
+        legacy 全可学习条件（H6 / HSTDN-EXP-2026-001，仅显式保留）；
+    对照组（ctrl / LSM 臂）: adapt_enabled=False —— 随机**固定**储备池（不
+        学习），仅 CALIBRATE 校准 + READOUT（经典 LSM，文档 §6 G1 回退方案；
+        v3.3 下 CALIBRATE 失败同样 HARD STOP，不软跳过）。
+两组都复用 core.scheduler.run_g1_protocol 作为唯一协议入口。
+
+v3.3 冻结 #6（G1-STDP 调查结案；main 侧配套见 hstdn/train.py --g1 [--profile]）：
+    - 默认运行路径全部基于**新配置（FIX-A 冻结 + LSM）**：run_ablation 的 exp
+      臂 = stdp_min 档（Spec.pool_learn=False 冻结池内 E→E 可塑性）+ 三开关开；
+      ctrl = LSM（adapt_enabled=False，随机固定储备池）。全可学习 legacy 条件
+      （exp, pool_learn=True 且三开关全开；H6 已发表证据链 HSTDN-EXP-2026-001）
+      **不再默认可运行** —— 仅经 run_expg_comparison(legacy=True) / CLI
+      ``--legacy-exp-all-learn`` 显式调用，代码路径保留但默认不可达。
+    - ``--expg``（判定臂：pool_learn=False + 三开关开）默认只与 ctrl(LSM)
+      组成**双臂**对比；加 ``--legacy-exp-all-learn`` 才并入 legacy 全可学习臂
+      （三臂表）。
 
 运行：
-    python -m hstdn.exp.ablation            # light（机制快速验证）
+    python -m hstdn.exp.ablation            # light（exp=stdp_min 档 vs ctrl LSM）
     python -m hstdn.exp.ablation --full     # 完整 G1（10 类、≥3 种子）
+    python -m hstdn.exp.ablation --expg [--full]          # expg 判定（双臂）
+    python -m hstdn.exp.ablation --expg --legacy-exp-all-learn [--full]
+                                                  # 三臂（含 H6 legacy 臂）
     python -m hstdn.exp.ablation --seeds 0 1 2 --classes 10 --pool 800 ...
     python -m hstdn.exp.ablation --json     # 附加 JSON 汇总输出
 
@@ -59,6 +73,8 @@ __all__ = [
 
 #: 轻量模式：4 类、双种子、池 200 —— 机制快速验证（无官方判据断言，
 #: 仅验证协议跑通并打印组间对比，官方判据提示用 --full）。
+#: v3.3 FIX-A：默认 pool_learn=False（冻结池内可塑性，STDP 臂唯一合法档，
+#: 见 hstdn/configs/stdp_min.yaml）。
 LIGHT_SPEC: Dict[str, Any] = dict(
     mode="light",
     n_pool=200,
@@ -73,7 +89,7 @@ LIGHT_SPEC: Dict[str, Any] = dict(
     calibrate_samples=5,
     calibrate_max_iter=2,
     t_ms=200,
-    pool_learn=True,
+    pool_learn=False,
 )
 
 #: 完整 G1：10 类、≥3 种子 —— 官方判据（§6）：实验组 ≥60% 且显著高于对照组。
@@ -91,7 +107,7 @@ FULL_SPEC: Dict[str, Any] = dict(
     calibrate_samples=5,
     calibrate_max_iter=2,
     t_ms=200,
-    pool_learn=True,
+    pool_learn=False,
 )
 
 # ---------------------------------------------------------------------------
@@ -109,8 +125,9 @@ _SPEC_KEYS = frozenset({
 class Spec:
     """一次消融运行的完整规格（mode: light/full 或自定义）。
 
-    pool_learn: True=池内 E→E 可塑性开启（默认，§4 现状）；False=冻结池内
-        可塑性（exp-g / Diehl-Cook 回归，仅输入→池可学习，池间连接固定）。
+    pool_learn: False=冻结池内 E→E 可塑性（默认，v3.3 FIX-A / exp-g /
+        Diehl-Cook 结构，仅输入→池可学习）；True=池内可塑性开启（legacy
+        全可学习条件，H6 / HSTDN-EXP-2026-001 —— 已退役，仅显式保留）。
     """
 
     n_pool: int
@@ -125,7 +142,7 @@ class Spec:
     calibrate_samples: int
     calibrate_max_iter: int
     t_ms: int
-    pool_learn: bool = True
+    pool_learn: bool = False
     mode: str = "custom"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -170,7 +187,7 @@ def default_spec(spec: Optional[Mapping[str, Any]] = None) -> Spec:
         calibrate_samples=int(base["calibrate_samples"]),
         calibrate_max_iter=int(base["calibrate_max_iter"]),
         t_ms=int(base["t_ms"]),
-        pool_learn=bool(base.get("pool_learn", True)),
+        pool_learn=bool(base.get("pool_learn", False)),  # #6：默认冻结
     )
 
 
@@ -188,7 +205,17 @@ class SeedResult:
     silence_frac: float
     capped_ratio: float
     calib_ok: bool = False
-    w_ratio: float = 1.0          # E 源（池→池）权重 末/初 均值比（冻结=1）
+    w_ratio: float = 1.0          # 池→池 E 源权重 末/初 均值比（冻结=1）
+    # --- v3.3 归因诊断（read_drift_stats 自动记账；#4 度量拆分）---
+    drift_frac: float = 0.0        # |Δw|>0.1·|w_init| 可学习边占比（学习度量）
+    input_drift_frac: float = 0.0  # 输入边漂移占比（input_w_drift 主项）
+    gini: float = 0.0              # within-neuron Gini（当前均值）
+    gini_ratio: float = 1.0        # ADAPT 后/初值比（选择性指数）
+    gini_std: float = 0.0          # per-neuron Gini 样本 std（正确 per-neuron std）
+    input_w_min_sat: float = 0.0   # 输入边 w<=w_lo+ε 占比（R7 触发器）
+    budget_dev: float = 0.0        # 劫持度量（FIX-A 后恒 ≈0）
+    r7_alert: bool = False         # R7 警报（死数值钉死 / gini_ratio 超限）
+    aborted: bool = False          # 协议硬停（v3.3 HARD STOP，未产出 EVAL）
     notes: List[str] = field(default_factory=list)
 
 
@@ -244,19 +271,21 @@ def _net_cfg(spec: Spec, seed: int) -> NetConfig:
 
 
 def make_protocol(spec: Spec, seed: int, switches_on: bool) -> ProtocolConfig:
-    """构造协议配置（实验组与对照组共用同一协议，仅开关不同）。
+    """构造协议配置（实验组与对照组共用同一协议，仅开关/臂标志不同）。
 
     Args:
         spec: 规格。
         seed: 种子。
-        switches_on: True=实验组：ADAPT 阶段开启 stdp/homeo/norm 三开关
-            （n_adapt_epochs>=1，run_g1_protocol 内唯一开启三开关的阶段）；
-            False=对照组：三开关全 False（n_adapt_epochs=0，等价于随机固定
-            储备池 + CALIBRATE + READOUT 的经典 LSM）。其余全部旋钮一致。
+        switches_on: True=实验组（STDP 臂）：ADAPT 阶段开启 stdp/homeo/norm
+            三开关（v3.3 core 经 adapt_enabled=True 进入 ADAPT）；
+            False=对照组（LSM 臂）：v3.3 core ``adapt_enabled=False`` ——
+            无 ADAPT 阶段、无 ADAPT 门禁（随机固定储备池 + CALIBRATE +
+            READOUT 经典 LSM；三开关全程全 False）。其余旋钮完全一致。
     """
     return ProtocolConfig(
         t_ms=spec.t_ms,
-        n_adapt_epochs=spec.adapt_epochs if switches_on else 0,
+        n_adapt_epochs=spec.adapt_epochs,
+        adapt_enabled=switches_on,
         adapt_diag_samples=3,
         adapt_gate_extra_max=spec.adapt_gate_extra_max,
         calibrate_samples=spec.calibrate_samples,
@@ -290,16 +319,6 @@ def make_data_fns(spec: Spec, seed: int):
     return train_fn, test_fn
 
 
-def _e_source_mask(bundle) -> np.ndarray:
-    """池→池 E 源边掩码（归因 w_ratio 用：冻结模式下这些边权重不动）。"""
-    cfg = bundle.cfg
-    src = bundle.csr_src.astype(np.intp)
-    is_pool_src = src >= cfg.n_in
-    e_mask = np.zeros(bundle.csr_w.size, dtype=bool)
-    e_mask[is_pool_src] = bundle.pool_is_E[src[is_pool_src] - cfg.n_in]
-    return e_mask
-
-
 def run_one_seed(spec: Spec, seed: int, switches_on: bool) -> SeedResult:
     """单组单种子：建网（seed 确定性）→ run_g1_protocol（唯一协议入口）。
 
@@ -308,22 +327,27 @@ def run_one_seed(spec: Spec, seed: int, switches_on: bool) -> SeedResult:
         seed: 种子（网络、数据、读出共用）。
         switches_on: True=实验组（ADAPT 三开关开）；False=对照组（全关）。
 
-    归因诊断：calib_ok（最后 CALIBRATE 轮是否落带）、w_ratio（池→池 E 源
-    权重均值 末/初 比——exp-g 冻结模式下应 ≈1）。
+    v3.3 自动记账（#4 制度化）：协议前 capture_drift_snapshot，协议后
+    read_drift_stats + assess_r7 写入 SeedResult —— drift_frac / Gini /
+    gini_ratio / input_w_min_sat / budget_dev / r7_alert；calib_ok（CALIBRATE
+    是否落带）；w_ratio（E 源池→池权重末/初比；冻结/ctrl 行 dev=0 = budget_dev
+    记账语义）。
     """
+    from hstdn.exp import diagnostics as diag
     cfg = _net_cfg(spec, seed)
     bundle = build_network(cfg)
-    w_e0 = float(bundle.csr_w[_e_source_mask(bundle)].mean())
+    snap = diag.capture_drift_snapshot(bundle)
     train_fn, test_fn = make_data_fns(spec, seed)
     pc = make_protocol(spec, seed, switches_on)
     t0 = time.perf_counter()
     rep: G1Report = run_g1_protocol(bundle, train_fn, test_fn, pc, seed=seed)
     wall = time.perf_counter() - t0
     ev = rep.eval_rounds[-1] if rep.eval_rounds else {}
-    w_e1 = float(bundle.csr_w[_e_source_mask(bundle)].mean())
-    w_ratio = float(w_e1 / w_e0) if w_e0 > 0.0 else 1.0
+    drift = diag.read_drift_stats(bundle, snap)
+    r7 = diag.assess_r7(bundle, snap)
     calib_ok = bool(rep.calibrate_rounds
                     and rep.calibrate_rounds[-1].get("ok", False))
+    aborted = bool(not rep.ok or not rep.eval_rounds)
     return SeedResult(
         seed=seed,
         switches_on=switches_on,
@@ -335,7 +359,16 @@ def run_one_seed(spec: Spec, seed: int, switches_on: bool) -> SeedResult:
         silence_frac=float(ev.get("silence_frac", 1.0)),
         capped_ratio=float(ev.get("capped_ratio", 0.0)),
         calib_ok=calib_ok,
-        w_ratio=float(w_ratio),
+        w_ratio=float(drift["w_ratio"]),
+        drift_frac=float(drift["drift_frac"]),
+        input_drift_frac=float(drift["input_drift_frac"]),
+        gini=float(drift["gini"]),
+        gini_ratio=float(drift["gini_ratio"]),
+        gini_std=float(drift["gini_std"]),
+        input_w_min_sat=float(drift["input_w_min_sat"]),
+        budget_dev=float(drift["budget_dev"]),
+        r7_alert=bool(r7["alert"]),
+        aborted=aborted,
         notes=list(rep.notes),
     )
 
@@ -442,17 +475,34 @@ def report_lines(result: AblationResult) -> List[str]:
         f"Ablation spec: mode={s['mode']} n_pool={s['n_pool']} "
         f"classes={s['n_classes']} train/class={s['train_per_class']} "
         f"test/class={s['test_per_class']} noise={s['noise']} "
-        f"seeds={s['seeds']} adapt_epochs={s['adapt_epochs']}",
+        f"seeds={s['seeds']} adapt_epochs={s['adapt_epochs']} "
+        f"pool_learn={s.get('pool_learn', False)}",
     ]
+    if not bool(s.get("pool_learn", False)):
+        lines.append(
+            "  arm note: FIX-A 冻结（pool_learn=False）—— exp 臂 = STDP-min"
+            " 条件（stdp_min 档）+ 三开关开；ctrl = LSM（默认新配置路径，"
+            "v3.3 冻结 #6）"
+        )
+    else:
+        lines.append(
+            "  [legacy] pool_learn=True 全可学习条件：H6 已退役路径，仅显式"
+            "保留（HSTDN-EXP-2026-001；默认不可达）"
+        )
     lines.append(diag.format_g1_ablation(
         result.exp.summary, result.ctrl.summary, result.compare))
     for grp in (result.exp, result.ctrl):
         for r in grp.seed_results:
             lines.append(
-                f"    seed {r.seed} ({grp.name}): acc={r.acc * 100:.1f}% "
+                f"    seed {r.seed} ({grp.name}): "
+                + ("[ABORT] " if r.aborted else "")
+                + f"acc={r.acc * 100:.1f}% "
                 f"eval_rate={r.eval_rate_hz:.1f}Hz "
                 f"silence={r.silence_frac * 100:.0f}% "
-                f"rounds={r.n_rounds} wall={r.wall_s:.0f}s"
+                f"rounds={r.n_rounds} "
+                f"drift={r.drift_frac:.3f} gini_r={r.gini_ratio:.3f} "
+                f"bdev={r.budget_dev:.1e} r7={int(r.r7_alert)} "
+                f"wall={r.wall_s:.0f}s"
             )
     if result.criterion.get("evaluated"):
         c = result.criterion
@@ -470,7 +520,7 @@ EXPG_CRITERIA = dict(acc_min=0.80, silence_max=0.05, w_ratio_tol=1e-6)
 
 
 def expg_metrics(grp: GroupResult) -> Dict[str, Any]:
-    """exp-g 组汇总指标（acc/静默/校准/w_ratio 的多种子统计）。"""
+    """exp-g 组汇总指标（acc/静默/校准/w_ratio + v3.3 归因漂移汇总）。"""
     accs = [r.acc for r in grp.seed_results]
     sils = [r.silence_frac for r in grp.seed_results]
     ratios = [r.w_ratio for r in grp.seed_results]
@@ -486,6 +536,16 @@ def expg_metrics(grp: GroupResult) -> Dict[str, Any]:
         "w_ratios": [float(x) for x in ratios],
         "w_ratio_dev_max": float(np.max(np.abs(np.asarray(ratios) - 1.0)))
         if ratios else 0.0,
+        # --- v3.3 归因汇总（#4 自动记账读数）---
+        "drift_mean": float(np.mean([r.drift_frac for r in grp.seed_results])),
+        "input_drift_mean": float(np.mean(
+            [r.input_drift_frac for r in grp.seed_results])),
+        "gini_mean": float(np.mean([r.gini for r in grp.seed_results])),
+        "gini_ratio_mean": float(np.mean(
+            [r.gini_ratio for r in grp.seed_results])),
+        "budget_dev_max": float(np.max(
+            [r.budget_dev for r in grp.seed_results]) or 0.0),
+        "r7_alerts": int(sum(1 for r in grp.seed_results if r.r7_alert)),
     }
 
 
@@ -533,10 +593,12 @@ def expg_report_lines(expg: GroupResult, metrics: Mapping[str, Any],
     ]
     for r in expg.seed_results:
         lines.append(
-            f"    seed {r.seed}: acc={r.acc * 100:.1f}% "
+            f"    seed {r.seed}: " + ("[ABORT] " if r.aborted else "")
+            + f"acc={r.acc * 100:.1f}% "
             f"rate={r.eval_rate_hz:.1f}Hz silence={r.silence_frac * 100:.1f}% "
             f"calib_ok={r.calib_ok} w_ratio={r.w_ratio:.9f} "
-            f"wall={r.wall_s:.0f}s"
+            f"drift={r.drift_frac:.3f} gini_r={r.gini_ratio:.3f} "
+            f"r7={int(r.r7_alert)} wall={r.wall_s:.0f}s"
         )
     lines.append(
         f"metrics: acc_mean={metrics['acc_mean'] * 100:.1f}% | "
@@ -549,70 +611,130 @@ def expg_report_lines(expg: GroupResult, metrics: Mapping[str, Any],
     return lines
 
 
-def run_expg_comparison(full: bool = False) -> Dict[str, Any]:
-    """exp-g 判定入口（light/full 两模式）：
+def run_expg_comparison(full: bool = False, *, legacy: bool = False
+                        ) -> Dict[str, Any]:
+    """exp-g 判定入口（light/full 两模式；v3.3 归因 Wave 1b / 冻结 #6）：
 
-    - 唯一变更：``pool_learn=False``（冻结池内可塑性 → Diehl-Cook 结构）；
-      协议三开关全开（等同 exp 组协议），种子/数据与 exp/ctrl 完全一致。
+    - expg（判定臂）：pool_learn=False（冻结池内可塑性 → Diehl-Cook 结构，
+      stdp_min 档）+ 三开关全开；
+    - ctrl（LSM 臂）：随机固定储备池（adapt_enabled=False，三开关全关）。
+    **默认双臂**（新配置 FIX-A 冻结 + LSM）；当 ``legacy=True``（CLI
+    ``--legacy-exp-all-learn``）时才并入 exp（legacy 对照臂）：pool_learn=
+    True（池内 E→E 可塑性，v3.3 前复现条件）+ 三开关全开 —— 该全可学习
+    条件属 H6 已发表证据链 HSTDN-EXP-2026-001，代码路径保留但**默认不可
+    达**（退役）。各臂同种子同数据；protocol/其余配置一致。
     - 输出：expg 判据表（silence<5% / CALIBRATE 全 ok / w_ratio≈1 /
-      acc>=80%）+ 与 exp/ctrl 的 acc/静默对比汇总。
+      acc>=80%）+ v3.3 归因读数（drift/gini/budget_dev/r7）+ 臂对比。
 
     Args:
         full: True=FULL 规模（10 类/noise0.16/池150/adapt2/3 种子）；
             False=light 规模（4 类/池200 双种子，冒烟）。
+        legacy: True=显式并入 H6 legacy 全可学习臂（三臂表；默认 False）。
 
     Returns:
-        dict：expg（GroupResult）、metrics、verdict、exp/ctrl 对比摘要、wall。
+        dict：expg（GroupResult）、metrics、verdict、臂对比摘要、wall；
+        ``legacy_exp_on`` 标记 legacy 臂是否并入。
     """
     mode = "full" if full else "light"
     t0 = time.perf_counter()
-    exp_spec = default_spec(mode)                       # pool_learn=True
-    expg_spec = default_spec({"mode": mode, "pool_learn": False})
-    exp = run_group("exp", True, exp_spec)
+    expg_spec = default_spec({"mode": mode, "pool_learn": False})  # 判定臂
+    ctrl_spec = default_spec(mode)                                 # LSM 臂
     expg = run_group("expg", True, expg_spec)
-    ctrl = run_group("ctrl", False, exp_spec)
+    ctrl = run_group("ctrl", False, ctrl_spec)
     metrics = expg_metrics(expg)
     verdict = evaluate_expg(metrics)
-    wall = time.perf_counter() - t0
-    out = {
+    compare = {
+        "expg": _group_compare(expg),
+        "ctrl": _group_compare(ctrl),
+    }
+    out: Dict[str, Any] = {
         "mode": mode,
-        "spec": dict(exp_spec.to_dict()),
+        "spec": dict(expg_spec.to_dict()),
         "expg": {"seed_results": [vars(r) for r in expg.seed_results]},
+        "legacy_exp_on": bool(legacy),
         "metrics": metrics,
         "verdict": verdict,
-        "compare": {
-            "exp": {"acc_mean": exp.summary["mean"],
-                    "acc_std": exp.summary["std"],
-                    "silence_mean": float(np.mean(
-                        [r.silence_frac for r in exp.seed_results]))},
-            "expg": {"acc_mean": metrics["acc_mean"],
-                     "acc_std": expg.summary["std"],
-                     "silence_mean": metrics["silence_mean"]},
-            "ctrl": {"acc_mean": ctrl.summary["mean"],
-                     "acc_std": ctrl.summary["std"],
-                     "silence_mean": float(np.mean(
-                         [r.silence_frac for r in ctrl.seed_results]))},
-        },
-        "wall_s": wall,
+        "compare": compare,
+        "wall_s": 0.0,
     }
+    if legacy:
+        exp_spec = default_spec({"mode": mode, "pool_learn": True})  # H6 legacy
+        exp = run_group("exp", True, exp_spec)
+        out["compare"] = {"exp": _group_compare(exp), **compare}
+        out["exp"] = {"seed_results": [vars(r) for r in exp.seed_results]}
+    out["wall_s"] = float(time.perf_counter() - t0)
     return out
 
 
+def _group_compare(grp: GroupResult) -> Dict[str, float]:
+    """组级对比摘要（acc±std + 静默 + v3.3 归因读数）。"""
+    rows = grp.seed_results
+    return {
+        "acc_mean": grp.summary["mean"],
+        "acc_std": grp.summary["std"],
+        "silence_mean": float(np.mean([r.silence_frac for r in rows])),
+        "drift_mean": float(np.mean([r.drift_frac for r in rows])),
+        "gini_mean": float(np.mean([r.gini for r in rows])),
+        "gini_ratio_mean": float(np.mean([r.gini_ratio for r in rows])),
+        "budget_dev_max": float(np.max([r.budget_dev for r in rows]) or 0.0),
+        "r7_alerts": float(sum(1 for r in rows if r.r7_alert)),
+        "aborted": float(sum(1 for r in rows if r.aborted)),
+    }
+
+
 def print_expg_comparison(out: Dict[str, Any]) -> None:
-    """打印 exp-g 判定结果 + 与 exp/ctrl 的对比汇总。"""
+    """打印 exp-g 判定结果（per-seed 判据表 + v3.3 归因读数）+ 臂对比。
+
+    默认双臂（expg 判定臂 vs ctrl LSM）；``legacy_exp_on=True`` 时另含 H6
+    legacy 全可学习臂（--legacy-exp-all-learn，退役保留路径）。
+    """
     print("=" * 78)
-    print(f"exp-g comparison (mode={out['mode']}, pool_learn=False)")
+    arms = " [+legacy exp 全可学习臂]" if out.get("legacy_exp_on") else ""
+    print(f"exp-g comparison (mode={out['mode']}, pool_learn=False){arms}")
     spec = out["spec"]
     print(f"spec: n_pool={spec['n_pool']} classes={spec['n_classes']} "
           f"train/class={spec['train_per_class']} "
           f"test/class={spec['test_per_class']} noise={spec['noise']} "
           f"seeds={spec['seeds']} adapt_epochs={spec['adapt_epochs']}")
+    if not out.get("legacy_exp_on"):
+        print("  (双臂：expg 判定臂 vs ctrl LSM；H6 legacy 全可学习臂经 "
+              "--legacy-exp-all-learn 显式启用——已退役默认不可达)")
     c = out["compare"]
-    for name in ("exp", "expg", "ctrl"):
+    print("  group | acc         | silence | drift | gini    | gini_ratio | "
+          "budget_dev | r7")
+    for name in c:
         cc = c[name]
-        print(f"  {name:5s}: acc={cc['acc_mean'] * 100:.1f}% ± "
-              f"{cc['acc_std'] * 100:.1f}%   "
-              f"silence={cc['silence_mean'] * 100:.1f}%")
+        print(f"  {name:5s} | {cc['acc_mean'] * 100:5.1f}±"
+              f"{cc['acc_std'] * 100:4.1f}% | "
+              f"{cc['silence_mean'] * 100:5.1f}% | "
+              f"{cc['drift_mean']:.3f} | {cc['gini_mean']:.4f} | "
+              f"{cc['gini_ratio_mean']:.3f}    | "
+              f"{cc['budget_dev_max']:.1e}   | {int(cc['r7_alerts'])}"
+              + (f"   [{int(cc['aborted'])}/{len(out['expg']['seed_results'])}"
+                 f" ABORTED]" if cc["aborted"] else ""))
+    print("  expg per-seed (v3.3 自动记账):")
+    for r in out["expg"]["seed_results"]:
+        print(f"    seed {r['seed']}: "
+              + ("[ABORT] " if r["aborted"] else "")
+              + f"acc={r['acc'] * 100:.1f}% "
+              f"rate={r['eval_rate_hz']:.1f}Hz silence={r['silence_frac'] * 100:.1f}% "
+              f"calib_ok={r['calib_ok']} "
+              f"w_ratio_dev={abs(r['w_ratio'] - 1):.2e} "
+              f"budget_dev={r['budget_dev']:.1e} "
+              f"drift={r['drift_frac']:.3f} gini={r['gini']:.4f} "
+              f"gini_ratio={r['gini_ratio']:.3f} r7={int(r['r7_alert'])} "
+              f"wall={r['wall_s']:.0f}s")
+    if out.get("legacy_exp_on") and "exp" in out:
+        print("  exp (legacy all-learn, pool_learn=True) per-seed:")
+        for r in out["exp"]["seed_results"]:
+            print(f"    seed {r['seed']}: "
+                  + ("[ABORT] " if r["aborted"] else "")
+                  + f"acc={r['acc'] * 100:.1f}% "
+                  f"rate={r['eval_rate_hz']:.1f}Hz "
+                  f"silence={r['silence_frac'] * 100:.1f}% "
+                  f"calib_ok={r['calib_ok']} "
+                  f"drift={r['drift_frac']:.3f} gini_r={r['gini_ratio']:.3f} "
+                  f"r7={int(r['r7_alert'])} wall={r['wall_s']:.0f}s")
     v = out["verdict"]
     print(f"exp-g criterion: healthy={v['healthy']} — {v['explain']}")
     print(f"total wall: {out['wall_s']:.0f}s")
@@ -644,7 +766,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="exp-g 判定：pool_learn=False 冻结池内 E→E 可塑性"
                          "（Diehl-Cook 结构），协议三开关全开；输出判据表"
                          "（silence<5%/CALIBRATE 全 ok/w_ratio≈1/acc>=80%）"
-                         "及与 exp/ctrl 对比（默认 light，--full 组合）")
+                         "及与 LSM ctrl 对比（默认双臂；默认 light，--full "
+                         "组合）")
+    ap.add_argument("--legacy-exp-all-learn", dest="legacy_all_learn",
+                    action="store_true",
+                    help="[退役路径] 把 H6 legacy 全可学习臂（pool_learn=True "
+                         "+ 三开关全开，HSTDN-EXP-2026-001）并入 exp-g 三臂"
+                         "对比（默认不可达；需配合 --expg）")
     ap.add_argument("--classes", type=int, default=None)
     ap.add_argument("--train", type=int, default=None,
                     help="每类训练样本数")
@@ -658,8 +786,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--json", action="store_true", help="附加 JSON 汇总")
     args = ap.parse_args(list(argv) if argv is not None else None)
 
-    if args.expg:
-        out = run_expg_comparison(full=args.full)
+    if args.expg or args.legacy_all_learn:
+        out = run_expg_comparison(full=args.full,
+                                  legacy=args.legacy_all_learn)
         print_expg_comparison(out)
         if args.json:
             print(json.dumps(out, indent=2, ensure_ascii=False,

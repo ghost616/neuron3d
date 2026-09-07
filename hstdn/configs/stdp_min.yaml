@@ -1,0 +1,83 @@
+﻿# =============================================================================
+# hstdn/configs/stdp_min.yaml —— v3.3 冻结清单 #5：STDP 条件唯一合法档
+#
+# 语义（G1-STDP 调查结案；文档 §7 风险登记册 / §3 M4 / 归因 Wave 1b）：
+#   pool_learn=False（冻结池内 E→E 可塑性 → Diehl-Cook 前馈结构）是 STDP
+#   条件下的唯一合法网络档；本文件把 **network/lif/stdp/homeo/protocol/
+#   readout_l0/features/readout_l1/encoder 全部字段显式列出**（与 default.yaml
+#   同构、逐键一致），唯一差异为 network.k_pool_learn: false —— 禁止省略式
+#   隐式继承（每个键都必须在此显式钉死），使 R1 runner（hstdn/exp/ablation）
+#   的 STDP 臂/对照臂唯一差异停留在 learn 标志位与三开关组上。
+#
+# G1 中性结论（如实引用）：10 类 FULL 3 种子下冻结 STDP 臂 healthy
+# （acc 89.7±4.2%、silence 0.0%、calib 3/3、w_ratio dev 0）≈ 随机 LSM 对照
+# （90.3±4.9%）—— STDP 在本合成任务族上中性（无增益亦无损害），
+# exp/ctrl 消融应在本档上运行（exp 臂 = 三开关开 + 本档）。
+# R1 runner 引用：hstdn/exp/ablation.py（Spec.pool_learn=False 即本档语义）。
+# =============================================================================
+
+network:
+  n_in: 100          # 输入神经元数
+  n_pool: 800        # 储备池神经元数
+  e_ratio: 0.8       # E/I 比例 80/20（D11）
+  extent: [1.0, 1.0, 0.3]   # 域范围 [x, y, z]
+  radius_in: 0.4     # R_IN
+  radius_pool: 0.18  # R_POOL
+  velocity: 0.05     # VEL
+  k_in: 16           # 输入→池每池最近 k
+  k_pool: 12         # 池→池 per-source k（D11）
+  # STDP 条件唯一合法档：冻结池内 E→E 可塑性（FIX-A 默认语义，v3.3）
+  k_pool_learn: false
+  max_delay: 15      # delay_max；L = delay_max+1 = 16
+
+lif:
+  tau_mem: 20
+  theta0: 1.0
+  refractory: 2
+  T: 200
+  dt: 1
+
+stdp:
+  eta_ltp: 0.008
+  eta_ltd: 0.004
+  tau_trace: 20
+  w_min: 0.02
+  w_max: 1.5
+
+homeo:
+  target_rate_hz: 8
+  eta_homeo: 0.05
+  ema_alpha: 0.1
+
+protocol:
+  adapt_epochs: 2
+  calibrate_samples: 10
+  calibrate_band: [3, 12]
+  calibrate_max_iter: 2
+  extra_loops: 2
+
+readout_l0:
+  lr: 0.5
+  iters: 300
+  l2_lambda: 1.0e-4
+
+features:
+  mode: v0
+  n_bins: 5
+  feature_mask: pool
+
+readout_l1:
+  mode: accumulate
+  n_out: 10
+  lr: 0.05
+  iters: 100
+  l2_lambda: 1.0e-4
+
+encoder:
+  mode: latency
+  t0: 2
+  t_span: 40.0
+  intensity_thr: 0.12
+  poisson_on: false
+  mnist_out: 10
+  dvs_n_in: 512

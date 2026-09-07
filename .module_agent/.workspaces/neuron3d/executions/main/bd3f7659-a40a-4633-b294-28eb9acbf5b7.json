@@ -18,5 +18,17 @@
     ],
     "summary": "执行总结：main 模块 train.py/eval.py 扩展完成（仅改这两个文件，未触碰 core/exp）。train.py 新增 --g1（run_g1_training）：protocol 节严格翻译 → 逐 seed build_network + run_g1_protocol → 阶段率/沉默/精度报告（_g1_seed_report_lines）→ _derive_readout 公开 core API 确定性重放得 W/b（scheduler 不暴露轮次权重）→ 每 seed 落盘 g1_train_s{seed}_*.npz（meta：seed/协议参数/config 指纹/stage_sequence/rolled_back/best_acc/各阶段读数/derived；codec 增 save_checkpoint(extra=)/load_g1_checkpoint，load_checkpoint 签名不变）；M6 注释由 TODO 更新为已实现；修复 _g1_data_fns 整批 10 类喂入 bug。eval.py 新增 --g1（run_g1_evaluation）：load_g1_checkpoint + 独立测试集（5000+seed）全 off 冻结推理 → build_features + predict → 测试精度/率/沉默/cos，对照打印协议 best_acc/stage/rolled_back，非 g1 ckpt 给明确指引。测试总结：全部自测通过 —— py_compile 两文件 OK；train --selfcheck PASS；D4 双模式回归 OK；train --g1 --classes 4 --train-samples 60 --test-samples 20 --seeds 1 exit 0（~48s/seed；rounds=3、阶段/notes 报告完整、derived acc 与 protocol best 一致=100%）；同参两次运行除 wall 外逐行一致（可复现）；eval --g1 --checkpoint g1_train_s1_*.npz --config default.yaml --samples 20 exit 0（独立 seed=5001，acc 与协议 best 对照打印）；错误路径（eval --g1 加载 D4 ckpt）给指引 exit 1。观测：小规模/低噪声下 ADAPT 门出现沉默/洪泛振荡、theta 触界，协议按设计 force-advance 并记录 notes——属 G1 校准范畴非入口缺陷（正式 G1 判据由 exp.gates/ablation 全规模口径评估）。",
     "errors": []
+  },
+  {
+    "plan_id": "plan_f2b525fc-7145-442a-b7ec-cf27cd3fa61e",
+    "plan": "v3.3 冻结 #6：main 侧与 exp ablation 退役（默认 LSM 生产线；STDP 实验臂显式/runner；G1-STDP 结案）",
+    "modified_files": [
+      "hstdn/train.py",
+      "hstdn/eval.py",
+      "hstdn/exp/ablation.py",
+      "hstdn/configs/default.yaml"
+    ],
+    "summary": "执行总结：① exp/ablation.py（本计划获权）：全可学习 legacy 条件退役——Spec.pool_learn 与 default_spec 默认翻转 False（FIX-A 冻结）；run_expg_comparison 默认双臂（expg vs ctrl LSM），legacy 臂仅 legacy=True/CLI --legacy-exp-all-learn 显式并入（保留不删，默认不可达）；run_ablation 默认即新配置；打印/报告/docstring 同步。② hstdn/train.py：主线默认 = LSM 生产线——flat 三开关默认 False；新增 --profile {lsm,stdp-min}，stdp-min 未配 --g1 即拒给指引；--g1 默认 LSM（adapt_enabled=False），--g1 --profile stdp-min = STDP 实验臂（stdp_min.yaml pool_learn=False 契约断言）；meta 增 profile/cfg_profile/aborted，HARD STOP [ABORT]/warning 显式标注；帮助/docstring 更新。③ hstdn/eval.py：默认评估对齐 LSM 档（恒冻结只读）；打印 profile（stdp-min 标注实验臂只读）；指纹失败按 profile 提示档文件；支持 lsm/stdp_min 协议 ckpt。④ hstdn/configs/default.yaml：仅顶层注释更新（LSM 生产线默认；stdp_min=实验臂唯一档），值未动。测试总结：全部实测 exit 0——默认 CLI train --epochs 1 --samples 10 走 LSM（三开关 off、theta 恒 1）；--selfcheck PASS；train --g1（lsm 与 stdp-min 两档）端到端通过（小规模下 v3.3 门禁 HARD STOP 均如实 [ABORT]+wall checkpoint+meta.aborted，属门禁健康行为非入口缺陷）；eval D4 与 --g1 对 lsm/stdp_min checkpoint 均 exit 0（profile 标注正确）；ablation 默认 run_ablation、--expg 双臂（无 legacy 臂）与 --expg --legacy-exp-all-learn 三臂均 exit 0（legacy 在 v3.3 light 下 2/2 ABORT 如实记录）；G0 十五项默认配置路径 15/15 全绿无回归；全部 py_compile 通过。环境备注：write/edit 工具新建文件原子写 EISDIR 失效，改动均经 pwsh WriteAllText 落盘。",
+    "errors": []
   }
 ]

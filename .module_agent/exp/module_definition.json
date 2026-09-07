@@ -7,7 +7,7 @@
     },
     {
       "path": "hstdn/configs/__init__.py",
-      "description": "配置加载辅助：default_path/resolve_path（路径解析）、load_config（pyyaml→dict + 顶层结构契约校验）、validate_config_dict（已知节/必含节/防漂移）；to_core_cfg 为过渡期桥：把 network/lif/stdp/homeo 四节严格映射为 core.layout.NetConfig（含 n_input_cols=√n_in、extent→pool_z_hi、T→window_s、dt=1 校验，未知键显式报错）。_NET_MAP 含 k_pool_learn→pool_learn（exp-g/Diehl-Cook 冻结开关，默认 True）映射，保证 yaml 严格键校验放行且正确桥接。"
+      "description": "配置加载辅助：default_path/resolve_path（路径解析）、load_config（pyyaml→dict + 顶层结构契约校验）、validate_config_dict（已知节/必含节/防漂移）；to_core_cfg 过渡桥：network/lif/stdp/homeo → core.layout.NetConfig（√n_in→n_input_cols、extent→pool_z_hi、T→window_s、dt=1 校验、未知键报错）；_NET_MAP 含 k_pool_learn→pool_learn（v3.3 FIX-A：default.yaml 默认 true 为 §4 现状、stdp_min 档 false 冻结）。v3.3 增命名档注册：DEFAULT_FILE/STDP_MIN_FILE/PROFILES/profile_path（'default'/'stdp_min'，R1 runner 引用 stdp_min 作为 STDP 条件唯一合法档）。"
     },
     {
       "path": "hstdn/exp/__init__.py",
@@ -15,15 +15,23 @@
     },
     {
       "path": "hstdn/exp/gates.py",
-      "description": "G0 十五项断言门禁权威实现 + G1 消融门禁（run_g1）登记。G0（python -m hstdn.exp.gates，全绿方可进入 G1；每项独立可执行）：①LIF 单神经元解析解对照<2% ②传导延迟 d/v<1ms ③时间轮同槽累加 ④CSR/CSC 回指一致 ⑤STDP 方向性 ⑥输入通道活性 ⑦同刻对净更新≈+eta_ltp ⑧homeostasis 闭环收敛 ⑨norm 守恒 Σw=in_sum0 ⑩ID 规范回归 ⑪内核性能（千神经元 200ms：空样本中位≤50ms、单事件突发中位≤150ms 预算包络，隔离实测 ~4ms/~60-80ms）⑫度分布 ⑬延迟上界 max_delay<L ⑭不应期严格封锁 ⑮状态重置回归（B11）。G1（--g1 轻量默认 / --g1 --full 官方判据）：run_g1 惰性调用 exp/ablation 消融并评估——轻量（4 类双种子池200）只验机制跑通+打印组间对比与提示；完整（10 类 ≥3 种子池150）按官方判据（实验组均值 ≥60% 且显著高于对照 = 均值差≥5pp 且逐配种子 exp>ctrl）断言 PASS/FAIL；退出码/清单协议与 G0 既有语义保持一致。自备确定性 micro 网络夹具（显式边表→CSR/CSC/B3/in_learn，与 core 布局同构）；§4 规模网络由 default.yaml 经 to_core_cfg 构建并按门禁克隆复用。"
+      "description": "G0 十五项断言门禁 + G1 消融门禁（run_g1）+ G2 双臂门禁（run_g2）。G0（python -m hstdn.exp.gates，全绿方可进入 G1；每项独立可执行）：①LIF 解析解<2% ②传导延迟 d/v<1ms ③时间轮同槽累加 ④CSR/CSC 回指 ⑤STDP 方向性 ⑥输入通道活性 ⑦同刻对≈+eta_ltp ⑧homeostasis 闭环收敛 ⑨norm 守恒 ⑩ID 规范回归 ⑪内核性能（空≤50ms/突发≤200ms 实时上限包络）⑫度分布 ⑬延迟上界 max_delay<L ⑭不应期严格封锁 ⑮状态重置回归。G1（--g1 轻量 / --full 官方判据；惰性调用 exp/ablation 消融；v3.3 FIX-A 冻结档默认）。G2（--g2 mini 机制 / --g2 --full 正式 R1 判据；惰性调用 exp/g2_runner：LSM 门禁 ≥70% 且配对差 mean>0 & >1×std 且 treatment valid）。G0 十五项保持 15/15 不回归；清单/退出码协议一致。自备确定性 micro 网络夹具；§4 规模网络经 default.yaml→to_core_cfg 构建并按门禁克隆复用。"
     },
     {
       "path": "hstdn/exp/diagnostics.py",
-      "description": "诊断面板函数（G1 与 gates 调试复用，core 惰性导入）：firing_rates_hz/silence_ratio/rate_summary（率与沉默）、cos_similarity/class_cosine_matrix（类间余弦）、feature_transform/feature_cos_similarity（sqrt+L2 特征可比性，mode='sqrt_l2'，支持列掩码）、capped_synapse_ratio（顶界突触占比）、input_to_pool_w_mean（输入→池 w 均值）、delay_histogram、plasticity_panel/network_panel/sample_panel/print_panel 汇总面板；G1 评估辅助（纯函数无断言）：multi_seed_summary（多种子 mean±std）、compare_groups（组间均值差/保守分离界）、format_g1_ablation（消融报告格式化）。"
+      "description": "诊断面板函数（G1 与 gates 调试复用，core 惰性导入、纯函数不承载断言）：firing_rates_hz/silence_ratio/rate_summary（均值率自 v3.3 起为参考项）、cos_similarity/class_cosine_matrix、feature_transform/feature_cos_similarity（sqrt+L2）、capped_synapse_ratio/input_to_pool_w_mean、delay_histogram、plasticity_panel/network_panel/sample_panel/print_panel、multi_seed_summary/compare_groups/format_g1_ablation。v3.3 冻结清单 #3/#4/#9：选择性指数 per_neuron_gini/gini_within_neuron（within-neuron Gini 均值；G3 终审机制级前哨）与 gini_ratio（快照对比）；率分布升级 rate_percentiles（P50/P95）/effective_dimension（非沉默且未过热 rate<3×target）/bimodality_coefficient/rate_distribution_panel；漂移/劫持度量拆分 capture_drift_snapshot/read_drift_stats（drift_frac、input_drift_frac、gini、gini_ratio、gini_std=正确 per-neuron std（历史 std_ratio 死汇总的正式替代）、w_ratio 及其 dev、input_w_min_sat、budget_dev（FIX-A 劫持度量，恒≈0））供 runner 复用；R7 触发器 assess_r7（输入边 w_min 饱和 >20% 或 gini_ratio>1.3 → 警报，正式替换旧均值触发器）。卫生 #9：无 std_ratio 死计算残留（仅 docstring 提及退役历史）。"
     },
     {
       "path": "hstdn/exp/ablation.py",
-      "description": "G1 随机储备池消融（R1；exp 模块，文档 §6 G1 / §8 / §11 冻结条件）+ exp-g 判定（归因 Wave 1b / §3 M4，Diehl-Cook 回归）。实验组（stdp/homeo/norm 三开关开，run_g1_protocol ADAPT）vs 对照组（三开关全关随机固定储备池 + CALIBRATE + READOUT 经典 LSM）；两组同数据同种子唯一差异即三开关。Spec 新增 pool_learn: bool=True（默认 True=现状；False=冻结池内 E→E 可塑性，Diehl-Cook 结构），经 _net_cfg 透传 NetConfig（build_network 前 replace）。提供 Spec/default_spec（LIGHT 4 类双种子池200 机制 / FULL 10 类≥3 种子池150 官方判据）、make_protocol/make_data_fns/run_one_seed（含 calib_ok 与 w_ratio=E 源池→池权重末/初比 归因诊断）/run_group/run_ablation/evaluate_full_criterion/report_lines；exp-g 入口 run_expg_comparison（light/full，pool_learn=False+三开关全开）：判据表 silence<5% / CALIBRATE 全种子 ok / w_ratio≈1 / acc≥80%（evaluate_expg/expg_metrics/expg_report_lines/print_expg_comparison）并打印与 exp/ctrl 对比；CLI 支持 --expg/--freeze-pool（可与 --full 组合）与 --json。"
+      "description": "G1 R1 消融 + exp-g 判定 + v3.3 归因记账（exp 模块；core FIX-A 时代）。Spec（pool_learn 默认 False=v3.3 FIX-A 冻结合法档；True=legacy 复现条件）与 default_spec（LIGHT 4 类双种子池200 / FULL 10 类≥3 种子池150 显式全字段）。make_protocol 对接 v3.3 scheduler：adapt_enabled=switches_on（对照组=False：无 ADAPT 无门禁的 LSM 臂；实验组=True：ADAPT 三开关开）——旧 n_adapt_epochs=0 控制技巧已被 v3.3 HARD STOP 取代。run_g1_protocol 唯一协议入口；run_one_seed 自动快照记账（capture_drift_snapshot→read_drift_stats→assess_r7 写入 SeedResult：drift_frac/input_drift_frac/gini/gini_ratio/gini_std/input_w_min_sat/budget_dev/r7_alert/aborted）。exp/ctrl/expg 三臂：run_expg_comparison（exp=legacy True、expg=冻结 False、ctrl=LSM，同种子同数据唯一差异 learn 标志/开关组）输出判据表（silence<5%/calib 全 ok/w_ratio≈1/acc≥80%）+ v3.3 归因读数；evaluate_full_criterion（G1 官方：exp≥60% 且显著>ctrl）；CLI --expg/--freeze-pool/--full/--json。对照组/冻结行 budget_dev=0.000 记账统一（w_ratio dev 语义）。"
+    },
+    {
+      "description": "v3.3 冻结清单 #5：STDP 条件唯一合法档（hstdn/configs/stdp_min.yaml）。pool_learn=False（冻结池内 E→E 可塑性，Diehl-Cook 前馈结构，FIX-A 语义）+ §4 全部协议参数显式列出（network/lif/stdp/homeo/protocol/readout_l0/features/readout_l1/encoder 与 default.yaml 同构、逐键一致，唯一差异 k_pool_learn: false），禁止省略式隐式继承。docstring 注明 G1 中性结论（冻结 STDP 臂 healthy≈LSM）与 R1 runner（hstdn/exp/ablation）引用关系：STDP 臂/对照臂唯一差异停留在 learn 标志位与三开关组。",
+      "path": "hstdn/configs/stdp_min.yaml"
+    },
+    {
+      "description": "G2 双臂 runner（exp 模块；v3.3 冻结清单 #7，R1 第一判合法性前提）。LSM 臂（对照组：adapt_enabled=False 无学习随机固定池 + CALIBRATE/COLLECT/READOUT/EVAL，main 默认 LSM 语义）vs STDP 臂（stdp_min.yaml 档 pool_learn=False + ADAPT 三开关开）；两臂共享同 seed 网络 cfg 与数据切分，唯一差异 = ADAPT 开关组，共享 run_g1_protocol 协议入口。强制同 seed 配对（正式 5 seeds G2_DEFAULT_SEEDS——G1 n=3 无功效升到 5；mini 2 seeds）。预注册判据：LSM 绝对门禁 ≥70%（R1_LSM_GATE_MIN）；R1 第一判 = 配对差 mean>0 且 >1×std；处理有效性迁移规则（评审 §2）：STDP 臂 ADAPT 后 read_drift_stats 读数 mean drift_frac ≥5% → valid、判据照常；<5% → inconclusive-treatment + 预注册一次性 η 校准（eta×G2_ETA_CALIB_FACTOR=2 仅一次）重跑。数据：MNIST D14 10x10 池化帧（data.mnist 真实子集需 torch，--data mnist/auto 缺依赖回退合成 MNIST 布局等价帧 noise0.18 并标注；G2 全量数据要求 docstring 注明）。CLI --mini(默认)/--full/--seeds/--data/--json；report_lines 输出 LSM/STDP 逐 seed 表 + 配对差汇总 + R1 判据判定 + treatment 标签。gates.py run_g2（--g2 mini / --g2 --full）登记。",
+      "path": "hstdn/exp/g2_runner.py"
     }
   ]
 }

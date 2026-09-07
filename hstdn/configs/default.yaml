@@ -8,6 +8,14 @@
 #
 # 命名沿用设计文档 §4 记号（tau_mem/radius_in/velocity/...），非 core 扁平
 # 字段名；节内键名拼写错误会由加载器显式报错（防漂移）。
+#
+# v3.3 冻结清单 #6 档位语义：本 default.yaml = **LSM 生产线默认档** —— main
+# 模块 train/eval 的默认路径（无实验 flag）以 三开关关闭 / adapt_enabled=False
+# 消费本档：随机固定储备池 + CALIBRATE + READOUT，无 STDP/ADAPT，主线不被
+# 实验条件污染。hstdn/configs/stdp_min.yaml（与本文逐键同构，唯一差异
+# network.k_pool_learn: false 冻结池内 E→E 可塑性）为 **STDP 实验臂唯一合法
+# 档**，仅经 R1 runner（hstdn.exp.ablation --expg 等）或显式
+# train --g1 --profile stdp-min 消费。
 # =============================================================================
 
 # ---- 网络规模与布线（network）------------------------------------------------

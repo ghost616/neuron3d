@@ -70,19 +70,18 @@ class NetConfig:
     n_pool: int = 8000        # pool neuron count (slab domain wiring)
     n_input_cols: int = 32    # input grid side length (default n_in == side**2)
     e_frac: float = 0.8       # excitatory (E) pool fraction (80/20 E/I, D11)
-    pool_learn: bool = False  # D11 learnability switch (v3.3 FIX-A default):
-                              # False = the DEFAULT since v3.3 -- frozen-pool
-                              # plasticity (Diehl-Cook feed-forward regression,
-                              # exp-g structure): pool-to-pool E-source edges
-                              # keep their wiring/delays/initial weights
-                              # U(0.18,0.42)*theta0 but never learn; only
-                              # input->pool synapses participate in STDP and
-                              # in the per-pool competitive budget
-                              # (in_learn_idx / in_sum0).  True = legacy
-                              # reproduction condition where intra-pool E->E
-                              # plasticity is fully learnable again.  Input
-                              # edges always learn; I-source edges never learn.
-                              # Every construction path defaults to False.
+    pool_learn: bool = True   # D11 learnability switch (frozen-pool plasticity
+                              # for exp-g / Diehl-Cook regression): True = the
+                              # default -- pool-to-pool E-source synapses are
+                              # learnable.  False = freeze intra-pool
+                              # plasticity: E-source pool edges keep their
+                              # wiring, delays and initial weights
+                              # U(0.18,0.42)*theta0 but are excluded from
+                              # STDP/LTP/LTD and from the per-pool competitive
+                              # budget -- in_learn_idx/in_sum0 then contain
+                              # input->pool synapses only (input edges always
+                              # learn; I-source edges never learn).
+                              # Every construction path defaults to True.
 
     # --- geometry (slab domain D13: inputs on z=0 plane; pools in
     #     [0,1]x[0,1]x[0,pool_z_hi]) ---

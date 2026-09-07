@@ -1,0 +1,10 @@
+{
+  "plan_id": "plan_ace7b1a4-aa76-4dd8-9b93-781aeae3127a",
+  "module_name": "exp",
+  "development_plan": "实施 v3.3 冻结清单 #7（exp 模块 G2 runner；R1 第一判合法性前提）。依赖 core 门禁硬化、exp 诊断升级/stdp_min.yaml、main 默认 LSM 就绪。\n1. 新增 hstdn/exp/g2_runner.py（或等价正式 runner）：\n   a) 双臂构造：LSM 臂（对照组：随机固定池、无学习，N_IN=100 MNIST D14 池化映射 10x10）与 STDP 臂（stdp_min.yaml 档：pool_learn=False + ADAPT 三开关开）——除 learn 标志位/开关组外逐字段一致（共享同一 default 协议参数，configs 两档显式对齐）。\n   b) 强制双臂同 seed 配对（5 seeds，G2 执行规格 Step 1：G1 n=3 在 ±4.2pp 方差下无功效，升到 5）；共享 COLLECT/READOUT/EVAL 代码路径（同一 run_g1_protocol 或等价入口）。\n   c) 内置逐 seed 配对差计算（mean±std of per-seed diffs）与 R1 判据字段自动输出（LSM 绝对门禁 ≥70%；R1 第一判：配对差 mean(diff)>0 且 >1×std(diff)）——判据预注册，不得事后移动。\n   d) 迁移性预注册规则内置（评审 §2）：对 STDP 臂 ADAPT 后自动做 drift_frac/gini 读数（复用 exp 诊断 read_drift_stats）：drift_frac ≥5% → 结论有效、判据照常执行；<5% → 判 'inconclusive-treatment'，按预注册的一次性 η 校准程序执行一次并重跑（校准机会全局仅此一次，防再调调滑坡）。\n   e) CLI：--seeds、--full/--mini、--json；输出 LSM/STDP 逐 seed 表 + 配对差汇总 + R1 判据判定 + 处理有效性标签。\n2. gates.py：注册 G2 门禁 run_g2（轻量/全量语义对齐 G1 模式；G0 15/15 保持不回归）。\n3. 自测：mini 模式（如 2 seeds × 小样本 MNIST 或轻量子集）端到端跑通 exit 0，输出配对差与判据字段；如实记录结果不掩盖。\n4. MNIST 数据：若 data.mnist 需要 1k 子集加载（依赖 torchvision/数据文件），mini 冒烟可用合成数据的 MNIST 布局等价输入或真实子集（按已就绪的 mnist 模块能力），docstring 注明 G2 全量数据要求。\n遵守代码规范与三件套纪律；不越权修改 core/main 文件（default.yaml 只读不改，若需共享协议对齐新增注释级说明可在 configs 内）。G0 不回归。",
+  "session_id": "8f636bcb-4e5b-49c4-962e-b57ce31d053e",
+  "modified_files": [
+    "hstdn/exp/g2_runner.py",
+    "hstdn/exp/gates.py"
+  ]
+}

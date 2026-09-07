@@ -47,9 +47,9 @@ from hstdn.core.kernel import run_sample
 from hstdn.core import plasticity as plast
 from hstdn.configs import load_config, to_core_cfg
 
-__all__ = ["GATE_SPECS", "G1_SPECS", "run_one", "run_many", "run_g1",
-           "main", "micro_bundle", "micro_cfg", "fresh_default",
-           "default_cfg"]
+__all__ = ["GATE_SPECS", "G1_SPECS", "G2_SPECS", "run_one", "run_many",
+           "run_g1", "run_g2", "main", "micro_bundle", "micro_cfg",
+           "fresh_default", "default_cfg"]
 
 # ---------------------------------------------------------------------------
 # 测试夹具：确定性 micro 网络（布局严格遵循 §2.2/§2.3；与 core 网络同构）
@@ -1005,6 +1005,63 @@ def run_g1(full: Optional[bool] = None) -> Tuple[bool, str]:
     return passed, report + "\n" + head
 
 
+# ---------------------------------------------------------------------------
+# G2 门禁（v3.3 冻结清单 #7；R1 第一判合法性前提 —— hstdn/exp/g2_runner）
+# ---------------------------------------------------------------------------
+
+
+#: CLI --full 与 --g2 组合时置 True：G2 正式模式（5 seeds 真实 MNIST）
+_G2_FULL_FLAG = False
+
+#: G2 门禁注册（经 --g2 / --g2 --full 执行）
+G2_SPECS: List[Tuple[int, str, str]] = [
+    (102, "g2_dual_arm_first_criterion",
+     "G2 双臂 R1 第一判（LSM 对照 vs STDP；配对差 mean>0 且 >1xstd）"),
+]
+
+
+def run_g2(full: Optional[bool] = None) -> Tuple[bool, str]:
+    """运行 G2 门禁（惰性导入 g2_runner）。
+
+    - 轻量（--g2 默认）：mini 冒烟（2 seeds、合成/自动数据回退），只验机制
+      跑通并输出配对差与预注册判据字段（官方判据需 --g2 --full）；
+    - 正式（--g2 --full）：5 seeds、真实 MNIST 子集（torch+torchvision 延迟
+      依赖），断言 R1 第一判（treatment valid + LSM 门禁 ≥70% +
+      mean(diff)>0 且 >1×std(diff)）。
+
+    Returns:
+        (是否通过, 报告文本)。
+    """
+    from hstdn.exp import g2_runner as g2mod
+
+    full = _G2_FULL_FLAG if full is None else full
+    try:
+        out = g2mod.run_g2_comparison(
+            full=full, data_source=("mnist" if full else "auto"))
+    except (ImportError, ValueError) as exc:
+        return False, (f"[FAIL] G2 {'full' if full else 'mini'}：{exc}\n"
+                       "       （正式 G2 需真实 MNIST + torch；mini 自动回退）")
+    report = "\n".join(g2mod.report_lines(out))
+    crit = out["criteria"]
+    if not full:
+        ok = bool(out["lsm_rows"] and out["stdp_rows"])
+        hint = ("[PASS] G2 mini 机制验证通过（判据字段已输出：LSM "
+                f"{crit['lsm_mean'] * 100:.1f}% vs STDP "
+                f"{crit['stdp_mean'] * 100:.1f}%，配对差 "
+                f"{crit['paired_diff_mean'] * 100:+.1f}±"
+                f"{crit['paired_diff_std'] * 100:.1f}pp；treatment="
+                f"{out['treatment']}）。官方 R1 判据请运行："
+                "python -m hstdn.exp.gates --g2 --full")
+        return ok, report + "\n" + hint
+    passed = bool(crit["criterion_pass"] and out["treatment"] == "valid")
+    head = ("[PASS] G2 full R1 第一判" if passed else
+            "[FAIL] G2 full R1 第一判未满足") + \
+        f"（LSM gate={'PASS' if crit['lsm_gate_pass'] else 'FAIL'}, " \
+        f"mean>0={crit['mean_gt_zero']}, mean>1xstd={crit['mean_gt_std']}, " \
+        f"treatment={out['treatment']}）"
+    return passed, report + "\n" + head
+
+
 def _spec(gid: int):
     for s in GATE_SPECS:
         if s[0] == gid:
@@ -1060,6 +1117,9 @@ def _print_list() -> None:
     print("G1 门禁（--g1 轻量默认 / --g1 --full 官方完整判据；--list 不含详情）：")
     for gid, key, title in G1_SPECS:
         print(f"  {gid}. {title}  [{key}]")
+    print("G2 门禁（--g2 mini 默认 / --g2 --full 正式 R1 判据）：")
+    for gid, key, title in G2_SPECS:
+        print(f"  {gid}. {title}  [{key}]")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1072,7 +1132,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 pass
     ap = argparse.ArgumentParser(
         prog="python -m hstdn.exp.gates",
-        description="G0 十五项断言门禁 + G1 消融门禁（run_g1）",
+        description="G0 十五项断言门禁 + G1 消融门禁（run_g1）+ G2 双臂门禁"
+                    "（run_g2）",
     )
     ap.add_argument("ids", nargs="*", type=int,
                     help="G0 门禁编号（默认运行全部 1..15）")
@@ -1082,18 +1143,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--g1", action="store_true",
                     help="同时运行 G1 门禁（默认轻量模式：4 类双种子快速"
                          "机制验证 + 打印提示）")
+    ap.add_argument("--g2", action="store_true",
+                    help="同时运行 G2 门禁（默认 mini：2 种子小样本机制验证"
+                         " + 输出配对差与预注册判据字段；合成数据回退）")
     ap.add_argument("--full", action="store_true",
-                    help="G1 完整模式：合成 10 类 ≥3 种子，官方判据"
-                         "（实验组 ≥60%% 且显著高于对照组；耗时较长）")
+                    help="G-门禁完整模式：G1=10 类 ≥3 种子官方判据；"
+                         "G2（需 --g2 组合）=5 seeds 真实 MNIST R1 第一判"
+                         "（LSM 门禁 ≥70%% 且配对差 mean>0 & >1xstd）")
     args = ap.parse_args(list(argv) if argv is not None else None)
     if args.list:
         _print_list()
         return 0
     ids = list(args.ids) if args.ids else [s[0] for s in GATE_SPECS]
     run_g1_flag = bool(args.g1 or args.full)
-    if run_g1_flag:
-        global _G1_FULL_FLAG
+    run_g2_flag = bool(args.g2)
+    if run_g1_flag or run_g2_flag:
+        global _G1_FULL_FLAG, _G2_FULL_FLAG
         _G1_FULL_FLAG = bool(args.full)
+        _G2_FULL_FLAG = bool(args.full)
     if args.trace:
         # 调试模式：不做异常包装 —— 首个失败直接抛给解释器打印完整 traceback
         for gid in sorted(set(ids)):
@@ -1107,20 +1174,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"[PASS] {title}：{detail}")
         return 0
     g0_code = run_many(ids)
-    if not run_g1_flag:
+    if not (run_g1_flag or run_g2_flag):
         return g0_code
+    final_ok = g0_code == 0
     # --- G1 门禁（轻量默认 / --full 完整判据）---
-    print("=" * 78)
-    print("G1 gate (%s mode)" % ("full" if args.full else "light"))
-    ok_g1, msg = run_g1()
-    print(msg)
-    if ok_g1:
-        print("G1 gate: PASS（见上；G0 汇总见前）")
-    else:
-        print("G1 gate: FAIL（G1 判据未满足；G0 汇总见前）")
-    if g0_code != 0:
-        return g0_code
-    return 0 if ok_g1 else 1
+    if run_g1_flag:
+        print("=" * 78)
+        print("G1 gate (%s mode)" % ("full" if args.full else "light"))
+        ok_g1, msg = run_g1()
+        print(msg)
+        print("G1 gate: PASS" if ok_g1 else "G1 gate: FAIL（判据未满足）")
+        final_ok = final_ok and ok_g1
+    # --- G2 门禁（--g2 mini 默认 / --g2 --full 正式 R1 判据）---
+    if run_g2_flag:
+        print("=" * 78)
+        print("G2 gate (%s mode)" % ("full" if args.full else "mini"))
+        ok_g2, msg2 = run_g2()
+        print(msg2)
+        print("G2 gate: PASS" if ok_g2 else "G2 gate: FAIL（判据未满足）")
+        final_ok = final_ok and ok_g2
+    return 0 if final_ok else 1
 
 
 if __name__ == "__main__":

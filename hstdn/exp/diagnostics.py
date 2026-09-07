@@ -31,6 +31,11 @@ __all__ = [
     "plasticity_panel", "delay_histogram", "network_panel",
     "sample_panel", "print_panel",
     "multi_seed_summary", "compare_groups", "format_g1_ablation",
+    # v3.3 诊断升级（#3/#4/#9）
+    "per_neuron_gini", "gini_within_neuron",
+    "rate_percentiles", "effective_dimension", "bimodality_coefficient",
+    "rate_distribution_panel",
+    "capture_drift_snapshot", "read_drift_stats", "assess_r7",
 ]
 
 
@@ -336,3 +341,320 @@ def format_g1_ablation(exp_summary: Mapping[str, Any],
             f"{compare['min_exp_gt_max_ctrl'] * 100:+.1f} pp"
         )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# v3.3 诊断升级（冻结清单 #3/#4/#9；§7 风险登记册 / §6 诊断；纯函数）
+#
+# 选择性指数：within-neuron Gini（每神经元可学习入突触权重 Gini）+ gini_ratio
+# （ADAPT 后/初值比）—— 原型经 manipulation check 验证（drift_frac≈28.7%、
+# gini Δ≈0），转正为正式诊断量（G3 终审机制级前哨）。
+# 度量拆分（#4）：budget_dev（劫持度量——池内突触并入预算时的预算偏差，
+#   FIX-A 后恒 ≈0：in_learn/in_sum0 仅覆盖输入边）与 input_w_drift（学习度量：
+#   drift_frac（|Δw|>0.1·|w_init| 的占比）+ within-neuron Gini）。
+# R7 触发器（#4，死数值钉死）：输入突触 w_min 饱和占比 >20% 或 gini_ratio>1.3。
+# 率分布（#3）：P50/P95 分位、有效维度（非沉默且未过热（rate<3×target））、
+#   双峰系数；均值率降级为参考项（键保留但标注 note）。
+# 卫生（#9）：无 std_ratio 类死汇总——per-neuron std 一律按定义正确计算
+#   （如 gini_std = per-neuron Gini 的样本 std，见 read_drift_stats）。
+# ---------------------------------------------------------------------------
+
+
+def _gini_1d(values: Any) -> float:
+    """单条样本的 Gini 系数（非负向量；n<2 时返回 0.0；公式稳定）。
+
+    G = (2 * Σ_{i=1..n} i * x_sorted_i) / (n * Σx) - (n+1)/n （x 升序）。
+    """
+    x = np.asarray(values, dtype=np.float64).ravel()
+    if x.size == 0:
+        return 0.0
+    x = x[x >= 0.0]
+    n = int(x.size)
+    if n == 0:
+        return 0.0
+    s = float(x.sum())
+    if s <= 0.0:
+        return 0.0
+    x = np.sort(x)
+    csum = float(np.dot(np.arange(1, n + 1), x))
+    return max(0.0, (2.0 * csum) / (float(n) * s) - (float(n) + 1.0) / float(n))
+
+
+def _learnable_incoming_groups(bundle: Any):
+    """(pool_ids, weights)：可学习入突触（bundle.in_learn 行，正权重）分组。
+
+    惰性导入 core 类型以保持模块轻量。
+    """
+    cfg = bundle.cfg
+    ptr = bundle.in_learn_ptr
+    idx = bundle.in_learn_idx
+    pool_ids = np.repeat(np.arange(int(cfg.n_pool), dtype=np.int64),
+                         np.diff(ptr))
+    w = np.asarray(bundle.csr_w[idx], dtype=np.float64)
+    return pool_ids, w
+
+
+def per_neuron_gini(bundle: Any) -> np.ndarray:
+    """逐神经元 within-neuron Gini（可学习入突触权重；无/单突触神经元 = 0）。"""
+    pool_ids, w = _learnable_incoming_groups(bundle)
+    n_pool = int(bundle.cfg.n_pool)
+    out = np.zeros(n_pool, dtype=np.float64)
+    counts = np.bincount(pool_ids, minlength=n_pool)
+    # 逐神经元向量化 Gini（按池分组：对每池排序+公式）
+    order = np.lexsort((w, pool_ids))          # 按池分组内升序
+    w = w[order]
+    pool_ids = pool_ids[order]
+    bounds = np.cumsum(counts)
+    lo = np.concatenate([[0], bounds[:-1]])
+    has = counts >= 2
+    for p in np.flatnonzero(has):
+        seg = w[lo[p]:bounds[p]]
+        n = int(counts[p])
+        s = float(seg.sum())
+        if s > 0.0:
+            csum = float(np.dot(np.arange(1, n + 1), seg))
+            out[p] = max(0.0, (2.0 * csum) / (float(n) * s)
+                         - (float(n) + 1.0) / float(n))
+    return out
+
+
+def gini_within_neuron(bundle: Any) -> float:
+    """within-neuron Gini（每神经元入突触权重 Gini）的全池均值。
+
+    返回 float ∈ [0, 1]（G3 终审机制级前哨；正式诊断量）。
+    """
+    vals = per_neuron_gini(bundle)
+    return float(vals.mean())
+
+
+def _rate_arr(spike_counts: Any, window_s: float) -> np.ndarray:
+    return np.asarray(spike_counts, dtype=np.float64) / float(window_s)
+
+
+def rate_percentiles(spike_counts: Any, window_s: float = 0.2,
+                     qs=(50.0, 95.0)) -> Dict[str, float]:
+    """发放率分位数面板（默认 P50/P95）。"""
+    r = _rate_arr(spike_counts, window_s)
+    if r.size == 0:
+        return {}
+    q = np.percentile(r, list(qs))
+    return {f"p{int(qi)}_rate_hz": float(v)
+            for qi, v in zip(qs, q)}
+
+
+def effective_dimension(spike_counts: Any, window_s: float = 0.2,
+                        overheat_factor: float = 3.0,
+                        target_rate_hz: Optional[float] = None) -> Dict[str, float]:
+    """有效维度：非沉默且未过热（rate < overheat_factor×target）的神经元。
+
+    target_rate_hz 缺省按 8 Hz 契约；返回 n_effective 与占比 effective_ratio
+    （相对总神经元数）。
+    """
+    r = _rate_arr(spike_counts, window_s)
+    n = int(r.size)
+    target = 8.0 if target_rate_hz is None else float(target_rate_hz)
+    if n == 0:
+        return {"n_effective": 0.0, "effective_ratio": 0.0,
+                "overheat_hz": float(overheat_factor) * target}
+    hot = r >= overheat_factor * target
+    eff = (r > 0.0) & (~hot)
+    return {"n_effective": float(np.count_nonzero(eff)),
+            "effective_ratio": float(np.count_nonzero(eff)) / float(n),
+            "overheat_hz": float(overheat_factor) * target}
+
+
+def bimodality_coefficient(spike_counts: Any, window_s: float = 0.2) -> float:
+    """发放率分布双峰系数 BC=(skew²+1)/(kurt+3(n−1)²/((n−2)(n−3)))。
+
+    BC>0.555 提示双峰；样本 n<4 时返回 0.0（信息不足）。纯 NumPy 矩。
+    """
+    r = _rate_arr(spike_counts, window_s)
+    n = int(r.size)
+    if n < 4:
+        return 0.0
+    mu = float(r.mean())
+    if mu == 0.0:
+        return 0.0
+    m2 = float(np.mean((r - mu) ** 2))
+    if m2 <= 0.0:
+        return 0.0
+    m3 = float(np.mean((r - mu) ** 3))
+    m4 = float(np.mean((r - mu) ** 4))
+    skew = m3 / (m2 ** 1.5)
+    kurt = m4 / (m2 ** 2.0) - 3.0
+    denom = kurt + 3.0 * (float(n) - 1.0) ** 2 / (
+        float(n - 2) * float(n - 3))
+    if denom <= 0.0:
+        return 1.0
+    return float(min(1.0, (skew ** 2 + 1.0) / denom))
+
+
+def rate_distribution_panel(spike_counts: Any, window_s: float = 0.2,
+                            target_rate_hz: Optional[float] = None,
+                            overheat_factor: float = 3.0) -> Dict[str, float]:
+    """率分布升级面板（#3）：P50/P95、有效维度、双峰系数。
+
+    均值率在此面板降级为参考项（键名加 _ref 并保留 mean_rate_hz_ref）。
+    """
+    r = _rate_arr(spike_counts, window_s)
+    n = int(r.size)
+    out: Dict[str, float] = rate_percentiles(spike_counts, window_s)
+    out.update(effective_dimension(spike_counts, window_s,
+                                   overheat_factor, target_rate_hz))
+    out["bimodality"] = bimodality_coefficient(spike_counts, window_s)
+    out["silence_ratio"] = silence_ratio(spike_counts)
+    out["mean_rate_hz_ref"] = float(r.mean()) if n else 0.0   # 参考项
+    out["mean_rate_hz_ref_note"] = 0.0   # 占位：键名即标注（参考项非主判据）
+    return out
+
+
+def capture_drift_snapshot(bundle: Any) -> Dict[str, Any]:
+    """训练/ADAPT 前权重快照（run_one_seed / runner 复用读接口）。
+
+    Args:
+        bundle: NetworkBundle（协议运行前调用）。
+
+    Returns:
+        dict：pos（可学习边 CSR 位置）、w0（初始权重拷贝）、src_gids、
+        w_in0（输入边子集位置与权重）、e_mask0（池→池 E 源边位置）、
+        gini0（within-neuron Gini 初值均值）、per_pool_sum0（in_sum0 拷贝）、
+        w_lo（契约权重下界）、pool_learn、pool_is_E。
+    """
+    cfg = bundle.cfg
+    pos = np.flatnonzero(bundle.csr_learn)
+    return {
+        "pos": pos.copy(),
+        "w0": np.asarray(bundle.csr_w[pos], dtype=np.float64).copy(),
+        "src_gids": np.asarray(bundle.csr_src[pos], dtype=np.int64).copy(),
+        "w_in0": (pos[bundle.csr_src[pos] < cfg.n_in].copy(),
+                  np.asarray(
+                      bundle.csr_w[pos[bundle.csr_src[pos] < cfg.n_in]],
+                      dtype=np.float64).copy()),
+        "e_mask0": _e_source_positions(bundle, pos),
+        "gini0": gini_within_neuron(bundle),
+        "per_pool_sum0": np.asarray(bundle.in_sum0, dtype=np.float64).copy(),
+        "w_lo": float(cfg.w_lo),
+        "pool_learn": bool(cfg.pool_learn),
+        "n_pool": int(cfg.n_pool),
+    }
+
+
+def _e_source_positions(bundle: Any, pos: np.ndarray) -> np.ndarray:
+    """pos 中属于池→池 E 源边的 CSR 位置数组。"""
+    cfg = bundle.cfg
+    src = bundle.csr_src[pos]
+    is_pool = src >= cfg.n_in
+    e = np.zeros(pos.size, dtype=bool)
+    if is_pool.any():
+        pool_ids = src[is_pool] - cfg.n_in
+        e[is_pool] = bundle.pool_is_E[pool_ids]
+    return pos[e]
+
+
+def read_drift_stats(bundle: Any, snapshot: Mapping[str, Any]) -> Dict[str, float]:
+    """协议运行后读取漂移/选择性统计（与 capture_drift_snapshot 配对）。
+
+    Args:
+        bundle: NetworkBundle（协议运行后，状态即终态）。
+        snapshot: capture_drift_snapshot 输出。
+
+    Returns（全部纯读数，不含断言）：
+        drift_frac        |Δw| > 0.1·|w_init| 的可学习边占比（学习度量）
+        input_drift_frac  同上但仅输入边（input_w_drift 的分布级主项）
+        gini             within-neuron Gini（当前均值）
+        gini_ratio       gini / gini0（ADAPT 后/初值比；gini0=0 时为 1.0）
+        gini_std         per-neuron Gini 的样本 std（正确 per-neuron std，
+                         替代历史 std_ratio 死汇总行的正确实现）
+        w_ratio          池→池 E 源权重均值 末/初 比（w_ratio dev 记账）
+        input_w_min_sat  输入边 w <= w_lo+1e-12 的占比（R7 触发器）
+        budget_dev       劫持度量：逐池可学习入突触 Σw 对 in_sum0 的
+                         最大相对偏差（FIX-A 后恒 ≈0）
+    """
+    cfg = bundle.cfg
+    pos = np.asarray(snapshot["pos"], dtype=np.intp)
+    w0 = np.asarray(snapshot["w0"], dtype=np.float64)
+    w1 = np.asarray(bundle.csr_w[pos], dtype=np.float64)
+    dw = np.abs(w1 - w0)
+    thr = 0.1 * np.abs(w0)
+    drift = float(np.count_nonzero(dw > thr) / max(1, int(w0.size)))
+    gini1 = gini_within_neuron(bundle)
+    gini0 = float(snapshot.get("gini0", 0.0))
+    gini_ratio = float(gini1 / gini0) if gini0 > 0.0 else 1.0
+    gini_std = float(per_neuron_gini(bundle).std())
+    # 输入边占比（输入→池 学习度量）
+    src = np.asarray(snapshot["src_gids"], dtype=np.int64)
+    in_m = src < cfg.n_in
+    input_drift = (float(np.count_nonzero(dw[in_m] > thr[in_m]) /
+                         max(1, int(np.count_nonzero(in_m))))
+                   if np.any(in_m) else 0.0)
+    w_lo = float(snapshot.get("w_lo", cfg.w_lo))
+    in_pos = np.asarray(snapshot["w_in0"][0], dtype=np.intp)
+    if in_pos.size:
+        w_in = np.asarray(bundle.csr_w[in_pos], dtype=np.float64)
+        input_w_min_sat = float(np.count_nonzero(w_in <= w_lo + 1e-12)
+                                / float(in_pos.size))
+    else:
+        input_w_min_sat = 0.0
+    # 池→池 E 源 w_ratio（记账统一：冻结/ctrl 行恒 ≈1 = budget_dev 语义）
+    e_pos = np.asarray(snapshot.get("e_mask0", np.zeros(0, dtype=np.intp)),
+                       dtype=np.intp)
+    if e_pos.size and snapshot["w0"].size:
+        e0 = w0[np.isin(pos, e_pos)]
+        e1 = w1[np.isin(pos, e_pos)]
+        w_ratio = float(e1.mean() / e0.mean()) if e0.size and e0.mean() > 0 \
+            else 1.0
+    else:
+        w_ratio = 1.0
+    # budget_dev（FIX-A 劫持度量：逐池相对预算偏差）
+    ptr = bundle.in_learn_ptr
+    idx = bundle.in_learn_idx
+    if idx.size:
+        pool_ids = np.repeat(np.arange(int(cfg.n_pool), dtype=np.int64),
+                             np.diff(ptr))
+        s = np.bincount(pool_ids, weights=bundle.csr_w[idx],
+                        minlength=int(cfg.n_pool))
+        sums0 = np.asarray(snapshot["per_pool_sum0"], dtype=np.float64)
+        dev = np.abs(s - sums0) / np.maximum(sums0, 1e-12)
+        budget_dev = float(np.max(dev)) if dev.size else 0.0
+    else:
+        budget_dev = 0.0
+    return {
+        "drift_frac": drift,
+        "input_drift_frac": input_drift,
+        "gini": gini1,
+        "gini_ratio": gini_ratio,
+        "gini_std": gini_std,
+        "w_ratio": w_ratio,
+        "w_ratio_dev": abs(w_ratio - 1.0),
+        "input_w_min_sat": input_w_min_sat,
+        "budget_dev": budget_dev,
+    }
+
+
+def assess_r7(bundle: Any, snapshot: Mapping[str, Any],
+              sat_threshold: float = 0.20,
+              gini_ratio_threshold: float = 1.3) -> Dict[str, Any]:
+    """R7 触发器（#4 正式替换旧均值触发器 0.5×初值——FIX-A 归一化钉死下失明）：
+
+    输入突触 w_min 饱和占比 >20%（死数值钉死）或 gini_ratio >1.3 → 警报。
+
+    Returns:
+        dict：input_w_min_sat / gini_ratio / alert（bool）/ explain。
+    """
+    st = read_drift_stats(bundle, snapshot)
+    sat = float(st["input_w_min_sat"])
+    gr = float(st["gini_ratio"])
+    alert = bool(sat > sat_threshold or gr > gini_ratio_threshold)
+    reasons = []
+    if sat > sat_threshold:
+        reasons.append(f"input_w_min_sat={sat * 100:.1f}% > "
+                       f"{sat_threshold * 100:.0f}%")
+    if gr > gini_ratio_threshold:
+        reasons.append(f"gini_ratio={gr:.3f} > {gini_ratio_threshold:.1f}")
+    return {
+        "input_w_min_sat": sat,
+        "gini_ratio": gr,
+        "thresholds": {"sat": sat_threshold, "gini_ratio": gini_ratio_threshold},
+        "alert": alert,
+        "explain": "; ".join(reasons) if reasons else "no R7 trigger",
+    }

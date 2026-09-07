@@ -33,5 +33,27 @@
     ],
     "summary": "执行总结：exp-g 判定配套三项交付完成，未越权修改 core/main。(1) hstdn/configs/default.yaml：network 节新增 k_pool_learn: true（默认 True=现状，G1 冻结纪律默认不变；False=exp-g 冻结池内 E→E 可塑性开关，含文档注释）；(2) hstdn/configs/__init__.py：_NET_MAP 增 k_pool_learn→NetConfig.pool_learn（严格键校验放行、桥接冒烟通过，load_config().network['k_pool_learn']→to_core_cfg().pool_learn=True）；(3) hstdn/exp/ablation.py：Spec 增 pool_learn（默认 True，to_dict/默认规格/LIGHT·FULL 含 True），_net_cfg build_network 前 replace 透传，SeedResult 增 calib_ok+w_ratio（E 源池→池权重末/初比，冻结=1）归因诊断；run_expg_comparison（light/full：唯一变更 pool_learn=False 且协议三开关全开=exp 协议）输出判据表（evaluate_expg：silence<5%/CALIBRATE 全种子 ok/w_ratio≈1/acc≥80%）与 exp/ctrl 对比；CLI --expg/--freeze-pool（可组合 --full）。测试总结：(a) G0 默认路径无回归——python -m hstdn.exp.gates 15/15 exit 0（k_pool_learn 默认 True）；(b) exp-g light 冒烟可运行并输出判据表（见下）；(c) exp-g full 3 种子已跑并如实记录。exp-g 结果（FULL，10 类/noise0.16/池150/adapt2/3 种子）：expg=89.7±4.2%、silence 0.0%、CALIBRATE 3/3 ok、w_ratio dev max=0.00e+00 → healthy=True（四项判据全过，acc≥80%）；对照 exp（池内可塑性开）=56.7±15.9%（silence 34%）、ctrl(随机 LSM)=90.3±4.9%（silence 0）。light（4 类池200 双种子）：expg=72.9±20.6（silence 0.8%、calib 2/2、w_ratio dev 0；acc<80% → light 判据 False，判据按 FULL 定义）、exp=45.8±23.6、ctrl=64.6±26.5。冻结语义独立验证：pool_learn=False 构建 learn 边==输入边（2377/2377）且 STDP 样本后池→池 E 权重逐位不变。结论：exp-g 健康 → 支持 H6 方向定案依据——冻结池内 E→E 可塑性消除 exp 组 θ 饱和/高沉默（34%→0），输入→池（Diehl-Cook 前馈）路径可学习且稳定，性能≈LSM（89.7 vs 90.3，±4-5% 内不显著）；上一轮 G1 exp<ctrl 的退化归因指向池内可塑性动态。剩余开放：exp-g 是否额外超越 LSM 需更难任务族/更大规模确认（light 下 expg 72.9 > ctrl 64.6 为正向提示）。",
     "errors": []
+  },
+  {
+    "plan_id": "plan_b2ab5b04-908c-48ee-8ef8-936dbd635da0",
+    "plan": "v3.3 冻结清单 #3/#4/#5/#9（exp 侧；诊断升级/R7 替换/stdp_min 档/卫生）",
+    "modified_files": [
+      "hstdn/exp/diagnostics.py",
+      "hstdn/exp/ablation.py",
+      "hstdn/configs/stdp_min.yaml",
+      "hstdn/configs/__init__.py"
+    ],
+    "summary": "执行总结：v3.3 冻结清单 exp 侧四项交付完成，未越权修改 core/main。(#3) hstdn/exp/diagnostics.py 新增：within-neuron Gini（gini_within_neuron/per_neuron_gini）+ gini_ratio（快照对比）选择性指数转正；率分布升级 P50/P95（rate_percentiles）、有效维度（非沉默且未过热 3×target）、双峰系数、rate_distribution_panel（均值率降级为 mean_rate_hz_ref 参考项）；纯函数、core 惰性导入。(#4) 度量拆分 capture_drift_snapshot/read_drift_stats：drift_frac、input_drift_frac、gini/gini_ratio/gini_std（正确 per-neuron std，卫生 #9：无 std_ratio 死计算残留）、w_ratio dev、input_w_min_sat、budget_dev（FIX-A 劫持度量，实测恒 ≈1e-16）；R7 新触发器 assess_r7（输入边 w_min 饱和>20% 或 gini_ratio>1.3）。ablation：make_protocol 对接 v3.3 scheduler adapt_enabled（ctrl=False=LSM 臂无 ADAPT 门禁，替代失效的 n_adapt_epochs=0 技巧——旧法在 v3.3 HARD STOP 下致对照臂硬停，已实测修复）；Spec pool_learn 默认翻转为 False（FIX-A）；run_one_seed 自动快照记账写入 SeedResult（drift/gini/r7/budget/aborted）；expg 三臂比较与判据表输出 v3.3 归因读数。(#5) hstdn/configs/stdp_min.yaml（STDP 条件唯一合法档：pool_learn=False 冻结 + §4 全字段显式钉死，与 default.yaml 同构仅 k_pool_learn 差异，同构校验通过）+ configs PROFILES/profile_path 命名档注册。测试总结：(a) G0 默认路径 15/15 exit 0 无回归；(b) 新诊断量冒烟合理（§4 默认 bundle：drift 0.033、gini_ratio 0.983、budget_dev 6.95e-16、R7 无告警；expg/ctrl 读数一致）；(c) exp-g full 3 种子如实记录（v3.3 core）：ctrl(LSM)=90.3±4.9 健康；expg seed0=91.0%、seed1=85.0% 健康、seed2 ADAPT HARD STOP（abort 前 drift≈0.448、gini_ratio≈1.173 升高但未触 R7 1.3 阈值，r7=0）→ expg 判据 2/3 未全绿；exp(legacy True 池内可塑性开)=3/3 ABORT（v3.3 硬门禁下不稳定，与既往结论一致）。light：expg 68.8±14.7 / ctrl 64.6±26.5（ctrl drift 0、gini_ratio 1.000、budget_dev 0.000 记账统一）。结论/分支归属（如实）：冻结池内可塑性（Diehl-Cook）在 v3.3 下大部分种子健康（85-91%≥80%）但存在种子级 ADAPT 硬停（seed2），H6 定案为**部分支持**；R7 前哨未触发但 seed2 drift≈0.45/gini_ratio≈1.17 呈升高趋势，提示需 η/门禁/校准余量治理（core/scheduler 侧或更保守 STDP 档，exp 不越权）。",
+    "errors": []
+  },
+  {
+    "plan_id": "plan_ace7b1a4-aa76-4dd8-9b93-781aeae3127a",
+    "plan": "v3.3 冻结清单 #7：G2 双臂 runner + gates run_g2 + mini 自测（R1 第一判合法性前提）",
+    "modified_files": [
+      "hstdn/exp/g2_runner.py",
+      "hstdn/exp/gates.py"
+    ],
+    "summary": "执行总结：#7 交付完成，未越权修改 core/main（default.yaml 只读未改）。(a) 新增 hstdn/exp/g2_runner.py：双臂构造——LSM 臂（对照组 adapt_enabled=False 无学习随机固定池 + CALIBRATE/COLLECT/READOUT/EVAL，main 默认 LSM 语义）与 STDP 臂（stdp_min.yaml 档 pool_learn=False + ADAPT 三开关开），两臂共享同 seed 网络 cfg（g2_net_cfg）与数据切分（make_g2_dataset auto/mnist/synth），唯一差异 ADAPT 开关组，共享 run_g1_protocol 入口；(b) 强制同 seed 配对：正式 5 seeds（G1 n=3 ±4.2pp 无功效 → Step1 升 5）、mini 2 seeds；逐 seed 配对差 mean±std；(c) 预注册判据字段：R1_LSM_GATE_MIN=0.70（LSM 绝对门禁）、R1 第一判 mean(diff)>0 且 >1×std(diff)（R1_DIFF_STD_FACTOR=1）、paired_complete 校验，自动输出不事后移动；(d) 迁移性预注册规则（评审 §2）：STDP ADAPT 后复用 diagnostics.read_drift_stats——mean drift_frac≥5% → valid、判据照常；<5% → inconclusive-treatment + 一次性 η 校准（G2_ETA_CALIB_FACTOR=2，全局仅一次防再调滑坡）并重跑；(e) CLI --mini(默认)/--full/--seeds/--data auto|mnist|synth/--json，report_lines 输出逐 seed 表+配对差+R1 判据+treatment 标签。gates.py 注册 run_g2（G2_SPECS id=102：--g2 mini 机制验证+字段输出；--g2 --full 正式 R1 判据需真实 MNIST）。测试总结：(a) G0 十五项 15/15 exit 0 无回归；(b) mini 冒烟端到端 exit 0：LSM 77.0%（seed 84.0/70.0）vs STDP 79.0%（86.0/72.0），配对差 +2.0±0.0pp（paired 2/2 无 ABORT），LSM 门禁 PASS，treatment=valid（drift 6.83%≥5%，无需校准），R1 第一判 mini（std=0）按规则 NOT MET——如实；(c) gates --g2 mini：G0 15/15 + G2 mini PASS exit 0；(d) G2 full（5 seeds 真实 MNIST）本机因 torch/torchvision 缺失无法执行（G2 延迟依赖，docstring/报错注明 pip 安装与 data/mnist 落盘要求）；合成回退低噪声（0.06）体制 STDP 臂在 v3.3 严格 ADAPT 门禁 HARD STOP 已如实记录并用 0.18 体制（双臂可过门禁）。无掩盖、判据字段与配对差均在 mini 输出中可见。",
+    "errors": []
   }
 ]

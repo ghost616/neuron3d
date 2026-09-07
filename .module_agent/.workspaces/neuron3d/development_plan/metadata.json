@@ -14,5 +14,37 @@
     "code_reviewed": true,
     "plan_completed": true,
     "test_passed": true
+  },
+  {
+    "plan_id": "plan_4d8c0175-f8b1-4f2d-adac-96461e4c7411",
+    "plan_summary": "core v3.3 #1/#2：pool_learn 默认化 False(FIX-A) + G0#18 构建断言 + scheduler 门禁硬化",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_b2ab5b04-908c-48ee-8ef8-936dbd635da0",
+    "plan_summary": "exp v3.3 #3/#4/#5/#9：诊断升级(gini/分位/有效维/双峰) + R7 触发器 + stdp_min.yaml + 卫生修复",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_f2b525fc-7145-442a-b7ec-cf27cd3fa61e",
+    "plan_summary": "main v3.3 #6：默认档切换 LSM 生产线 + ablation 退役(legacy flag) + eval 对齐 + default.yaml 注释",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_ace7b1a4-aa76-4dd8-9b93-781aeae3127a",
+    "plan_summary": "exp v3.3 #7：新增 G2 runner（LSM/STDP 双臂同 seed 配对 + R1 判据预注册）+ gates run_g2 注册",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
   }
 ]

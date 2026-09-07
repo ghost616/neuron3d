@@ -18,6 +18,15 @@
 hstdn.core / hstdn.exp 接口。cos 仅为「类均值特征可分离性」骨架读数，
 G1 的读出/特征可比性统计由 exp/data 模块按里程碑补充。
 
+v3.3 冻结 #6（默认评估 = LSM 档冻结只读；STDP 实验臂 ckpt 可读）
+----------------------------------------------------------------
+默认路径（D4 模式与 --g1 协议评估）均以**冻结只读**评估任意 train 产物：
+stdp/homeo/norm 恒 False，不修改权重/阈值 —— 与 LSM 生产线默认口径一致。
+checkpoint meta 带 ``profile``（train 落盘：lsm / stdp-min）时如实打印；
+profile=stdp-min（stdp_min.yaml 实验臂档）的 checkpoint 可由同一只读路径
+评估（读出权重 W/b 在 g1 checkpoint 内）。--config 指纹比对失败时提示按
+profile 选用匹配档文件。
+
 G1 协议评估模式（--g1）
 ----------------------
 加载 train.py --g1 产出的协议 checkpoint（meta.mode="g1"，含读出权重 W/b），
@@ -41,7 +50,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -74,11 +83,13 @@ def build_parser() -> argparse.ArgumentParser:
     """评估入口命令行参数。"""
     p = argparse.ArgumentParser(
         prog="hstdn.eval",
-        description="H-STDN 评估入口骨架：checkpoint + 配置 -> 冻结测试集 "
-                    "run_sample -> 率/沉默/cos 汇总。",
+        description="H-STDN 评估入口（v3.3 冻结 #6：默认评估 = LSM 档冻结只读；"
+                    "支持 lsm 与 stdp_min 档 checkpoint）：checkpoint + 配置 -> "
+                    "冻结测试集 run_sample -> 率/沉默/cos（--g1 另含测试精度）。",
     )
     p.add_argument("--checkpoint", required=True, metavar="PATH",
-                   help="train.py 产出的 npz checkpoint 路径（必填）")
+                   help="train.py 产出的 npz checkpoint 路径（必填；LSM 与 "
+                        "stdp-min 档产物均可——评估恒为冻结只读）")
     p.add_argument("--config", default=None, metavar="PATH",
                    help="yaml 配置路径（可选；给出时与 checkpoint 配置指纹比对）")
     p.add_argument("--samples", type=int, default=_DEF_SAMPLES,
@@ -93,9 +104,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quiet", action="store_true", help="仅打印汇总面板")
     g = p.add_argument_group("G1 protocol eval (--g1)")
     g.add_argument("--g1", action="store_true",
-                   help="G1 模式：加载 train --g1 的协议 checkpoint，独立测试"
-                        "集冻结推理输出测试精度（缺省为 D4 率/沉默/cos 模式）")
+                   help="G1 模式：加载 train --g1 的协议 checkpoint（lsm 或 "
+                        "stdp-min profile 均可），独立测试集冻结推理输出测试"
+                        "精度（缺省为 D4 率/沉默/cos 模式）")
     return p
+
+
+def _print_profile(meta: Dict[str, Any],
+                   run_args: Optional[Mapping[str, Any]] = None) -> None:
+    """打印 checkpoint 运行档（meta.profile；兼容旧 ckpt 从 run_args 取）。"""
+    profile = meta.get("profile") or ((run_args or {}).get("profile"))
+    if profile == "stdp-min":
+        print("  profile: stdp-min  [STDP 实验臂 stdp_min 档 checkpoint；"
+              "本评估为冻结只读]")
+    elif profile:
+        print(f"  profile: {profile}")
+    else:
+        print("  profile: n/a (pre-#6 checkpoint；评估仍为冻结只读)")
 
 
 def _verify_config(meta: Dict[str, Any], config_path: Optional[str]) -> None:
@@ -106,17 +131,23 @@ def _verify_config(meta: Dict[str, Any], config_path: Optional[str]) -> None:
         config_path: 用户显式给出的 yaml 路径；None 时信任落盘配置。
 
     Raises:
-        AssertionError: 指纹不一致（附两侧指纹前缀与路径的可读消息）。
+        AssertionError: 指纹不一致（附两侧指纹前缀/路径与 profile 提示）。
     """
     if config_path is None:
         return
     fp_checkpoint = str(meta.get("fingerprint", ""))
     fp_file = config_fingerprint(load_config(config_path))
     if fp_file != fp_checkpoint:
+        profile = meta.get("profile")
+        hint = (
+            f"checkpoint profile={profile}；如为 stdp-min 实验臂请用 "
+            "hstdn/configs/stdp_min.yaml，或省略 --config 信任落盘配置"
+            if profile else "或省略 --config 信任落盘配置"
+        )
         raise AssertionError(
             f"配置指纹与 checkpoint 不一致：file({config_path}) "
             f"{fp_file[:16]}... != checkpoint {fp_checkpoint[:16]}...；"
-            "评估必须与被评估的训练配置对齐（重训或换用匹配的 --config）"
+            f"评估必须与被评估的训练配置对齐（{hint}）"
         )
 
 
@@ -182,6 +213,7 @@ def run_evaluation(args: argparse.Namespace) -> Dict[str, Any]:
     run_args = meta.get("run_args") or {}
     if run_args:
         print(f"  trained with: {run_args}")
+    _print_profile(meta, run_args)
 
     # ---- 冻结评估（全 off）：权重/阈值不再演化，仅读池响应 ----
     win = float(netcfg.window_s)
@@ -325,8 +357,13 @@ def run_g1_evaluation(args: argparse.Namespace) -> Dict[str, Any]:
 
     # ---- 报告（格式与 ablation/gates 种子行口径对齐）----
     best_acc = float(meta.get("best_acc", 0.0))
+    g1_profile = meta.get("profile") or run_args.get("profile")
+    profile_line = (f"  profile: {g1_profile}  [stdp_min 实验臂档，评估只读]"
+                    if g1_profile == "stdp-min"
+                    else f"  profile: {g1_profile or 'n/a (pre-#6)'}")
     lines = [
         f"G1 eval: checkpoint={ckpt.name}",
+        profile_line,
         f"  seed {seed} (independent test_seed={test_seed}): "
         f"acc={acc * 100:.1f}% n={n_use}",
         f"  rate={agg['mean_rate_hz']:.2f}Hz silence="
@@ -341,6 +378,7 @@ def run_g1_evaluation(args: argparse.Namespace) -> Dict[str, Any]:
 
     summary: Dict[str, Any] = {
         "checkpoint": str(ckpt),
+        "profile": meta.get("profile") or run_args.get("profile"),
         "seed": seed,
         "test_seed": test_seed,
         "n_test_samples": float(n_use),

@@ -7,21 +7,16 @@ Strict state flow of the design-doc M6 state diagram:
 - ADAPT: plasticity on (stdp_on/homeo_on/norm_on=True) for ``n_adapt_epochs``
   full passes over the training iterator; gate diagnostics after each pass
   (all-off measurements): mean firing rate in [3, 15] Hz and silent pool
-  fraction < 5% are required.  Hard gate sequence (v3.3 hardening): when the
-  gate is unmet after the extra single epoch (``adapt_gate_extra_max``), the
-  protocol automatically halves eta_stdp/eta_homeo and restarts ADAPT at most
-  ``adapt_retry_max`` (1) times; if the gate is still unmet the protocol
-  **hard-terminates** -- it never force-advances into COLLECT with a sick
-  population.  Before terminating it dumps a wall checkpoint
-  (theta/rate_ema/csr_w/counts snapshot + reason, see
-  ``G1Report.wall_checkpoint``) so the failure can be dissected offline.
+  fraction < 5% are required.  While the gate is unmet, up to
+  ``adapt_gate_extra_max`` extra single epochs run; beyond that the protocol
+  force-advances with a recorded warning.
 - CALIBRATE: all plasticity off; ``calibrate_samples`` inference samples give
   the per-pool mean rate; uniform negative feedback per FIX-B2:
   ``factor = clip(measured_rate / 8, 1/3, 3)`` and
   ``theta = clip(theta * factor, 0.5, 20)``; the band [3, 12] Hz must be met
   within ``calibrate_max_iter`` (2) iterations.  On failure the protocol
-  returns to ADAPT (eta halved) while a round budget remains, otherwise it
-  hard-terminates with a wall checkpoint as well.
+  returns to ADAPT with eta_stdp/eta_homeo halved (recorded) -- when no loop
+  budget remains it force-advances with a warning.
 - COLLECT: all off; pure inference over the full training iterator; features
   built with core.features.build_features (V0 default).
 - READOUT: all off; core.readout.train_linear_readout (10% validation early
@@ -33,12 +28,6 @@ Strict state flow of the design-doc M6 state diagram:
   eta_stdp x0.5 and eta_homeo x0.5 each round; a per-round checkpoint is kept
   and when a later round accuracy does not improve the previous best the
   protocol rolls the bundle back to that checkpoint.
-- G2 symmetry (both arms through this same code path, guaranteed by
-  construction): the LSM arm is expressed as ``adapt_enabled=False`` -- the
-  ADAPT stage and its #2 gate do not apply, but CALIBRATE / COLLECT /
-  READOUT / EVAL checks are identical (a CALIBRATE failure still
-  hard-terminates; nothing soft-skips).  STDP arm default ``adapt_enabled
-  =True``.
 
 Samples are fed one at a time (buckets via core.encoder.latency_encode) so
 memory stays bounded.  Per-sample-end homeo/norm are handled inside
@@ -49,9 +38,6 @@ re-implements them.
 
 from __future__ import annotations
 
-import os
-import tempfile
-import time as _time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
@@ -80,15 +66,12 @@ class ProtocolConfig:
 
     t_ms: int = 200                # sample length in ms (matches kernel default)
     # --- ADAPT ---
-    n_adapt_epochs: int = 2        # full training passes per ADAPT attempt
+    n_adapt_epochs: int = 2        # full training passes per ADAPT round
     adapt_diag_samples: int = 5    # all-off samples per gate measurement
-    adapt_gate_extra_max: int = 1  # extra single epochs allowed per attempt
-                                   # (v3.3: exactly the "extend by 1 epoch"
-                                   # step before halved-eta retry / stop)
+    adapt_gate_extra_max: int = 3  # extra single epochs allowed before forcing
     silence_frac_max: float = 0.05  # gate: silent-pool fraction < 5%
     adapt_rate_lo: float = 3.0      # gate: mean rate band [3, 15] Hz
     adapt_rate_hi: float = 15.0
-    adapt_retry_max: int = 1        # hard-gate retries with halved eta (v3.3)
     # --- CALIBRATE (FIX-B2) ---
     calibrate_samples: int = 10
     calibrate_max_iter: int = 2
@@ -102,16 +85,6 @@ class ProtocolConfig:
     # --- loops & eta decay ---
     extra_loops: int = 2
     eta_scale: float = 0.5          # eta_stdp & eta_homeo multiplier per round
-    # --- arm selection (G2 symmetry) ---
-    adapt_enabled: bool = True      # False = LSM arm: no ADAPT stage, hence no
-                                    # #2 ADAPT gate; CALIBRATE/EVAL checks and
-                                    # hard termination still apply.
-    calibrate_hard_stop: bool = True  # when no ADAPT re-entry budget remains a
-                                    # failed CALIBRATE hard-terminates instead
-                                    # of force-advancing (v3.3 hardening)
-    # --- failure wall checkpoint ---
-    fail_checkpoint_dir: Optional[str] = None  # directory for the failure npz
-                                    # dump (None -> system temp dir)
     # --- features (delegated to core.features) ---
     feat_mode: str = "v0"
     feat_n_bins: int = 5
@@ -448,13 +421,7 @@ def _restore_checkpoint(bundle: NetworkBundle, ck: _Checkpoint) -> None:
 
 @dataclass
 class G1Report:
-    """Full protocol report (scalars/strings only; safe to serialize).
-
-    Failure recording (v3.3): a hard-terminated run carries terminated=True,
-    failed_stage ('ADAPT'/'CALIBRATE'), fail_reason, fail_stats and the path
-    of the wall checkpoint npz (wall_checkpoint) that was force-dumped before
-    exit.  A clean run has terminated=False.
-    """
+    """Full protocol report (scalars/strings only; safe to serialize)."""
 
     ok: bool
     n_rounds: int
@@ -470,12 +437,6 @@ class G1Report:
     rolled_back: bool = False
     best_acc: float = 0.0
     notes: List[str] = field(default_factory=list)
-    # --- v3.3 hard-termination recording ---
-    terminated: bool = False
-    failed_stage: Optional[str] = None
-    fail_reason: str = ""
-    wall_checkpoint: Optional[str] = None
-    fail_stats: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Plain-dict view (JSON-safe)."""
@@ -494,11 +455,6 @@ class G1Report:
             "rolled_back": self.rolled_back,
             "best_acc": self.best_acc,
             "notes": list(self.notes),
-            "terminated": self.terminated,
-            "failed_stage": self.failed_stage,
-            "fail_reason": self.fail_reason,
-            "wall_checkpoint": self.wall_checkpoint,
-            "fail_stats": dict(self.fail_stats),
         }
 
 
@@ -514,51 +470,6 @@ def _halve_eta(bundle: NetworkBundle, pcfg: ProtocolConfig) -> float:
     )
     bundle.cfg = new_cfg  # NetworkBundle.cfg is a mutable attribute slot
     return float(scale)
-
-
-def _dump_failure(bundle: NetworkBundle, pcfg: ProtocolConfig, stage: str,
-                  reason: str, stats: Dict[str, Any]) -> str:
-    """Force-dump a wall checkpoint before a hard termination (never silent).
-
-    Persists theta / rate_ema / csr_w / counts / first_spike snapshots plus
-    the failure reason and stage into a ``.npz`` file (directory from
-    ``pcfg.fail_checkpoint_dir`` or the system temp dir; unique timestamp
-    name) and returns its absolute path for ``G1Report.wall_checkpoint``.
-
-    Args:
-        bundle: NetworkBundle whose state is snapshotted.
-        pcfg: protocol config (checkpoint directory).
-        stage: failed stage name ('ADAPT'/'CALIBRATE').
-        reason: human-readable failure reason.
-        stats: stage statistics dict (scalar fields are embedded).
-
-    Returns:
-        Absolute path of the written checkpoint file.
-
-    Raises:
-        OSError: when the dump cannot be written (never silently swallowed).
-    """
-    d = pcfg.fail_checkpoint_dir
-    if not d:
-        d = tempfile.gettempdir()
-    os.makedirs(d, exist_ok=True)
-    stamp = _time.strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(d, f"g1_fail_{stage}_{stamp}.npz")
-    scalar = {k: v for k, v in (stats or {}).items()
-              if isinstance(v, (int, float, str, bool)) or v is None}
-    np.savez(
-        path,
-        theta=bundle.theta,
-        rate_ema=bundle.rate_ema,
-        csr_w=bundle.csr_w,
-        counts=bundle.counts,
-        first_spike=bundle.first_spike,
-        stage=np.asarray([stage], dtype="U16"),
-        reason=np.asarray([reason], dtype="U512"),
-        mean_rate_hz=np.asarray([float(scalar.get("mean_rate_hz", float("nan")))]),
-        silence_frac=np.asarray([float(scalar.get("silence_frac", float("nan")))]),
-    )
-    return os.path.abspath(path)
 
 
 def run_g1_protocol(bundle: NetworkBundle, train_data_fn: DataFn,
@@ -578,11 +489,8 @@ def run_g1_protocol(bundle: NetworkBundle, train_data_fn: DataFn,
         seed: optional seed override (data/readout randomness).
 
     Returns:
-        G1Report.  On a hard gate failure the report has terminated=True,
-        failed_stage/fail_reason/fail_stats set and wall_checkpoint pointing
-        at the dumped npz; the protocol never soft-advances into COLLECT with
-        a sick population.  ``bundle`` is left in the failed state (usable for
-        post-mortem analysis).
+        G1Report with per-stage statistics, readout/eval results and the
+        rollback flag.
 
     Raises:
         RuntimeError: an iterator produced no samples where one was required.
@@ -591,76 +499,36 @@ def run_g1_protocol(bundle: NetworkBundle, train_data_fn: DataFn,
     if seed is None:
         seed = pcfg.seed
     rep = G1Report(ok=False, n_rounds=0)
-    max_rounds = 1 + pcfg.extra_loops if pcfg.adapt_enabled else 1
+    max_rounds = 1 + pcfg.extra_loops
     best_ck: Optional[_Checkpoint] = None
     rounds = 0
     halvings = 0
-
-    def _terminate(stage: str, reason: str, stats: Dict[str, Any]) -> G1Report:
-        """Hard termination: record + dump + stop (no COLLECT/READOUT/EVAL)."""
-        rep.terminated = True
-        rep.failed_stage = stage
-        rep.fail_reason = reason
-        rep.fail_stats = {
-            k: v for k, v in (stats or {}).items()
-            if isinstance(v, (int, float, str, bool)) or v is None
-        }
-        path = _dump_failure(bundle, pcfg, stage, reason, stats or {})
-        rep.wall_checkpoint = path
-        rep.notes.append(
-            f"HARD STOP at {stage}: {reason} (wall checkpoint: {path})"
-        )
-        rep.n_rounds = rounds
-        rep.eta_scale_final = float(pcfg.eta_scale ** halvings)
-        return rep
-
     while rounds < max_rounds:
-        if pcfg.adapt_enabled:
-            # Every (re-)entry into ADAPT halves eta once (round>0 entries
-            # after a previous EVAL; CALIBRATE failures re-enter below).
-            if rounds > 0:
-                _halve_eta(bundle, pcfg)
-                halvings += 1
-            label = ("ADAPT(eta x%.3f)" % (pcfg.eta_scale ** halvings)
-                     if rounds > 0 else "ADAPT")
-            rep.stage_sequence.append(label)
-            attempt = 0
-            while True:
-                adapt = _adapt_round(bundle, train_data_fn, pcfg)
-                rep.adapt_rounds.append(adapt)
-                if adapt["passed"]:
-                    break
-                # Hard gate: extend-by-1-epoch already happened inside
-                # _adapt_round; now halve eta and restart ADAPT up to
-                # adapt_retry_max times, then hard-terminate (never COLLECT).
-                if attempt < pcfg.adapt_retry_max:
-                    _halve_eta(bundle, pcfg)
-                    halvings += 1
-                    attempt += 1
-                    rep.notes.append(
-                        "ADAPT gate unmet; halved eta and restarted ADAPT "
-                        f"(attempt {attempt}/{pcfg.adapt_retry_max}; "
-                        f"rate={adapt['mean_rate_hz']:.2f} Hz, "
-                        f"silence={adapt['silence_frac']:.3f})"
-                    )
-                    continue
-                return _terminate(
-                    "ADAPT",
-                    "ADAPT gate unmet after extra epoch and "
-                    f"{pcfg.adapt_retry_max} halved-eta retries "
-                    f"(rate={adapt['mean_rate_hz']:.2f} Hz, "
-                    f"silence={adapt['silence_frac']:.3f} >= "
-                    f"{pcfg.silence_frac_max:.2f})",
-                    adapt,
-                )
-        # --- CALIBRATE (identical for STDP and LSM arms) ---
+        # Every re-entry into ADAPT (after the first round, after looping from
+        # EVAL, or after a CALIBRATE failure) halves eta once -- documented
+        # eta_stdp/eta_homeo decay per return to ADAPT.
+        if rounds > 0:
+            _halve_eta(bundle, pcfg)
+            halvings += 1
+        stage = ("ADAPT(eta x%.3f)" % (pcfg.eta_scale ** halvings)
+                 if rounds > 0 else "ADAPT")
+        rep.stage_sequence.append(stage)
+        adapt = _adapt_round(bundle, train_data_fn, pcfg)
+        rep.adapt_rounds.append(adapt)
+        if adapt["forced"]:
+            rep.notes.append(
+                "ADAPT gate unmet after extra epochs; force-advancing "
+                f"(rate={adapt['mean_rate_hz']:.2f} Hz, "
+                f"silence={adapt['silence_frac']:.3f})"
+            )
         rep.stage_sequence.append("CALIBRATE")
         calib = _calibrate(bundle, train_data_fn, pcfg)
         rep.calibrate_rounds.append(calib)
         if not calib["ok"]:
-            # Failed calibration may re-enter ADAPT while a round budget and
-            # an ADAPT arm remain; otherwise hard-terminate (no soft skip).
-            if pcfg.adapt_enabled and (rounds + 1 < max_rounds):
+            # calibrate failed: go back to ADAPT (eta halved on re-entry at
+            # the loop top) while a round budget remains, otherwise
+            # force-advance with a warning
+            if rounds + 1 < max_rounds:
                 rep.notes.append(
                     "CALIBRATE band unmet; returning to ADAPT "
                     f"(mean rate {calib['final_mean_rate_hz']:.2f} Hz; "
@@ -668,15 +536,10 @@ def run_g1_protocol(bundle: NetworkBundle, train_data_fn: DataFn,
                 )
                 rounds += 1
                 continue
-            return _terminate(
-                "CALIBRATE",
-                f"CALIBRATE band [{pcfg.calib_rate_lo}, "
-                f"{pcfg.calib_rate_hi}] Hz unmet after "
-                f"{calib['iterations']} iteration(s) "
-                f"(final mean rate {calib['final_mean_rate_hz']:.2f} Hz)",
-                calib,
+            rep.notes.append(
+                "CALIBRATE band unmet and no round budget left; "
+                "force-advancing to COLLECT"
             )
-        # --- COLLECT / READOUT / EVAL ---
         rep.stage_sequence.append("COLLECT")
         Xtr, ytr, cinfo = _collect(train_data_fn, bundle, pcfg)
         rep.collect_n = cinfo["n_samples"]

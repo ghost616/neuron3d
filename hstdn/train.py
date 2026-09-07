@@ -18,19 +18,33 @@
 网络构建（build rng）与每 epoch 数据生成（seed + epoch 派生），运行参数与
 配置指纹全部落盘。
 
-M6 调度器接入状态（已实现）
---------------------------
+M6 调度器接入状态（已实现）+ v3.3 冻结 #6（主线默认 = LSM 生产线）
+-----------------------------------------------------------------
 core.scheduler（M6，core 模块交付）已实现完整 G1 协议状态机
-``run_g1_protocol``（ADAPT→CALIBRATE→COLLECT→READOUT→EVAL，含轮次回滚 /
-eta 衰减）；本入口以 ``--g1`` 消费它（见 :func:`run_g1_training`）。默认
-（无 --g1）仍为 D4 冒烟 flat 循环 :func:`_training_epochs`（只跑单样本
-链路，不消费 protocol 节）。协议超参唯一来源为 default.yaml ``protocol``
-节（由 :func:`_protocol_kwargs_from_yaml` 翻译，禁止散落魔法数字）。
+``run_g1_protocol``（ADAPT→CALIBRATE→COLLECT→READOUT→EVAL；v3.3 增加
+``adapt_enabled`` 臂开关与门禁 HARD STOP）。v3.3 冻结清单 #6 起，主线默认
+档为 **LSM 生产线（对照组口径）**：随机固定储备池（无 STDP/ADAPT）+ 
+CALIBRATE + READOUT，任何实验条件不进入默认路径：
+
+- 默认 CLI（无 --profile / 无 --g1）：D4 冒烟 flat 循环
+  :func:`_training_epochs` —— LSM 档：stdp/homeo/norm 三开关默认 False
+  （随机固定储备池，仅链路冒烟，不演化权重/阈值）。
+- ``--g1`` 协议：默认同为 LSM 档（``adapt_enabled=False``：随机池 +
+  CALIBRATE + COLLECT + READOUT + EVAL）。协议超参唯一来源 default.yaml
+  ``protocol`` 节（:func:`_protocol_kwargs_from_yaml` 翻译，禁散落魔法数）。
+- **STDP 实验臂（stdp_min.yaml + 三开关开 + ADAPT）只经显式参数/runner**：
+  ``--g1 --profile stdp-min``（LSM 之外必须显式给出），或 R1 runner
+  ``python -m hstdn.exp.ablation``（exp 模块；默认 expg/ctrl = FIX-A 冻结 +
+  LSM；legacy 全可学习臂需显式 ``--legacy-exp-all-learn`` —— H6 /
+  HSTDN-EXP-2026-001 保留路径，默认不可达）。
 
 命令行（项目根 E:\\neuron3d）
-    python -m hstdn.train --epochs 1 --samples 10          # D4 冒烟
+    python -m hstdn.train --epochs 1 --samples 10          # 默认：LSM 冒烟
     python -m hstdn.train --g1 --classes 4 --train-samples 60 ^
-                         --test-samples 20 --seeds 1       # G1 协议训练
+                         --test-samples 20 --seeds 1       # LSM 协议档
+    python -m hstdn.train --g1 --profile stdp-min --classes 4 ^
+                         --train-samples 60 --test-samples 20 --seeds 1
+                                                           # STDP 实验臂
     python -m hstdn.train --help
     python -m hstdn.train --selfcheck        # 指纹 + checkpoint 编解码自检
 退出码：0 = 成功；1 = 运行期失败（异常上抛并打印）；2 = 参数错误。
@@ -437,6 +451,41 @@ _G1_DEF_SEEDS = (0, 1)        # 默认双种子（消融惯例 >= 2 种子）
 _G1_TRAIN_SEED_OFFSET = 1000
 _G1_TEST_SEED_OFFSET = 2000
 
+#: 运行档（v3.3 冻结 #6）：lsm=LSM 生产线默认；stdp-min=STDP 实验臂唯一档
+PROFILE_LSM = "lsm"
+PROFILE_STDP_MIN = "stdp-min"
+#: --profile 值 → hstdn.configs.PROFILES 命名档键（"default"/"stdp_min"）
+_PROFILE_TO_CFG = {PROFILE_LSM: "default", PROFILE_STDP_MIN: "stdp_min"}
+
+
+def _profile_cfg_path(profile: str) -> Path:
+    """运行档对应的 §4 契约文件路径（复用 hstdn.configs.profile_path）。"""
+    from hstdn.configs import profile_path
+    return profile_path(_PROFILE_TO_CFG[profile])
+
+
+def _resolve_profile(args: argparse.Namespace) -> str:
+    """归一化并校验运行档：STDP 实验臂必须显式配合 --g1（或走 exp runner）。
+
+    Raises:
+        ValueError: profile 非 lsm/stdp-min，或 stdp-min 未配合 --g1
+            （STDP 条件不进主线默认路径）。
+    """
+    profile = str(getattr(args, "profile", PROFILE_LSM))
+    if profile not in (PROFILE_LSM, PROFILE_STDP_MIN):
+        raise ValueError(
+            f"unknown --profile {profile!r}（可选 {PROFILE_LSM}/"
+            f"{PROFILE_STDP_MIN}）"
+        )
+    if profile == PROFILE_STDP_MIN and not bool(getattr(args, "g1", False)):
+        raise ValueError(
+            "STDP 实验臂（--profile stdp-min）只允许显式运行在 --g1 协议下，"
+            "或经 R1 runner：python -m hstdn.exp.ablation（--expg / "
+            "--legacy-exp-all-learn）；主线默认 = LSM 档（对照组：随机池 + "
+            "CALIBRATE + READOUT），不承载实验条件"
+        )
+    return profile
+
 #: default.yaml protocol 节键 → core.scheduler ProtocolConfig 字段（唯一翻译）
 _PROTOCOL_KEY_MAP = {
     "adapt_epochs": "n_adapt_epochs",
@@ -600,11 +649,13 @@ def _derive_readout(bundle: NetworkBundle, train_fn: Callable,
 
 def _g1_seed_report_lines(rep: Any, seed: int, wall_s: float) -> List[str]:
     """把单次 run_g1_protocol 的 G1Report 格式化为阶段报告行（纯格式化）。"""
+    aborted = bool(not rep.ok)
     lines = [
-        f"G1 seed {seed}: ok={rep.ok} rounds={rep.n_rounds} "
+        f"G1 seed {seed}: " + ("[ABORT] " if aborted else "")
+        + f"ok={rep.ok} rounds={rep.n_rounds} "
         f"best_acc={rep.best_acc * 100:.1f}% rolled_back={rep.rolled_back} "
         f"wall={wall_s:.1f}s",
-        f"  stages: {' -> '.join(rep.stage_sequence)}",
+        f"  stages: {' -> '.join(rep.stage_sequence) or '(none)'}",
     ]
     for idx, a in enumerate(rep.adapt_rounds):
         lines.append(
@@ -647,11 +698,28 @@ def run_g1_training(args: argparse.Namespace) -> Dict[str, Any]:
     协议即落盘一个 checkpoint（meta 指纹含 seed/协议参数/config 指纹/
     阶段 stage_sequence/是否回滚 rolled_back）。
 
+    v3.3 冻结 #6 运行档（--profile，默认 lsm）：
+        - ``lsm``（默认）：LSM 生产线（对照组口径）—— adapt_enabled=False，
+          无 ADAPT 阶段/门禁、extra_loops=0（随机池 + CALIBRATE + COLLECT +
+          READOUT + EVAL）；协议其余旋钮同 default.yaml protocol 节。
+        - ``stdp-min``（实验臂，需显式）：消费 stdp_min.yaml（pool_learn=
+          False 冻结 + §4 全字段钉死）+ adapt_enabled=True（三开关开 +
+          ADAPT）；契约断言 pool_learn 必须为 False。
+    STDP 实验条件不进主线默认路径；正式对照经 exp.ablation R1 runner。
+
     Raises:
         ValueError/AssertionError: 参数非法或契约被违反（含统计数值）。
     """
-    cfg_yaml = load_config(args.config)
+    profile = _resolve_profile(args)
+    cfg_path = args.config if args.config else _profile_cfg_path(profile)
+    cfg_yaml = load_config(cfg_path)
     netcfg = to_core_cfg(cfg_yaml)              # 超参唯一契约的权威翻译
+    if profile == PROFILE_STDP_MIN and bool(netcfg.pool_learn):
+        raise AssertionError(
+            "--profile stdp-min 档契约：pool_learn 必须为 False（池内 E→E "
+            f"冻结，stdp_min.yaml 唯一合法档）；cfg({cfg_path}) 解析得 "
+            f"pool_learn={netcfg.pool_learn}"
+        )
     fp_cfg = config_fingerprint(cfg_yaml)
 
     n_classes = int(args.classes or _G1_DEF_CLASSES)
@@ -679,6 +747,12 @@ def run_g1_training(args: argparse.Namespace) -> Dict[str, Any]:
     train_tpc = int((train_total + n_classes - 1) // n_classes)
     test_tpc = int((test_total + n_classes - 1) // n_classes)
     pcfg_kw = _protocol_kwargs_from_yaml(cfg_yaml)
+    if profile == PROFILE_LSM:
+        # LSM 臂（对照组口径，v3.3 冻结 #6）：无 ADAPT 阶段/#2 门禁、不回环
+        pcfg_kw["adapt_enabled"] = False
+        pcfg_kw["extra_loops"] = 0
+    else:
+        pcfg_kw["adapt_enabled"] = True   # STDP 实验臂显式（stdp_min 档）
 
     t0 = time.perf_counter()
     checkpoints: List[str] = []
@@ -687,9 +761,10 @@ def run_g1_training(args: argparse.Namespace) -> Dict[str, Any]:
     for s in seeds:
         net = replace(netcfg, n_pool=pool, seed=int(s)).with_derived()
         bundle = build_network(net)
-        print(f"=== hstdn.train --g1 ===  seed {s}  (pool={pool}, "
-              f"classes={n_classes}, train={n_classes * train_tpc}, "
-              f"test={n_classes * test_tpc}, noise={noise}) ===")
+        print(f"=== hstdn.train --g1 [{profile}] ===  seed {s}  "
+              f"(pool={pool}, classes={n_classes}, "
+              f"train={n_classes * train_tpc}, test={n_classes * test_tpc}, "
+              f"noise={noise}) ===")
         train_fn, test_fn = _g1_data_fns(n_classes, train_tpc, test_tpc,
                                          noise, graded, int(s))
         from hstdn.core.scheduler import ProtocolConfig, run_g1_protocol
@@ -701,14 +776,22 @@ def run_g1_training(args: argparse.Namespace) -> Dict[str, Any]:
                                      feat_n_bins=pc.feat_n_bins)
         wall = time.perf_counter() - t_s
         print("\n".join(_g1_seed_report_lines(rep, int(s), wall)))
-        acc_eq = abs(float(dacc["derived_acc"]) - float(rep.best_acc)) <= 1e-9
-        print(f"  derived readout: acc={dacc['derived_acc'] * 100:.1f}% "
-              f"(protocol best {rep.best_acc * 100:.1f}%, "
-              f"consistent={acc_eq})")
+        if rep.ok:
+            acc_eq = abs(float(dacc["derived_acc"])
+                         - float(rep.best_acc)) <= 1e-9
+            print(f"  derived readout: acc={dacc['derived_acc'] * 100:.1f}% "
+                  f"(protocol best {rep.best_acc * 100:.1f}%, "
+                  f"consistent={acc_eq})")
+        else:
+            print("  [protocol HARD STOP] ok=False（v3.3 门禁硬停：ADAPT/CALIBRATE "
+                  "未落带且无重试预算；本 seed 无 EVAL 轮）。checkpoint 仍落盘供 "
+                  "离线拆解；derived readout 仅供参考（非协议结论）。")
 
         # ---- meta 指纹：seed / 协议参数 / config 指纹 / 阶段 / 是否回滚 ----
         meta_run_args = {
             "mode": "g1",
+            "profile": profile,
+            "cfg_profile": _PROFILE_TO_CFG[profile],
             "seed": int(s),
             "pool": pool,
             "classes": n_classes,
@@ -724,6 +807,9 @@ def run_g1_training(args: argparse.Namespace) -> Dict[str, Any]:
         meta = {
             "format": CKPT_FORMAT,
             "mode": "g1",
+            "profile": profile,
+            "cfg_profile": _PROFILE_TO_CFG[profile],
+            "aborted": bool(not rep.ok),
             "fingerprint": fp_cfg,
             "run_fingerprint": fp_run,
             "config_json": _json_safe(cfg_yaml),
@@ -751,6 +837,7 @@ def run_g1_training(args: argparse.Namespace) -> Dict[str, Any]:
         }
         rows.append({
             "seed": int(s),
+            "aborted": bool(not rep.ok),
             "acc": float(rep.best_acc),
             "derived_acc": float(dacc["derived_acc"]),
             "wall_s": wall,
@@ -774,6 +861,11 @@ def run_g1_training(args: argparse.Namespace) -> Dict[str, Any]:
         f"(n={int(summary['n'])}, min {summary['min'] * 100:.1f}% / "
         f"max {summary['max'] * 100:.1f}%)"
     )
+    n_abort = int(sum(1 for r in rows if r["aborted"]))
+    if n_abort:
+        print(f"  [warning] {n_abort}/{len(rows)} seed(s) ABORT"
+              "（v3.3 门禁 HARD STOP，无 EVAL 轮）；含 abort 的 acc 均值"
+              "不具结论性（检查 meta.notes / 协议失败 wall checkpoint）")
     print(f"total wall: {time.perf_counter() - t0:.1f} s")
     return {"seeds": rows, "acc_summary": summary,
             "checkpoints": checkpoints}
@@ -783,8 +875,11 @@ def build_parser() -> argparse.ArgumentParser:
     """训练入口命令行参数（超参一律来自 yaml，此处只收运行参数）。"""
     p = argparse.ArgumentParser(
         prog="hstdn.train",
-        description="H-STDN 训练入口骨架（config→build_network→run_sample），"
-                    "D1-D4 首期用途：链路打通 / G0 调试 / 单样本冒烟。",
+        description="H-STDN 训练入口骨架（config→build_network→run_sample）。"
+                    "v3.3 冻结 #6：默认 = LSM 生产线（对照组：随机固定储备池 + "
+                    "CALIBRATE + READOUT，无 STDP/ADAPT）；STDP = 实验臂，仅经 "
+                    "显式 --g1 --profile stdp-min 或 R1 runner "
+                    "(hstdn.exp.ablation)。",
     )
     p.add_argument("--config", default=None, metavar="PATH",
                    help="yaml 配置路径（缺省：configs/default.yaml）")
@@ -801,12 +896,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=_DEF_SEED,
                    help=f"随机种子（build + 数据派生，默认 {_DEF_SEED}）")
     p.add_argument("--stdp", dest="stdp_on", action=argparse.BooleanOptionalAction,
-                   default=True, help="STDP 开关（默认开）")
+                   default=False,
+                   help="flat 冒烟 STDP 调试开关（默认关 = LSM 档随机固定储备池；"
+                        "实验臂 STDP 条件请用 --g1 --profile stdp-min 或 R1 "
+                        "runner hstdn.exp.ablation）")
     p.add_argument("--homeo", dest="homeo_on",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="homeostasis 开关（默认开）")
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="flat 冒烟 homeostasis 调试开关（默认关；实验条件同上）")
     p.add_argument("--norm", dest="norm_on", action=argparse.BooleanOptionalAction,
-                   default=True, help="competitive norm 开关（默认开）")
+                   default=False,
+                   help="flat 冒烟 competitive-norm 调试开关（默认关；实验条件"
+                        "同上）")
     p.add_argument("--out-dir", default=_DEF_OUT_DIR, metavar="DIR",
                    help=f"checkpoint 输出目录（默认 {_DEF_OUT_DIR}，被 gitignore）")
     p.add_argument("--tag", default=None, metavar="TAG",
@@ -819,7 +919,17 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("G1 protocol mode (--g1)")
     g.add_argument("--g1", action="store_true",
                    help="运行 M6 完整协议：core.scheduler.run_g1_protocol "
-                        "（ADAPT→CALIBRATE→COLLECT→READOUT→EVAL）")
+                        "（默认 LSM 档 adapt_enabled=False：随机池 + CALIBRATE "
+                        "+ COLLECT + READOUT + EVAL；STDP 臂需另加 "
+                        "--profile stdp-min）")
+    g.add_argument("--profile", dest="profile", metavar="{lsm,stdp-min}",
+                   choices=(PROFILE_LSM, PROFILE_STDP_MIN),
+                   default=PROFILE_LSM,
+                   help="运行档：lsm = LSM 生产线（默认，对照组：随机固定储备池"
+                        "+ CALIBRATE + READOUT，无 STDP/ADAPT）；stdp-min = "
+                        "STDP 实验臂（stdp_min.yaml 冻结档 pool_learn=False + "
+                        "三开关开 + ADAPT）——STDP 臂必须显式给出且配合 --g1"
+                        "（或经 exp.ablation R1 runner），不进主线默认路径")
     g.add_argument("--classes", type=int, default=None, metavar="K",
                    help=f"G1 类别数（默认 {_G1_DEF_CLASSES}）")
     g.add_argument("--train-samples", type=int, default=None, metavar="N",
@@ -882,6 +992,11 @@ def _selfcheck() -> int:
 def run_training(args: argparse.Namespace) -> Dict[str, Any]:
     """训练编排主体：配置 → 建网 → flat 训练 → 诊断 → checkpoint。
 
+    默认档 = LSM 生产线（v3.3 冻结 #6）：随机固定储备池冒烟 ——
+    stdp/homeo/norm 默认 False（不演化权重/阈值，配置经 --profile lsm →
+    default.yaml）；--profile stdp-min（实验臂）在此路径被拒绝
+    （见 _resolve_profile）。--config 显式路径优先于 profile 档文件。
+
     Args:
         args: build_parser().parse_args 的结果。
 
@@ -900,7 +1015,9 @@ def run_training(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError(f"--noise 必须 >= 0，got {args.noise}")
 
     t0 = time.perf_counter()
-    cfg_yaml = load_config(args.config)
+    profile = _resolve_profile(args)
+    cfg_path = args.config if args.config else _profile_cfg_path(profile)
+    cfg_yaml = load_config(cfg_path)
     netcfg = to_core_cfg(cfg_yaml)              # 超参唯一契约的权威翻译
     fp_cfg = config_fingerprint(cfg_yaml)
 
@@ -908,6 +1025,8 @@ def run_training(args: argparse.Namespace) -> Dict[str, Any]:
     n_per_class = int((int(args.samples) + N_CLASSES - 1) // N_CLASSES)
 
     run_args = {
+        "profile": profile,
+        "cfg_profile": _PROFILE_TO_CFG[profile],
         "seed": int(args.seed),
         "epochs": int(args.epochs),
         "samples": int(args.samples),
@@ -920,8 +1039,8 @@ def run_training(args: argparse.Namespace) -> Dict[str, Any]:
     }
     fp_run = _run_fingerprint(run_args)
 
-    print(f"=== hstdn.train ===  (config fingerprint {fp_cfg[:16]}... , "
-          f"run fingerprint {fp_run[:16]}...)")
+    print(f"=== hstdn.train ===  (profile {profile}, config fingerprint "
+          f"{fp_cfg[:16]}... , run fingerprint {fp_run[:16]}...)")
     bundle = build_network(netcfg, rng=np.random.default_rng(int(args.seed)))
     print_report(bundle)
 
@@ -954,6 +1073,8 @@ def run_training(args: argparse.Namespace) -> Dict[str, Any]:
 
     meta = {
         "format": CKPT_FORMAT,
+        "profile": profile,
+        "cfg_profile": _PROFILE_TO_CFG[profile],
         "fingerprint": fp_cfg,
         "run_fingerprint": fp_run,
         "config_json": _json_safe(cfg_yaml),

@@ -13,3 +13,10 @@ G1 协议接入（M6 消费，main 模块 train/eval 扩展；协议超参唯一
 - eval.py --g1（run_g1_evaluation）：load_g1_checkpoint → 独立测试集（test_seed = 5000 + 训练 seed + --seed，与协议 EVAL 2000+seed 数据流错开）全 off 冻结推理 → build_features/predict_linear_readout → 测试精度 + 率/沉默/cos，对照打印协议训练 best_acc/stage/rolled_back；报告口径与 exp.gates --g1 / exp.ablation 对齐。
 - codec：save_checkpoint 增可选 extra 数组；新增 load_g1_checkpoint/_read_checkpoint；load_checkpoint 保持 (bundle, meta) 签名不变。
 - 冒烟：train --g1 --classes 4 --train-samples 60 --test-samples 20 --seeds 1 与 eval --g1 --checkpoint ... --samples 20 均 exit 0（~48s/seed）；两次同参协议结果逐行一致（仅 wall 不同）。
+v3.3 冻结 #6（G1-STDP 调查结案；main 默认 = LSM 生产线；STDP = 实验臂显式/runner）：
+
+- train.py 运行档 --profile {lsm,stdp-min}（默认 lsm）：flat 默认三开关 False（随机固定储备池冒烟，不演化）；--g1 默认 LSM（scheduler ProtocolConfig.adapt_enabled=False、extra_loops=0：随机池 + CALIBRATE + COLLECT + READOUT + EVAL）；STDP 实验臂 = 显式 --g1 --profile stdp-min（stdp_min.yaml：pool_learn=False 冻结 + 三开关开 + ADAPT；pool_learn False 契约断言）或 exp.ablation R1 runner（--expg / --legacy-exp-all-learn）。meta 增 profile/cfg_profile/aborted；HARD STOP 以 [ABORT]/warning 显式标注（wall checkpoint 落系统临时目录离线拆解）。
+- eval.py 默认评估对齐 LSM 档（stdp/homeo/norm 恒 False 冻结只读，任意 train 产物可评）；读取/标注 checkpoint profile（stdp-min 实验臂档只读）；指纹比对失败按 profile 提示档文件；支持 lsm 与 stdp_min 协议 checkpoint（--g1 读出 W/b）。
+- exp/ablation.py 退役语义（本计划获权）：Spec.pool_learn / default_spec 默认 False（FIX-A 冻结）；run_ablation 默认路径 = exp(stdp_min 冻结档 + 三开关) vs ctrl(LSM)；run_expg_comparison 默认双臂（expg vs ctrl），H6 legacy 全可学习臂（pool_learn=True + 三开关，HSTDN-EXP-2026-001）仅 legacy=True / CLI --legacy-exp-all-learn 显式并入（保留不删，默认不可达）。
+- configs/default.yaml 顶层注释说明档位语义（值未变，指纹不变）；stdp_min.yaml 为实验臂唯一合法档（PROFILES['stdp_min']）。
+- 实测：train 默认 CLI / --selfcheck / G0 15/15 默认路径 / train --g1 (lsm|stdp-min) / eval (D4|--g1, lsm|stdp_min ckpt) / ablation (run_ablation|--expg[±legacy]) 全部 exit 0。

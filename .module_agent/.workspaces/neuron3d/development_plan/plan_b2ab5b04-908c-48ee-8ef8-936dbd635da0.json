@@ -1,0 +1,12 @@
+{
+  "plan_id": "plan_b2ab5b04-908c-48ee-8ef8-936dbd635da0",
+  "module_name": "exp",
+  "development_plan": "实施 v3.3 冻结清单 #3/#4/#5/#9（exp 侧，文档 §7 风险登记册/§6 诊断；G1-STDP 调查结案）。依赖 core 的 FIX-A 默认化与 G0#18。\n#3 诊断升级（hstdn/exp/diagnostics.py）：\n1. 新增选择性指数：within-neuron Gini（gini_within_neuron(bundle) 每神经元入突触权重 Gini，返回均值）与 gini_ratio（ADAPT 后/初值比）；其原型已在 manipulation check 验证（drift_frac 28.7%、gini Δ≈0），转正为正式诊断量（G3 终审机制级前哨）。\n2. 新增 P50/P95 分位率（rate percentiles 面板扩展）、有效维度（非沉默且非过热（rate 低于过热阈值如 3×target）的神经元计数/占比）、双峰系数（bimodality 系数，基于 rate 分布偏度/峰度）。均值率降级为参考项（面板保留但标注）。\n3. 保持纯函数定位、不承载断言；core 惰性导入。\n#4 R7 触发器替换 + 度量拆分（diagnostics.py/ablation.py）：\n4. R7 新触发器（死数值钉死）：输入突触 w_min 饱和占比 >20%（输入边 w<=w_lo+ε 的比例）或 gini_ratio >1.3 → 触发 R7 警报（旧均值触发器 0.5×初值在 FIX-A 归一化钉死下失明，正式替换）。\n5. 度量拆分：budget_dev（劫持度量——池内突触入预算时的预算偏差，FIX-A 后恒 0；输出并在 expg 下验证）与 input_w_drift（学习度量——分布级：drift_frac（|Δw|>0.1·w_init 占比）与 within-neuron Gini；原型已验证直接转正）。w_ratio dev 记账统一：ctrl 行 dev=0.000（budget_dev 语义），消除混用。\n6. drift_frac/gini 自动日志制度化：STDP 臂 ADAPT 后自动记录（并入 run_expg_comparison 或 G2 runner 调用的读数接口——提供收集函数 read_drift_stats(bundle, w_init_snapshot) 供 runner 复用）。\n#5 stdp_min.yaml（hstdn/configs/ 新增）：\n7. 配置为 STDP 条件唯一合法档：pool_learn=False（冻结）+ §4 全部协议参数钉死（network/lif/stdp/homeo/protocol/readout/features/encoder 全部字段与 default.yaml 同构但显式列出，禁止省略隐式继承），使双臂唯一差异停留在 learn 标志位/开关组；docstring 注明 G1 中性结论与 R1 runner 引用关系。\n#9 卫生（评审 §4#9）：\n8. 修复/删除诊断脚本中 std_ratio 死汇总行（per-neuron std 计算的坏行——此前 manipulation check 尾行崩溃即其残留；在正式诊断代码中以正确 per-neuron std 实现替换，无坏死输出行）。\n9. 回归：G0 15/15 不回归（默认配置路径）；自测新诊断量冒烟（gini/drift/r7 触发器/budget_dev 在 expg 与默认配置下输出合理值）。\n遵守代码规范与三件套纪律；不越权修改 core/main 文件。",
+  "session_id": "8f636bcb-4e5b-49c4-962e-b57ce31d053e",
+  "modified_files": [
+    "hstdn/exp/diagnostics.py",
+    "hstdn/exp/ablation.py",
+    "hstdn/configs/stdp_min.yaml",
+    "hstdn/configs/__init__.py"
+  ]
+}

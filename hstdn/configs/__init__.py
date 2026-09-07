@@ -18,6 +18,10 @@ forbidden elsewhere.  This package provides:
                               core does not read yaml yet.  Once core adopts
                               this file as its own source, this bridge degrades
                               to a pure validator.
+- ``PROFILES`` / ``profile_path``  named profile registry (v3.3 freeze #5):
+                              "default" -> default.yaml, "stdp_min" ->
+                              stdp_min.yaml（STDP 条件唯一合法档：
+                              pool_learn=False 冻结 + 全字段显式钉死）。
 
 ID/notation note: yaml keys follow the design-doc Sec.4 notation
 (``tau_mem``, ``radius_in``, ``velocity`` ...), which differs from the flat
@@ -37,9 +41,12 @@ import yaml
 
 __all__ = [
     "DEFAULT_FILE",
+    "STDP_MIN_FILE",
+    "PROFILES",
     "KNOWN_SECTIONS",
     "SIM_SECTIONS",
     "default_path",
+    "profile_path",
     "resolve_path",
     "load_config",
     "validate_config_dict",
@@ -48,6 +55,13 @@ __all__ = [
 
 #: contract file name inside this package
 DEFAULT_FILE = "default.yaml"
+
+#: v3.3 freeze #5：STDP 条件唯一合法档（pool_learn=False 冻结 + 全字段显式）
+STDP_MIN_FILE = "stdp_min.yaml"
+
+#: named profile registry（R1 runner 引用：exp/ablation 的 STDP 臂应按
+#: "stdp_min" 档运行，使双臂唯一差异停留在 learn 标志位/三开关组）
+PROFILES = {"default": DEFAULT_FILE, "stdp_min": STDP_MIN_FILE}
 
 #: all top-level sections allowed in the contract file (typo protection)
 KNOWN_SECTIONS = (
@@ -64,6 +78,22 @@ _PKG_DIR = Path(__file__).resolve().parent
 def default_path() -> Path:
     """Path of the Sec.4 contract file (``<pkg>/default.yaml``)."""
     return _PKG_DIR / DEFAULT_FILE
+
+
+def profile_path(name: str = "default") -> Path:
+    """命名的 §4 契约档路径（"default" / "stdp_min"，见 PROFILES）。
+
+    Raises:
+        ValueError: 未知档名（防拼写漂移）。
+    """
+    try:
+        fname = PROFILES[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown config profile {name!r}; known profiles: "
+            f"{sorted(PROFILES)}"
+        ) from None
+    return _PKG_DIR / fname
 
 
 def resolve_path(path: Optional[str | Path] = None) -> Path:

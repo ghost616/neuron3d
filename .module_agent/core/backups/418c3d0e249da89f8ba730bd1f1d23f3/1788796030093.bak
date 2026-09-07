@@ -18,12 +18,6 @@ serves (numbers follow the project gate plan):
           competitive norm, weight bounds, capped-ratio / input-w diagnostics
     encoder (M2) sanity (not a numbered gate yet; feeds later gates)
     M5 (features/readout) and M6 (scheduler protocol) smoke groups
-    G0 #18 (v3.3 FIX-A): default frozen pool learning -- pool->pool E edges
-           learn=False, in_learn = input edges only, in_sum0 domain ==
-           in_learn_idx; plus the legacy pool_learn=True reproduction
-    scheduler gate hardening (v3.3): ADAPT/CALIBRATE hard stop with wall
-           checkpoint dump; LSM arm (adapt_enabled=False) skips ADAPT but
-           keeps the CALIBRATE/EVAL checks
 
 Run: ``python -m hstdn.core.selfcheck`` from the project root (E:\\neuron3d).
 Exit code 0 on full pass; any failure raises AssertionError with statistics.
@@ -181,14 +175,12 @@ def check_layout() -> None:
     assert c2.wheel_l == DEFAULT_CFG.wheel_l
     # dtype constants
     assert np.dtype(F8) == np.float64 and np.dtype(I8) == np.int64
-    # pool_learn FIX-A default compatibility (all construction paths default
-    # to False = frozen-pool plasticity; True is the legacy condition)
-    assert DEFAULT_CFG.pool_learn is False
-    assert NetConfig().pool_learn is False
-    assert NetConfig(pool_learn=True).with_derived().pool_learn is True
-    assert cfg_from_mapping(None).pool_learn is False
-    assert cfg_from_mapping({"pool_learn": True}).pool_learn is True
+    # pool_learn default compatibility (all construction paths default True)
+    assert DEFAULT_CFG.pool_learn is True
+    assert NetConfig().pool_learn is True
+    assert NetConfig(pool_learn=False).with_derived().pool_learn is False
     assert cfg_from_mapping({"pool_learn": False}).pool_learn is False
+    assert cfg_from_mapping({"pool_learn": True}).pool_learn is True
     _ok("constants & ID conversion/domain contracts")
 
 
@@ -284,10 +276,7 @@ def check_network() -> None:
     assert bundle.csr_delay.max() < cfg.wheel_l
     src_in = bundle.csr_src < cfg.n_in
     src_E = (~src_in) & bundle.pool_is_E[(bundle.csr_src - cfg.n_in).astype(int)]
-    # learn mask contract: input edges always; E-pool edges iff pool_learn
-    # (FIX-A: default bundle is frozen, so learn == input edges only)
-    expected_learn = src_in | (src_E & cfg.pool_learn)
-    assert np.array_equal(bundle.csr_learn, expected_learn)
+    assert np.array_equal(bundle.csr_learn, src_in | src_E)
     assert np.all(bundle.csr_w[src_in | src_E] > 0)
     assert np.all(bundle.csr_w[~src_in & ~src_E] < 0)
     _ok("wiring invariants, CSR/CSC/B3 consistency and gain report")
@@ -511,59 +500,67 @@ def check_dynamics(bundle: NetworkBundle) -> None:
 
 
 # ---------------------------------------------------------------------------
-# G0 #18 build assertions (v3.3 FIX-A: default pool_learn=False) and the
-# legacy pool_learn=True reproduction condition
+# frozen-pool plasticity (pool_learn=False; exp-g / Diehl-Cook regression)
 # ---------------------------------------------------------------------------
 
 
-def check_g0_18(bundle_default: NetworkBundle) -> None:
-    print("G0 #18 build assertions (FIX-A default frozen) + legacy True:")
+def check_pool_freeze(bundle_default: NetworkBundle) -> None:
+    print("pool_learn frozen mode (intra-pool plasticity off):")
+    # --- (c) default True path is the regression anchor ---
     cfg0 = bundle_default.cfg
-    assert cfg0.pool_learn is False, "FIX-A: default must freeze pool learning"
+    assert cfg0.pool_learn is True
     src0 = bundle_default.csr_src
     cls_in0 = src0 < cfg0.n_in
     cls_E0 = (~cls_in0) & bundle_default.pool_is_E[
         (src0 - cfg0.n_in).astype(np.intp)]
-    cls_pool0 = ~cls_in0
-    # (a) every pool->pool edge (E source included) has csr_learn False
-    assert not bundle_default.csr_learn[cls_pool0].any(), \
-        "G0#18a: pool-source edges must not be learnable under the default"
-    # (b) in_learn_idx contains input->pool synapses only and matches n_edges_in
-    assert np.all(bundle_default.csr_src[bundle_default.in_learn_idx] < cfg0.n_in)
-    assert bundle_default.in_learn_idx.size == bundle_default.n_edges_in
-    assert bundle_default.in_learn_ptr[-1] == bundle_default.n_edges_in
-    # (c) in_sum0 summation domain equals in_learn_idx exactly (no budget drift)
-    inp0 = np.flatnonzero(cls_in0)
-    inp0_dst = bundle_default.csr_dst_local[inp0]
-    per0 = np.diff(bundle_default.in_learn_ptr)
-    cnt0 = np.bincount(inp0_dst, minlength=cfg0.n_pool)
-    assert np.array_equal(per0, cnt0)
-    s0 = np.bincount(inp0_dst, weights=bundle_default.csr_w[inp0],
-                     minlength=cfg0.n_pool)
-    assert np.allclose(s0, bundle_default.in_sum0, atol=1e-12)
-    assert np.all(bundle_default.in_sum0 > 0)
-    assert int(per0.min()) >= 1
-    # frozen E edges keep their initial U(0.18,0.42)*theta0 distribution
-    wE0 = bundle_default.csr_w[cls_E0]
-    lo0 = cfg0.w_ee_lo * cfg0.theta0
-    hi0 = cfg0.w_ee_hi * cfg0.theta0
-    assert float(wE0.min()) >= lo0 - 1e-12 and float(wE0.max()) <= hi0 + 1e-12
-    assert np.isclose(float(wE0.mean()), 0.30 * cfg0.theta0, atol=0.01)
-    # legacy True reproduction: intra-pool E->E fully learnable again
-    cfg_l = NetConfig(n_in=64, n_pool=300, n_input_cols=8,
-                      pool_learn=True).with_derived()
-    bl = build_network(cfg_l)
-    assert bl.cfg.pool_learn is True
-    srcl = bl.csr_src
-    cls_in_l = srcl < cfg_l.n_in
-    cls_E_l = (~cls_in_l) & bl.pool_is_E[(srcl - cfg_l.n_in).astype(np.intp)]
-    expected_l = cls_in_l | cls_E_l
-    assert np.array_equal(bl.csr_learn, expected_l)
-    assert bl.csr_learn[cls_E_l].any()  # E->E edges learn in legacy mode
-    assert bl.in_learn_idx.size == bl.n_edges_in + int(
-        np.count_nonzero(cls_E_l))
-    _ok("G0#18: pool->pool learn=False; in_learn=input edges only; in_sum0 "
-        "consistent; legacy pool_learn=True reproduces E->E learning")
+    assert np.array_equal(
+        bundle_default.csr_learn, cls_in0 | cls_E0
+    ), "pool_learn=True must keep learn == input | E-source (no regression)"
+    # --- frozen build on a small config ---
+    cfg_f = NetConfig(n_in=64, n_pool=500, n_input_cols=8,
+                      pool_learn=False).with_derived()
+    bf = build_network(cfg_f)
+    assert bf.cfg.pool_learn is False
+    src = bf.csr_src
+    n_in = cfg_f.n_in
+    cls_in = src < n_in
+    cls_E = (~cls_in) & bf.pool_is_E[(src - n_in).astype(np.intp)]
+    cls_I = ~(cls_in | cls_E)
+    # a) pool-to-pool E edges are not learnable but keep their initial weights
+    assert not bf.csr_learn[cls_E].any(), "E-pool edges must be frozen"
+    wE = bf.csr_w[cls_E]
+    lo = cfg_f.w_ee_lo * cfg_f.theta0
+    hi = cfg_f.w_ee_hi * cfg_f.theta0
+    assert float(wE.min()) >= lo - 1e-12 and float(wE.max()) <= hi + 1e-12
+    assert np.isclose(float(wE.mean()), 0.30 * cfg_f.theta0, atol=0.02)
+    assert bool(bf.csr_learn[cls_in].all())      # input edges always learn
+    assert not bf.csr_learn[cls_I].any()          # I edges never learn
+    # b) in_learn rows contain input edges only; in_sum0 = input weight sums
+    assert np.all(bf.csr_src[bf.in_learn_idx] < n_in)
+    assert bf.in_learn_idx.size == bf.n_edges_in
+    inp = np.flatnonzero(cls_in)
+    inp_dst = bf.csr_dst_local[inp]
+    per = np.diff(bf.in_learn_ptr)
+    cnt_in = np.bincount(inp_dst, minlength=cfg_f.n_pool)
+    assert np.array_equal(per, cnt_in)
+    assert int(per.min()) >= 1                    # structure check still holds
+    s0 = np.bincount(inp_dst, weights=bf.csr_w[inp], minlength=cfg_f.n_pool)
+    assert np.allclose(s0, bf.in_sum0, atol=1e-12)
+    # plasticity smoke: STDP/homeo/norm leave frozen E weights untouched
+    wE_before = bf.csr_w[cls_E].copy()
+    rng = np.random.default_rng(3)
+    for _ in range(4):
+        fr = np.clip(rng.normal(0.5, 0.25, size=(64,)), 0.0, 1.0)
+        bks = encoder.latency_encode(fr, cfg=bf.cfg)
+        run_sample(bf, bks, T=60, stdp_on=True, homeo_on=True, norm_on=True)
+    assert np.array_equal(bf.csr_w[cls_E], wE_before), \
+        "frozen E-pool weights must not move under plasticity"
+    assert np.all(bf.csr_w[bf.csr_learn] >= bf.cfg.w_lo - 1e-9)
+    assert np.all(bf.csr_w[bf.csr_learn] <= bf.cfg.w_hi + 1e-9)
+    assert np.all(bf.theta >= bf.cfg.theta_lo - 1e-9)
+    assert np.all(bf.theta <= bf.cfg.theta_hi + 1e-9)
+    _ok("frozen mode: E edges learn=False with initial weights; in_learn/"
+        "in_sum0 = input edges only; default True path unchanged")
 
 
 # ---------------------------------------------------------------------------
@@ -637,16 +634,15 @@ def check_readout() -> None:
     _ok("L0 softmax readout converges >95% on separable data; L1/L2 stubs")
 
 
-def _sched_protos(n_classes: int) -> list:
-    """Three smooth 8x8 class prototypes in [0,1]."""
+def _sched_frames(n_classes: int, rng: np.random.Generator) -> list:
     xx = np.linspace(0.0, 6.28, 8)
     protos = [
         np.outer(np.sin(xx), np.cos(xx)),
         np.outer(np.cos(xx + 1.0), np.sin(xx + 2.0)),
         np.outer(np.sin(xx + 4.0), np.cos(xx + 3.0)),
-    ]
+    ][:n_classes]
     frames = []
-    for p in protos[:n_classes]:
+    for p in protos:
         pn = (p - p.min()) / (p.max() - p.min() + 1e-12)
         frames.append(pn)
     return frames
@@ -654,19 +650,16 @@ def _sched_protos(n_classes: int) -> list:
 
 def check_scheduler() -> None:
     print("scheduler protocol (M6):")
-    # Full STDP-arm flow tuned into the ADAPT gate band ([3,15] Hz) and the
-    # CALIBRATE band ([3,12] Hz) with t_ms=200 (homeostasis-consistent):
-    n_classes, n_tr, n_te = 3, 6, 3
-    sched_cfg = NetConfig(n_in=64, n_pool=300, n_input_cols=8,
-                          seed=5).with_derived()
+    n_classes, n_tr, n_te = 3, 8, 4
+    sched_cfg = NetConfig(n_in=64, n_pool=200, n_input_cols=8).with_derived()
     bundle = build_network(sched_cfg)
-    rng = np.random.default_rng(1)
-    protos = _sched_protos(n_classes)
+    rng = np.random.default_rng(5)
+    protos = _sched_frames(n_classes, rng)
 
     def make_frame(c: int) -> np.ndarray:
         p = protos[c]
-        fr = np.clip(0.05 + 0.15 * p
-                     + rng.normal(0.0, 0.03, size=p.shape), 0.0, 1.0)
+        fr = np.clip(0.15 + 0.8 * p
+                     + rng.normal(0.0, 0.06, size=p.shape), 0.0, 1.0)
         return fr
 
     def train_fn():
@@ -679,18 +672,15 @@ def check_scheduler() -> None:
             for _ in range(n_te):
                 yield make_frame(c), c
 
-    pc = ProtocolConfig(extra_loops=0, t_ms=200, n_adapt_epochs=2,
-                        adapt_diag_samples=3, adapt_gate_extra_max=1,
-                        calibrate_samples=3, calibrate_max_iter=3,
-                        adapt_retry_max=1)
+    pc = ProtocolConfig(extra_loops=0, t_ms=60, n_adapt_epochs=1,
+                        adapt_diag_samples=2, adapt_gate_extra_max=1,
+                        calibrate_samples=3, calibrate_max_iter=2)
     rep = run_g1_protocol(bundle, train_fn, test_fn, pc, seed=1)
     assert isinstance(rep, G1Report)
-    assert rep.ok and not rep.terminated and rep.n_rounds == 1
+    assert rep.ok and rep.n_rounds == 1
     seq = rep.stage_sequence
     assert seq[:3] == ["ADAPT", "CALIBRATE", "COLLECT"]
     assert "READOUT" in seq and "EVAL" in seq
-    assert rep.adapt_rounds and rep.adapt_rounds[-1]["passed"] is True
-    assert rep.calibrate_rounds and rep.calibrate_rounds[-1]["ok"] is True
     assert rep.collect_n == n_classes * n_tr
     assert rep.feat_dim == sched_cfg.n_pool
     assert rep.n_class == n_classes
@@ -700,99 +690,9 @@ def check_scheduler() -> None:
     assert rep.best_acc >= 0.0
     d = rep.to_dict()
     for k in ("ok", "n_rounds", "stage_sequence", "adapt_rounds",
-              "calibrate_rounds", "eval_rounds", "readout", "best_acc",
-              "terminated", "failed_stage", "wall_checkpoint", "fail_stats",
-              "fail_reason"):
+              "calibrate_rounds", "eval_rounds", "readout", "best_acc"):
         assert k in d
-    _ok("G1 protocol full STDP-arm flow (gates passed) completes; report "
-        "structure incl. termination fields")
-
-
-def _silent_runner(n_classes: int, n_tr: int = 3, n_te: int = 1):
-    """Data functions over fully silent (zero-intensity) frames."""
-    def tr():
-        for c in range(n_classes):
-            for _ in range(n_tr):
-                yield np.zeros((8, 8)), c
-
-    def te():
-        for c in range(n_classes):
-            for _ in range(n_te):
-                yield np.zeros((8, 8)), c
-    return tr, te
-
-
-def check_scheduler_gate() -> None:
-    print("scheduler gate hardening (v3.3):")
-    import os
-    import shutil
-    import tempfile
-    n_classes = 3
-    tmpd = tempfile.mkdtemp(prefix="g1fail_selfcheck_")
-    try:
-        # (1) STDP arm: fully silent population -> ADAPT hard terminate with a
-        #     dumped wall checkpoint; COLLECT must never run
-        b = build_network(NetConfig(n_in=64, n_pool=200, n_input_cols=8,
-                                     seed=5).with_derived())
-        tr, te = _silent_runner(n_classes)
-        pc = ProtocolConfig(extra_loops=0, t_ms=100, n_adapt_epochs=1,
-                            adapt_diag_samples=2, adapt_gate_extra_max=1,
-                            calibrate_samples=2, calibrate_max_iter=1,
-                            adapt_retry_max=1, fail_checkpoint_dir=tmpd)
-        rep = run_g1_protocol(b, tr, te, pc, seed=1)
-        assert rep.terminated and rep.failed_stage == "ADAPT"
-        assert "COLLECT" not in rep.stage_sequence and "EVAL" not in rep.stage_sequence
-        assert rep.wall_checkpoint and os.path.exists(rep.wall_checkpoint)
-        assert "mean_rate_hz" in rep.fail_stats
-        z = np.load(rep.wall_checkpoint)
-        assert {"theta", "rate_ema", "csr_w", "counts", "reason"}.issubset(
-            set(z.files))
-        z.close()
-        # (2) LSM arm (adapt_enabled=False): no ADAPT stage/gate, but the
-        #     CALIBRATE check is preserved -> hard terminate at CALIBRATE
-        b2 = build_network(NetConfig(n_in=64, n_pool=200, n_input_cols=8,
-                                     seed=5).with_derived())
-        tr2, te2 = _silent_runner(n_classes)
-        pc2 = ProtocolConfig(extra_loops=0, t_ms=100, adapt_enabled=False,
-                             calibrate_samples=2, calibrate_max_iter=1,
-                             fail_checkpoint_dir=tmpd)
-        rep2 = run_g1_protocol(b2, tr2, te2, pc2, seed=1)
-        assert rep2.terminated and rep2.failed_stage == "CALIBRATE"
-        assert "ADAPT" not in rep2.stage_sequence
-        assert "COLLECT" not in rep2.stage_sequence
-        assert rep2.wall_checkpoint and os.path.exists(rep2.wall_checkpoint)
-        # (3) LSM arm healthy flow (no ADAPT, CALIBRATE passes) still completes
-        b3 = build_network(NetConfig(n_in=64, n_pool=300, n_input_cols=8,
-                                     seed=5).with_derived())
-        rng = np.random.default_rng(1)
-        protos = _sched_protos(n_classes)
-
-        def make_frame(c: int) -> np.ndarray:
-            p = protos[c]
-            return np.clip(0.05 + 0.15 * p
-                           + rng.normal(0.0, 0.03, size=p.shape), 0.0, 1.0)
-
-        def tr3():
-            for c in range(n_classes):
-                for _ in range(6):
-                    yield make_frame(c), c
-
-        def te3():
-            for c in range(n_classes):
-                for _ in range(3):
-                    yield make_frame(c), c
-        pc3 = ProtocolConfig(extra_loops=0, t_ms=200, adapt_enabled=False,
-                             calibrate_samples=3, calibrate_max_iter=3)
-        rep3 = run_g1_protocol(b3, tr3, te3, pc3, seed=1)
-        assert rep3.ok and not rep3.terminated
-        assert "ADAPT" not in rep3.stage_sequence
-        assert rep3.stage_sequence == ["CALIBRATE", "COLLECT", "READOUT",
-                                       "EVAL"]
-        assert rep3.eval_rounds
-    finally:
-        shutil.rmtree(tmpd, ignore_errors=True)
-    _ok("gate hardening: ADAPT/CALIBRATE hard stop + wall checkpoint; LSM arm "
-        "skips ADAPT but keeps CALIBRATE/EVAL checks")
+    _ok("G1 protocol full flow completes on a small net; report structure")
 
 
 def main() -> int:
@@ -801,7 +701,7 @@ def main() -> int:
     check_shapes()
     check_spatial_hash()
     bundle = check_network()
-    check_g0_18(bundle)
+    check_pool_freeze(bundle)
     check_kernel_basic()
     check_kernel_refractory()
     check_kernel_wheel_far_delay()
@@ -812,7 +712,6 @@ def main() -> int:
     check_features()
     check_readout()
     check_scheduler()
-    check_scheduler_gate()
     print(f"\ncore selfcheck PASSED: {_PASS} assertion groups")
     return 0
 
