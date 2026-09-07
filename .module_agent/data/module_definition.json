@@ -11,7 +11,7 @@
     },
     {
       "path": "hstdn/data/mnist.py",
-      "description": "MNIST 子集加载与 D14 28x28->10x10 池化映射（G2 期使用，已实现）：adaptive_pool_ranges（torch adaptive_avg_pool2d 语义分界公式）、pool_mnist_to_units（批次向量化自适应平均池化，与 core.encoder.mnist_adaptive_pool 逐帧等价，自测交叉校验防漂移）、MnistSubset 容器（images (N,28,28) f8 [0,1]、labels (N,) i8，提供 pool/flat 便捷映射）；load_mnist_subset（torch/torchvision 函数内延迟引入，缺失时抛带安装指引的可读 ImportError；默认 1k 确定性随机子集，像素 ToTensor 归一化）。"
+      "description": "MNIST 子集加载与 D14 28x28->10x10 池化映射（G2 full 双臂 5 seeds 前置）。池化映射族不变：adaptive_pool_ranges（torch adaptive_avg_pool2d 语义分界公式）、pool_mnist_to_units（批次向量化自适应平均池化，与 core.encoder.mnist_adaptive_pool 逐帧等价并自测交叉校验）、MnistSubset 容器（images (N,28,28) f8 [0,1]、labels (N,) i8，pool/flat 便捷映射）。**纯 NumPy IDX 加载路径（解除 torch/torchvision 强制依赖）**：MNIST_SOURCE_URL（ossci-datasets S3 镜像，yann.lecun.com 主源不可达）与 MNIST_IDX_FILES 常量；parse_mnist_idx_file（自动识别 gz/裸字节，大端魔数 2051/2049、28x28 维度与数据长度校验，损坏抛含「删除缓存重下」建议的可读 ValueError）；fetch_mnist_idx（urllib 分块下载至 root、缓存命中跳过、.part 临时文件原子改名、失败抛含 URL 的 RuntimeError，支持 source_url 覆盖供离线错误测试）；load_mnist_idx / load_mnist_subset（签名 n/train/root/seed 不变，uint8->float64/255 归一化 [0,1]、rng(seed) 不放回确定性子集，兼容 g2_runner 既有调用；load_mnist_subset 为兼容入口委托 load_mnist_idx）。模块顶层不导入 torch。自测 python -m hstdn.data.mnist：池化映射/子集容器 + 内存级 IDX 解析单测（不触网）+ 缓存命中端到端（归一化/确定性/计数不一致/超规模）+ 下载失败分支 + torch-free 加载；python -m hstdn.data.mnist --download-smoke 追加真实小规模下载冒烟（失败仅记录原因不阻塞）。"
     },
     {
       "path": "hstdn/data/dvs_gesture.py",

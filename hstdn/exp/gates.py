@@ -1023,11 +1023,12 @@ G2_SPECS: List[Tuple[int, str, str]] = [
 def run_g2(full: Optional[bool] = None) -> Tuple[bool, str]:
     """运行 G2 门禁（惰性导入 g2_runner）。
 
-    - 轻量（--g2 默认）：mini 冒烟（2 seeds、合成/自动数据回退），只验机制
-      跑通并输出配对差与预注册判据字段（官方判据需 --g2 --full）；
-    - 正式（--g2 --full）：5 seeds、真实 MNIST 子集（torch+torchvision 延迟
-      依赖），断言 R1 第一判（treatment valid + LSM 门禁 ≥70% +
-      mean(diff)>0 且 >1×std(diff)）。
+    - 轻量（--g2 默认）：mini 冒烟（2 seeds、自动数据：缓存/网络优先、仅
+      完全离线无缓存回退合成），只验机制跑通并输出配对差与预注册判据字段
+      （官方判据需 --g2 --full）；
+    - 正式（--g2 --full）：5 seeds、真实 MNIST 子集（data.mnist **纯 NumPy
+      IDX**：缓存命中或网络可达即自动获取，无 torch 依赖），断言 R1 第一判
+      （treatment valid + LSM 门禁 ≥70% + mean(diff)>0 且 >1×std(diff)）。
 
     Returns:
         (是否通过, 报告文本)。
@@ -1038,9 +1039,11 @@ def run_g2(full: Optional[bool] = None) -> Tuple[bool, str]:
     try:
         out = g2mod.run_g2_comparison(
             full=full, data_source=("mnist" if full else "auto"))
-    except (ImportError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         return False, (f"[FAIL] G2 {'full' if full else 'mini'}：{exc}\n"
-                       "       （正式 G2 需真实 MNIST + torch；mini 自动回退）")
+                       "       （正式 G2 需真实 MNIST：无缓存且无网络时请先"
+                       "联网自动获取或放置 data/mnist 缓存后重跑；mini auto "
+                       "仅在完全离线无缓存时回退合成并如实标注）")
     report = "\n".join(g2mod.report_lines(out))
     crit = out["criteria"]
     if not full:

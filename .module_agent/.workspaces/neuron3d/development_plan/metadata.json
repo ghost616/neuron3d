@@ -46,5 +46,21 @@
     "code_reviewed": true,
     "plan_completed": true,
     "test_passed": true
+  },
+  {
+    "plan_id": "plan_949656cb-7dc9-4f13-9564-50812250cf54",
+    "plan_summary": "data mnist.py 纯 NumPy IDX 下载/解析路径，解除 torchvision 强制依赖（G2 full 前置）",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_2314613e-f56a-46e6-a85e-0cd48fa1b35c",
+    "plan_summary": "exp g2_runner 适配 data.mnist 纯 NumPy 加载路径（G2 full 真实 MNIST 前置）",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
   }
 ]

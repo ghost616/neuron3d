@@ -55,5 +55,15 @@
     ],
     "summary": "执行总结：#7 交付完成，未越权修改 core/main（default.yaml 只读未改）。(a) 新增 hstdn/exp/g2_runner.py：双臂构造——LSM 臂（对照组 adapt_enabled=False 无学习随机固定池 + CALIBRATE/COLLECT/READOUT/EVAL，main 默认 LSM 语义）与 STDP 臂（stdp_min.yaml 档 pool_learn=False + ADAPT 三开关开），两臂共享同 seed 网络 cfg（g2_net_cfg）与数据切分（make_g2_dataset auto/mnist/synth），唯一差异 ADAPT 开关组，共享 run_g1_protocol 入口；(b) 强制同 seed 配对：正式 5 seeds（G1 n=3 ±4.2pp 无功效 → Step1 升 5）、mini 2 seeds；逐 seed 配对差 mean±std；(c) 预注册判据字段：R1_LSM_GATE_MIN=0.70（LSM 绝对门禁）、R1 第一判 mean(diff)>0 且 >1×std(diff)（R1_DIFF_STD_FACTOR=1）、paired_complete 校验，自动输出不事后移动；(d) 迁移性预注册规则（评审 §2）：STDP ADAPT 后复用 diagnostics.read_drift_stats——mean drift_frac≥5% → valid、判据照常；<5% → inconclusive-treatment + 一次性 η 校准（G2_ETA_CALIB_FACTOR=2，全局仅一次防再调滑坡）并重跑；(e) CLI --mini(默认)/--full/--seeds/--data auto|mnist|synth/--json，report_lines 输出逐 seed 表+配对差+R1 判据+treatment 标签。gates.py 注册 run_g2（G2_SPECS id=102：--g2 mini 机制验证+字段输出；--g2 --full 正式 R1 判据需真实 MNIST）。测试总结：(a) G0 十五项 15/15 exit 0 无回归；(b) mini 冒烟端到端 exit 0：LSM 77.0%（seed 84.0/70.0）vs STDP 79.0%（86.0/72.0），配对差 +2.0±0.0pp（paired 2/2 无 ABORT），LSM 门禁 PASS，treatment=valid（drift 6.83%≥5%，无需校准），R1 第一判 mini（std=0）按规则 NOT MET——如实；(c) gates --g2 mini：G0 15/15 + G2 mini PASS exit 0；(d) G2 full（5 seeds 真实 MNIST）本机因 torch/torchvision 缺失无法执行（G2 延迟依赖，docstring/报错注明 pip 安装与 data/mnist 落盘要求）；合成回退低噪声（0.06）体制 STDP 臂在 v3.3 严格 ADAPT 门禁 HARD STOP 已如实记录并用 0.18 体制（双臂可过门禁）。无掩盖、判据字段与配对差均在 mini 输出中可见。",
     "errors": []
+  },
+  {
+    "plan_id": "plan_2314613e-f56a-46e6-a85e-0cd48fa1b35c",
+    "plan": "同步 g2_runner 至 data.mnist 纯 NumPy IDX 路径（真实 MNIST G2 full 前置）",
+    "modified_files": [
+      "hstdn/exp/g2_runner.py",
+      "hstdn/exp/gates.py"
+    ],
+    "summary": "执行总结：g2_runner 数据路径同步完成（未越权改 data/core/main 业务逻辑）。(1) 文案：docstring/注释/CLI/gates run_g2 中「真实 MNIST 需 torch+torchvision 延迟依赖」全部改为「真实 MNIST 经 data.mnist 纯 NumPy IDX 下载（gzip+urllib ossci S3，无 torch 依赖，缓存命中或网络可达自动获取）」，make_g2_dataset note/docstring 同步（auto 回退合成仅用于完全离线场景并如实标注）。(2) _make_mnist_split 移除 torch ImportError 捕获/报错分支（不再期望 ImportError；数据/网络错误经 data.mnist 透传或可读提示），mini 冒烟回退保留为 auto 语义。(3) 真实数据可用性探测：新增 mnist_cache_available(root)（4 个 IDX gz 缓存齐全→full 可直接离线跑；无缓存且无网络→可读指引，绝不静默回退合成伪装真实数据）；真实数据改为按类安全超集（每类需要量×8）确定性取样，修复随机子集类欠采样（实测 120 样本 class2 仅 8<12）。(4) gates.py G2 注册文案/异常捕获同步（OSError/ValueError/RuntimeError，无 torch 措辞）。测试总结：(a) G0 十五项 15/15 exit 0 无回归；(b) mini synth 回退 exit 0 不回归（LSM 77.0% vs STDP 79.0%，配对差 +2.0pp，treatment valid）；(c) 真实 MNIST 缓存可用后 mini auto 实跑 data=mnist exit 0 并如实记录：seed0 LSM 38.0% vs STDP 52.0%（d+0.14）、seed1 LSM ABORT（sil 100%）/STDP 36.0%（d+0.36）、LSM 门禁 38%<70% FAIL、paired 1/2 → R1 第一判 NOT MET——真实 MNIST 小样本读出难度显著高于合成（此前网络自动下载已成功落缓存，验证纯 NumPy 路径可用）。全量 G2（5 seeds）本轮未跑（耗时与门禁评估另述），数据路径与判据已就绪。",
+    "errors": []
   }
 ]

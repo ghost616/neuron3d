@@ -1,0 +1,9 @@
+{
+  "plan_id": "plan_949656cb-7dc9-4f13-9564-50812250cf54",
+  "module_name": "data",
+  "development_plan": "为 H-STDN data/mnist.py 新增纯 NumPy MNIST IDX 下载/解析路径，解除 load_mnist_subset 对 torchvision 的强制依赖（G2 full 双臂 5 seeds 前置；网络源 ossci-datasets s3 镜像可达已验证，yann.lecun.com 不可达）。\n1. 新增纯 NumPy IDX 加载：函数（如 fetch_mnist_idx / load_mnist_idx 或等价命名）用 gzip+urllib.request 从 https://ossci-datasets.s3.amazonaws.com/mnist/ 下载 4 个文件（train-images-idx3-ubyte.gz / train-labels-idx1-ubyte.gz / t10k-images-idx3-ubyte.gz / t10k-labels-idx1-ubyte.gz）到 DEFAULT_ROOT（data/mnist，已存在则跳过下载）；解析 IDX 格式：魔数（images 2051 / labels 2049）校验、大端字节序、维度长度（images 28x28、labels 标量）、行数一致检查；images 像素 uint8→float64 /255 归一化到 [0,1]、labels int64；输出与 MnistSubset 契约一致（images (N,28,28) f8、labels (N,) i8）。\n2. load_mnist_subset 改造：签名不变（n/train/root/seed），内部优先走纯 NumPy 路径——root 下不存在缓存文件时自动下载（纯 urllib+gzip，无 torch）；torchvision 后端降级为可选（若 torch/torchvision 已装且希望用它，可保留分支，否则移除其 import 依赖）；确定性 1k 子集抽取逻辑（seed 派生 rng.choice 不放回）保持不变。函数 docstring 更新（无 torch 依赖；说明源 URL 与缓存语义）。\n3. 错误处理：网络不可达/下载失败抛带指引的可读异常（含 URL）；磁盘缓存损坏（魔数不符/尺寸不符）抛可读错误建议删缓存重下；n 超数据集大小 ValueError 保持。\n4. 自测更新：python -m hstdn.data.mnist 增加/保留：a) 纯 NumPy 解析器的内存级单元测试（手工构造 4 字节魔数/行数的最小 IDX gz 字节流喂入解析函数，验证形状/归一化/魔数拒绝路径——不触网）；b) 既有池化映射/子集容器/加载器门测试适配（torch 缺失时不再要求 ImportError，改为验证可加载路径与缓存语义，或跳过真实下载仅测错误分支）；c) 若网络允许可做一次真实小规模下载冒烟（train 集 10 样本子集）验证端到端，失败不硬性阻塞（记录原因）。\n5. 契约保持：MnistSubset/pool_mnist_to_units/flat 与 D14 10x10 映射完全不变；模块级导出与既有调用方（g2_runner 的 load_mnist_subset 调用）签名兼容。\n遵守代码规范与三件套纪律；不越权修改其他模块；既有 data 自测与 G0 不回归。",
+  "session_id": "c5816ba3-1f3a-4470-9e7e-45fcbe46ebe5",
+  "modified_files": [
+    "hstdn/data/mnist.py"
+  ]
+}

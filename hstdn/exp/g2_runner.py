@@ -26,11 +26,13 @@ COLLECT/READOUT/EVAL 路径（不重复实现，遵循 core scheduler 约定）�
       校准机会全局仅此一次（防再调调滑坡）；重跑后仍 <5% → 终判
       inconclusive-treatment（不再校准）。
 
-数据（MNIST）：G2 全量要求真实 MNIST 1k 子集（data.mnist.load_mnist_subset，
-torch+torchvision 延迟依赖 + data/mnist 落盘）。mini/冒烟在 torch 缺失时
-回退到**合成 MNIST 布局等价输入**（10x10 单元网格 = N_IN 100、10 类、类别
-条件强度帧 —— 与 D14 池化后单元布局同构），并在输出中如实标注
-data_source=synth/mnist；--data mnist 强制真实子集（缺失依赖时报可读错误）。
+数据（MNIST）：G2 全量要求真实 MNIST 1k 子集（data.mnist.load_mnist_subset
+——**纯 NumPy IDX 下载，无 torch 依赖**：gzip + urllib 从 ossci S3 镜像自动
+获取并缓存到 data/mnist，网络可达时无需手工准备）。mini/冒烟默认经 auto：
+缓存命中或网络可达 → 真实 MNIST；**仅完全离线且无缓存**时才回退到合成
+MNIST 布局等价输入（10x10 单元网格 = N_IN 100、10 类、类别条件强度帧），
+并在输出中如实标注 data_source=synth/mnist；--data mnist 强制真实子集
+（无缓存且无网络时报可读指引，**不静默回退合成伪装真实数据**）。
 
 CLI：python -m hstdn.exp.g2_runner [--mini|--full] [--seeds 0 1 2 3 4]
       [--data auto|synth|mnist] [--json]
@@ -97,6 +99,17 @@ def g2_net_cfg(seed: int, *, n_pool: int = 150,
     return cfg
 
 
+def mnist_cache_available(root: str = "data/mnist") -> bool:
+    """真实 MNIST 是否已缓存（data 模块下载过的 4 个 IDX gz 文件齐全）。"""
+    from hstdn.data.mnist import MNIST_IDX_FILES
+    from pathlib import Path
+    base = Path(root)
+    files = []
+    for split, (img, lbl, _n) in MNIST_IDX_FILES.items():
+        files += [base / img, base / lbl]
+    return all(p.is_file() and p.stat().st_size > 0 for p in files)
+
+
 def make_g2_dataset(source: str, *, n_train_per_class: int,
                     n_test_per_class: int, seed: int, n_pool: int = 150,
                     root: str = "data/mnist") -> Dict[str, Any]:
@@ -104,28 +117,37 @@ def make_g2_dataset(source: str, *, n_train_per_class: int,
 
     Args:
         source: 'synth'=合成 MNIST 布局等价帧（10x10 单元、类别条件强度；
-            冒烟/回退用）；'mnist'=真实 MNIST（data.mnist 池化 10x10，需
-            torch+torchvision）；'auto'=优先 mnist、缺依赖回退 synth 并标注。
+            仅完全离线冒烟/回退用）；'mnist'=真实 MNIST（data.mnist **纯
+            NumPy IDX 下载**：无 torch 依赖，网络可达时自动获取/缓存）；
+            'auto'=缓存命中或网络可达 → 真实 MNIST；仅完全离线无缓存才回退
+            synth 并如实标注（绝不静默用合成冒充真实）。
         n_train_per_class / n_test_per_class: 每类训练/测试样本数。
         seed: 数据切分种子（双臂共享同一数据集）。
         n_pool: 透传（仅用于占位一致性，当前数据与池规模无关）。
-        root: torchvision 落盘目录。
+        root: MNIST IDX 落盘目录（data/mnist，默认相对项目根）。
 
     Returns:
         dict：train/test（frames (N,10,10) f8, labels (N,) i8），
         data_source（'mnist'/'synth'），note。
     """
     if source == "auto":
-        try:
+        if mnist_cache_available(root):
+            # 缓存命中：离线也可直接用真实 MNIST
             return _make_mnist_split(n_train_per_class, n_test_per_class,
                                      seed, root)
-        except ImportError as exc:
+        try:
+            # 无缓存：尝试网络自动获取（纯 NumPy IDX，无 torch 依赖）
+            return _make_mnist_split(n_train_per_class, n_test_per_class,
+                                     seed, root)
+        except (OSError, ValueError) as exc:
             out = _make_synth_split(n_train_per_class, n_test_per_class, seed)
             out["data_source"] = "synth"
-            out["note"] = (f"torch/torchvision 缺失（G2 延迟依赖）；mini 冒烟"
-                           f"回退合成 MNIST 布局等价帧。错误：{exc}")
+            out["note"] = (f"真实 MNIST 不可用（无缓存/子集不足或网络获取"
+                           f"失败）——mini/冒烟回退合成 MNIST 布局等价帧，"
+                           f"仅完全离线场景。错误：{exc}")
             return out
     if source == "mnist":
+        # 强制真实：无缓存且网络不可达时给出可读错误（不静默回退合成）
         return _make_mnist_split(n_train_per_class, n_test_per_class,
                                  seed, root)
     if source == "synth":
@@ -157,24 +179,25 @@ def _make_synth_split(n_tr: int, n_te: int, seed: int) -> Dict[str, Any]:
     te_f, te_l = _frames(n_te)
     return {"train": (tr_f, tr_l), "test": (te_f, te_l),
             "data_source": "synth", "note": "synthetic MNIST-layout (10x10) "
-            "equivalent frames, noise 0.18 (G2 mini smoke / torch-free "
-            "fallback)"}
+            "equivalent frames, noise 0.18 (G2 offline-only fallback)"}
 
 
 def _make_mnist_split(n_tr: int, n_te: int, seed: int,
                       root: str) -> Dict[str, Any]:
-    """真实 MNIST：torch 延迟加载 10x10 池化帧，按类取前 n 个（确定性）。"""
+    """真实 MNIST：data.mnist 纯 NumPy IDX 加载（无 torch 依赖）+ 10x10 池化。
+
+    网络/数据可用性错误直接透传（data.mnist 自带可读 ValueError 与缓存
+    损坏指引）；无缓存且无网络时由上层（auto/强制 mnist）给出可读提示。
+    类平衡：从随机子集的**安全超集**（每类需要量 × 8）里按类取前 n 个
+    （确定性：子集抽取 seed 由 load_mnist_subset 决定；类序优先），
+    避免随机子集按类欠采样。
+    """
     from hstdn.data.mnist import load_mnist_subset
-    try:
-        tr = load_mnist_subset(N_CLASSES * n_tr, train=True,
-                               root=root, seed=seed)
-        te = load_mnist_subset(N_CLASSES * n_te, train=False,
-                               root=root, seed=1000 + seed)
-    except ImportError as exc:
-        raise ImportError(
-            "G2 full requires real MNIST via data.mnist.load_mnist_subset "
-            "(torch+torchvision, delayed G2 dependency)"
-        ) from exc
+    oversample = 8
+    tr = load_mnist_subset(N_CLASSES * n_tr * oversample, train=True,
+                           root=root, seed=seed)
+    te = load_mnist_subset(N_CLASSES * n_te * oversample, train=False,
+                           root=root, seed=1000 + seed)
 
     def _bucket(sub, n):
         frames, labels = [], []
@@ -183,7 +206,8 @@ def _make_mnist_split(n_tr: int, n_te: int, seed: int,
             if idx.size < n:
                 raise ValueError(
                     f"MNIST class {k} has only {idx.size} samples in the "
-                    f"loaded subset; need {n}"
+                    f"{sub.labels.size}-sample subset; need {n}（安全超集 "
+                    f"仍不足：请扩大子集或检查缓存）"
                 )
             frames.append(sub.images[idx])
             labels.append(np.full(n, k, dtype=np.int64))
@@ -195,7 +219,8 @@ def _make_mnist_split(n_tr: int, n_te: int, seed: int,
     te_p, te_l = _bucket(te, n_te)
     return {"train": (tr_p, tr_l), "test": (te_p, te_l),
             "data_source": "mnist",
-            "note": "real MNIST D14 10x10 pooled subset (load_mnist_subset)"}
+            "note": "real MNIST D14 10x10 pooled subset "
+                    "(data.mnist pure-NumPy IDX; network auto-fetch)"}
 
 
 def make_g2_data_fns(data: Dict[str, Any]):
@@ -292,11 +317,12 @@ def run_g2_comparison(full: bool = False, *, seeds: Optional[Sequence[int]] = No
     """运行 G2 双臂配对对比并输出预注册判据字段。
 
     Args:
-        full: True=正式（5 seeds、真实 MNIST 语义要求——data_source 非 synth
-            时需 torch；G2 全量数据要求见模块 docstring）；False=mini 冒烟
-            （2 seeds，小样本，允许 synth 回退）。
+        full: True=正式（5 seeds、真实 MNIST——data.mnist 纯 NumPy IDX，缓存
+            命中或网络可达即自动获取；G2 全量数据要求见模块 docstring）；
+            False=mini 冒烟（2 seeds，小样本，仅完全离线无缓存时回退 synth）。
         seeds: 种子列表（None → full: G2_DEFAULT_SEEDS / mini: G2_MINI_SEEDS）。
-        data_source: auto/mnist/synth（auto 缺 torch 回退 synth 并标注）。
+        data_source: auto/mnist/synth（auto：缓存或网络 → 真实；仅完全离线
+            无缓存才回退 synth 并标注——绝不静默冒充真实数据）。
         n_train_per_class/n_test_per_class/n_pool: 数据与网络规模。
 
     Returns:
@@ -308,7 +334,7 @@ def run_g2_comparison(full: bool = False, *, seeds: Optional[Sequence[int]] = No
     n_tr = n_train_per_class if not full else 24   # full 每类训练样本
     n_te = n_test_per_class if not full else 20
     if full and data_source == "auto":
-        data_source = "mnist"      # 正式 G2 要求真实 MNIST（缺失则报错）
+        data_source = "mnist"      # 正式 G2 强制真实 MNIST（无缓存无网络报错）
     data = make_g2_dataset(data_source, n_train_per_class=n_tr,
                            n_test_per_class=n_te, seed=int(seeds[0]),
                            n_pool=n_pool)
@@ -461,11 +487,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--mini", action="store_true", default=True,
                     help="mini 冒烟：2 seeds、小样本（默认）")
     ap.add_argument("--full", action="store_true",
-                    help="正式 G2：5 seeds、真实 MNIST 子集（需 torch）")
+                    help="正式 G2：5 seeds、真实 MNIST 子集（data.mnist 纯 "
+                         "NumPy IDX，缓存命中或网络可达即自动获取）")
     ap.add_argument("--seeds", type=_parse_seeds, default=None,
                     help="种子列表，如 0,1,2,3,4（覆盖默认）")
     ap.add_argument("--data", choices=("auto", "mnist", "synth"),
-                    default="auto")
+                    default="auto",
+                    help="auto=缓存/网络优先、仅完全离线回退 synth；"
+                         "mnist=强制真实（无缓存无网络报错）；synth=合成")
     ap.add_argument("--json", action="store_true", help="附加 JSON 汇总")
     args = ap.parse_args(list(argv) if argv is not None else None)
     if args.mini and args.full:
@@ -473,7 +502,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         out = run_g2_comparison(full=args.full, seeds=args.seeds,
                                 data_source=args.data)
-    except (ImportError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         print(f"[ERROR] G2 run failed: {exc}")
         return 2
     print("\n".join(report_lines(out)))

@@ -30,8 +30,8 @@
       "path": "hstdn/configs/stdp_min.yaml"
     },
     {
-      "description": "G2 双臂 runner（exp 模块；v3.3 冻结清单 #7，R1 第一判合法性前提）。LSM 臂（对照组：adapt_enabled=False 无学习随机固定池 + CALIBRATE/COLLECT/READOUT/EVAL，main 默认 LSM 语义）vs STDP 臂（stdp_min.yaml 档 pool_learn=False + ADAPT 三开关开）；两臂共享同 seed 网络 cfg 与数据切分，唯一差异 = ADAPT 开关组，共享 run_g1_protocol 协议入口。强制同 seed 配对（正式 5 seeds G2_DEFAULT_SEEDS——G1 n=3 无功效升到 5；mini 2 seeds）。预注册判据：LSM 绝对门禁 ≥70%（R1_LSM_GATE_MIN）；R1 第一判 = 配对差 mean>0 且 >1×std；处理有效性迁移规则（评审 §2）：STDP 臂 ADAPT 后 read_drift_stats 读数 mean drift_frac ≥5% → valid、判据照常；<5% → inconclusive-treatment + 预注册一次性 η 校准（eta×G2_ETA_CALIB_FACTOR=2 仅一次）重跑。数据：MNIST D14 10x10 池化帧（data.mnist 真实子集需 torch，--data mnist/auto 缺依赖回退合成 MNIST 布局等价帧 noise0.18 并标注；G2 全量数据要求 docstring 注明）。CLI --mini(默认)/--full/--seeds/--data/--json；report_lines 输出 LSM/STDP 逐 seed 表 + 配对差汇总 + R1 判据判定 + treatment 标签。gates.py run_g2（--g2 mini / --g2 --full）登记。",
-      "path": "hstdn/exp/g2_runner.py"
+      "path": "hstdn/exp/g2_runner.py",
+      "description": "G2 双臂 runner（exp 模块；v3.3 冻结清单 #7，R1 第一判合法性前提）。LSM 臂（对照组 adapt_enabled=False 无学习随机固定池 + CALIBRATE/READOUT/EVAL，main 默认 LSM 语义）vs STDP 臂（stdp_min.yaml 档 pool_learn=False + ADAPT 三开关开）；两臂共享同 seed 网络 cfg（g2_net_cfg）与数据切分、唯一差异 ADAPT 开关组、共享 run_g1_protocol。强制同 seed 配对（正式 5 seeds G2_DEFAULT_SEEDS；mini 2 seeds）。预注册判据：LSM 绝对门禁 ≥70%（R1_LSM_GATE_MIN）；R1 第一判 = 配对差 mean>0 且 >1×std；处理有效性迁移规则（评审 §2）：STDP ADAPT 后 read_drift_stats 读数 mean drift_frac≥5% → valid；<5% → inconclusive-treatment + 一次性 η×2 校准（全局仅一次）重跑。数据（v3.3 sync）：真实 MNIST 经 data.mnist **纯 NumPy IDX 下载**（gzip+urllib ossci S3，无 torch 依赖，缓存命中/网络可达自动获取；mnist_cache_available 探测）；auto：缓存或网络 → 真实，仅完全离线无缓存回退合成 MNIST 布局等价帧（noise0.18）并如实标注（绝不静默冒充）；--data mnist 强制真实（无缓存无网络报可读指引）；真实数据按类安全超集（×8）确定性取样。CLI --mini(默认)/--full/--seeds/--data auto|mnist|synth/--json；report_lines 输出逐 seed 表+配对差+R1 判据+treatment 标签。gates.py run_g2（--g2 mini / --g2 --full）登记。"
     }
   ]
 }

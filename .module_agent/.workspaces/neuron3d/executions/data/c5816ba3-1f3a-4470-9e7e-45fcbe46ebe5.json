@@ -12,5 +12,14 @@
     ],
     "summary": "执行总结：数据模块首期任务全部完成，共新建 6 个文件并在 module_definition 登记、change_history 记录。synthetic.py 完整可用：10 类固定活动模式（0..8 高亮块 + 9 边框，掩码划分 10x10=100 单元）、graded 渐变强度、高斯加噪可复现契约、SyntheticBatch + intensities()/encode(cfg)（cfg.n_in==100 校验），docstring 附喂入 encoder/run_sample 完整示例。mnist.py 实现 adaptive_avg_pool2d 28x28->10x10 批次池化映射（与 core.encoder.mnist_adaptive_pool 交叉校验一致）与 1k 子集加载器（torch 延迟引入 + 可读 ImportError）。dvs_gesture.py / gpu_bridge.py 为合规骨架（设计说明 + 显式 NotImplementedError，无 pass）。\n\n测试总结：全部本地自测通过 —— synthetic 4 组、mnist 3 组（本机未装 torch 走错误分支验证）、dvs/bridge 占位检查各 2 项；py_compile 全过（python 3.12.10 / numpy 2.5.3）；集成冒烟通过（synthetic_batch -> latency_encode -> run_sample，n_in=100/n_input_cols=10，10 类池响应质心两两可分离，最小间距 91.0）。passed_count=11（synthetic 4 + mnist 3 + dvs 2 + gpu_bridge 2），failed_count=0，skip_count=0。期间修复 synthetic_batch 漏加的 noise>0 无随机源保护并回归通过。说明：本会话 write/edit 工具机械性失败（EISDIR staging），新文件经 PowerShell UTF-8（无 BOM）落盘并逐字验证；离朱/皋陶轮次未启动（任务范围限定本地自测）。",
     "errors": []
+  },
+  {
+    "plan_id": "plan_949656cb-7dc9-4f13-9564-50812250cf54",
+    "plan": "mnist.py 纯 NumPy MNIST IDX 下载/解析路径：解除 load_mnist_subset 对 torchvision 的强制依赖（G2 full 双臂 5 seeds 前置；网络源用 ossci-datasets S3 镜像）。",
+    "modified_files": [
+      "hstdn/data/mnist.py"
+    ],
+    "summary": "执行总结：mnist.py 重构完成（单文件，D14 池化映射/MnistSubset/契约未动）。新增纯 NumPy IDX 路径：MNIST_SOURCE_URL（ossci S3 镜像）+ MNIST_IDX_FILES 常量；parse_mnist_idx_file（gz/裸字节自动识别、大端魔数 2051/2049、28x28 维度与长度校验、可读 ValueError 含删缓存建议）；fetch_mnist_idx（urllib 分块下载、缓存命中跳过、.part 原子改名、失败 RuntimeError 含 URL、source_url 覆盖供离线错误测试）；load_mnist_idx 与兼容入口 load_mnist_subset（签名 n/train/root/seed 不变，g2_runner 兼容；uint8/255 归一化、rng(seed) 不放回子集与旧 torchvision 语义一致），彻底移除 torch/torchvision import 依赖与强制 ImportError 分支。\n\n测试总结：passed=7 组（池化映射交叉校验 1、子集容器 1、IDX 解析器内存级单测含魔数/维度/长度/过短/gzip 破损拒绝 1、缓存命中端到端含归一化/确定性/计数不一致/超规模 1、下载失败分支含 URL 1、torch-free 加载兼容 1，另加 synthetic 4/dvs 2/bridge 2 回归全过），failed=0，skip=0；真实下载冒烟 --download-smoke 两次实跑通过（train n=10，像素 [0,1]、标签 0..9，端到端验证 S3 镜像可达）；py_compile 全绿（python 3.12.10 / numpy 2.5.3）。修复 3 处自测期问题：part.replace(dst) 原子改名方向、craft 像素值断言公式、子集标签排序误断言。",
+    "errors": []
   }
 ]
