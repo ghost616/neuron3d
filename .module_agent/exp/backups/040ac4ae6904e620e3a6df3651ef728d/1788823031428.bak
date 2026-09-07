@@ -26,8 +26,6 @@ COLLECT/READOUT/EVAL 路径（不重复实现，遵循 core scheduler 约定）�
       校准机会全局仅此一次（防再调调滑坡）；重跑后仍 <5% → 终判
       inconclusive-treatment（不再校准）。
 
-数据规模：正式 full = 每类训练 100、测试 20（10 类 × 100 = 1000 train——
-设计文档 §6 'MNIST 1k 子集'；200 test）；mini 冒烟默认每类 12/10。
 数据（MNIST）：G2 全量要求真实 MNIST 1k 子集（data.mnist.load_mnist_subset
 ——**纯 NumPy IDX 下载，无 torch 依赖**：gzip + urllib 从 ossci S3 镜像自动
 获取并缓存到 data/mnist，网络可达时无需手工准备）。mini/冒烟默认经 auto：
@@ -60,7 +58,6 @@ from hstdn.exp import diagnostics as diag
 __all__ = [
     "R1_LSM_GATE_MIN", "R1_DIFF_STD_FACTOR", "DRIFT_VALID_MIN",
     "G2_ETA_CALIB_FACTOR", "G2_DEFAULT_SEEDS", "G2_MINI_SEEDS",
-    "G2_FULL_TRAIN_PER_CLASS", "G2_FULL_TEST_PER_CLASS",
     "make_g2_dataset", "make_g2_data_fns", "g2_net_cfg", "run_arm",
     "run_g2_comparison", "report_lines", "main",
 ]
@@ -81,10 +78,6 @@ G2_ETA_CALIB_FACTOR: float = 2.0
 G2_DEFAULT_SEEDS: tuple = (0, 1, 2, 3, 4)
 #: mini 冒烟 2 seeds
 G2_MINI_SEEDS: tuple = (0, 1)
-#: G2 full 每类训练样本数（10 类 × 100 = 1000 train —— 设计文档 §6 MNIST 1k 子集）
-G2_FULL_TRAIN_PER_CLASS: int = 100
-#: G2 full 每类测试样本数（10 类 × 20 = 200 test）
-G2_FULL_TEST_PER_CLASS: int = 20
 
 
 def g2_net_cfg(seed: int, *, n_pool: int = 150,
@@ -277,12 +270,7 @@ def run_arm(data: Dict[str, Any], seed: int, *, arm: str,
 
     Returns:
         dict：seed/arm/acc/eval_rate/silence/calib_ok/drift_frac/gini/
-        gini_ratio/budget_dev/r7_alert/aborted/terminated/failed_stage/
-        fail_reason/n_rounds/notes/wall_s。其中 aborted 为既有汇总标记；
-        terminated/failed_stage/fail_reason 从 G1Report 直接透传
-        （rep.terminated/rep.failed_stage/rep.fail_reason），供报表在 ABORT
-        行标注真实失败原因：failed_stage ∈ {'ADAPT','CALIBRATE',None}，
-        fail_reason 为空串表示未硬停。
+        gini_ratio/budget_dev/r7_alert/aborted/notes/wall_s。
     """
     cfg = g2_net_cfg(seed, eta_scale=eta_scale)
     bundle = build_network(cfg)
@@ -310,9 +298,6 @@ def run_arm(data: Dict[str, Any], seed: int, *, arm: str,
         "budget_dev": float(drift["budget_dev"]),
         "r7_alert": bool(r7["alert"]),
         "aborted": bool(not rep.ok or not rep.eval_rounds),
-        "terminated": bool(rep.terminated),
-        "failed_stage": rep.failed_stage,
-        "fail_reason": rep.fail_reason,
         "n_rounds": int(rep.n_rounds),
         "wall_s": float(wall),
         "notes": list(rep.notes),
@@ -333,14 +318,12 @@ def run_g2_comparison(full: bool = False, *, seeds: Optional[Sequence[int]] = No
 
     Args:
         full: True=正式（5 seeds、真实 MNIST——data.mnist 纯 NumPy IDX，缓存
-            命中或网络可达即自动获取；数据规模 10 类 × 100 = 1000 train /
-            10 类 × 20 = 200 test，即设计文档 §6 'MNIST 1k 子集'）；
+            命中或网络可达即自动获取；G2 全量数据要求见模块 docstring）；
             False=mini 冒烟（2 seeds，小样本，仅完全离线无缓存时回退 synth）。
         seeds: 种子列表（None → full: G2_DEFAULT_SEEDS / mini: G2_MINI_SEEDS）。
         data_source: auto/mnist/synth（auto：缓存或网络 → 真实；仅完全离线
             无缓存才回退 synth 并标注——绝不静默冒充真实数据）。
-        n_train_per_class/n_test_per_class/n_pool: mini 每类训练/测试样本
-            数（full 固定 100/20，见模块 docstring）与网络规模。
+        n_train_per_class/n_test_per_class/n_pool: 数据与网络规模。
 
     Returns:
         dict：data、rows（lsm/stdp 逐 seed 行）、paired_diffs、汇总、
@@ -348,8 +331,8 @@ def run_g2_comparison(full: bool = False, *, seeds: Optional[Sequence[int]] = No
     """
     seeds = tuple(seeds) if seeds is not None else (
         G2_DEFAULT_SEEDS if full else G2_MINI_SEEDS)
-    n_tr = n_train_per_class if not full else G2_FULL_TRAIN_PER_CLASS
-    n_te = n_test_per_class if not full else G2_FULL_TEST_PER_CLASS
+    n_tr = n_train_per_class if not full else 24   # full 每类训练样本
+    n_te = n_test_per_class if not full else 20
     if full and data_source == "auto":
         data_source = "mnist"      # 正式 G2 强制真实 MNIST（无缓存无网络报错）
     data = make_g2_dataset(data_source, n_train_per_class=n_tr,
@@ -435,28 +418,6 @@ def run_g2_comparison(full: bool = False, *, seeds: Optional[Sequence[int]] = No
     }
 
 
-def _fmt_arm_row(row: Dict[str, Any], tag: str) -> str:
-    """把单个臂行格式化为展示串（ABORT 行标注 no-eval + 真实失败原因）。
-
-    非 ABORT 行保持既有风格：``tag=88.0% (sil 12.3%)``。ABORT 行不再打印
-    占位 silence 100.0%，而标注 ``tag=ABORT (no-eval; <stage>: <fail_reason>)``
-    —— 从 run_arm 透传的 failed_stage/fail_reason 给出真实原因（如
-    "CALIBRATE: CALIBRATE band [...] Hz unmet ..." / "ADAPT: ADAPT gate
-    unmet ..."），避免把 CALIBRATE 带未达成的 1.0 占位误报为沉默率。
-    """
-    if not row["aborted"]:
-        return (f"{tag}={row['acc'] * 100:5.1f}% "
-                f"(sil {row['silence_frac'] * 100:4.1f}%)")
-    stage = row.get("failed_stage") or ""
-    reason = (row.get("fail_reason") or "").strip()
-    inner = "no-eval"
-    if stage:
-        inner += f"; {stage}"
-    if reason:
-        inner += f": {reason}"
-    return f"{tag}=ABORT ({inner})"
-
-
 def report_lines(out: Dict[str, Any]) -> List[str]:
     """把 G2 运行结果格式化为可打印行。"""
     lines = [
@@ -468,10 +429,16 @@ def report_lines(out: Dict[str, Any]) -> List[str]:
         "  LSM arm | STDP arm | per-seed paired diff:",
     ]
     for l, s in zip(out["lsm_rows"], out["stdp_rows"]):
-        d_txt = (f"d={s['acc'] - l['acc']:+.3f}"
-                 if not l["aborted"] and not s["aborted"] else "d=n/a")
-        lines.append(f"    seed {l['seed']}: {_fmt_arm_row(l, 'lsm')} | "
-                     f"{_fmt_arm_row(s, 'stdp')} | {d_txt}")
+        lines.append(
+            f"    seed {l['seed']}: lsm={l['acc'] * 100:5.1f}% "
+            f"(sil {l['silence_frac'] * 100:4.1f}%"
+            + (", ABORT" if l["aborted"] else "")
+            + ") | stdp="
+            + (f"{s['acc'] * 100:5.1f}%" if not s["aborted"] else " ABORT ")
+            + f" (sil {s['silence_frac'] * 100:4.1f}%"
+            + (", ABORT" if s["aborted"] else "")
+            + f") | d={s['acc'] - l['acc']:+.3f}"
+        )
     c = out["criteria"]
     n_abort = sum(1 for r in out["stdp_rows"] if r["aborted"]) + \
         sum(1 for r in out["lsm_rows"] if r["aborted"])

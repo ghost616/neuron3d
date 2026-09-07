@@ -1,0 +1,16 @@
+{
+  "plan_id": "plan_9304bd0a-1c92-4631-abf8-c47ea008c915",
+  "module_name": "",
+  "development_plan": "审查 G2 full 修正：1) run_arm 透传 terminated/failed_stage/fail_reason + report_lines ABORT 显示真实原因（no-eval 标注替代误导性 sil 100%）；2) full 每类训练样本 24→100（对齐 §6 MNIST 1k 子集）；3) 自测通过（离朱两轮、G0 15/15、mini 无回归、full 1k 实跑如实记录）。验证显示修复正确性、规模对齐、向后兼容、无回归。",
+  "session_id": "",
+  "modified_files": [
+    "hstdn/configs/default.yaml",
+    "hstdn/configs/__init__.py",
+    "hstdn/exp/__init__.py",
+    "hstdn/exp/gates.py",
+    "hstdn/exp/diagnostics.py",
+    "hstdn/exp/ablation.py",
+    "hstdn/configs/stdp_min.yaml",
+    "hstdn/exp/g2_runner.py"
+  ]
+}

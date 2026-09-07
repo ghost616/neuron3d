@@ -62,5 +62,21 @@
     "code_reviewed": true,
     "plan_completed": true,
     "test_passed": true
+  },
+  {
+    "plan_id": "plan_f272a7c2-6ca0-4f23-9137-76a572dce5aa",
+    "plan_summary": "G2 full 修正：ABORT 显示 bug + full 规模对齐 1k 子集",
+    "starter_session_id": "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_9304bd0a-1c92-4631-abf8-c47ea008c915",
+    "plan_summary": "G2 full 修正：ABORT 显示 bug + full 规模对齐 1k 子集",
+    "starter_session_id": "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": false
   }
 ]

@@ -1,0 +1,9 @@
+{
+  "plan_id": "plan_f272a7c2-6ca0-4f23-9137-76a572dce5aa",
+  "module_name": "exp",
+  "development_plan": "修复 hstdn/exp/g2_runner.py 的两处问题，为 G2 full（真实 MNIST 1k 子集）R1 第一判提供正确数据：\n\n1. ABORT 显示 bug 修复：run_arm 返回行字典中 silence_frac 在 ABORT（无 EVAL 数据）时取默认 1.0，导致报表把 CALIBRATE 率带未达标误显示为 \"sil 100.0%, ABORT\"。修复：\n   a) run_arm 行字典新增 terminated/failed_stage/fail_reason 字段（从 G1Report 透传：rep.terminated/rep.failed_stage/rep.fail_reason）；\n   b) report_lines 中 ABORT 行（lsm 或 stdp）不再仅打印 \"sil {silence_frac*100:.1f}%, ABORT\"——silence_frac 为占位默认时应标注占位（如 \"no-eval\"）并附真实 fail_reason（如 \"CALIBRATE band unmet 12.8Hz\" / \"ADAPT gate unmet ...\"）；\n   c) 保持字典 schema 向后兼容（既有字段不动，仅新增字段与显示逻辑调整）。\n\n2. full 规模对齐 G2 规格：run_g2_comparison 中 full 每类训练样本 n_tr = 24 → 100（即 10 类 × 100 = 1000 train，符合设计文档 §6 'MNIST 1k 子集'），n_te 保持 20/类 = 200 test；mini 模式默认（每类 12/10 或现行为）保持不变。相应 docstring/注释同步。\n\n3. 自测：a) 无回归——python -m hstdn.data.mnist 与 G0 十五项（python -m hstdn.exp.gates 15/15）不回归；b) g2_runner --mini 仍 exit 0；c) 若资源允许，重跑 g2_runner --full --data mnist（5 seeds、真实 MNIST 1k 子集）并如实记录完整输出（逐 seed LSM/STDP 配对、paired diff mean±std、LSM 门禁 ≥70% PASS/FAIL、R1 第一判判定、treatment 有效性、ABORT 行真实原因）——无论达标与否如实写入执行总结。\n\n遵守代码规范与三件套纪律；不越权修改 core/main/data 文件。若 G2 full 重跑在合理时间内无法完成（如单 seed 耗时长），记录已完成的 seed 数与预计总时长，不静默截断。",
+  "session_id": "36a4f51c-0b76-4e99-9c71-ef743c67cda6",
+  "modified_files": [
+    "hstdn/exp/g2_runner.py"
+  ]
+}

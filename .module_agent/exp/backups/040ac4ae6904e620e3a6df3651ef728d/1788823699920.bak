@@ -471,7 +471,7 @@ def report_lines(out: Dict[str, Any]) -> List[str]:
         d_txt = (f"d={s['acc'] - l['acc']:+.3f}"
                  if not l["aborted"] and not s["aborted"] else "d=n/a")
         lines.append(f"    seed {l['seed']}: {_fmt_arm_row(l, 'lsm')} | "
-                     f"{_fmt_arm_row(s, 'stdp')} | {d_txt}")
+                     f"stdp={_fmt_arm_row(s, 'stdp')} | {d_txt}")
     c = out["criteria"]
     n_abort = sum(1 for r in out["stdp_rows"] if r["aborted"]) + \
         sum(1 for r in out["lsm_rows"] if r["aborted"])

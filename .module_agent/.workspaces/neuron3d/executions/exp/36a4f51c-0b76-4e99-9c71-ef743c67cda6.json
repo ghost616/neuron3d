@@ -1,0 +1,11 @@
+[
+  {
+    "plan_id": "plan_f272a7c2-6ca0-4f23-9137-76a572dce5aa",
+    "plan": "G2 修复：ABORT 显示 bug（run_arm 透传 terminated/failed_stage/fail_reason + report_lines no-eval/fail_reason）+ full 每类 n_tr 24→100 + 自测",
+    "modified_files": [
+      "hstdn/exp/g2_runner.py"
+    ],
+    "summary": "执行总结：仅修改 hstdn/exp/g2_runner.py（core/main/data 未越权）。\n(1) ABORT 显示 bug 修复——run_arm 行字典新增 terminated/failed_stage/fail_reason 字段（从 G1Report 透传 rep.terminated/rep.failed_stage/rep.fail_reason），既有字段与 schema 向后兼容；report_lines 弃用占位 \"sil 100.0%, ABORT\"，新增 _fmt_arm_row 助手：ABORT 行标注 \"ABORT (no-eval; <stage>: <fail_reason>)\"（真实原因如 CALIBRATE band unmet / ADAPT gate unmet），非 ABORT 行格式不变（lsm/stdp tag 对称单次输出——首轮离朱发现我引入的 stdp=stdp= 重复前缀已二次修复并经回归验证），配对差列在任一侧 ABORT 时显示 d=n/a（原对 0.0 占位 acc 求差误导）。\n(2) full 规模对齐设计文档 §6 MNIST 1k 子集——run_g2_comparison full 每类训练 24→100（新常量 G2_FULL_TRAIN_PER_CLASS=100、G2_FULL_TEST_PER_CLASS=20；10 类×100=1000 train/200 test），mini 默认每类 12/10 不变；docstring/注释/__all__ 同步。\n测试总结：离朱两轮测试全过（passed 23+17 项断言、failed 0、skipped 0）。\n第 1 轮（66130322）6/6 通过标准满足：T1 py_compile exit0；T2 python -m hstdn.data.mnist 6/6 exit0；T3 G0 15/15 exit0 无回归；T4a mini 真实 MNIST exit0（seed1 LSM ABORT 行正确标注 no-eval+CALIBRATE 12.43Hz、d=n/a、无 sil 100.0%）；T4b 构造断言13项+真实 --json 键集17项全过（常量 100/20）；T5 full 分支短路实跑 n_train=100/n_test=20（实际帧 1000/200、10 类）；T6 full 真实 MNIST 5 seeds 完整实跑约6分钟 exit0（如实记录，结果未达标属客观数据结论）：逐 seed LSM 65.0-66.5% vs STDP 61.0-67.0%，seed3 LSM ABORT（CALIBRATE band [3.0,12.0]Hz unmet 12.35Hz），paired diff mean -1.13pp±3.09pp（paired 4/5），LSM 门禁 65.9%<70% FAIL，R1 第一判 NOT MET，treatment=valid（drift 90.4% 无需校准）。第 1 轮附带发现 stdp=stdp= 重复前缀（本轮引入）已修复；第 2 轮回归 R1 py_compile exit0、R2 17/17（healthy/healthy、lsm ABORT、stdp ABORT 三种配对各 tag 恰好一次、全文无 stdp=stdp=/lsm=lsm=/sil 100.0%）、R3 mini exit0 无 stdp=stdp=、R4 真实 LSM ABORT 路径正确。模块元数据（definition 描述、change_history ×2）已同步。",
+    "errors": []
+  }
+]
