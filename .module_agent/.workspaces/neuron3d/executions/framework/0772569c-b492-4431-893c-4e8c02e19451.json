@@ -1,0 +1,16 @@
+[
+  {
+    "plan_id": "plan_9e2c6f61-a9f7-48dd-b049-7f19562221fd",
+    "plan": "H-STDN 根级地基：requirements.txt + pyproject.toml + README.md + .gitignore + hstdn 包（__init__.py + checks.py G0 断言公共工具），Python 3.12。",
+    "modified_files": [
+      "requirements.txt",
+      "pyproject.toml",
+      "README.md",
+      ".gitignore",
+      "hstdn/__init__.py",
+      "hstdn/checks.py"
+    ],
+    "summary": "执行总结：本轮完成 H-STDN 根级地基，新增 6 个文件——① requirements.txt：numpy>=1.24 / scipy>=1.10 / numba>=0.59（Py3.12 兼容最低版本）/ pyyaml / matplotlib，torch/tonic/snntorch 注释为 G2/G3 按需延迟引入；② pyproject.toml：包名 hstdn、requires-python>=3.12、动态版本读 hstdn.__version__、setuptools find 限定 hstdn*（后续 core/exp/data/main 子包自动纳入）；③ README.md：项目简介、H-STDN v3.2-final 唯一权威规范引用、代码布局、环境要求、快速开始、G0 门禁运行方式、公共断言工具用法；④ .gitignore：Python 常规忽略 + 实验产物目录（outputs/runs/checkpoints/logs）；⑤ hstdn/__init__.py：__version__=0.1.0，重导出 checks 六个公共断言函数；⑥ hstdn/checks.py：assert_global_ids / assert_local_ids（ID 域校验）、assert_shape / assert_dtype、assert_finite、assert_non_decreasing，失败一律抛含可读消息+统计数值的 AssertionError，仅做通用校验（业务契约由 core 实现）。未改动其他模块代码。已登记 module_definition（6 文件）、current_spec（依赖与构建配置 / G0 断言公共工具 两个 section）、change_history。已验证（Python 3.12.10）：py_compile 两文件通过；tomllib 解析 pyproject 通过（name=hstdn、deps 正确）；命名空间导入冒烟通过（version=0.1.0、__all__ 6 个名称全部可解析）；文件均为 UTF-8 无 BOM。\n\n测试总结：环境原因无法执行单元/数值测试，skip_count=1, passed_count=0, failed_count=0。当前机器唯一 Python 3.12.10 解释器未安装 numpy/scipy/yaml（ModuleNotFoundError），而 checks.py/__init__.py 顶层依赖 numpy；按项目纪律依赖安装由用户手动执行，未代装。真实 import hstdn 及断言函数的行为验证需先执行（README 已记录）：python -m pip install -r requirements.txt（或 python -m pip install -e .），随后 python -c \"import hstdn; print(hstdn.__version__)\" 期望输出 0.1.0；另可用 python -c \"from hstdn import assert_global_ids, assert_local_ids, assert_shape, assert_dtype, assert_finite, assert_non_decreasing\" 做 API 冒烟。补充说明：本会话 write/edit 工具在 E:\\neuron3d 卷上因 tmpdir→link 步骤报 EISDIR 无法落盘（新建/改名经 pwsh 验证正常，属工具与卷的兼容问题），故文件经 pwsh [IO.File]::WriteAllText(UTF-8 no BOM) 写入并已 read-back 校验内容完整。",
+    "errors": []
+  }
+]

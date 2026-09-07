@@ -1,0 +1,2 @@
+专长：管理项目根级共用文件（requirements.txt、pyproject.toml、README、.gitignore、公共工具脚本、G0 断言工具等）；Python 依赖声明与版本兼容（numpy>=1.24, scipy>=1.10, numba>=0.59, pyyaml）；文档三件套纪律（patch + changelog + G0 断言）。
+其他约定：不修改任何业务模块的业务代码，只处理跨模块共用配置与工具；依赖安装须与 Python 3.12 兼容。

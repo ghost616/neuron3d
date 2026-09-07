@@ -1,0 +1,2 @@
+专长：合成 10 类数据生成（G1 用）；MNIST 子集加载与 adaptive_avg_pool2d 10x10 映射（D14）；DVS-Gesture patch 聚合双极性映射（D14，预留）；CPU-GPU 桥接（batch 级 copy_，禁逐样本拷贝）。
+其他约定：输入映射严格遵循 D14 裁决（MNIST 100 单元、DVS 512 单元）；数据模块输出契约与 encoder 输入契约对齐；torch 依赖按需延迟引入（G2/G3 前不阻塞 L0 运行）。

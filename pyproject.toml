@@ -1,0 +1,40 @@
+# ======================================================================
+# H-STDN 工程化实现 —— 构建与依赖权威声明（Python 3.12）
+#
+# 包名：hstdn（科研代码库，唯一权威规范 = H-STDN 详细设计文档 v3.2-final）
+# 代码全部位于 hstdn/ 包内（core/data/exp/main 等子包由各业务模块逐步填充），
+# 因此包发现仅匹配 hstdn*；顶层其余目录均为工程配置而非 Python 包。
+# ======================================================================
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hstdn"
+dynamic = ["version"]
+description = "H-STDN（混合时空脉冲神经网络）v3.2-final 工程化实现：STDP 储备池 + 读出端到端科研代码库"
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "numba>=0.59",  # Python 3.12 兼容所需最低版本
+    "pyyaml",
+    "matplotlib",
+    # 说明：torch / tonic / snntorch 按 G2/G3 阶段延迟引入，不在此声明，
+    # 避免为 G0-G1（纯 CPU 模拟）引入重型/不兼容依赖。
+]
+
+[tool.setuptools]
+# 只收集 hstdn 命名空间下的包（含后续 core/exp/data/main 子包），
+# 顶层 exp/、main/、results 等目录即使含 __init__.py 也不打包。
+packages = { find = { where = ["."], include = ["hstdn*"] } }
+
+[tool.setuptools.dynamic]
+version = { attr = "hstdn.__version__" }

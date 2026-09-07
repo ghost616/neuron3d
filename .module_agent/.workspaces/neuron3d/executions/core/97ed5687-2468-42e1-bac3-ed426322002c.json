@@ -1,0 +1,18 @@
+[
+  {
+    "plan_id": "plan_35a2bea3-7b23-4adf-ab14-918d73cfb183",
+    "plan": "实现 H-STDN 核心模拟栈（首期 D1–D4）：layout/spatial_hash/network/kernel/encoder/plasticity + 最小自检脚本（G0 编号标注）",
+    "modified_files": [
+      "hstdn/core/__init__.py",
+      "hstdn/core/layout.py",
+      "hstdn/core/spatial_hash.py",
+      "hstdn/core/network.py",
+      "hstdn/core/kernel.py",
+      "hstdn/core/encoder.py",
+      "hstdn/core/plasticity.py",
+      "hstdn/core/selfcheck.py"
+    ],
+    "summary": "执行总结：新增 hstdn/core 包 8 个文件（__init__/layout/spatial_hash/network/kernel/encoder/plasticity/selfcheck），完成 D1–D4 核心模拟栈。layout.py 集中定义 NetConfig（§4 超参 frozen+with_derived）、N_IN/N_POOL/REFR/ETA_LTP/WHEEL_L 等常量、F8/I8 dtype、全局/局部 ID 断言与唯一转换 pool_local_of、shape/dtype 断言（G0 #4/#13）。spatial_hash.py SpatialHash3D（cell=R_POOL，O(N) 构建、O(1) 均摊查询，query_radius/nearest_k+exclude_self）。network.py build_network→NetworkBundle：输入 z=0 网格+抖动、池 [0,1]²×[0,0.3] 平板域（D13）、80/20 E/I、池→池 per-source 最近 k=12/输入→池每池 16（R_IN=0.4）、权重分类（输入/E learn、I 冻结 -1.2exp(-d/0.12)）、delay=clip(round(d/VEL),1,15)、CSR 稳定排序、CSC B3 修正（断言 csr_dst≥N_IN）、in_learn_ptr/in_learn_idx/in_sum0、ring 时间轮 L=16、结构自检报告（孤立=0/零入度=0/E 源出度≤12/延迟直方图/增益标定 输入≈1.1θ0、E≈0.3θ0、|I|min≥E mean）。kernel.py run_sample L0 内核：B11 入口重置（theta/rate_ema 保持）、严格 ①-⑥ 顺序、R1 严格不应期、同刻 pre_ltd→置迹→post_ltp（D12）、input-channel STDP（ADR-001）、run_sample_l1 显式 NotImplementedError。encoder.py latency_encode（t=2+(1-I)*40、I>0.12、FIX-B8 排序分桶）、MNIST 10×10 自适应池化映射（D14）、DVS 接口（NotImplementedError）、Poisson 默认关。plasticity.py input_channel_stdp/pre_ltd/post_ltp/homeo_update/competitive_norm + capped_ratio/input_w_mean 诊断。selfcheck.py G0 编号标注最小自检。模块元数据（module_definition/current_spec/change_history）已同步。\n测试总结：全部通过（passed 76，failed 0，skipped 0）：模块自带 python -m hstdn.core.selfcheck 12 组断言 PASS（exit 0）；离朱补充测试 .lizhu_env/lizhu_tests/extra_core_tests.py 64 组断言 PASS（exit 0），覆盖反向/边界/异常维度（layout 非法配置与 ID 域边界、spatial_hash 空集/坏参数/半径边界/k=0/并列排序、network 小配置固定 seed 确定性重建+结构报告、kernel T≤0/桶越界/非法 gid/L1 NotImplementedError/不应期边界、plasticity 域拒绝与 w/θ clip 边界、encoder I=0.12 严格阈值/clip/ids_offset/MNIST floor-ceil 逐单元对照）；python -m compileall -q hstdn exit 0。补充测试首跑 1 处失败系测试脚本自身断言笔误（并列点排序切片），离朱已修正，被测代码零缺陷。接口/E2E 测试不适用（纯 NumPy 库、无 UI）。\n环境备注：本会话 write 工具在 E: 卷原子链接失败（EISDIR），已改用 pwsh 写文件 + edit 修订；自测所需 numpy 2.5.3 / pyyaml 6.0.3 已装入系统 Python（scipy 未装，产品代码未依赖）。exp/gates.py（G0 十五项权威门禁）属 exp 模块待建，本模块自检脚本已在文件头逐组标注 G0 编号对应关系。另：core 目标常量/默认超参以 layout.DEFAULT_CFG 为准（configs/default.yaml 就绪后由其覆盖，代码已支持 cfg 注入）。",
+    "errors": []
+  }
+]

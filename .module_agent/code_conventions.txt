@@ -1,0 +1,26 @@
+# H-STDN 项目代码规范
+
+## 语言与风格
+- Python 3.12，遵循 PEP8；模块/类/函数均含中文或英文 docstring，说明职责、参数、返回与关键不变量。
+- 类型注解：公开函数与数据结构（数组形状/类型）必须注解或文档化。
+- NumPy 优先向量化；禁止在热路径（run_sample 循环内）使用 Python 标量 for 遍历大数组（L0 例外仅限稀疏局部，须注释说明）。
+- 命名：snake_case 函数/变量；数组常量大写；全局常量（如 N_IN、N_POOL、REFR、ETA_LTP）沿用设计文档记号。
+
+## ID 契约（违反即失败）
+- 存储层（CSR/CSC/trace）一律全局 ID；状态数组访问层（V/theta/refr/counts/rate_ema/ring/csc_ptr）一律池局部 ID。
+- 全局→局部转换只发生在内核投递处：dst_local = dst - N_IN。
+- 结构体字段、形状、dtype 必须与设计文档 §2.2/§2.3 完全一致。
+
+## 纪律
+- 三件套纪律：每次修改 = 代码 patch + change_history 记录 + G0 断言覆盖。
+- 禁止 pass 占位进入 L1 Numba 分支——未实现的 L1 功能须显式 raise NotImplementedError。
+- G1 前冻结超参（以 configs/default.yaml 为唯一来源），禁止散落魔法数字。
+- 修改既有实现必须先跑相关 G0 断言再提交。
+
+## 异常与错误处理
+- 断言用于契约/不变量（G0）；运行时预期错误用异常并附上下文信息。
+- 所有 G0 检查项失败须给出可读消息 + 相关统计数值。
+
+## 测试
+- G0 十五项断言（exp/gates.py）为门槛，全绿方可进入下一阶段；每项独立可执行。
+- 新功能若涉及数据结构或不变量，须补充对应 G0 断言或在 gates.py 中登记。

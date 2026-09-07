@@ -1,0 +1,45 @@
+# ======================================================================
+# H-STDN 项目 .gitignore（Python 3.12）
+# ======================================================================
+
+# ---- Python 字节码与包构建产物 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+.venv-win/
+
+# ---- 测试 / 静态检查 / 类型检查缓存 ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# ---- IDE / 编辑器 / OS ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- H-STDN 运行产物：实验结果 / 日志 / 检查点 / 诊断输出 ----
+/outputs/
+/runs/
+/checkpoints/
+/logs/
+/exp/runs/
+/exp/outputs/
+*.log

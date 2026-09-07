@@ -1,0 +1,13 @@
+{
+  "module_name": "main",
+  "files": [
+    {
+      "description": "训练入口骨架（D1-D4：config→build_network→run_sample 链路打通）。只做编排不做算法实现：加载 configs/default.yaml（load_config/to_core_cfg）→ build_network 建网（固定 seed rng）→ data.synthetic 合成 10 类批次逐样本 latency 编码 → run_sample 驱动（stdp/homeo/norm 可开关，epoch seed 派生）→ exp.diagnostics 率/沉默/可塑性面板 → save_checkpoint 落盘 npz checkpoint（格式 hstdn-network-bundle-v1：bundle 全部数组字段 + __meta__/__cfg__ 0-d JSON 记录，含 config 指纹 sha256 与运行参数指纹）。固定随机种子可复现；M6 scheduler 协议（default.yaml protocol 节）以 TODO/注释预留接入点、未伪造实现；含 --selfcheck（指纹确定性与 checkpoint 编解码往返的 G0 类自检）与 shape/ID 断言闸。CLI：python -m hstdn.train --epochs 1 --samples 10（退出码 0/1/2）。",
+      "path": "hstdn/train.py"
+    },
+    {
+      "description": "评估入口骨架（D1-D4）。加载 train.py 产出的 npz checkpoint（复用 hstdn.train.load_checkpoint，cfg 落盘复验 + bundle 形状/ID 闸）与配置（显式 --config 时与 checkpoint 配置指纹比对，不一致即失败）→ 独立派生 seed 的合成测试集（test_seed = 1000003 + seed）→ 全 off 冻结 run_sample（stdp/homeo/norm 恒为 False）→ 输出率/沉默聚合面板（train.sample_aggregate_panel）与类均值发放特征两两余弦汇总（class_mean_features + exp.diagnostics.class_cosine_matrix）。CLI：python -m hstdn.eval --checkpoint <npz> --samples 10（退出码 0/1/2）。",
+      "path": "hstdn/eval.py"
+    }
+  ]
+}

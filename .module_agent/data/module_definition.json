@@ -1,0 +1,29 @@
+{
+  "module_name": "data",
+  "files": [
+    {
+      "path": "hstdn/data/__init__.py",
+      "description": "hstdn.data 子包入口：说明数据模块与 encoder 输入契约的对齐方式（data 只产出输入单元强度图/强度向量，spike 桶与 input 全局 ID 分配由 core/encoder 负责）；保持顶层导入轻量。"
+    },
+    {
+      "path": "hstdn/data/synthetic.py",
+      "description": "合成 10 类数据生成器（G1 首跑，完整可用）：MNIST 10x10 单元布局（N_GRID=10 -> N_UNITS=100，对应 cfg.n_in==100/n_input_cols==10）；10 个固定活动模式类别（0..8 = 3x3 局部高亮块、9 = L 形边框，掩码恰好划分 100 单元且两两不相交）；支持 graded（掩码内强度渐变 -> latency 时空首发波前）/graded=False（纯空间码）、高斯加噪（seed/rng 可复现，noise>0 无随机源抛 ValueError）；输出 (N,10,10) f8 强度帧 + (N,) i8 标签的 SyntheticBatch，提供行主序 intensities() 展平 (N,100) 与 encode(cfg)（校验 cfg.n_in==N_UNITS）批量 latency 编码入口；模块自测 python -m hstdn.data.synthetic（G0 数据契约断言）。"
+    },
+    {
+      "path": "hstdn/data/mnist.py",
+      "description": "MNIST 子集加载与 D14 28x28->10x10 池化映射（G2 期使用，已实现）：adaptive_pool_ranges（torch adaptive_avg_pool2d 语义分界公式）、pool_mnist_to_units（批次向量化自适应平均池化，与 core.encoder.mnist_adaptive_pool 逐帧等价，自测交叉校验防漂移）、MnistSubset 容器（images (N,28,28) f8 [0,1]、labels (N,) i8，提供 pool/flat 便捷映射）；load_mnist_subset（torch/torchvision 函数内延迟引入，缺失时抛带安装指引的可读 ImportError；默认 1k 确定性随机子集，像素 ToTensor 归一化）。"
+    },
+    {
+      "path": "hstdn/data/dvs_gesture.py",
+      "description": "DVS-Gesture 加载与 8x8 patch 双极性聚合骨架（G3 里程碑预留）：docstring 固化职责边界（原始事件/单元级数据归 data 模块，spike 桶化归 core.encoder.dvs_patch_aggregate 的 N_IN=512 契约）与几何草案（8x8 空间 patch x 2 极性 x 4 时间窗 = 512，G3 排期时按 D14 裁决定稿）；load_dvs_gesture_subset / aggregate_dvs_events 显式 raise NotImplementedError（禁止静默 pass）；模块顶层仅依赖 numpy，tonic 延迟引入。"
+    },
+    {
+      "path": "hstdn/bridge/__init__.py",
+      "description": "hstdn.bridge 子包入口：说明 CPU-GPU 批量桥接为 G2/G3 预留骨架（随 torch 引入实现），顶层导入轻量。"
+    },
+    {
+      "path": "hstdn/bridge/gpu_bridge.py",
+      "description": "CPU-GPU 批量缓冲 copy_ 桥接骨架（G2/G3 预留）：docstring 固化设计要点——batch 级整块 copy_（禁逐样本 Python 循环拷贝）、缓冲布局遵循 D14 单元契约（MNIST (B,100) / DVS (B,512) 行主序）、桥接只做纯搬运不做 D14 映射、dtype 由调用方显式指定、torch 函数内延迟引入；copy_intensity_batch_to_device / copy_tensor_batch_to_host 显式 raise NotImplementedError（禁止静默 pass）。"
+    }
+  ]
+}

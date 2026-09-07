@@ -1,0 +1,1 @@
+实现 hstdn/data/synthetic.py（合成 10 类数据，G1 用）、mnist.py（1k 子集 + 10x10 池化映射，G2 用，预留）、dvs_gesture.py（patch 聚合管线，G3 用，预留）、hstdn/bridge/gpu_bridge.py（批量缓冲桥接，预留）。首期先实现 synthetic.py 支撑 G1。

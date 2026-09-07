@@ -1,0 +1,42 @@
+[
+  {
+    "plan_id": "plan_9e2c6f61-a9f7-48dd-b049-7f19562221fd",
+    "plan_summary": "搭建 H-STDN 项目根级地基（pyproject/requirements/README/.gitignore、hstdn 公共包与断言辅助）",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_35a2bea3-7b23-4adf-ab14-918d73cfb183",
+    "plan_summary": "实现 H-STDN 核心模拟栈：layout/spatial_hash/network/kernel/encoder/plasticity，L0 NumPy 实现并自检",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_06bb9ccd-e967-4bcf-9420-9a49709f8e56",
+    "plan_summary": "实现 H-STDN 数据模块：synthetic 合成数据生成器 + mnist/dvs/bridge 合规占位",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_c59eebf7-1d0a-4b27-b8c5-92e454c3a883",
+    "plan_summary": "实现 H-STDN 实验验证模块：default.yaml 超参 + G0 十五项门禁 gates + diagnostics 诊断面板",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_34577b41-dd0b-4416-871b-fed27ec56074",
+    "plan_summary": "实现 H-STDN 训练与评估入口：train.py + eval.py 打通 config→build_network→run_sample 链路并冒烟自测",
+    "starter_session_id": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  }
+]

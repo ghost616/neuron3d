@@ -1,0 +1,25 @@
+{
+  "module_name": "exp",
+  "files": [
+    {
+      "path": "hstdn/configs/default.yaml",
+      "description": "§4 超参唯一契约（G1 前冻结）：network/lif/stdp/homeo/protocol/readout_l0/features/readout_l1/encoder 九节，命名沿用设计文档 §4 记号（tau_mem/radius_in/velocity/e_ratio/extent/T/dt 等）。全部实验超参的唯一来源，禁止散落魔法数字；core 就绪后升格为 core.layout.NetConfig 唯一来源。"
+    },
+    {
+      "path": "hstdn/configs/__init__.py",
+      "description": "配置加载辅助：default_path/resolve_path（路径解析）、load_config（pyyaml→dict + 顶层结构契约校验）、validate_config_dict（已知节/必含节/防漂移）；to_core_cfg 为过渡期桥：把 network/lif/stdp/homeo 四节严格映射为 core.layout.NetConfig（含 n_input_cols=√n_in、extent→pool_z_hi、T→window_s、dt=1 校验），未知键显式报错。"
+    },
+    {
+      "path": "hstdn/exp/__init__.py",
+      "description": "hstdn.exp 实验验证模块包入口（保持导入轻量），声明 gates.py（G0 十五项门禁）与 diagnostics.py（诊断面板）职责边界。"
+    },
+    {
+      "path": "hstdn/exp/gates.py",
+      "description": "G0 十五项断言门禁权威实现（python -m hstdn.exp.gates，全绿方可进入 G1）。每项独立可执行/独立通过：①LIF 单神经元解析解对照<2% ②传导延迟 d/v<1ms（几何公式+内核实测 t+1/t+15）③时间轮同槽累加 ④CSR/CSC 回指一致 ⑤STDP 方向性（pre→post LTP/post→pre LTD 符号+量值）⑥输入通道活性（单事件→输入→池 w 必变化）⑦同刻对净更新≈+eta_ltp（D12）⑧homeostasis 闭环收敛（稳定带判据）⑨competitive_norm 守恒 Σw=in_sum0（幂等/I 冻结）⑩ID 规范回归（全局/局部域+唯一转换入口）⑪内核性能（900 神经元 200ms：空样本+单事件突发均值<0.1s）⑫度分布（E 源出度≤12、零入度=0）⑬延迟上界 max_delay<L ⑭不应期严格封锁（截窗+放行边界双证）⑮状态重置回归（B11）。自备确定性 micro 网络夹具（显式边表→CSR/CSC/B3/in_learn，与 core 布局同构）；§4 规模网络由 default.yaml 经 to_core_cfg 构建并按门禁克隆复用。"
+    },
+    {
+      "path": "hstdn/exp/diagnostics.py",
+      "description": "诊断面板函数（G1 与 gates 调试复用，core 惰性导入）：firing_rates_hz/silence_ratio/rate_summary（率与沉默）、cos_similarity/class_cosine_matrix（类间余弦）、feature_transform/feature_cos_similarity（sqrt+L2 特征可比性，mode='sqrt_l2'，支持列掩码）、capped_synapse_ratio（顶界突触占比）、input_to_pool_w_mean（输入→池 w 均值）、delay_histogram、plasticity_panel/network_panel/sample_panel/print_panel 汇总面板。"
+    }
+  ]
+}

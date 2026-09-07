@@ -1,0 +1,16 @@
+[
+  {
+    "plan_id": "plan_06bb9ccd-e967-4bcf-9420-9a49709f8e56",
+    "plan": "D3 数据部分与 D14 映射首期：synthetic.py（G1 合成 10 类，N_IN=100 10x10 布局）+ mnist.py（G2 1k 子集与 adaptive_avg_pool2d 10x10 映射）+ dvs_gesture.py / bridge/gpu_bridge.py 合规占位。",
+    "modified_files": [
+      "hstdn/data/__init__.py",
+      "hstdn/data/synthetic.py",
+      "hstdn/data/mnist.py",
+      "hstdn/data/dvs_gesture.py",
+      "hstdn/bridge/__init__.py",
+      "hstdn/bridge/gpu_bridge.py"
+    ],
+    "summary": "执行总结：数据模块首期任务全部完成，共新建 6 个文件并在 module_definition 登记、change_history 记录。synthetic.py 完整可用：10 类固定活动模式（0..8 高亮块 + 9 边框，掩码划分 10x10=100 单元）、graded 渐变强度、高斯加噪可复现契约、SyntheticBatch + intensities()/encode(cfg)（cfg.n_in==100 校验），docstring 附喂入 encoder/run_sample 完整示例。mnist.py 实现 adaptive_avg_pool2d 28x28->10x10 批次池化映射（与 core.encoder.mnist_adaptive_pool 交叉校验一致）与 1k 子集加载器（torch 延迟引入 + 可读 ImportError）。dvs_gesture.py / gpu_bridge.py 为合规骨架（设计说明 + 显式 NotImplementedError，无 pass）。\n\n测试总结：全部本地自测通过 —— synthetic 4 组、mnist 3 组（本机未装 torch 走错误分支验证）、dvs/bridge 占位检查各 2 项；py_compile 全过（python 3.12.10 / numpy 2.5.3）；集成冒烟通过（synthetic_batch -> latency_encode -> run_sample，n_in=100/n_input_cols=10，10 类池响应质心两两可分离，最小间距 91.0）。passed_count=11（synthetic 4 + mnist 3 + dvs 2 + gpu_bridge 2），failed_count=0，skip_count=0。期间修复 synthetic_batch 漏加的 noise>0 无随机源保护并回归通过。说明：本会话 write/edit 工具机械性失败（EISDIR staging），新文件经 PowerShell UTF-8（无 BOM）落盘并逐字验证；离朱/皋陶轮次未启动（任务范围限定本地自测）。",
+    "errors": []
+  }
+]

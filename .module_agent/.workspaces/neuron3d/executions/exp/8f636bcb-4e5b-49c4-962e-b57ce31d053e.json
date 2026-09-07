@@ -1,0 +1,15 @@
+[
+  {
+    "plan_id": "plan_c59eebf7-1d0a-4b27-b8c5-92e454c3a883",
+    "plan": "H-STDN exp 模块首期：configs/default.yaml + gates.py(G0 十五项) + diagnostics.py",
+    "modified_files": [
+      "hstdn/configs/default.yaml",
+      "hstdn/configs/__init__.py",
+      "hstdn/exp/__init__.py",
+      "hstdn/exp/gates.py",
+      "hstdn/exp/diagnostics.py"
+    ],
+    "summary": "执行总结：首期四项交付全部完成。①hstdn/configs/default.yaml：§4 超参唯一契约（network/lif/stdp/homeo 严格按任务数值；protocol/readout_l0/features/readout_l1/encoder 含注释性默认，M5/M2 记号待 core 落位冻结）；②hstdn/configs/__init__.py：加载辅助（pyyaml→dict、路径解析、结构校验、未知键报错）+ to_core_cfg 桥（→core NetConfig，含 √n_in→n_input_cols、extent→pool_z_hi、T→window_s、dt=1 校验）；③hstdn/exp/gates.py：G0 十五项门禁权威实现，每项独立检查函数、独立可执行，支持批量/单项/--list/--trace，PASS/FAIL 逐项输出与全绿汇总；④hstdn/exp/diagnostics.py：诊断面板（率/沉默/类间 cos/sqrt+L2 特征可比性/顶界突触占比/输入→池 w 均值/延迟直方图/plasticity+network+sample 面板与打印）。core/data 已就绪，G0 未降级、十五项全部实跑。测试总结：python -m hstdn.exp.gates 两轮均 PASS 15/15、exit 0（末轮为最终版，逐项输出见计划结果）；diagnostics 纯函数与 §4 规模 bundle 面板冒烟通过；config 桥字段逐一核对；core 基线 selfcheck exit 0。G0 门禁本身即本项目权威验收套件，实跑全绿即通过判据；本次无独立离朱复测（如需风后另行安排）。遗留注明：readout_l1/encoder 数值待 §4 官方表冻结；L0 高密度帧超 0.1s 预算（gate11 钉住空+单事件突发可达工作点，L1 Numba 动机）；ablation.py 与 G1+ 门禁留待后续阶段。",
+    "errors": []
+  }
+]

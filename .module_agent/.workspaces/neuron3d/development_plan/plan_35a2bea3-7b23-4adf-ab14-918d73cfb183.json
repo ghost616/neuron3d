@@ -1,0 +1,16 @@
+{
+  "plan_id": "plan_35a2bea3-7b23-4adf-ab14-918d73cfb183",
+  "module_name": "core",
+  "development_plan": "实现 H-STDN 核心模拟栈（首期 D1–D4 范围），按下列顺序在同一模块内推进，严格对照 v3.2-final 文档 §2/§3：\n1. layout.py：ID 契约与断言工具（全局 ID 0..N_IN-1 输入、N_IN..N_IN+N_POOL-1 池；存储层全局 ID / 状态数组层池局部 ID 规范、shape/dtype 常量 N_IN/N_POOL/REFR/ETA_LTP 等集中定义），供 G0 #4/#10/#13 使用。\n2. spatial_hash.py：SpatialHash3D（cell_size=R_POOL，O(N) 构建、邻域 O(1) 均摊查询）。\n3. network.py：build_network(cfg)->NetworkBundle（SoA 状态 + CSR/CSC + ring + in_learn_idx + in_sum0 + 自检报告）。要点：输入神经元 z=0 平面网格+抖动；池神经元均匀采样 [0,1]x[0,1]x[0,0.3] 平板域（D13）；80/20 E/I 标记；输入→池 query_radius(R_IN=0.4) 取最近 k=16（过滤自身）；池→池 per-source 取最近 k=12（D11：E 权重 U(0.18,0.42) learn=True，I 权重 -1.2*exp(-d/0.12) learn=False）；delay=clip(round(dist/VEL),1,15)；CSR 稳定排序 + csr_src_g；CSC 按目标构建（np.add.at(csc_ptr[1:], csr_dst-N_IN,1) 后 cumsum，B3 修正，断言 csr_dst>=N_IN）；in_learn_idx/in_sum0 只收 learn=True 入突触；增益标定（输入 ~U(0.9,1.3)*theta0、E 循环 ~0.3*theta0、I 幅值>=E 不可学习、rho 仅打印）；自检报告含孤立神经元=0、零入度=0、E 源出度<=12、延迟直方图。\n4. kernel.py：run_sample(bundle, input_buckets, T=200, stdp_on/homeo_on/norm_on=False)。严格顺序不变量：入口处状态重置契约（V/refr/counts/first_spike/trace/ring 清零，theta/rate_ema 保持，B11）；每步 ①V*=decayV ②V+=ring[slot]清槽 ③输入注入 np.add.at 投递未来槽 + 当步 input_channel_stdp（ADR-001）④发放判定 (V>=theta)&(t>refr) 严格大于（R1）；同刻对按经典顺序 pre_ltd→置迹(trace[N_IN+spk]=1)→post_ltp（ADR-003/D12）⑤放电投递 + V=0 + refr=t+2 ⑥迹衰减 *=decayT。时间轮 L=16（断言 max_delay<L）。本阶段仅 L0 NumPy；L1 未实现处禁止 pass 占位。\n5. encoder.py：latency_encode（t=2+(1-I)*40 仅 I>0.12，按 t 排序后分桶 FIX-B8，输出 input_buckets: Dict[t_step->(ids,strengths)]）；MNIST adaptive_avg_pool2d 28->10x10=100 单元映射（D14）；DVS patch 聚合（D14，N_IN=512）留接口；Poisson 默认关闭。\n6. plasticity.py：input_channel_stdp（pre 侧 LTD 于全部出突触 + trace[in_id]=1，ADR-001/D10）、post_ltp（CSC 侧，csr_w += ETA_LTP*trace[csc_src]，clip[0.02,1.5]）、pre_ltd（CSR 侧，trace 全局索引）、逐神经元 homeostasis（rate_ema=0.9*ema+0.1*(counts/0.2)；theta=clip(theta+0.05*(ema-8),0.5,20)）、竞争归一化（仅 learn 入突触，csr_w[idx]*=in_sum0/s，clip）。新增诊断量：顶界突触占比、输入→池 w 均值。\n7. 本模块文件全部实现后自测可通过 exp/gates 中依赖项（若 exp 尚未就绪，先提供最小自检断言脚本自查，注明 G0 对应编号）。\n遵守代码规范、ID 契约与三件套纪律；禁止引入未实现占位；功能级别自查不越权修改其他模块。",
+  "session_id": "97ed5687-2468-42e1-bac3-ed426322002c",
+  "modified_files": [
+    "hstdn/core/__init__.py",
+    "hstdn/core/layout.py",
+    "hstdn/core/spatial_hash.py",
+    "hstdn/core/network.py",
+    "hstdn/core/kernel.py",
+    "hstdn/core/encoder.py",
+    "hstdn/core/plasticity.py",
+    "hstdn/core/selfcheck.py"
+  ]
+}

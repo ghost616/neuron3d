@@ -1,0 +1,11 @@
+{
+  "workspaces": [
+    {
+      "name": "neuron3d",
+      "created_at": "2026-09-07T10:16:45.342Z"
+    }
+  ],
+  "bindings": {
+    "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6": "neuron3d"
+  }
+}

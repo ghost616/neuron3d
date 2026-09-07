@@ -1,0 +1,14 @@
+{
+  "plan_id": "plan_9e2c6f61-a9f7-48dd-b049-7f19562221fd",
+  "module_name": "framework",
+  "development_plan": "搭建 H-STDN 项目根级地基，支撑后续所有模块：\n1. 创建 requirements.txt（numpy>=1.24, scipy>=1.10, numba>=0.59, pyyaml, matplotlib；torch/tonic/snntorch 注释为按需延迟引入）与 pyproject.toml（Python 3.12，包名 hstdn，声明 hstdn/ 包路径与依赖）。\n2. 创建 README.md（项目简介、引用 H-STDN v3.2-final 为唯一权威规范、快速开始、G0 门禁运行方式）。\n3. 创建 .gitignore（Python 常规忽略项：__pycache__、.venv、*.egg-info、dist、实验结果目录等）。\n4. 创建公共 G0 断言工具模块 hstdn/__init__.py 与 framework 的断言辅助（如 assert_global_ids、assert_local_ids、形状/dtype 校验辅助函数，供 core/layout 与 exp/gates 复用）——保持轻量，具体契约断言实现细节由 core 模块负责。\n5. 验证包可被 Python 3.12 导入（hstdn 命名空间可用），记录环境依赖安装说明。\n遵守代码规范与三件套纪律；本模块不改动其他业务模块代码。",
+  "session_id": "0772569c-b492-4431-893c-4e8c02e19451",
+  "modified_files": [
+    "requirements.txt",
+    "pyproject.toml",
+    "README.md",
+    ".gitignore",
+    "hstdn/__init__.py",
+    "hstdn/checks.py"
+  ]
+}

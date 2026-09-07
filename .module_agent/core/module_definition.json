@@ -1,0 +1,37 @@
+{
+  "module_name": "core",
+  "files": [
+    {
+      "path": "hstdn/core/__init__.py",
+      "description": "hstdn.core 包入口：极轻量（不引入 numpy 依赖），仅声明 __version__ 与子模块清单（layout/spatial_hash/network/kernel/encoder/plasticity），保持导入轻量供 exp/gates 按需显式导入。"
+    },
+    {
+      "path": "hstdn/core/layout.py",
+      "description": "ID 契约与超参/形状规格集中定义（M1 数据布局基础）：NetConfig（§4 超参 frozen dataclass，with_derived 派生 wheel_l/decay_v/decay_t/n_total/n_e_pool 等）、cfg_from_mapping、模块级常量 N_IN/N_POOL/N_TOTAL/REFR/ETA_LTP/ETA_LTD/W_LO/W_HI/THETA0/WHEEL_L/R_IN/R_POOL/K_IN/K_POOL/DECAY_V/DECAY_T、dtype 常量 F8/I8；全局/局部 ID 域校验与唯一转换（assert_input_gids/assert_pool_gids/assert_pool_local_ids/pool_local_of/pool_gid_of）以及形状/dtype 断言助手（assert_pool_local_shape1/assert_global_trace_shape/assert_ring_shape/assert_f8/assert_i8），供 G0 #4/#10/#13 使用。"
+    },
+    {
+      "path": "hstdn/core/spatial_hash.py",
+      "description": "SpatialHash3D 三维均匀网格空间哈希：O(N) 构建（lexsort 分桶）+ O(1) 均摊邻域查询；query_radius 返回按距离升序（并列按索引）的候选，nearest_k 取半径内最近 k 个并支持 exclude_self；供 network 布线（D11/D13：输入→池 R_IN、池→池 R_POOL per-source 最近 k）与 G0 #10 使用。"
+    },
+    {
+      "path": "hstdn/core/network.py",
+      "description": "M1 网络构建 build_network(cfg)->NetworkBundle（SoA 状态 + CSR/CSC 双索引 + in_learn 行 + ring 时间轮）：输入 z=0 网格+抖动、池均匀采样 [0,1]x[0,1]x[0,0.3] 平板域（D13）、80/20 E/I 标记（D11）、per-source 最近 k（输入 16/池 12，排除自身）、权重分类（E 源 learn=True、I 源 -1.2exp(-d/0.12) learn=False、输入 U(0.9,1.3)*θ0）、delay=clip(round(dist/VEL),1,15)、CSR 稳定排序、CSC B3 修正构建、in_learn_idx/in_sum0、自检报告（孤立=0、零入度=0、E 源出度≤12、延迟直方图、增益标定）与结构断言；NetworkBundle dataclass 集中字段规格；供 G0 #12/#13 使用。"
+    },
+    {
+      "path": "hstdn/core/kernel.py",
+      "description": "M3 L0 时间轮 LIF 内核 run_sample(bundle, input_buckets, T, stdp_on/homeo_on/norm_on)：严格每步顺序 ①V*=decayV ②V+=ring[slot]清槽 ③输入注入 np.add.at 投递未来槽+input_channel_stdp(ADR-001) ④发放判定 (V>=θ)&(t>refr)（R1 严格不应期）同刻经典序 pre_ltd→置迹→post_ltp(D12/ADR-003) ⑤投递+V=0+refr=t+REFR ⑥迹衰减；入口 B11 状态重置契约（theta/rate_ema 保持）；reset_state；L1 入口 run_sample_l1 显式 raise NotImplementedError；供 G0 #1/#2/#3/#6/#7/#14/#15 使用。"
+    },
+    {
+      "path": "hstdn/core/encoder.py",
+      "description": "M2 输入编码：latency_encode（t=2+(1-I)*40、仅 I>0.12、按时间排序后分桶 FIX-B8，输出 Dict[t->(ids,strengths)]）；mnist_adaptive_pool（纯 NumPy 自适应均值池化 28→10x10=100 单元，D14）；mnist_encode（N_IN=100 行主序映射）；dvs_patch_aggregate（D14 N_IN=512 聚合接口，G3 里程碑前显式 raise NotImplementedError）；Poisson 默认关闭。"
+    },
+    {
+      "path": "hstdn/core/plasticity.py",
+      "description": "M4 可塑性：input_channel_stdp（输入通道 pre 侧 LTD 于全部出突触 + trace[in_id]=1，ADR-001/D10）、pre_ltd（池 pre 发放 CSR 侧乘性 LTD，用全局 trace[dst]）、post_ltp（池 post 发放 CSC 侧 csr_w += ETA_LTP*trace[csc_src]，仅 learnable、clip[0.02,1.5]，D11 I 突触冻结）、homeo_update（rate_ema=0.9ema+0.1*counts/窗口、theta=clip(theta+0.05*(ema-8),0.5,20)）、competitive_norm（仅 learn 入突触按池缩放回 in_sum0 后 clip）；诊断 capped_ratio（顶界突触占比）与 input_w_mean（输入→池 w 均值）；供 G0 #5/#8/#9 使用。"
+    },
+    {
+      "path": "hstdn/core/selfcheck.py",
+      "description": "core 最小自检脚本（exp/gates.py 就绪前的过渡断言，标注 G0 编号 #1-#15 家族对应）：layout ID/形状断言、SpatialHash3D 与暴力对照、默认配置 build_network 布线不变量与 CSR/CSC/B3/in_learn 一致性、kernel 时序/不应期/时间轮/STDP 顺序微测试（手工构造确定性 toy 网络）、plasticity 各原语与归一化单元断言、encoder 桶/MNIST 映射断言、默认配置动态冒烟（确定性、stdp/homeo/norm 边界）；python -m hstdn.core.selfcheck 运行。"
+    }
+  ]
+}
