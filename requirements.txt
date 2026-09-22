@@ -1,25 +1,12 @@
-# ======================================================================
-# H-STDN 运行时依赖清单（Python 3.12，Windows 本地 / 跨平台）
+# N3D 一期原型（三维神经元空间架构）依赖清单
+# 目标环境：Windows / Linux + Python 3.12，CPU 训练优先
 #
-# 权威依赖声明位于 pyproject.toml 的 [project.dependencies]；
-# 本文件为「免构建」的常规安装入口：
-#     python -m pip install -r requirements.txt
-# 推荐方式（含包安装）：
-#     python -m pip install -e .
-# ======================================================================
+# 安装方式（本文件位于仓库根目录，命令在仓库根执行）：
+#   pip install -r requirements.txt
+#
+# 说明：torch / torchvision 默认安装 CPU wheel；若需要 GPU 版本，
+# 请按 https://pytorch.org/get-started/locally/ 提供的索引地址安装对应 CUDA 版本。
 
-numpy>=1.24
-scipy>=1.10
-numba>=0.59        # Python 3.12 兼容所需最低版本（numba 0.59 起提供 cp312 支持）
-pyyaml
-matplotlib
-
-# ----------------------------------------------------------------------
-# 按需延迟引入（勿默认安装）——对应 G2/G3 阶段需求，届时单独安装：
-#     torch        # G2：MNIST 读出 / CPU-GPU 批量桥接
-#     tonic        # G3：DVS-Gesture 数据加载
-#     snntorch     # 可选：读出端对比基线
-# ----------------------------------------------------------------------
-# torch
-# tonic
-# snntorch
+torch>=2.2.0
+torchvision>=0.17.0
+numpy>=1.26.0

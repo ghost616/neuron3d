@@ -1,14 +1,25 @@
 搭建项目根级基础：requirements.txt、pyproject.toml、README、.gitignore、G0 断言公共工具（ID 规范断言、契约断言辅助函数），作为 H-STDN v3.2-final 工程化的地基。
 ## 依赖与构建配置
 
-项目根级工程配置（framework 模块维护，Python 3.12）：
-- requirements.txt：运行时依赖免构建安装清单（numpy>=1.24、scipy>=1.10、numba>=0.59、pyyaml、matplotlib；torch/tonic/snntorch 注释为 G2/G3 按需延迟引入）。
-- pyproject.toml：构建与依赖权威声明。包名 hstdn，requires-python>=3.12，setuptools 包发现限定 hstdn*（随 core/exp/data/main 子包建立自动纳入），动态版本读取 hstdn.__version__。
-- README.md：项目简介、唯一权威规范（H-STDN 详细设计文档 v3.2-final）引用、代码布局、环境要求、快速开始、G0 门禁运行方式、工程纪律摘要。
-- .gitignore：Python 常规忽略 + H-STDN 实验产物目录（outputs/runs/checkpoints/logs）。
+项目根级共用文件（framework 模块维护）。仓库现为 N3D 一期原型项目：代码位于 `n3d_proto/` 子目录，根目录只保留跨模块共用文件。
+
+- `requirements.txt`（仓库根）：N3D 运行时依赖安装清单——`torch>=2.2.0`、`torchvision>=0.17.0`、`numpy>=1.26.0`；注释说明本文件位于仓库根目录、安装命令为 `pip install -r requirements.txt`，并指引 GPU 版本按 PyTorch 官方索引安装所需 CUDA wheel。由原 `n3d_proto/requirements.txt` 迁移而来，依赖条目原样保留。
+- `README.md`（仓库根）：N3D 项目主页文档。首部「仓库布局」说明明确：**代码位于 `n3d_proto/` 子目录，本说明位于仓库根目录**；正文含项目简介与设计动机、四步闭环架构示意与归一化方向硬契约、安装与运行方式（**全部运行命令保持 `python n3d_proto/train.py ...` 形式不变**）、环境与数据说明、产物保护规则、文件说明表、一期范围、验收标准与阶段 B 实测结果分析。由原 `n3d_proto/README.md` 迁移而来，自指路径表述已按根目录位置校正。
+- `.gitignore`（仓库根，**保持原样、内容未改写**）：Python 常规忽略（`__pycache__/`、`*.py[cod]`、egg-info、build/dist）、虚拟环境、测试与静态检查缓存、IDE/OS 文件、运行产物目录（`/outputs/`、`/runs/`、`/checkpoints/`、`/logs/`、`*.log`——其中 `/checkpoints/` 忽略使 checkpoint 工件不进入版本控制）与 `.lizhu_env/` 本地测试环境。
+
+已移除：`pyproject.toml`（原 H-STDN 构建与依赖权威声明，包名 hstdn）随 H-STDN 代码一并删除；`n3d_proto/README.md`、`n3d_proto/requirements.txt` 已上移为仓库根文件，`n3d_proto/` 下不再残留这两个文件。
 ## G0 断言公共工具
 
-framework 维护的轻量 G0 契约断言辅助（公共工具），供 hstdn/core/layout 与 hstdn/exp/gates 复用：
-- hstdn/checks.py：assert_global_ids（存储层全局 ID 域 [0, n_total) 校验）、assert_local_ids（状态数组层池局部 ID 域 [0, n_local) 校验）、assert_shape / assert_dtype（形状与 dtype 精确校验）、assert_finite（NaN/Inf 有限性校验）、assert_non_decreasing（CSR indptr / 排序 ID 单调不减校验）。
-- hstdn/__init__.py：包入口，__version__=0.1.0（pyproject 动态版本来源），重导出 checks 全部公共函数。
-- 约定：失败一律抛含可读消息与统计数值的 AssertionError；只做通用校验，业务契约断言实现细节由 core 模块负责。
+**（已废弃）** 本节所述 G0 断言公共工具随 H-STDN 代码一并移除，当前不再存在：
+
+- 原 `hstdn/checks.py`（`assert_global_ids` / `assert_local_ids` / `assert_shape` / `assert_dtype` / `assert_finite` / `assert_non_decreasing`）与 `hstdn/__init__.py` 包入口（`__version__=0.1.0`）均已随 `hstdn/` 整目录删除。
+- 删除原因：仓库已由 H-STDN 转向 N3D 一期原型（`n3d_proto/`），两套规范互不覆盖，H-STDN 的 ID 契约（全局 ID / 池局部 ID）与 G0 十五项断言不再适用于当前项目。
+- 现状：N3D 侧不依赖这些断言工具（已全仓搜索确认无任何 `hstdn` 引用残留）；`n3d_proto/utils.py` 内部提供本项目所需的形状与数值校验辅助。
+- 若后续需要重建根级公共断言工具，应按 N3D 契约（张量形状、边级稀疏表示、`tau > 0`、稀疏度口径等）重新设计，而非恢复 H-STDN 的 ID 域断言。
+## 仓库根级共用文件
+
+仓库根级共用文件由本模块管理，当前为 `README.md`、`requirements.txt`、`.gitignore`。
+
+- `README.md` 与 `requirements.txt` 原属 `n3d_proto` 模块，H-STDN 项目移除时上移至仓库根目录，所有权移交本模块。
+- `pyproject.toml` 已随 H-STDN 一并删除；`.gitignore` 内容未改动。
+

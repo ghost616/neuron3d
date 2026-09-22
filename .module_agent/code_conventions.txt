@@ -1,35 +1,6 @@
-# H-STDN 项目代码规范
+# N3D 项目代码规范
 
-## 语言与风格
-- Python 3.12，遵循 PEP8；模块/类/函数均含中文或英文 docstring，说明职责、参数、返回与关键不变量。
-- 类型注解：公开函数与数据结构（数组形状/类型）必须注解或文档化。
-- NumPy 优先向量化；禁止在热路径（run_sample 循环内）使用 Python 标量 for 遍历大数组（L0 例外仅限稀疏局部，须注释说明）。
-- 命名：snake_case 函数/变量；数组常量大写；全局常量（如 N_IN、N_POOL、REFR、ETA_LTP）沿用设计文档记号。
-
-## ID 契约（违反即失败）
-- 存储层（CSR/CSC/trace）一律全局 ID；状态数组访问层（V/theta/refr/counts/rate_ema/ring/csc_ptr）一律池局部 ID。
-- 全局→局部转换只发生在内核投递处：dst_local = dst - N_IN。
-- 结构体字段、形状、dtype 必须与设计文档 §2.2/§2.3 完全一致。
-
-## 纪律
-- 三件套纪律：每次修改 = 代码 patch + change_history 记录 + G0 断言覆盖。
-- 禁止 pass 占位进入 L1 Numba 分支——未实现的 L1 功能须显式 raise NotImplementedError。
-- G1 前冻结超参（以 configs/default.yaml 为唯一来源），禁止散落魔法数字。
-- 修改既有实现必须先跑相关 G0 断言再提交。
-
-## 异常与错误处理
-- 断言用于契约/不变量（G0）；运行时预期错误用异常并附上下文信息。
-- 所有 G0 检查项失败须给出可读消息 + 相关统计数值。
-
-## 测试
-- G0 十五项断言（exp/gates.py）为门槛，全绿方可进入下一阶段；每项独立可执行。
-- 新功能若涉及数据结构或不变量，须补充对应 G0 断言或在 gates.py 中登记。
-
----
-
-# N3D 一期原型代码规范
-
-> **适用范围：仅 `n3d_proto/` 子目录**。上文 H-STDN 规范仅适用于 `hstdn/`，两套规范互不覆盖。
+> 适用范围：整个仓库。代码位于 `n3d_proto/` 子目录；仓库根目录为依赖清单（`requirements.txt`）、说明文档（`README.md`）与 `.gitignore`，由 `framework` 模块管理。
 
 ## 语言与风格
 - Python 3.12 + PyTorch（CPU 优先，兼容 GPU），遵循 PEP8。
@@ -38,13 +9,13 @@
 - 关键步骤必须写中文注释解释原理，尤其四步闭环（2a 空间连接 / 2b scatter sum / 2c 神经元激活 / 2d broadcast + 残差 + LayerNorm）的每一步。
 
 ## 张量与形状契约（违反即失败）
-- 参数名、张量名、形状、类型必须与 `current_spec.md` 的「数据结构与张量形状总表」完全一致。
+- 参数名、张量名、形状、类型必须与 `.module_agent/n3d_proto/current_spec.md` 的「数据结构与张量形状总表」完全一致。
 - 存储与索引层一律边级：`edge_index` [2, E]、`edge_dist` [E]、`W_conn_sparse` [E]。
 - **禁止 materialize dense [N*y_out, N*y_in] 权重矩阵**（N=256, y_in=y_out=8 时达 4M 参数且 99% 为零）。
 - 所有矩阵运算以 batch 为第一维度，利用 PyTorch 批量矩阵乘法优化。
 
 ## 稀疏与效率
-- `sparse_propagate` 必须用 `edge_index` + `scatter_add_` 实现；`segment_softmax` 优先 `torch_scatter`，环境缺失时在 `utils.py` 提供纯 PyTorch fallback（scatter_max + scatter_add）。
+- `sparse_propagate` 必须用 `edge_index` + `scatter_add_` 实现；`segment_softmax` 优先 `torch_scatter`，环境缺失时用纯 PyTorch fallback（scatter_max + scatter_add）。
 - 禁止用 Python for 循环遍历神经元或突触，必须向量化 / 稀疏张量操作。
 - 全部拓扑量（dist、mask、edge_index、edge_dist、scatter_out_to_neuron、broadcast_neuron_to_in）必须在 `__init__` 中预计算并 `register_buffer`，前向传播中不得重算。
 - 归一化方向固定：对每个输出突触，在其连接的输入突触上做 softmax（按 `edge_index[0]` 分组）；禁止对输入突触维度做 softmax，禁止全局 softmax。
@@ -56,13 +27,16 @@
 
 ## 设备与可复现
 - 张量统一通过 `register_buffer` 或 `to(device)` 管理，支持 CPU / GPU。
-- 所有随机过程（坐标采样、权重初始化、数据打乱）由 seed 控制，保证可复现。
+- 所有随机过程由 seed 控制；`num_workers > 0` 时须先调用 `utils.set_seed(config.seed)`，基种子才会传导到各 worker。
+
+## 产物纪律
+- 交付工件为 `checkpoints/n3d_model_full.pt`。
+- 验证类命令（`--smoke-test`、含 `--max-batches` 的限批运行）一律写入 `checkpoints/_verify/`，不得覆盖正式产物。
 
 ## 禁止事项
-- 禁止修改 `hstdn/` 下既有代码，禁止修改工程根目录既有文件（README.md、requirements.txt、pyproject.toml 等）。
 - 禁止臆造运行结果：必须真实执行命令并粘贴真实终端输出。
 
 ## 测试与验收
-- 阶段 A 冒烟测试为门槛：`python n3d_proto/train.py --smoke-test` 在 CPU 上 2 分钟内完成，全部可学习参数梯度范数 > 0，loss 不为 NaN/Inf，连接稀疏度 < 0.1，tau > 0。
-- 阶段 B 为 bonus：正式训练 10 epoch，MNIST 测试准确率 ≥ 90%；未达标须在 README 分析原因并给出调参建议。
+- 阶段 A 冒烟测试为门槛：`python n3d_proto/train.py --smoke-test` 在 CPU 上 2 分钟内完成，全部可学习参数梯度范数 > 0，loss 不为 NaN/Inf，连接稀疏度（密度 `E/(N*y_out*N*y_in)`）< 0.1，tau > 0。
+- 阶段 B：正式训练 10 epoch，MNIST 测试准确率 ≥ 90%（实测 97.20% / 97.53%）。
 - 新增功能若涉及形状或不变量，须补充对应校验或断言。

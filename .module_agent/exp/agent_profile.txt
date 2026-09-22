@@ -1,2 +1,0 @@
-专长：G0 十五项断言门禁脚本（gates.py）；率/沉默/类间 cos/顶界突触占比/输入 w 均值/延迟直方图诊断（diagnostics.py）；消融与随机储备池对照（ablation.py）；YAML 超参配置（configs/default.yaml，文档 §4 为唯一契约）。
-其他约定：G0 每项独立通过才允许进入下一阶段；G1 对照组与实验组唯一差异是 stdp_on/homeo_on/norm_on 三开关；G1 前冻结全部超参。

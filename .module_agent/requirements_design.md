@@ -1,26 +1,27 @@
-# H-STDN（混合时空脉冲神经网络）需求设计
+# N3D（三维神经元空间架构）需求设计
 
 ## 项目定位
-H-STDN v3.2-final 的工程化 Python 实现。以设计文档 v3.2-final（唯一权威规范）为准绳，从零搭建 `hstdn/` 科研代码库，目标是通过 G0–G4 分级验证关卡，最终在合成 10 类、MNIST、DVS-Gesture 上验证 STDP 储备池 + 读出的端到端精度。
+受生物大脑启发的神经网络架构一期原型：神经元分布在三维空间中，每个神经元带 y_in 个输入突触与 y_out 个输出突触，突触自身也有三维坐标；仅当输入突触与输出突触的距离 ≤ D 时才允许传递数据。输入层连接全部神经元的输入突触，输出层连接全部输出突触。
+
+一期采用**静态拓扑**：神经元与突触的三维坐标在初始化后固定不变，仅学习权重参数。目标是验证前向传播与反向传播能否走通，不追求性能。代码位于 `n3d_proto/` 子目录；仓库根目录存放依赖清单与说明文档。
 
 ## 权威规范
-- 唯一权威文档：H-STDN 详细设计文档 v3.2-final（含 D1–D14 设计裁决、B1–B11 勘误、§2 数据布局、§3 模块设计 M1–M6、§4 超参、§9 实施计划）。
-- 四份源文档（kimi/ds/智谱/千问）已降级/归档，禁止作为实现依据。
+- 唯一权威规范：`.module_agent/n3d_proto/current_spec.md`，包含数据结构与张量形状总表、四步闭环信息流、masked softmax 归一化方向、稀疏实现约束、验收标准、实现说明与验收口径澄清。
 
-## 首期范围（当前里程碑：D1–D4 + G0 十五项断言全绿）
-按 §9 实施计划阶段推进：
-1. **D1** layout.py + network.py + spatial_hash.py（平板布线 z∈[0,0.3]、per-source k=12、CSC 修正构建、增益标定、自检报告）→ G0 #4/#10/#12/#13
-2. **D2** kernel.py L0（时间轮、严格不应期、输入通道 STDP、同刻经典顺序、状态重置契约）→ G0 #1/#2/#3/#6/#7/#14/#15
-3. **D3** encoder.py + data/synthetic.py + 诊断面板（latency 修复排序、MNIST 10×10 池化映射）
-4. **D4** plasticity.py（input_channel_stdp + post_ltp + pre_ltd + 逐神经元 homeo + 竞争归一化）→ G0 #5/#8/#9
+## 首期范围（已交付）
+1. `config.py`：`Config` 数据类与两套预设（`SMALL_CONFIG` N=64/y=4,4/T=2/batch=32；`DEFAULT_CONFIG` N=256/y=8,8/T=3/batch=64）。
+2. `utils.py`：随机种子、设备选择、日志、`segment_softmax`（含纯 PyTorch fallback）、边表与 scatter/broadcast 映射构建、参数与连接统计。
+3. `model.py`：`ThreeDNeuronSpace`，`__init__` 预计算全部拓扑量并注册 buffer，`forward` 实现四步闭环迭代，边级参数化 `W_conn_sparse[E]`，含 `count_parameters` / `get_connection_stats`。
+4. `data.py`：MNIST 数据加载（复用仓库 `data/mnist/` 原始 IDX，784 维展平）。
+5. `train.py`：两阶段训练入口（阶段 A 冒烟测试 / 阶段 B 正式训练），支持 `--smoke-test`、`--checkpoint`、`--epochs`、`--max-batches` 等参数。
 
-后续阶段（不在本期）：D5 scheduler/readout/features → G1 首跑；D6 MNIST G2；D7+ L1 Numba / DVS G3 / 规模化 G4。
+**不在本期**：动态拓扑与结构可塑性（二期方向）。
 
 ## 环境
-Python 3.12.10，Windows 本地；依赖 numpy>=1.24, scipy>=1.10, numba>=0.59（Py3.12 兼容微调）, pyyaml, matplotlib；torch/tonic/snntorch 按 G2/G3 需要延迟引入。
+Python 3.12 + PyTorch CPU（torch 2.14.0+cpu / torchvision 0.29.0+cpu）+ numpy；`torch_scatter` 缺失时由纯 PyTorch fallback 承担。
 
 ## 工程纪律
-- 三件套纪律：patch + changelog + G0 断言。
-- ID 契约：存储层全局 ID / 状态数组层池局部 ID，转换仅在内核投递处。
-- L1 Numba 分支禁止 pass 占位（未实现须显式抛 NotImplementedError）。
-- G1 前冻结全部超参，禁止调参破坏归因基线。
+- 三件套纪律：代码 patch + change_history 记录 + 冒烟判据覆盖。
+- 禁止 materialize dense 权重矩阵，连接一律边级参数化。
+- 交付工件 `checkpoints/n3d_model_full.pt` 不得被验证类命令覆盖。
+- 运行结果必须真实执行后粘贴，禁止臆造。

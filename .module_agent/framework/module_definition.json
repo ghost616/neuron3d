@@ -3,27 +3,15 @@
   "files": [
     {
       "path": "requirements.txt",
-      "description": "项目根级 Python 3.12 依赖安装清单：numpy>=1.24、scipy>=1.10、numba>=0.59（Py3.12 兼容最低版本）、pyyaml、matplotlib；torch/tonic/snntorch 注释为 G2/G3 按需延迟引入。与 pyproject.toml [project.dependencies] 配套的免构建安装入口。"
-    },
-    {
-      "path": "pyproject.toml",
-      "description": "项目构建与依赖权威声明：包名 hstdn，requires-python>=3.12，运行时依赖 numpy>=1.24/scipy>=1.10/numba>=0.59/pyyaml/matplotlib（torch 系按 G2/G3 延迟不声明）；setuptools 包发现限定 hstdn*（含后续 core/exp/data/main 子包）；动态版本取自 hstdn.__version__。"
+      "description": "仓库根级 Python 依赖安装清单（N3D 一期原型，与 n3d_proto/ 配套）：torch>=2.2.0、torchvision>=0.17.0、numpy>=1.26.0；注释说明本文件位于仓库根目录、安装命令为 pip install -r requirements.txt，并指引 GPU 版本按 PyTorch 官方索引安装 CPU/GPU wheel。历史：原为 H-STDN 依赖清单（numpy/scipy/numba/pyyaml/matplotlib），已由 n3d_proto/requirements.txt 覆盖迁移而来。"
     },
     {
       "path": "README.md",
-      "description": "项目主页文档：项目简介、唯一权威规范（H-STDN 详细设计文档 v3.2-final）引用、代码布局、环境要求（Python 3.12 + 延迟引入清单）、快速开始（venv + pip install -e . + 冒烟验证）、G0 门禁运行方式、公共 G0 断言工具用法、工程纪律摘要。"
+      "description": "仓库根级项目主页文档（N3D 一期原型）：说明「代码位于 n3d_proto/ 子目录、本说明位于仓库根目录」的仓库布局；项目简介与设计动机（空间稀疏连接、四步闭环 + 残差 + LayerNorm、距离衰减 + 可学习边权）；四步闭环架构示意（2a 稀疏空间连接 / 2b scatter sum / 2c 神经元激活 / 2d broadcast + 残差 + LayerNorm）与归一化方向硬契约；安装（pip install -r requirements.txt）；运行方式（阶段 A python n3d_proto/train.py --smoke-test、阶段 B 正式训练与常用可选参数）；环境与数据说明（torch 经 user site-packages 可见、torch_scatter 缺失时纯 PyTorch fallback、MNIST 复用 data/mnist/ 不联网下载）；产物保护规则（冒烟/限批写入 checkpoints/_verify/，正式训练覆盖前自动 .bak）；文件说明表（config/utils/model/data/train 五个模块职责）；一期范围与 T>=2 硬约束；后续展望（二期）；验收标准（阶段 A 必须、阶段 B 尽力）；阶段 B 结果与分析（实测 97.53%/97.20%、checkpoint SHA256、连接稀疏度口径与「未 materialize 稠密矩阵」验证）。历史：本文件原为 H-STDN 项目 README，已由 n3d_proto/README.md 覆盖迁移而来。"
     },
     {
       "path": ".gitignore",
-      "description": "项目根 git 忽略规则：Python 常规项（__pycache__、.venv、*.egg-info、build/dist）、测试与静态检查缓存、IDE/OS 文件、H-STDN 实验产物目录（outputs/runs/checkpoints/logs 及 *.log）。"
-    },
-    {
-      "path": "hstdn/__init__.py",
-      "description": "hstdn 包根（framework 模块维护）：包 docstring（权威规范、代码布局、framework 职责边界）、__version__ 0.1.0（pyproject 动态版本唯一来源）、重导出 hstdn.checks 六个公共 G0 断言函数并维护 __all__；导入轻量，供 hstdn.core/exp/data/main 复用。"
-    },
-    {
-      "path": "hstdn/checks.py",
-      "description": "framework 模块提供的轻量 G0 契约断言辅助模块（公共工具）：assert_global_ids / assert_local_ids（存储层全局 ID 与状态数组层池局部 ID 的一维整数域校验）、assert_shape / assert_dtype（形状与 dtype 精确校验）、assert_finite（NaN/Inf 有限性校验）、assert_non_decreasing（CSR indptr 等单调不减校验）；失败一律抛含可读消息与统计数值的 AssertionError；只做通用校验，业务契约断言细节由 core 模块负责；供 core/layout 与 exp/gates 复用。"
+      "description": "仓库根 git 忽略规则（保持原样、未修改）：Python 常规项（__pycache__、*.py[cod]、egg-info、build/dist）、虚拟环境、测试与静态检查缓存、IDE/OS 文件、运行产物目录（/outputs/、/runs/、/checkpoints/、/logs/、*.log——其中 /checkpoints/ 忽略使 checkpoints 下工件不进入版本控制）与 .lizhu_env/ 本地测试环境。"
     }
   ]
 }

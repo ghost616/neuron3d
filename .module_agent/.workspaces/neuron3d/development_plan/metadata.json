@@ -102,5 +102,13 @@
     "code_reviewed": true,
     "plan_completed": true,
     "test_passed": true
+  },
+  {
+    "plan_id": "plan_0c89bb64-5266-45bf-80d5-d5be9435afd0",
+    "plan_summary": "把 n3d_proto 的 README.md / requirements.txt 上移到仓库根目录并校正自指路径，删除 hstdn/ 整棵目录、pyproject.toml、5 个 H-STDN 离朱测试与 5 个旧 npz 工件，保留 .gitignore/N3D 测试/n3d_model_full.pt，最后跑冒烟测试验证",
+    "starter_session_id": "session-0e40f23a-f94e-4774-813e-bb1a3139a36a",
+    "code_reviewed": false,
+    "plan_completed": true,
+    "test_passed": true
   }
 ]

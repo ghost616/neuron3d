@@ -2,23 +2,7 @@
   "modules": [
     {
       "name": "framework",
-      "description": "系统框架模块，管理所有模块共用的文件（项目根配置、公共工具、G0 断言工具）"
-    },
-    {
-      "name": "core",
-      "description": "H-STDN 核心模拟模块（M1-M6），实现 hstdn/core/ 下全部算法：网络构建、空间哈希、输入编码、模拟内核、可塑性引擎、特征抽取、读出头、训练调度"
-    },
-    {
-      "name": "data",
-      "description": "H-STDN 数据模块，实现 hstdn/data/ 与 hstdn/bridge/：合成数据生成、MNIST 加载与池化映射、DVS-Gesture 数据管线（预留）、GPU 桥接"
-    },
-    {
-      "name": "exp",
-      "description": "H-STDN 实验与验证模块，实现 hstdn/exp/ 与 hstdn/configs/：G0-G4 门禁脚本、诊断面板、消融实验、默认超参配置"
-    },
-    {
-      "name": "main",
-      "description": "H-STDN 训练与评估入口模块：hstdn/train.py 与 hstdn/eval.py，编排 M6 训练调度器与评估流程"
+      "description": "系统框架模块，管理仓库根目录共用文件（README.md、requirements.txt、.gitignore）"
     },
     {
       "name": "n3d_proto",

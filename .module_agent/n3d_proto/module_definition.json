@@ -22,14 +22,6 @@
       "path": "n3d_proto/train.py"
     },
     {
-      "description": "N3D 一期原型文档：项目简介与设计动机（空间稀疏连接、四步闭环+残差+LayerNorm、距离衰减+可学习边权）、四步闭环 ASCII 架构示意、安装方式（pip install -r n3d_proto/requirements.txt）、两种运行方式（--smoke-test 冒烟 / 正式训练）、文件职责表、一期范围说明（静态拓扑，含 T>=2 的实测结论）、后续展望（二期动态拓扑与结构可塑性）、验收标准、阶段 B 实测结果与未达标调参建议、连接稀疏度口径矛盾的说明。",
-      "path": "n3d_proto/README.md"
-    },
-    {
-      "description": "N3D 一期原型依赖清单：torch>=2.2.0、torchvision>=0.17.0、numpy>=1.26.0（Python 3.12，CPU 优先），并说明 GPU 版本的安装指引。",
-      "path": "n3d_proto/requirements.txt"
-    },
-    {
       "description": "N3D 一期原型包声明文件，导出 config/utils/model/data/train 子模块，使 n3d_proto 可作为包导入（同时各模块保留脚本直跑兼容分支）。",
       "path": "n3d_proto/__init__.py"
     }
