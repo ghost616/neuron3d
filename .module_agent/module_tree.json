@@ -19,6 +19,10 @@
     {
       "name": "main",
       "description": "H-STDN 训练与评估入口模块：hstdn/train.py 与 hstdn/eval.py，编排 M6 训练调度器与评估流程"
+    },
+    {
+      "name": "n3d_proto",
+      "description": "N3D 一期原型模块：三维神经元空间架构（静态拓扑）的 PyTorch 实现，含配置、工具、模型、数据加载与训练入口"
     }
   ]
 }

@@ -1,0 +1,12 @@
+# N3D 一期原型（三维神经元空间架构）依赖清单
+# 目标环境：Windows / Linux + Python 3.12，CPU 训练优先
+#
+# 安装方式：
+#   pip install -r n3d_proto/requirements.txt
+#
+# 说明：torch / torchvision 默认安装 CPU wheel；若需要 GPU 版本，
+# 请按 https://pytorch.org/get-started/locally/ 提供的索引地址安装对应 CUDA 版本。
+
+torch>=2.2.0
+torchvision>=0.17.0
+numpy>=1.26.0

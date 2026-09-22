@@ -1,0 +1,265 @@
+"""N3D 一期原型（三维神经元空间架构）超参数配置层。
+
+本模块只承载超参数与常量，不含任何计算逻辑，便于契约校验与可复现性管理。
+所有超参以 Config dataclass 的字段为唯一来源，禁止在其它文件中散落魔法数字。
+
+设计要点
+--------
+* 三维空间定义在边长 L 的立方体 [0, L)^3 内；
+* 神经元坐标 neuron_pos 在空间内稀疏均匀随机分布（最小间距 min_neuron_dist）；
+* 每个神经元的输入/输出突触坐标在其神经元周围 H 半径的球体内随机分布；
+* 仅当输出突触 i 与输入突触 j 的距离 dist[i, j] <= D 时才建立连接边。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+__all__ = ["Config", "SMALL_CONFIG", "DEFAULT_CONFIG"]
+
+
+@dataclass
+class Config:
+    """N3D 一期原型的完整超参数集合。
+
+    参数
+    ----
+    N : int
+        神经元数量。默认 256。
+    y_in : int
+        每个神经元的输入突触数量。默认 8。
+    y_out : int
+        每个神经元的输出突触数量。默认 8。
+    H : float
+        突触相对所属神经元坐标的分布半径（球体内均匀采样）。默认 0.1。
+    D : float
+        连接距离阈值：输出突触与输入突触距离 <= D 才建边。默认 0.15。
+    L : float
+        三维空间边长（立方体 [0, L)^3）。默认 1.0。
+    T : int
+        四步闭环的迭代轮数。**验收/生产场景要求 T >= 2**（T=1 时末轮的 LayerNorm 与
+        阈值不会进入输出通路，其梯度恒为 None，无法满足"所有可学习参数梯度范数 > 0"）。
+        字段级校验仅强制 T >= 1，T >= 2 由 SMALL_CONFIG / DEFAULT_CONFIG 保证。默认 3。
+    input_dim : int
+        输入维度（MNIST 展平为 784）。默认 784。
+    output_dim : int
+        输出类别数（MNIST 为 10）。默认 10。
+    batch_size : int
+        批大小。默认 64。
+    lr : float
+        学习率。默认 1e-3。
+    epochs : int
+        正式训练轮数。默认 10。
+    seed : int
+        全局随机种子，控制坐标采样、权重初始化与数据打乱。默认 42。
+    device : str
+        计算设备，cpu / cuda / auto（auto 表示自动选择）。默认 auto。
+    tau_init : float
+        tau_raw 参数的初始值，tau = softplus(tau_raw) + 0.01。默认 0.2。
+    alpha : float
+        四步闭环 2d 的残差系数，s_in_next = LN(s_in_new + alpha * s_in)。默认 0.1。
+    min_neuron_dist : float
+        神经元坐标采样的最小间距，用于实现空间内稀疏分布。默认 0.08。
+    max_sample_tries : int
+        神经元坐标拒绝采样的最大尝试轮数（防止死循环）。默认 50。
+    data_root : str
+        MNIST 数据根目录（工程内已存在的 IDX 文件所在目录）。默认 data/mnist。
+    num_workers : int
+        DataLoader 工作进程数（Windows 下建议 0）。默认 0。
+    log_interval : int
+        训练日志打印间隔（按 batch 计）。默认 100。
+
+    关键不变量
+    ----------
+    * N > 0、y_in > 0、y_out > 0、T >= 1（验收场景要求 T >= 2）；
+    * H > 0、D > 0、L > 0 且 H < L；
+    * alpha >= 0；tau_init 为任意实数（经 softplus 后保证 tau > 0）。
+    """
+
+    # ---- 拓扑规模 ----
+    N: int = 256
+    y_in: int = 8
+    y_out: int = 8
+
+    # ---- 三维空间 ----
+    H: float = 0.1
+    D: float = 0.15
+    L: float = 1.0
+
+    # ---- 迭代与网络 ----
+    T: int = 3
+    input_dim: int = 784
+    output_dim: int = 10
+
+    # ---- 训练 ----
+    batch_size: int = 64
+    lr: float = 1e-3
+    epochs: int = 10
+    seed: int = 42
+    device: str = "auto"
+
+    # ---- 数值参数 ----
+    tau_init: float = 0.2
+    alpha: float = 0.1
+
+    # ---- 采样与数据 ----
+    min_neuron_dist: float = 0.08
+    max_sample_tries: int = 50
+    data_root: str = "data/mnist"
+    num_workers: int = 0
+    log_interval: int = 100
+
+    # ---- 派生量（不参与构造，供便捷访问） ----
+    _derived: dict = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """构造后校验超参合法性，并预计算派生规模量。
+
+        异常
+        ----
+        ValueError
+            任一超参越界时抛出，并附带具体数值上下文。
+        """
+        # 显式校验：把错误暴露在构造期，而不是等到张量 shape mismatch
+        if self.N <= 0:
+            raise ValueError(f"Config.N 必须为正整数，当前 N={self.N}")
+        if self.y_in <= 0:
+            raise ValueError(f"Config.y_in 必须为正整数，当前 y_in={self.y_in}")
+        if self.y_out <= 0:
+            raise ValueError(f"Config.y_out 必须为正整数，当前 y_out={self.y_out}")
+        if self.T < 1:
+            raise ValueError(f"Config.T 必须 >= 1，当前 T={self.T}")
+        if not (self.H > 0.0):
+            raise ValueError(f"Config.H 必须 > 0，当前 H={self.H}")
+        if not (self.D > 0.0):
+            raise ValueError(f"Config.D 必须 > 0，当前 D={self.D}")
+        if not (self.L > 0.0):
+            raise ValueError(f"Config.L 必须 > 0，当前 L={self.L}")
+        if not (self.H < self.L):
+            raise ValueError(
+                f"Config.H 必须小于空间边长 L，当前 H={self.H}, L={self.L}"
+            )
+        if self.alpha < 0.0:
+            raise ValueError(f"Config.alpha 必须 >= 0，当前 alpha={self.alpha}")
+        if self.batch_size <= 0:
+            raise ValueError(
+                f"Config.batch_size 必须为正整数，当前 batch_size={self.batch_size}"
+            )
+        if self.lr <= 0.0:
+            raise ValueError(f"Config.lr 必须 > 0，当前 lr={self.lr}")
+
+        # 派生规模量：输入/输出突触总数（池内全局索引空间）
+        self._derived = {
+            "n_input_syn": self.N * self.y_in,
+            "n_output_syn": self.N * self.y_out,
+        }
+
+
+    # ------------------------------------------------------------------
+    # 便捷属性
+    # ------------------------------------------------------------------
+    @property
+    def n_input_syn(self) -> int:
+        """输入突触总数 N * y_in（即 s_in 的宽度）。"""
+        return self._derived["n_input_syn"]
+
+    @property
+    def n_output_syn(self) -> int:
+        """输出突触总数 N * y_out（即 s_out 的宽度）。"""
+        return self._derived["n_output_syn"]
+
+    def to_dict(self) -> dict:
+        """返回超参字典（不含内部派生字段），便于日志打印与 checkpoint 存档。"""
+        return {
+            "N": self.N,
+            "y_in": self.y_in,
+            "y_out": self.y_out,
+            "H": self.H,
+            "D": self.D,
+            "L": self.L,
+            "T": self.T,
+            "input_dim": self.input_dim,
+            "output_dim": self.output_dim,
+            "batch_size": self.batch_size,
+            "lr": self.lr,
+            "epochs": self.epochs,
+            "seed": self.seed,
+            "device": self.device,
+            "tau_init": self.tau_init,
+            "alpha": self.alpha,
+            "min_neuron_dist": self.min_neuron_dist,
+            "max_sample_tries": self.max_sample_tries,
+            "data_root": self.data_root,
+            "num_workers": self.num_workers,
+        }
+
+    def describe(self) -> str:
+        """返回人类可读的超参摘要字符串（单行多段，便于终端输出）。"""
+        parts = [
+            f"N={self.N}",
+            f"y_in={self.y_in}",
+            f"y_out={self.y_out}",
+            f"H={self.H}",
+            f"D={self.D}",
+            f"L={self.L}",
+            f"T={self.T}",
+            f"input_dim={self.input_dim}",
+            f"output_dim={self.output_dim}",
+            f"batch_size={self.batch_size}",
+            f"lr={self.lr}",
+            f"epochs={self.epochs}",
+            f"seed={self.seed}",
+            f"device={self.device}",
+            f"tau_init={self.tau_init}",
+            f"alpha={self.alpha}",
+        ]
+        return "Config(" + ", ".join(parts) + ")"
+
+
+# ----------------------------------------------------------------------
+# 两套预设
+# ----------------------------------------------------------------------
+# SMALL_CONFIG：阶段 A 冒烟测试专用，规模小、CPU 友好
+#   N=64, y_in=4, y_out=4, T=2, batch_size=32
+# 说明：T 必须 >= 2。四步闭环中 2d 的输出（经 LayerNorm 的 s_in_next）只有在"下一轮"
+# 才会进入输出通路；若 T=1，末轮的 ln_s_in / neuron_threshold 不参与 loss 计算，
+# 其 .grad 恒为 None，无法满足"所有可学习参数梯度范数 > 0"的验收条款。
+SMALL_CONFIG = Config(
+    N=64,
+    y_in=4,
+    y_out=4,
+    H=0.15,
+    D=0.25,
+    L=1.0,
+    T=2,
+    input_dim=784,
+    output_dim=10,
+    batch_size=32,
+    lr=1e-3,
+    epochs=1,
+    seed=42,
+    device="auto",
+    tau_init=0.2,
+    alpha=0.1,
+)
+
+# DEFAULT_CONFIG：一期正式训练默认配置
+#   N=256, y_in=8, y_out=8, T=3, batch_size=64
+DEFAULT_CONFIG = Config(
+    N=256,
+    y_in=8,
+    y_out=8,
+    H=0.1,
+    D=0.15,
+    L=1.0,
+    T=3,
+    input_dim=784,
+    output_dim=10,
+    batch_size=64,
+    lr=1e-3,
+    epochs=10,
+    seed=42,
+    device="auto",
+    tau_init=0.2,
+    alpha=0.1,
+)

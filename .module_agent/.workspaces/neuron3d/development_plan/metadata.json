@@ -78,5 +78,29 @@
     "code_reviewed": true,
     "plan_completed": true,
     "test_passed": false
+  },
+  {
+    "plan_id": "plan_6070e2f5-5492-40f9-b2d8-ccb5617616b2",
+    "plan_summary": "在 n3d_proto/ 子目录从零实现三维神经元空间架构一期原型（静态拓扑）：config/utils/model/data/train/README，四步闭环稀疏前向，跑通冒烟测试",
+    "starter_session_id": "session-0e40f23a-f94e-4774-813e-bb1a3139a36a",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_27b23f41-8756-4697-9062-400313b68e9a",
+    "plan_summary": "第二轮修复：稀疏度口径回归规格公式并恢复默认冒烟退出码 0、文档口径统一、checkpoint 产物保护、重跑全量训练留存可复现工件、数据层与入口健壮性、回归验证与规格同步",
+    "starter_session_id": "session-0e40f23a-f94e-4774-813e-bb1a3139a36a",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_1210103c-9b43-48b4-be32-2099c0403bf3",
+    "plan_summary": "第三轮收尾：清理陈旧 model.pt 工件、校准 README 数据来源与措辞、完善 train.py 日志与 help、文档与实现对齐、回归验证（不改训练语义、不重训）",
+    "starter_session_id": "session-0e40f23a-f94e-4774-813e-bb1a3139a36a",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
   }
 ]

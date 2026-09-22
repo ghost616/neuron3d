@@ -1,7 +1,8 @@
 {
   "gaotao": {
     "c3633db4-e1f9-4572-8d20-d9ddbc122915": "11a47773-d983-4c54-8dd5-72008d268631",
-    "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6": "76c7557c-a67c-4ff6-8fa1-65fa65ac1167"
+    "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6": "76c7557c-a67c-4ff6-8fa1-65fa65ac1167",
+    "session-0e40f23a-f94e-4774-813e-bb1a3139a36a": "6ed3cbf2-9543-446f-aef7-d319879d95dd"
   },
   "limu": {
     "0772569c-b492-4431-893c-4e8c02e19451": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
@@ -9,12 +10,14 @@
     "c5816ba3-1f3a-4470-9e7e-45fcbe46ebe5": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
     "8f636bcb-4e5b-49c4-962e-b57ce31d053e": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
     "bd3f7659-a40a-4633-b294-28eb9acbf5b7": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
-    "36a4f51c-0b76-4e99-9c71-ef743c67cda6": "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6"
+    "36a4f51c-0b76-4e99-9c71-ef743c67cda6": "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6",
+    "0d844612-2a83-419e-b497-3d1e40567b33": "session-0e40f23a-f94e-4774-813e-bb1a3139a36a"
   },
   "lizhu": {},
   "lizhu_fengzhou": {
     "ac78845b-b080-4625-bfc5-05387969a8f9": "c3633db4-e1f9-4572-8d20-d9ddbc122915",
-    "66130322-fd64-4d82-bd85-942fab507424": "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6"
+    "66130322-fd64-4d82-bd85-942fab507424": "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6",
+    "4cd6d877-a0b7-4b09-936c-939a5a5589d9": "session-0e40f23a-f94e-4774-813e-bb1a3139a36a"
   },
   "kui": {
     "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6": "c3633db4-e1f9-4572-8d20-d9ddbc122915"

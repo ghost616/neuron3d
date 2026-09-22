@@ -127,6 +127,35 @@
           "name": "评估入口"
         }
       ]
+    },
+    {
+      "name": "n3d_proto",
+      "description": "N3D 一期原型：三维神经元空间架构（静态拓扑）的 PyTorch 实现",
+      "responsibilities": [
+        "提供三维神经元空间架构的全部超参配置（小规模验证预设与标准预设）",
+        "构建并固定神经元/输入突触/输出突触的三维坐标，预计算距离、掩码与稀疏边表",
+        "实现四步闭环稀疏前向传播（空间连接 → scatter 聚合 → 神经元激活 → broadcast 广播 + 残差 + LayerNorm）",
+        "提供边级可学习权重、温度参数与神经元阈值的参数化与统计（参数总数、连接稀疏度、平均度数、tau）",
+        "提供 MNIST 数据加载（784 维展平）与两阶段训练入口（冒烟测试 / 正式训练）"
+      ],
+      "functions": [
+        {
+          "name": "三维空间拓扑构建",
+          "description": "按 N/y_in/y_out/H/L/D 生成固定的神经元与突触坐标，预计算 dist、mask、edge_index、edge_dist 及 scatter/broadcast 映射矩阵"
+        },
+        {
+          "name": "稀疏前向传播",
+          "description": "输入编码后做 T 轮四步闭环迭代（masked softmax 稀疏传播、scatter sum、ReLU 激活、broadcast + 残差 + LayerNorm），末轮输出突触信号接输出层得到 logits"
+        },
+        {
+          "name": "拓扑与参数统计",
+          "description": "输出可学习参数总数、连接稀疏度 E/(N*y_out*N*y_in)、平均度数 E/(N*y_out) 与当前 tau 值"
+        },
+        {
+          "name": "两阶段训练入口",
+          "description": "阶段 A 冒烟测试（SMALL_CONFIG，1 epoch，校验梯度范数/loss/稀疏度/tau）；阶段 B 正式训练（DEFAULT_CONFIG，10 epoch，保存 checkpoints/model.pt）"
+        }
+      ]
     }
   ]
 }

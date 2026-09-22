@@ -1,0 +1,12 @@
+## 专长
+- PyTorch 深度学习工程：nn.Module 建模、autograd 反向传播、梯度范数诊断与数值稳定性调试
+- 稀疏神经网络实现：edge_index + scatter_add_ 消息传递、分组（segment）softmax、严格避免 materialize dense 大矩阵
+- 数值稳定性技巧：LayerNorm 归一化、softplus 参数化保证正值、softmax 分组最大值减除
+
+## 其他约定
+- 所有函数签名必须带类型注解；类与重要函数必须有 docstring；关键步骤写中文注释解释原理（尤其四步闭环的每一步）
+- 禁止用 Python for 循环遍历神经元或突触，必须向量化 / 稀疏张量操作
+- 所有随机过程由 seed 控制，保证可复现；张量统一通过 register_buffer 或 to(device) 管理，设备无关
+- 输入形状、设备一致性必须显式校验；tau 计算后必须 assert tau > 0
+- 所有代码写入 n3d_proto/ 子目录，禁止修改 hstdn/ 下既有代码与根目录既有文件
+- 执行结果必须真实：写完后实际运行冒烟测试命令，粘贴真实终端输出，禁止臆造运行结果

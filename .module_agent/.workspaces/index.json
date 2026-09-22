@@ -3,9 +3,14 @@
     {
       "name": "neuron3d",
       "created_at": "2026-09-07T10:16:45.342Z"
+    },
+    {
+      "name": "n3d_proto",
+      "created_at": "2026-09-22T10:37:45.212Z"
     }
   ],
   "bindings": {
-    "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6": "neuron3d"
+    "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6": "neuron3d",
+    "session-0e40f23a-f94e-4774-813e-bb1a3139a36a": "neuron3d"
   }
 }

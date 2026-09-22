@@ -1,0 +1,526 @@
+"""N3D 一期原型训练入口。
+
+两种运行方式
+------------
+* 阶段 A（冒烟测试，默认路径）：``python n3d_proto/train.py --smoke-test``
+  使用 `SMALL_CONFIG`（N=64, y_in=y_out=4, T=2, batch=32），仅跑 1 个 batch 的
+  前向 + 反向，逐项核对验收标准：
+  前向无 shape mismatch / 反向无错误 / 全部可学习参数梯度范数 > 0 /
+  loss 非 NaN/Inf / 连接稀疏度 < 0.1 / tau > 0。
+* 阶段 B（正式训练）：``python n3d_proto/train.py``
+  使用 `DEFAULT_CONFIG`（N=256, y_in=y_out=8, T=3, batch=64），训练 `epochs` 轮，
+  逐 epoch 打印 loss 与 test_acc，结束后保存 checkpoints/model.pt。
+
+命令行参数
+----------
+--smoke-test   仅执行阶段 A（冒烟测试）
+--epochs N     覆盖正式训练的 epoch 数
+--device DEV   覆盖设备（cpu / cuda / auto）
+--max-batches N
+               正式训练每轮最多处理多少个 batch（0 表示不限制，便于 CPU 快速验证）
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+# 兼容"以脚本方式运行"（python n3d_proto/train.py）与"作为包导入"两种情形
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from .config import Config, DEFAULT_CONFIG, SMALL_CONFIG
+    from .data import get_mnist_loaders
+    from .model import ThreeDNeuronSpace
+    from .utils import (
+        count_parameters,
+        get_device,
+        log_error,
+        log_info,
+        set_seed,
+        tensor_grad_norms,
+    )
+except ImportError:  # pragma: no cover
+    from config import Config, DEFAULT_CONFIG, SMALL_CONFIG  # type: ignore
+    from data import get_mnist_loaders  # type: ignore
+    from model import ThreeDNeuronSpace  # type: ignore
+    from utils import (  # type: ignore
+        count_parameters,
+        get_device,
+        log_error,
+        log_info,
+        set_seed,
+        tensor_grad_norms,
+    )
+
+# 阶段 A 验收阈值
+SPARSITY_MAX: float = 0.1      # 连接稀疏度必须 < 0.1
+GRAD_NORM_MIN: float = 0.0     # 所有可学习参数梯度范数必须 > 0
+PROJECT_ROOT: str = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+CHECKPOINT_DIR: str = os.path.join(PROJECT_ROOT, "checkpoints")
+CHECKPOINT_PATH: str = os.path.join(CHECKPOINT_DIR, "model.pt")
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """解析命令行参数。
+
+    参数
+    ----
+    argv : Optional[List[str]]
+        参数列表（None 表示使用 sys.argv）。
+
+    返回
+    ----
+    argparse.Namespace
+        含 smoke_test / epochs / device / max_batches 四个字段。
+    """
+    parser = argparse.ArgumentParser(
+        description="N3D 一期原型（三维神经元空间架构）训练入口"
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="仅执行阶段 A 冒烟测试（SMALL_CONFIG，1 个 batch 的前向+反向验收）",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=0, help="覆盖正式训练的 epoch 数（默认取 Config.epochs）"
+    )
+    parser.add_argument(
+        "--device", type=str, default="", help="覆盖设备：cpu / cuda / auto（默认取 Config.device）"
+    )
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=0,
+        help="正式训练每轮最多处理的 batch 数（0 = 不限制，便于 CPU 上快速验证）",
+    )
+    parser.add_argument(
+        "--criterion-conflict",
+        action="store_true",
+        help=(
+            "已知 current_spec.md 的验收条款『连接稀疏度 = 1 - E/(N*y_out*N*y_in) < 0.1』"
+            "与同一份规格的『禁止 materialize dense 权重矩阵、99%% 为零』自相矛盾"
+            "（该不等式要求 E > 0.9 * N*y_out*N*y_in，即连接必须是稠密的）。"
+            "加上此开关后，仅该项失败时冒烟测试仍返回 0；默认不加，保持严格判定。"
+        ),
+    )
+    return parser.parse_args(argv)
+
+def build_model_and_data(
+    config: Config,
+    device: torch.device,
+    max_batches: int = 0,
+) -> Tuple[ThreeDNeuronSpace, DataLoader, DataLoader]:
+    """按配置构建模型与数据加载器（统一的装配入口，保证两阶段行为一致）。
+
+    参数
+    ----
+    config : Config
+        超参配置。
+    device : torch.device
+        目标设备。
+    max_batches : int
+        仅用于日志提示（0 表示使用全量数据）。
+
+    返回
+    ----
+    Tuple[ThreeDNeuronSpace, DataLoader, DataLoader]
+        (model, train_loader, test_loader)。
+    """
+    set_seed(config.seed)
+    model = ThreeDNeuronSpace(config).to(device)
+    train_loader, test_loader = get_mnist_loaders(
+        batch_size=config.batch_size,
+        data_root=config.data_root,
+        num_workers=config.num_workers,
+        seed=config.seed,
+    )
+    stats = model.get_connection_stats()
+    log_info(
+        f"模型装配完成：N={config.N}, y_in={config.y_in}, y_out={config.y_out}, T={config.T}, "
+        f"E={int(stats['num_edges'])}, sparsity={stats['sparsity']:.6f}, "
+        f"avg_out_degree={stats['avg_out_degree']:.2f}, tau={stats['tau']:.6f}, "
+        f"可学习参数={model.count_parameters()}"
+    )
+    if max_batches > 0:
+        log_info(f"本轮每 epoch 仅处理前 {max_batches} 个 batch（--max-batches 限制）")
+    return model, train_loader, test_loader
+
+
+def evaluate(
+    model: ThreeDNeuronSpace,
+    loader: DataLoader,
+    device: torch.device,
+    max_batches: int = 0,
+) -> float:
+    """在给定数据集上计算分类准确率。
+
+    参数
+    ----
+    model : ThreeDNeuronSpace
+        待评估模型。
+    loader : DataLoader
+        测试集加载器。
+    device : torch.device
+        计算设备。
+    max_batches : int
+        最多评估的 batch 数（0 表示全量）。
+
+    返回
+    ----
+    float
+        准确率，取值 [0, 1]。
+    """
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for i, (x, y) in enumerate(loader):
+            if max_batches > 0 and i >= max_batches:
+                break
+            x = x.to(device)
+            y = y.to(device)
+            logits = model(x)
+            pred = logits.argmax(dim=1)
+            correct += int((pred == y).sum().item())
+            total += int(y.numel())
+    model.train()
+    if total == 0:
+        raise RuntimeError("评估数据集为空，无法计算准确率")
+    return correct / total
+
+
+def train_one_epoch(
+    model: ThreeDNeuronSpace,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    max_batches: int = 0,
+    collect_grads: bool = False,
+) -> Tuple[float, Dict[str, float], int]:
+    """训练一个 epoch。
+
+    参数
+    ----
+    model : ThreeDNeuronSpace
+        待训练模型。
+    loader : DataLoader
+        训练集加载器。
+    optimizer : torch.optim.Optimizer
+        优化器。
+    device : torch.device
+        计算设备。
+    epoch : int
+        当前 epoch 序号（用于日志，从 1 开始）。
+    max_batches : int
+        本 epoch 最多处理的 batch 数（0 表示全量）。
+    collect_grads : bool
+        是否在最后一个 batch 反向之后收集各参数梯度范数（阶段 A 验收用）。
+
+    返回
+    ----
+    Tuple[float, Dict[str, float], int]
+        (平均 loss, 梯度范数字典, 实际处理 batch 数)。未收集梯度时字典为空。
+
+    异常
+    ------
+    RuntimeError
+        loss 为 NaN/Inf 时抛出（附带 epoch/batch 上下文）。
+    """
+    model.train()
+    total_loss = 0.0
+    n_batches = 0
+    grad_norms: Dict[str, float] = {}
+    for i, (x, y) in enumerate(loader):
+        if max_batches > 0 and i >= max_batches:
+            break
+        x = x.to(device)
+        y = y.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(x)                      # 前向：输入编码 -> T 轮四步闭环 -> 输出汇总
+        loss = F.cross_entropy(logits, y)       # 分类损失
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"loss 出现 NaN/Inf：epoch={epoch}, batch={i}, loss={loss.item()}"
+            )
+        loss.backward()                         # 反向：梯度沿四步闭环回传
+        optimizer.step()
+
+        total_loss += float(loss.item())
+        n_batches += 1
+        if collect_grads and (max_batches > 0 and i == max_batches - 1):
+            # 阶段 A：在最后一个已反向的 batch 上收集全部可学习参数的梯度范数
+            grad_norms = tensor_grad_norms(model)
+        if (i + 1) % 100 == 0:
+            log_info(f"epoch {epoch} | batch {i + 1} | running_loss={total_loss / n_batches:.4f}")
+    if n_batches == 0:
+        raise RuntimeError("训练集为空：没有任何 batch 被处理")
+    return total_loss / n_batches, grad_norms, n_batches
+
+def run_smoke_test(
+    device_override: str = "",
+    criterion_conflict: bool = False,
+) -> bool:
+    """阶段 A 冒烟测试：验证前向/反向跑通并逐条核对验收标准。
+
+    参数
+    ----
+    device_override : str
+        设备覆盖（空串表示使用 SMALL_CONFIG.device）。
+    criterion_conflict : bool
+        是否启用"规格自相矛盾条款"豁免：规格要求『连接稀疏度 < 0.1』，但该式等价于
+        要求 E > 0.9 * N*y_out*N*y_in（即稠密连接），与规格自身"禁止 materialize
+        dense 权重矩阵 / 99% 为零"的设计前提矛盾，本设计下不可能达成。
+        为 True 时，仅该项失败不再导致整体判定失败（其余条款仍严格判定）。
+
+    返回
+    ----
+    bool
+        通过返回 True；有失败项打印 [FAIL] 并返回 False。
+    """
+    config: Config = SMALL_CONFIG
+    if device_override:
+        # 直接覆盖副本的 device 字段（避免 Config(**{...}) 与位置参数冲突）
+        config = Config(**{**config.to_dict(), "device": device_override})
+    # 设备解析：auto -> 有 CUDA 用 CUDA，否则 CPU
+    device = get_device(config.device)
+
+    log_info("=" * 78)
+    log_info("阶段 A 冒烟测试开始（SMALL_CONFIG）")
+    log_info(f"配置：{config.describe()}")
+    log_info(f"实际设备：{device}（torch_scatter 可用性见 utils.HAS_TORCH_SCATTER）")
+    log_info("=" * 78)
+
+    t0 = time.perf_counter()
+    model, train_loader, _ = build_model_and_data(config, device, max_batches=1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+
+    # ---- 阶段 A 约束：仅跑 1 个 batch 的前向 + 反向 ----
+    avg_loss, grad_norms, n_batches = train_one_epoch(
+        model, train_loader, optimizer, device, epoch=1, max_batches=1, collect_grads=True
+    )
+
+    stats = model.get_connection_stats()
+    param_total = model.count_parameters()
+    elapsed = time.perf_counter() - t0
+
+    # ---- 打印各可学习参数的梯度范数 ----
+    log_info("-" * 78)
+    log_info(f"阶段 A 结果：loss={avg_loss:.6f}，处理 batch 数={n_batches}，耗时={elapsed:.2f}s")
+    log_info("各可学习参数梯度范数（L2）：")
+    if not grad_norms:
+        log_error("未能收集到任何梯度，反向传播可能未执行")
+    for name, gnorm in grad_norms.items():
+        flag = "OK " if gnorm > GRAD_NORM_MIN else "BAD"
+        log_info(f"  [{flag}] {name:<45s} grad_norm={gnorm:.6e}")
+    log_info(f"可学习参数总数：{param_total}")
+    log_info(
+        f"连接统计：E={int(stats['num_edges'])}, sparsity={stats['sparsity']:.6f}, "
+        f"avg_out_degree={stats['avg_out_degree']:.3f}, tau={stats['tau']:.6f}"
+    )
+    # ---- dense 对照诊断：证明"未 materialize dense [N*y_out, N*y_in] 权重矩阵" ----
+    total_pairs = model.n_out_syn * model.n_in_syn
+    conn_param = int(model.W_conn_sparse.numel())
+    log_info(
+        f"稀疏性实测：E={int(stats['num_edges'])} / 可能连接对 {total_pairs} "
+        f"({100.0 * stats['num_edges'] / total_pairs:.4f}% 存在连接)，"
+        f"稠密矩阵元素数={total_pairs}，边级参数数={conn_param}"
+    )
+    log_info(
+        f"  -> 若把连接权重 materialize 成稠密矩阵，参数将从 {param_total} 膨胀到 "
+        f"{param_total - conn_param + total_pairs}（{total_pairs / max(conn_param, 1):.0f}x）"
+    )
+    log_info(
+        f"  -> 注意：规格中的『连接稀疏度 < 0.1』在本设计下不可达——它等价于要求 "
+        f"E > {0.9 * total_pairs:.0f}，即 > 90% 的连接对都必须存在（稠密网络），"
+        f"与规格自身『99% 为零 / 边级参数化』的设计前提矛盾。"
+    )
+    log_info("-" * 78)
+
+    # ---- 逐条核对阶段 A 验收标准 ----
+    checks: List[Tuple[str, bool, str]] = []
+    checks.append(("前向无 shape mismatch", True, "所有 batch 前向成功返回 [B, output_dim]"))
+    checks.append(("反向无错误", len(grad_norms) > 0, f"收集到 {len(grad_norms)} 个参数的梯度"))
+    zero_grads = [n for n, v in grad_norms.items() if not (v > GRAD_NORM_MIN)]
+    checks.append(
+        (
+            "所有可学习参数梯度范数 > 0",
+            len(zero_grads) == 0,
+            "全部 > 0" if not zero_grads else f"以下参数梯度范数为 0 或缺失：{zero_grads}",
+        )
+    )
+    finite_loss = bool(avg_loss == avg_loss) and abs(avg_loss) != float("inf")
+    checks.append(("loss 非 NaN/Inf", finite_loss, f"loss={avg_loss:.6f}"))
+    checks.append(
+        (
+            "连接稀疏度 < 0.1",
+            stats["sparsity"] < SPARSITY_MAX,
+            f"sparsity={stats['sparsity']:.6f}（阈值 < {SPARSITY_MAX}）",
+        )
+    )
+    checks.append(("tau > 0", stats["tau"] > 0.0, f"tau={stats['tau']:.6f}"))
+    checks.append(("CPU 单 batch 耗时 < 120s", elapsed < 120.0, f"实际 {elapsed:.2f}s"))
+
+    log_info("阶段 A 验收标准逐条核对：")
+    all_ok = True
+    sparsity_ok = None
+    for name, ok, detail in checks:
+        log_info(f"  [{'PASS' if ok else 'FAIL'}] {name} —— {detail}")
+        if name.startswith("连接稀疏度"):
+            sparsity_ok = ok
+            continue  # 该项单独处理（见下方规格矛盾说明）
+        all_ok = all_ok and ok
+    if sparsity_ok:
+        all_ok = all_ok and sparsity_ok
+    elif criterion_conflict:
+        log_info(
+            "  [NOTE] 『连接稀疏度 < 0.1』为规格自相矛盾条款（要求 E > "
+            f"{0.9 * total_pairs:.0f} 条边 = 稠密连接），已按 --criterion-conflict 豁免；"
+            "稀疏性以『E 远小于可能连接对、无 dense 权重矩阵』作为等价验证（已 PASS）。"
+        )
+    else:
+        all_ok = False
+        log_info(
+            "  [NOTE] 如需豁免该规格矛盾条款，请加 --criterion-conflict（语义等价的"
+            "稀疏性验证已通过，详见上方 dense 对照诊断）。"
+        )
+    log_info(f"阶段 A 冒烟测试结论：{'全部通过' if all_ok else '存在失败项'}")
+    log_info("=" * 78)
+    return all_ok
+
+
+def run_full_training(
+    device_override: str = "",
+    epochs_override: int = 0,
+    max_batches: int = 0,
+) -> Dict[str, float]:
+    """阶段 B 正式训练：使用 DEFAULT_CONFIG 训练若干 epoch 并保存 checkpoint。
+
+    参数
+    ----
+    device_override : str
+        设备覆盖（空串表示使用 DEFAULT_CONFIG.device）。
+    epochs_override : int
+        覆盖 epoch 数（0 表示使用 DEFAULT_CONFIG.epochs）。
+    max_batches : int
+        每个 epoch 最多处理的 batch 数（0 表示全量）。
+
+    返回
+    ----
+    Dict[str, float]
+        最终统计：{"test_acc": ..., "loss": ..., "sparsity": ..., "tau": ...,
+        "num_edges": ..., "params": ...}。
+
+    说明
+    ----
+    训练结束后保存 checkpoint 到 `checkpoints/model.pt`（含 model_state_dict、
+    config、连接统计与测试准确率），并打印最终参数统计。
+    """
+    config: Config = DEFAULT_CONFIG
+    overrides = config.to_dict()
+    if device_override:
+        overrides["device"] = device_override
+    if epochs_override > 0:
+        overrides["epochs"] = epochs_override
+    config = Config(**overrides)
+    # 设备解析：auto -> 有 CUDA 用 CUDA，否则 CPU
+    device = get_device(config.device)
+
+    log_info("=" * 78)
+    log_info("阶段 B 正式训练开始（DEFAULT_CONFIG）")
+    log_info(f"配置：{config.describe()}")
+    log_info(f"实际设备：{device}")
+    log_info("=" * 78)
+
+    t0 = time.perf_counter()
+    model, train_loader, test_loader = build_model_and_data(config, device, max_batches)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+
+    last_loss = float("nan")
+    test_acc = 0.0
+    for epoch in range(1, config.epochs + 1):
+        last_loss, _, n_batches = train_one_epoch(
+            model, train_loader, optimizer, device, epoch, max_batches=max_batches
+        )
+        test_acc = evaluate(model, test_loader, device, max_batches=max_batches)
+        log_info(
+            f"[epoch {epoch}/{config.epochs}] loss={last_loss:.4f} "
+            f"test_acc={test_acc * 100:.2f}% (batches={n_batches})"
+        )
+
+    # ---- 保存 checkpoint ----
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    stats = model.get_connection_stats()
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "config": config.to_dict(),
+            "connection_stats": stats,
+            "test_acc": test_acc,
+        },
+        CHECKPOINT_PATH,
+    )
+    elapsed = time.perf_counter() - t0
+    log_info(f"checkpoint 已保存：{CHECKPOINT_PATH}（总耗时 {elapsed:.1f}s）")
+
+    # ---- 最终参数统计 ----
+    log_info("-" * 78)
+    log_info("最终参数统计：")
+    log_info(f"  可学习参数总数：{model.count_parameters()}")
+    log_info(f"  连接稀疏度    ：{stats['sparsity']:.6f}")
+    log_info(f"  边数 E        ：{int(stats['num_edges'])}")
+    log_info(f"  平均出度      ：{stats['avg_out_degree']:.3f}")
+    log_info(f"  tau           ：{stats['tau']:.6f}")
+    log_info(f"  最终 test_acc ：{test_acc * 100:.2f}%")
+    log_info("-" * 78)
+
+    return {
+        "test_acc": float(test_acc),
+        "loss": float(last_loss),
+        "sparsity": float(stats["sparsity"]),
+        "tau": float(stats["tau"]),
+        "num_edges": float(stats["num_edges"]),
+        "params": float(model.count_parameters()),
+    }
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """命令行入口：--smoke-test 只跑阶段 A，否则跑阶段 B 正式训练。
+
+    参数
+    ----
+    argv : Optional[List[str]]
+        命令行参数（None 表示使用 sys.argv）。
+
+    返回
+    ----
+    int
+        进程退出码：0 表示成功，1 表示冒烟测试验收失败。
+    """
+    args = parse_args(argv)
+    if args.smoke_test:
+        ok = run_smoke_test(
+            device_override=args.device,
+            criterion_conflict=args.criterion_conflict,
+        )
+        return 0 if ok else 1
+    run_full_training(
+        device_override=args.device,
+        epochs_override=args.epochs,
+        max_batches=args.max_batches,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

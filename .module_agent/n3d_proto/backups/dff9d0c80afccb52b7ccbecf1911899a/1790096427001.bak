@@ -1,0 +1,479 @@
+"""N3D 一期原型核心模型：三维神经元空间（静态拓扑）。
+
+张量形状契约（严格遵循 current_spec.md 的"数据结构与张量形状总表"）
+-----------------------------------------------------------------
+| 名称                     | 形状                  | 类型      |
+|--------------------------|-----------------------|-----------|
+| neuron_pos               | [N, 3]                | buffer    |
+| input_syn_pos            | [N*y_in, 3]           | buffer    |
+| output_syn_pos           | [N*y_out, 3]          | buffer    |
+| dist                     | [N*y_out, N*y_in]     | buffer    |
+| mask                     | [N*y_out, N*y_in]     | buffer    |
+| edge_index               | [2, E]                | buffer    |
+| edge_dist                | [E]                   | buffer    |
+| W_conn_sparse            | [E]                   | Parameter |
+| tau_raw                  | 标量                  | Parameter |
+| neuron_threshold         | [N]                   | Parameter |
+| W_in                     | [input_dim, N*y_in]   | Parameter |
+| W_out                    | [N*y_out, output_dim] | Parameter |
+| scatter_out_to_neuron    | [N, N*y_out]          | buffer    |
+| broadcast_neuron_to_in   | [N*y_in, N]           | buffer    |
+
+四步闭环（每一轮 T 的实现位置见 `forward`）
+------------------------------------------
+* 2a 稀疏空间连接（`sparse_propagate`）：对每个输出突触 o，在其连接的输入突触集合上
+  做 masked softmax，得到 s_out[b, o] = Σ_j w_oj · s_in[b, j]；
+* 2b 输出突触 -> 神经元（scatter sum）：`sparse_aggregate`，neuron_input = Σ_{o∈n} s_out；
+* 2c 神经元激活：a = ReLU(neuron_input + neuron_threshold)；
+* 2d 神经元 -> 输入突触（broadcast）+ 残差 + LayerNorm：
+  s_in_next = LN(sparse_broadcast(a) + alpha · s_in)，残差系数 alpha 默认 0.1。
+
+稀疏实现约束
+------------
+禁止 materialize dense [N*y_out, N*y_in] 权重矩阵（N=256, y=8 时达 4M 元素且 99% 为零）。
+连接权重以边级参数 `W_conn_sparse` [E] 表示，2b/2d 分别用 `index_add_` / `index_select`
+实现，复杂度均为 O(B · N · y)。
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+try:  # 兼容"以脚本方式直接运行 n3d_proto/model.py"与"作为包导入"两种情形
+    from .config import Config, DEFAULT_CONFIG
+    from .utils import (
+        build_edge_index_from_dist,
+        connection_sparsity,
+        log_warn,
+        segment_softmax,
+        sparse_aggregate,
+        sparse_broadcast,
+    )
+except ImportError:  # pragma: no cover
+    from config import Config, DEFAULT_CONFIG  # type: ignore
+    from utils import (  # type: ignore
+        build_edge_index_from_dist,
+        connection_sparsity,
+        log_warn,
+        segment_softmax,
+        sparse_aggregate,
+        sparse_broadcast,
+    )
+
+__all__ = ["ThreeDNeuronSpace", "NEURON_THRESHOLD_INIT"]
+
+# 神经元阈值初始值（正偏置）：保证 2c 的 ReLU 在训练初期不会被完全抑制，
+# 避免 neuron_threshold / ln_s_in 参数梯度为 0（初期激活通过率约 40%~60%）。
+NEURON_THRESHOLD_INIT: float = 0.1
+
+
+class ThreeDNeuronSpace(nn.Module):
+    """三维神经元空间网络（一期静态拓扑原型）。
+
+    参数
+    ----
+    config : Config
+        超参配置对象（见 `n3d_proto/config.py`）。
+
+    关键不变量
+    ----------
+    * `dist` / `mask` / `edge_index` / `edge_dist` / `scatter_out_to_neuron` /
+      `broadcast_neuron_to_in` 全部在 `__init__` 中预计算并注册为 buffer，
+      `forward` 中不得重算；
+    * `tau = softplus(tau_raw) + 0.01`，构造后立即断言 `tau > 0`；
+    * 边数 E > 0（拓扑为空时直接抛异常，避免训练出无意义结果）。
+    """
+
+    def __init__(self, config: Config = DEFAULT_CONFIG) -> None:
+        super().__init__()
+        self.config = config
+        self.N: int = config.N
+        self.y_in: int = config.y_in
+        self.y_out: int = config.y_out
+        self.T: int = config.T
+        self.alpha: float = config.alpha
+        self.n_in_syn: int = config.n_input_syn   # N * y_in
+        self.n_out_syn: int = config.n_output_syn  # N * y_out
+        # 用 config.seed 派生的局部生成器采样固定坐标，保证模块级可复现且不扰动全局随机状态
+        gen = torch.Generator(device="cpu").manual_seed(int(config.seed))
+
+        # ---------------- 固定三维坐标（buffer，不参与训练） ----------------
+        neuron_pos = self._sample_neuron_positions(gen)
+        # 输入/输出突触坐标：在所属神经元 H 半径的球体内均匀采样
+        input_syn_pos = self._sample_synapse_positions(neuron_pos, self.y_in, gen)
+        output_syn_pos = self._sample_synapse_positions(neuron_pos, self.y_out, gen)
+        self.register_buffer("neuron_pos", neuron_pos, persistent=True)
+        self.register_buffer("input_syn_pos", input_syn_pos, persistent=True)
+        self.register_buffer("output_syn_pos", output_syn_pos, persistent=True)
+
+        # ---------------- 预计算拓扑（全部在 __init__ 完成） ----------------
+        # dist[o, j] = ||output_syn_pos[o] - input_syn_pos[j]||，形状 [N*y_out, N*y_in]
+        dist = torch.cdist(output_syn_pos, input_syn_pos, p=2)
+        mask, edge_index, edge_dist = build_edge_index_from_dist(dist, config.D)
+        self.register_buffer("dist", dist, persistent=True)
+        self.register_buffer("mask", mask, persistent=True)
+        self.register_buffer("edge_index", edge_index, persistent=True)
+        self.register_buffer("edge_dist", edge_dist, persistent=True)
+        self.num_edges: int = int(edge_index.shape[1])
+
+        # 预计算的两个映射算子（稠密 0/1 标记矩阵，非零元个数 = 突触数，本身并不稠密）
+        # scatter_out_to_neuron[n, o] = 1 当且仅当输出突触 o 属于神经元 n
+        neuron_of_output_syn = torch.arange(
+            self.n_out_syn, dtype=torch.long
+        ) // self.y_out
+        # broadcast_neuron_to_in[i, n] = 1 当且仅当输入突触 i 属于神经元 n
+        neuron_of_input_syn = torch.arange(self.n_in_syn, dtype=torch.long) // self.y_in
+        scatter_out_to_neuron = torch.zeros(
+            (self.N, self.n_out_syn), dtype=dist.dtype
+        )
+        scatter_out_to_neuron[
+            neuron_of_output_syn, torch.arange(self.n_out_syn, dtype=torch.long)
+        ] = 1.0
+        broadcast_neuron_to_in = torch.zeros(
+            (self.n_in_syn, self.N), dtype=dist.dtype
+        )
+        broadcast_neuron_to_in[
+            torch.arange(self.n_in_syn, dtype=torch.long), neuron_of_input_syn
+        ] = 1.0
+        self.register_buffer("scatter_out_to_neuron", scatter_out_to_neuron, persistent=True)
+        self.register_buffer("broadcast_neuron_to_in", broadcast_neuron_to_in, persistent=True)
+        # 下面两个整型映射是 2b/2d 的高效稀疏算子索引，随模型一起搬到目标设备
+        self.register_buffer("neuron_of_output_syn", neuron_of_output_syn, persistent=True)
+        self.register_buffer("neuron_of_input_syn", neuron_of_input_syn, persistent=True)
+
+        # ---------------- 可学习参数 ----------------
+        # 边级参数化：每条边一个权重（禁止 dense [N*y_out, N*y_in] 矩阵）
+        self.W_conn_sparse = nn.Parameter(torch.zeros(self.num_edges))
+        # tau = softplus(tau_raw) + 0.01 > 0 恒成立
+        self.tau_raw = nn.Parameter(torch.tensor(float(config.tau_init)))
+        # 神经元阈值（2c 中的正偏置）：初始化为正值常数，保证 ReLU 初期有激活、
+        # 从而 neuron_threshold / ln_s_in 等参数都能拿到非零梯度（否则死 ReLU 会使
+        # 这些参数的 .grad 为 None，违反"所有可学习参数梯度范数 > 0"的验收条款）
+        self.neuron_threshold = nn.Parameter(
+            torch.full((self.N,), NEURON_THRESHOLD_INIT)
+        )
+        self.W_in = nn.Parameter(torch.empty(config.input_dim, self.n_in_syn))
+        self.W_out = nn.Parameter(torch.empty(self.n_out_syn, config.output_dim))
+        self._init_parameters()
+
+        # 输入突触信号的层归一化：抑制纯线性迭代导致的信号坍缩/爆炸
+        self.ln_s_in = nn.LayerNorm(self.n_in_syn)
+
+        # 数值契约：构造后立即验证 tau > 0
+        tau = self.current_tau()
+        assert tau > 0.0, f"[契约失败] tau 必须 > 0，当前 tau={tau}"
+
+    # ==================================================================
+    # 坐标采样（仅在 __init__ 中调用）
+    # ==================================================================
+    def _sample_neuron_positions(self, gen: torch.Generator) -> torch.Tensor:
+        """在边长 L 的立方体内采样 N 个神经元坐标（带最小间距的稀疏分布）。
+
+        算法：逐神经元向量化拒绝采样——每轮为"尚未安置"的神经元一次性采样一批候选，
+        检查其与固定神经元集合的最小距离是否满足 `min_neuron_dist`，满足者安置并固定，
+        不满足者进入下一轮。整个过程是"轮 × 批量"的向量化操作，没有按神经元逐个循环。
+
+        参数
+        ----
+        gen : torch.Generator
+            由 config.seed 派生的随机生成器。
+
+        返回
+        ----
+        torch.Tensor
+            形状 [N, 3] 的神经元坐标。
+
+        异常
+        ------
+        ValueError
+            若达到 `max_sample_tries` 轮后仍有神经元无法安置（空间过密），
+            给出可读错误并提示调小 `min_neuron_dist` 或减小 N。
+        """
+        L = float(self.config.L)
+        min_dist = float(self.config.min_neuron_dist)
+        # 初始坐标：立方体内均匀随机
+        positions = torch.rand((self.N, 3), generator=gen) * L
+        placed = torch.zeros(self.N, dtype=torch.bool)
+        placed[0] = True  # 第一个神经元直接安置，作为拒绝采样的种子
+        remaining = torch.nonzero(~placed, as_tuple=False).reshape(-1)
+
+        if min_dist > 0.0:
+            for _ in range(int(self.config.max_sample_tries)):
+                if remaining.numel() == 0:
+                    break
+                # 为所有未安置神经元一次性生成候选坐标 [R, 3]
+                cand = torch.rand((remaining.numel(), 3), generator=gen) * L
+                placed_pos = positions[placed]  # [P, 3]
+                # 候选与已安置点的两两距离平方 [R, P]
+                d2 = torch.cdist(cand, placed_pos, p=2)
+                ok = (d2.min(dim=1).values >= min_dist)
+                if ok.any():
+                    idx = remaining[ok]
+                    positions[idx] = cand[ok]
+                    placed[idx] = True
+                    remaining = torch.nonzero(~placed, as_tuple=False).reshape(-1)
+            if remaining.numel() > 0:
+                raise ValueError(
+                    f"神经元坐标采样失败：{remaining.numel()}/{self.N} 个神经元在 "
+                    f"{self.config.max_sample_tries} 轮内无法满足最小间距 "
+                    f"min_neuron_dist={min_dist}（空间边长 L={L}）。"
+                    f"请调小 min_neuron_dist 或减小 N。"
+                )
+        return positions
+
+    def _sample_synapse_positions(
+        self,
+        neuron_pos: torch.Tensor,
+        y: int,
+        gen: torch.Generator,
+    ) -> torch.Tensor:
+        """在所属神经元 H 半径的球体内均匀采样突触坐标。
+
+        参数
+        ----
+        neuron_pos : torch.Tensor
+            形状 [N, 3] 的神经元坐标。
+        y : int
+            每个神经元的突触数量（输入 y_in 或输出 y_out）。
+        gen : torch.Generator
+            随机生成器。
+
+        返回
+        ----
+        torch.Tensor
+            形状 [N*y, 3] 的突触坐标；第 n*y + k 行属于神经元 n。
+            采样方式：方向在单位球面上均匀（正态归一化），半径 r = H * u^(1/3) 保证
+            球体内体积均匀。
+        """
+        H = float(self.config.H)
+        n = neuron_pos.shape[0]
+        direction = torch.randn((n, y, 3), generator=gen)
+        direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        u = torch.rand((n, y, 1), generator=gen)
+        radius = H * u.pow(1.0 / 3.0)
+        pos = neuron_pos.unsqueeze(1) + direction * radius
+        return pos.reshape(n * y, 3).contiguous()
+
+    # ==================================================================
+    # 参数初始化与数值量
+    # ==================================================================
+    def _init_parameters(self) -> None:
+        """初始化全部可学习参数（由 config.seed 保证可复现）。
+
+        * `W_in`：LeCun 风格正态初始化，std = 1/sqrt(fan_in)，保证叠加方差可控；
+        * `W_out`：Xavier 均匀初始化；
+        * `W_conn_sparse`：零初始化（softmax 权重初始即为"按距离的 Boltzmann 分布"）；
+        * `tau_raw`：由 `config.tau_init` 决定；
+        * `neuron_threshold`：初始化为正偏置 NEURON_THRESHOLD_INIT，保证初期存在激活。
+        """
+        c = self.config
+        gen = torch.Generator(device="cpu").manual_seed(int(c.seed) + 1)
+        with torch.no_grad():
+            std = 1.0 / math.sqrt(float(c.input_dim))
+            self.W_in.normal_(0.0, std, generator=gen)
+            # Xavier 均匀：bound = sqrt(6 / (fan_in + fan_out))
+            fan_in, fan_out = self.n_out_syn, int(c.output_dim)
+            bound = math.sqrt(6.0 / float(fan_in + fan_out))
+            self.W_out.uniform_(-bound, bound, generator=gen)
+            self.W_conn_sparse.zero_()
+            self.neuron_threshold.fill_(NEURON_THRESHOLD_INIT)
+            self.tau_raw.fill_(float(c.tau_init))
+
+    def current_tau(self) -> float:
+        """返回当前 tau 的数值（= softplus(tau_raw) + 0.01 > 0）。"""
+        return float((F.softplus(self.tau_raw) + 0.01).item())
+    # ==================================================================
+    # 步骤 2a：稀疏空间连接（masked softmax）
+    # ==================================================================
+    def sparse_propagate(self, s_in: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+        """步骤 2a：按边索引做 masked softmax 的空间连接传播（稀疏实现）。
+
+        数学形式
+        --------
+        对每个输出突触 o：
+            logits_oj = -dist[o, j] / tau + W_conn[o, j]
+            w_oj      = exp(logits_oj - m_o) / Σ_{j' ∈ conn(o)} exp(logits_oj' - m_o)
+            s_out[b, o] = Σ_{j ∈ conn(o)} w_oj · s_in[b, j]
+        其中 conn(o) 是输出突触 o 连接的输入突触集合（mask=1 的边）。
+
+        参数
+        ----
+        s_in : torch.Tensor
+            形状 [B, N*y_in] 的输入突触信号。
+        tau : torch.Tensor
+            标量张量，tau > 0，距离衰减温度。
+
+        返回
+        ----
+        torch.Tensor
+            形状 [B, N*y_out] 的输出突触信号。
+
+        关键不变量
+        ----------
+        * 归一化按 `edge_index[0]`（输出突触）分组——即"对每个输出突触，在其连接的
+          输入突触上做 softmax"，禁止反向分组、禁止全局 softmax；
+        * 仅遍历 E 条边，**不构造 dense [N*y_out, N*y_in] 权重矩阵**。
+        """
+        # ---- 形状与设备一致性校验（契约） ----
+        if s_in.dim() != 2:
+            raise ValueError(f"s_in 必须为 2D [B, N*y_in]，当前 shape={tuple(s_in.shape)}")
+        if s_in.shape[1] != self.n_in_syn:
+            raise ValueError(
+                f"s_in 第二维必须为 N*y_in={self.n_in_syn}，当前 {s_in.shape[1]}"
+            )
+        if s_in.device != self.edge_dist.device:
+            raise ValueError(
+                f"设备不一致：s_in 在 {s_in.device}，模型拓扑 buffer 在 "
+                f"{self.edge_dist.device}，请先 model.to(device) 或 x.to(device)"
+            )
+        assert tau > 0, f"[契约失败] sparse_propagate 要求 tau > 0，当前 tau={tau}"
+
+        # ---- 边级 logits：-dist/tau + 可学习边权 ----
+        edge_logits = -self.edge_dist / tau + self.W_conn_sparse
+        # 分组 softmax（分组 = 输出突触）；mask 已体现在"哪些边存在"上
+        edge_weight = segment_softmax(edge_logits, self.edge_index[0], self.n_out_syn)
+
+        # ---- 消息传递：msgs[e] = w_e * s_in[:, edge_index[1][e]] ----
+        msg = s_in.index_select(1, self.edge_index[1]) * edge_weight.unsqueeze(0)
+        # ---- 稀疏聚合到输出突触（scatter_add 语义） ----
+        s_out = torch.zeros(
+            (s_in.shape[0], self.n_out_syn), dtype=s_in.dtype, device=s_in.device
+        )
+        s_out = s_out.index_add(1, self.edge_index[0], msg)
+        return s_out
+
+    # ==================================================================
+    # 前向传播：输入编码 -> T 轮四步闭环 -> 输出汇总
+    # ==================================================================
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播：严格按"输入编码 -> T 轮四步闭环 -> 输出汇总"实现。
+
+        参数
+        ----
+        x : torch.Tensor
+            形状 [B, input_dim] 的输入特征（MNIST 已展平为 784 维）。
+
+        返回
+        ----
+        torch.Tensor
+            形状 [B, output_dim] 的分类 logits。
+
+        流程
+        ----
+        1. 输入编码：s_in = x @ W_in，[B, input_dim] -> [B, N*y_in]；
+        2. 迭代 T 轮四步闭环：
+           2a s_out  = sparse_propagate(s_in, tau)          # 稀疏空间连接
+           2b n_inp  = sparse_aggregate(s_out, ...)          # scatter sum 到神经元
+           2c a      = ReLU(n_inp + neuron_threshold)        # 神经元激活
+           2d s_in   = LN(sparse_broadcast(a, ...) + alpha * s_in)  # 广播 + 残差 + LN
+        3. 输出汇总：用最后一轮 2a 得到的 s_out 接输出层，logits = s_out @ W_out。
+
+        说明
+        ----
+        当 T 轮迭代全部结束后，最后一步 2d 只更新了输入突触信号；为了让"输出突触"
+        与最终状态一致，这里额外执行一次 2a（T 轮的最后一轮内则复用该结果），
+        因此 `logits` 使用的是【最终轮 2a】的输出突触信号，符合规格第 3 条。
+        """
+        # ---- 形状与设备一致性校验（契约） ----
+        if not torch.is_tensor(x):
+            raise TypeError(f"forward 输入必须为 torch.Tensor，当前类型 {type(x).__name__}")
+        if x.dim() != 2:
+            raise ValueError(f"输入必须为 2D [B, input_dim]，当前 shape={tuple(x.shape)}")
+        if x.shape[1] != self.config.input_dim:
+            raise ValueError(
+                f"输入第二维必须为 input_dim={self.config.input_dim}，当前 {x.shape[1]}"
+            )
+        if x.device != self.W_in.device:
+            raise ValueError(
+                f"设备不一致：x 在 {x.device}，模型参数在 {self.W_in.device}，"
+                f"请先 model.to(device) 或 x.to(device)"
+            )
+        if self.T < 1:
+            raise ValueError(f"迭代轮数 T 必须 >= 1，当前 T={self.T}")
+
+        tau = F.softplus(self.tau_raw) + 0.01
+        assert tau.item() > 0.0, f"[契约失败] tau 必须 > 0，当前 tau={tau.item()}"
+
+        # ---- 1. 输入编码：[B, input_dim] -> [B, N*y_in] ----
+        s_in = x @ self.W_in
+
+        s_out = torch.zeros(
+            (x.shape[0], self.n_out_syn), dtype=s_in.dtype, device=s_in.device
+        )
+        for _ in range(self.T):
+            # ---- 2a 稀疏空间连接（masked softmax）----
+            s_out = self.sparse_propagate(s_in, tau)
+            # ---- 2b 输出突触 -> 神经元（scatter sum）----
+            neuron_input = sparse_aggregate(
+                s_out, self.neuron_of_output_syn, self.N
+            )
+            # ---- 2c 神经元激活：ReLU(neuron_input + threshold) ----
+            a = F.relu(neuron_input + self.neuron_threshold)
+            # ---- 2d 神经元 -> 输入突触（broadcast）+ 残差 + LayerNorm ----
+            s_in_new = sparse_broadcast(a, self.neuron_of_input_syn)
+            s_in = self.ln_s_in(s_in_new + self.alpha * s_in)
+
+        # ---- 3. 输出汇总：使用最终轮 2a 的输出突触信号 ----
+        logits = s_out @ self.W_out
+        return logits
+
+    # ==================================================================
+    # 统计接口
+    # ==================================================================
+    def count_parameters(self) -> int:
+        """返回可学习参数总数（含 LayerNorm 的 weight/bias）。"""
+        return int(sum(p.numel() for p in self.parameters() if p.requires_grad))
+
+    def count_dense_weight_tensors(self) -> int:
+        """统计形状恰为 [N*y_out, N*y_in] 的**权重类**张量个数（应为 0）。
+
+        这是"禁止 materialize dense 权重矩阵"这一设计约束的可执行判据：
+        连接权重必须是边级参数 `W_conn_sparse` [E]，不允许出现 [N*y_out, N*y_in]
+        形状的可学习权重。拓扑量 `dist` / `mask` 虽然是同一形状，但它们是**预计算的
+        几何/掩码 buffer**（非权重、不参与训练），故不计入。
+
+        返回
+        ----
+        int
+            命中的权重类张量个数；本设计下恒为 0。
+        """
+        target = (self.n_out_syn, self.n_in_syn)
+        hits = 0
+        for name, p in self.named_parameters():
+            if tuple(p.shape) == target:
+                log_warn(f"发现 dense 权重张量：参数 {name} 形状 {tuple(p.shape)}")
+                hits += 1
+        # buffer 中只允许 dist / mask 两个拓扑量具有该形状（已知且必须存在）
+        for name, b in self.named_buffers():
+            if tuple(b.shape) == target and name not in ("dist", "mask"):
+                log_warn(f"发现 dense 权重张量：buffer {name} 形状 {tuple(b.shape)}")
+                hits += 1
+        return hits
+
+    def get_connection_stats(self) -> Dict[str, float]:
+        """返回连接统计：连接密度（规格口径）、零元素占比、平均出度、当前 tau。
+
+        返回
+        ----
+        Dict[str, float]
+            * "num_edges"：边数 E；
+            * "sparsity"：**连接密度** = E/(N*y_out*N*y_in)，即 current_spec.md 规定的
+              "连接稀疏度"口径（规格公式即密度定义）；阶段 A 要求 < 0.1；
+            * "zero_ratio"：dense 矩阵的零元素占比 = 1 - E/(N*y_out*N*y_in)，
+              仅用于日志对照，不参与验收判据；
+            * "avg_out_degree"：平均每个输出突触的连接数 E/(N*y_out)；
+            * "tau"：当前 tau 值（> 0）。
+        """
+        density = connection_sparsity(self.num_edges, self.n_out_syn, self.n_in_syn)
+        return {
+            "num_edges": float(self.num_edges),
+            "sparsity": float(density),
+            "zero_ratio": float(1.0 - density),
+            "avg_out_degree": float(self.num_edges) / float(self.n_out_syn),
+            "tau": self.current_tau(),
+        }
