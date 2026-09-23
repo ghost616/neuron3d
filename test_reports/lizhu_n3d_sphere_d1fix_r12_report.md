@@ -1,0 +1,141 @@
+# n3d_sphere 离朱第 11 轮 D1 修复 —— 离朱独立测试报告
+
+- **测试对象**：`n3d_sphere/train.py`（`apply_overrides` 值等价短路）、`_verify/run_smoke_matrix.py`（新增写入一致性断言与 3 个记录字段）、README §8.2/§10.2、`current_spec.md`
+- **测试依据**：绑定的《n3d_sphere 离朱第 11 轮 D1 修复 —— 待测试功能说明（补充测试）》
+- **环境**：Windows + Python 3.12.10 + torch 2.14.0+cpu（CPU only）
+- **测试脚本**：`.lizhu_env/lizhu_tests/lizhu_n3d_r12_d1fix_tests.py`（11 项，判据全部独立构造）
+
+---
+
+## 一、测试概览
+
+| 项 | 用例数 | 通过 | 失败 | 结论 |
+|---|---|---|---|---|
+| D1 字节确定性（6 种等值命令形式） | 4 | **4** | 0 | D1 **已修复**（字节级等价达成） |
+| 非等值覆盖不得被短路吞掉 | 2 | **2** | 0 | 全部通过 |
+| 冒烟矩阵新断言与 3 个新字段 | 2 | **2** | 0 | 全部通过（证据文件已自洽） |
+| 全量回归（`verify_all.py`） | 1 | **1** | 0 | 全部通过 |
+| 硬约束（一期 / 产物纪律） | 1 | **1** | 0 | 全部通过 |
+| `--arch mlp` 回归 | 1 | **1** | 0 | 6/6 PASS |
+| **合计** | **11** | **11** | **0** | 仅 1 项**说明文字不准确**（D2，非代码缺陷） |
+
+---
+
+## 二、D1 核心：值等价路径的字节确定性 —— 已修复
+
+**6 种等值命令形式逐条实测**（每次执行后计算 `_verify/smoke.pt` 的 SHA256）：
+
+| # | 命令 | 退出码 | PASS | `smoke.pt` SHA256 | == 规范值 |
+|---|---|---|---|---|---|
+| 1 | `--smoke-test` | 0 | 15 | `1A9D68D8F16FF88D…43D7` | ✅ |
+| 2 | `--smoke-test --input-scope any_isolated --readout-scope any_isolated` | 0 | 15 | `1A9D68D8F16FF88D…43D7` | ✅ |
+| 3 | `--smoke-test --input-scope any_isolated` | 0 | 15 | `1A9D68D8F16FF88D…43D7` | ✅ |
+| 4 | `--smoke-test --space-radius 0.0` | 0 | 15 | `1A9D68D8F16FF88D…43D7` | ✅ |
+| 5 | `--smoke-test --preset default` | 0 | 15 | `1A9D68D8F16FF88D…43D7` | ✅ |
+| 6 | `--smoke-test --seed 0` | 0 | 15 | `1A9D68D8F16FF88D…43D7` | ✅ |
+
+- **6/6 逐字节相同**，且全部等于规范值 `1A9D68D8F16FF88D7D848189A45D1AB6868F447ACE79950E3A545F69BC7443D7`（修复前的 `4E09D031…` 不再出现）；
+- 每次 loss 均为 `2.326995849609375`、**15/15 PASS、退出码 0**；
+- **独立对象身份验证**：6 种形式下 `build_smoke_config(parse_args([...])) is SMALL_CONFIG` **均为 True**（不只是字段相等，而是**同一对象**）；
+- **根因独立性验证**：`SMALL_CONFIG.to_dict()` 中 `input_scope is readout_scope`（两者指向同一 interned 字符串对象），短路后该身份关系仍保持 —— 这正是 pickle memo 命中、字节一致的必要条件。
+
+---
+
+## 三、非等值覆盖仍然生效（未过度短路）
+
+**返回对象判定**（9 组非等值覆盖，`is SMALL_CONFIG` 断言为 **False**，且 `to_dict()` 与基线不同）：
+
+`--input-scope all_isolated`、`--readout-scope all_isolated`、`--input-scope all_isolated --readout-scope any_isolated`、`--n 32`、`--seed 7`、`--flow-axis x`、`--d 0.3`、`--h 0.12`、`--y-in 2` —— **9/9 均照常走覆盖分支**。
+
+**产物名与 loss 实测**（显式覆盖仍写指纹名，不落回 `smoke.pt`）：
+
+| 命令 | 产物 | loss |
+|---|---|---|
+| `--input-scope any_isolated --readout-scope all_isolated` | `smoke_N64_y4x4_H0.15_D0.25_plfcc_axz_isany_rsall_bs32_s42.pt` | `2.299027681350708` ✅ |
+| `--input-scope all_isolated --readout-scope any_isolated` | `smoke_N64_y4x4_H0.15_D0.25_plfcc_axz_isall_rsany_bs32_s42.pt` | `2.2900023460388184` ✅ |
+| `--input-scope all_isolated --readout-scope all_isolated` | `smoke_N64_y4x4_H0.15_D0.25_plfcc_axz_isall_rsall_bs32_s42.pt` | `2.283543109893799` ✅ |
+| `--n 32` | `smoke_N32_y4x4_H0.15_D0.25_plfcc_axz_isany_rsany_bs32_s42.pt` | ✅ |
+| `--seed 7` | `smoke_N64_y4x4_H0.15_D0.25_plfcc_axz_isany_rsany_bs32_s7.pt` | ✅ |
+| `--flow-axis x` | `smoke_N64_y4x4_H0.15_D0.25_plfcc_axx_isany_rsany_bs32_s42.pt` | ✅ |
+
+四值互不相同；与上一轮矩阵记录的产物名一致；**每次覆盖运行后 `smoke.pt` 仍为规范 SHA**（未被扰动）。另实测真实覆盖仍打印“冒烟测试配置已被显式覆盖”告警且**不**打印值等价行 —— 语义边界正确。
+
+---
+
+## 四、冒烟矩阵新断言与字段（D1 可被捕获）
+
+| 判据 | 结果 |
+|---|---|
+| `run_smoke_matrix.py` 退出码 0、11/11 `item_ok=true` | ✅ |
+| 输出含“产物路径写入一致性（同一路径多次写入必须逐位一致）：**True**” | ✅ |
+| `smoke.pt` 一行显示“被 **3** 条组合写入，SHA 去重后 **1** 种：一致” | ✅ |
+| 每条记录含 `artifact_sha256_at_end` / `artifact_sha256_stable` / `artifact_shared_writers` | ✅ **11/11 齐全** |
+| **11/11** `artifact_sha256_stable == true` | ✅ |
+| **11/11** `artifact_sha256_at_end == artifact_sha256` | ✅ |
+| **11/11** `artifact_sha256` 与盘上文件实际 SHA 一致 | ✅ |
+| `smoke.pt` 的 3 条写入者 SHA 去重后唯一且 == 规范值 | ✅ `artifact_shared_writers = ['preset default', 'scope any/any seed42', 'seed 0']`，三者的 `artifact_sha256` 全为 `1A9D…` |
+
+**独立复核捕获能力**：逐条比较“记录 SHA vs 盘上实际 SHA vs `artifact_sha256_at_end`”，**11/11 全部自洽**（修复前记录 [0] 会与其 `artifact_sha256_at_end` 不一致 —— 该形态已消失）。
+
+---
+
+## 五、全量回归
+
+| 项 | 结果 |
+|---|---|
+| `verify_all.py` 退出码 | ✅ 0；9 条命令全部退出码 0、无 FAIL |
+| 末尾文档数字行 | ✅ “全部一致（一致 93 / 不一致 0 / 跳过 0）” |
+| 计数口径 | ✅ `R1-R7b sphere_dag=10`、`D1-D7 device=6`、`E2 smoke=15`、`E2b smoke_mlp=6`、`E5 proto_smoke=9`、`snapshot=1` |
+| `--smoke-test --arch mlp` | ✅ **6/6 PASS、退出码 0** |
+| 回归后 `smoke.pt` | ✅ 仍为规范 SHA `1A9D…43D7` |
+
+## 六、一期回归与产物纪律（硬约束）
+
+| 项 | 结果 |
+|---|---|
+| `git status --porcelain -- n3d_proto` | ✅ 输出为空 |
+| `python n3d_proto/train.py --smoke-test` | ✅ **9/9 PASS、退出码 0、loss=2.419689** |
+| 一期三件产物 SHA256 | ✅ 逐字符一致（`888556B0…8924` / `9F21AC34…3F8` / `0F7CF500…5011`） |
+| `python -m compileall -q n3d_sphere` | ✅ 退出码 0 |
+| `checkpoints/n3d_sphere/model.pt` | ✅ **不存在**（验证产物全部落 `_verify/`） |
+
+---
+
+## 七、问题清单（1 项：说明文字不准确，非代码缺陷）
+
+### 【低 D2】说明 §1 要求“6 条命令的日志中应出现‘值等价…’这一行”，实测仅 **3 条**会出现 —— 与说明 §1 自身的机制描述冲突
+
+**实测（逐条核对日志）**：
+
+| 命令形式 | 代码路径 | 是否打印“值等价…复用基线配置对象” |
+|---|---|---|
+| `--smoke-test --input-scope any_isolated --readout-scope any_isolated` | `explicit=True` → 进入 `apply_overrides` → 命中短路分支 | ✅ **打印** |
+| `--smoke-test --input-scope any_isolated` | 同上 | ✅ **打印** |
+| `--smoke-test --space-radius 0.0` | 同上 | ✅ **打印** |
+| `--smoke-test`（裸跑） | `explicit=False` → `build_smoke_config` 直接 `return SMALL_CONFIG` | ❌ 不打印 |
+| `--smoke-test --preset default` | 同上（`args.preset == "default"` 不计入 explicit） | ❌ 不打印 |
+| `--smoke-test --seed 0` | 同上（`seed_override=0` 表示“不覆盖”，不计入 explicit） | ❌ 不打印 |
+
+**原因**：该日志位于 `apply_overrides`（`n3d_sphere/train.py:818`）的短路分支内，而**非显式**形式在 `build_smoke_config`（第 876-877 行）就 `if not explicit: return SMALL_CONFIG` 提前返回，**根本不会调用 `apply_overrides`**。
+说明 §1 自身的机制描述亦指出“该告警仅在覆盖真的改变取值时打印”，并称短路发生在 `apply_overrides` 内 —— 与“6 条全部打印”的要求**互相矛盾**。
+
+**影响**：无功能影响 —— 6 条命令的**产物字节、loss、判据**全部正确且一致（见 §2），仅“日志行出现次数”与说明文字不符。属**说明文字不准确**（与第 10 轮 D2 同类的文档一致性问题）。
+**建议**：把说明 §1 改为“**进入覆盖路径的 3 条**命令（显式传等值 scope / 等值 space-radius）打印该行；裸跑 / `--preset default` / `--seed 0` 走提前返回分支，不打印”；若确实希望 6 条统一打印，则在 `build_smoke_config` 的 `if not explicit: return SMALL_CONFIG` 分支补一行同义日志（语义上此时“无显式覆盖 = 天然复用基线对象”，打印亦无歧义）。
+
+---
+
+## 八、环境说明
+
+| 项 | 值 |
+|---|---|
+| Python / torch | 3.12.10 / 2.14.0+cpu（`cuda.is_available() == False`） |
+| 数据 | 工程内 `data/mnist` IDX（未联网） |
+| 耗时 | 单次冒烟约 6~7s；矩阵（11 组合）约 2~3 分钟；`verify_all.py`（9 命令）< 4 分钟 |
+
+## 九、结论
+
+- **D1 已彻底修复并升级为字节级等价**：6 种语义等值的命令形式产出**同一字节**的 `smoke.pt`（SHA256 全部为规范值 `1A9D68D8F16FF88D7D848189A45D1AB6868F447ACE79950E3A545F69BC7443D7`），且 `build_smoke_config(...) is SMALL_CONFIG` 为 True（同一对象），根因（interned 字符串身份 → pickle memo）已按预期保持；每次 15/15 PASS、退出码 0、loss 精确。
+- **短路未过度**：9 组非等值覆盖仍照常生效，产物写指纹名、loss 与上一轮一致且四值互异，真实覆盖仍打印覆盖告警；`smoke.pt` 不被扰动。
+- **矩阵取证已自洽**：新增“同一路径多次写入逐位一致”断言与 3 个字段，11/11 `artifact_sha256_stable=true`、`artifact_sha256_at_end == artifact_sha256`、且与盘上文件实际 SHA 一致；`smoke.pt` 由 3 条组合写入、SHA 去重后 1 种。
+- **全量回归与硬约束全绿**：`verify_all.py` 9 条命令退出码 0、文档数字 93/0/0、计数口径 10/6/15/6/9/1；`--arch mlp` 6/6 PASS；一期 9/9 PASS + loss=2.419689 + 三个 SHA256 一致 + `n3d_proto` 零改动 + `compileall` 退出码 0；正式 `model.pt` 不存在。
+- **唯一注记 D2（低/文档）**：说明 §1 的“6 条命令均打印值等价日志”与实现（及说明自身机制描述）不符 —— 实际仅进入 `apply_overrides` 的 3 条会打印。建议修正说明文字或在提前返回分支补一行同义日志。

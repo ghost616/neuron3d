@@ -1,7 +1,7 @@
 """N3D 纯球形分层有向无环架构（FCC 规则堆积 + 神经元级连接）超参数配置层。
 
 本模块只承载超参数与常量，不含任何计算逻辑。模块**只保留球体几何**：
-既没有几何类型字段，也没有边长字段，更没有任何与球体无关的几何派生量。
+不存在 `topology` 字段、不存在 `L` 字段、不存在任何立方体（cube）派生量。
 
 几何尺度（半径由公式唯一确定）
 ------------------------------
@@ -28,7 +28,7 @@
 关键不变量
 ----------
 * `N > 0`、`y_in > 0`、`y_out > 0`；
-* `H > 0`、`D > 0`；
+* `H > 0`、`D > 0`、`T >= 1`（验收场景要求 T >= 2）；
 * `flow_axis ∈ {"x", "y", "z"}`；
 * `input_scope ∈ {"any_isolated", "all_isolated"}`、`readout_scope` 同理；
 * `space_radius == 0.0`（默认，表示取 R_min）或 `space_radius ∈ [R_min, R_max]`。
@@ -46,11 +46,10 @@ __all__ = [
     "HIGHACC_CONFIG",
     "FLOW_AXIS_CHOICES",
     "SCOPE_CHOICES",
-    "PLACEMENT_CHOICES",
     "PACKING_PHI",
     "min_space_radius",
     "max_space_radius",
-    "SPHERE_ONLY_NOTE",
+    "CUBE_FREE_NOTE",
 ]
 
 # 全局流向轴：输入突触取负半球（−axis）、输出突触取正半球（+axis）
@@ -59,14 +58,11 @@ FLOW_AXIS_CHOICES = ("x", "y", "z")
 # 输入层驱动判据 / 读出判据的取值域
 SCOPE_CHOICES = ("any_isolated", "all_isolated")
 
-# 神经元放置方式：当前仅支持 FCC 规则堆积（不存在随机放置分支）
-PLACEMENT_CHOICES = ("fcc",)
-
 # 最优堆积系数（面心立方最密堆积）：φ = π/(3√2) ≈ 0.740480
 PACKING_PHI: float = 0.7405
 
-# 本模块为纯球形分层 DAG 架构（保留此常量便于验证脚本做"零残留"断言）
-SPHERE_ONLY_NOTE: str = "pure_sphere_dag"
+# 本模块为纯球形分层 DAG 架构（保留此常量便于验证脚本做"零 cube 残留"断言）
+CUBE_FREE_NOTE: str = "pure_sphere_dag"
 
 
 def min_space_radius(N: int, H: float) -> float:
@@ -159,10 +155,6 @@ class Config:
     space_radius : float
         球空间半径。`0.0`（默认）表示取公式下界 `R_min`；显式指定时必须落在
         `[R_min, R_max]` 内，否则构造期报错。
-    placement : str
-        神经元放置方式。**当前仅支持 `"fcc"`**（面心立方规则堆积，晶格常数
-        `a = 2√2·H`，最近邻距恰为 `2H`）。不存在随机放置分支；保留该字段是为了让
-        配置/产物指纹显式记录放置方式（便于后续扩展时区分产物）。默认 `"fcc"`。
     input_scope : str
         输入层驱动判据：`"any_isolated"`（神经元有 ≥1 个输入突触孤立即进入 S_in）
         / `"all_isolated"`（神经元全部 y_in 个输入突触都孤立才进入 S_in）。
@@ -171,6 +163,9 @@ class Config:
         读出判据：`"any_isolated"`（神经元有 ≥1 个输出突触孤立即进入 S_out）
         / `"all_isolated"`（神经元全部 y_out 个输出突触都孤立才进入 S_out）。
         默认 `"any_isolated"`。
+    T : int
+        逐层传播的重复轮数（同一张 DAG 上把阶段 2 再跑 T 轮，用于加深信息流）。
+        **验收要求 T >= 2**（T=1 时参数梯度可能不完整）。默认 3。
     input_dim : int
         输入维度（MNIST 展平为 784）。默认 784。
     output_dim : int
@@ -223,13 +218,13 @@ class Config:
     D: float = 0.15
     flow_axis: str = "z"
     space_radius: float = 0.0
-    placement: str = "fcc"
 
     # ---- 判据开关 ----
     input_scope: str = "any_isolated"
     readout_scope: str = "any_isolated"
 
-    # ---- 网络 ----
+    # ---- 迭代与网络 ----
+    T: int = 3
     input_dim: int = 784
     output_dim: int = 10
     hidden_dim: int = 2048  # 仅 `--arch mlp` 对照基线使用（主模型不使用该字段）
@@ -270,6 +265,8 @@ class Config:
             raise ValueError(f"Config.y_in 必须为正整数，当前 y_in={self.y_in}")
         if self.y_out <= 0:
             raise ValueError(f"Config.y_out 必须为正整数，当前 y_out={self.y_out}")
+        if self.T < 1:
+            raise ValueError(f"Config.T 必须 >= 1，当前 T={self.T}")
         if not (self.H > 0.0):
             raise ValueError(f"Config.H 必须 > 0，当前 H={self.H}")
         if not (self.D > 0.0):
@@ -293,10 +290,6 @@ class Config:
         if self.input_scope not in SCOPE_CHOICES:
             raise ValueError(
                 f"Config.input_scope 仅允许 {SCOPE_CHOICES}，当前 input_scope={self.input_scope!r}"
-            )
-        if self.placement not in PLACEMENT_CHOICES:
-            raise ValueError(
-                f"Config.placement 仅允许 {PLACEMENT_CHOICES}，当前 placement={self.placement!r}"
             )
         if self.readout_scope not in SCOPE_CHOICES:
             raise ValueError(
@@ -397,9 +390,9 @@ class Config:
             "D": self.D,
             "flow_axis": self.flow_axis,
             "space_radius": self.space_radius,
-            "placement": self.placement,
             "input_scope": self.input_scope,
             "readout_scope": self.readout_scope,
+            "T": self.T,
             "input_dim": self.input_dim,
             "output_dim": self.output_dim,
             "hidden_dim": self.hidden_dim,
@@ -427,9 +420,9 @@ class Config:
             f"D={self.D}",
             f"flow_axis={self.flow_axis}",
             f"space_radius={self.space_radius}->{self.effective_space_radius:.6f}",
-            f"placement={self.placement}",
             f"input_scope={self.input_scope}",
             f"readout_scope={self.readout_scope}",
+            f"T={self.T}",
             f"input_dim={self.input_dim}",
             f"output_dim={self.output_dim}",
             f"batch_size={self.batch_size}",
@@ -449,13 +442,16 @@ class Config:
 # 预设
 # ----------------------------------------------------------------------
 # SMALL_CONFIG：阶段 A 冒烟测试专用，规模小、CPU 友好
-#   N=64, y_in=4, y_out=4, batch_size=32
+#   N=64, y_in=4, y_out=4, T=2, batch_size=32
+#   T >= 2：阶段 2 的逐层传播与双副本展开需要在多轮中体现梯度，
+#   避免出现"参与 loss 的子图不覆盖全部可学习参数"的情形。
 SMALL_CONFIG = Config(
     N=64,
     y_in=4,
     y_out=4,
     H=0.15,
     D=0.25,
+    T=2,
     input_dim=784,
     output_dim=10,
     batch_size=32,
@@ -466,7 +462,7 @@ SMALL_CONFIG = Config(
 )
 
 # DEFAULT_CONFIG：正式训练默认配置
-#   N=256, y_in=8, y_out=8, batch_size=64
+#   N=256, y_in=8, y_out=8, T=3, batch_size=64
 #   space_radius 取默认 0.0 -> R_min = 0.701840（N=256, H=0.10, φ=0.7405）
 DEFAULT_CONFIG = Config(
     N=256,
@@ -474,6 +470,7 @@ DEFAULT_CONFIG = Config(
     y_out=8,
     H=0.1,
     D=0.15,
+    T=3,
     input_dim=784,
     output_dim=10,
     batch_size=64,
@@ -484,14 +481,16 @@ DEFAULT_CONFIG = Config(
 )
 
 # HIGHACC_CONFIG：高精度冲刺配置
-#   相比 DEFAULT_CONFIG 的变化：batch 64->128、lr 1e-3->2e-3、epochs 10->20，
-#   并启用 AdamW(weight_decay=1e-4)、输出层 bias、cosine 学习率调度、梯度裁剪 1.0。
+#   相比 DEFAULT_CONFIG 的变化：T 3->4、batch 64->128、lr 1e-3->2e-3、
+#   epochs 10->20，并启用 AdamW(weight_decay=1e-4)、输出层 bias、
+#   cosine 学习率调度、梯度裁剪 1.0。
 HIGHACC_CONFIG = Config(
     N=256,
     y_in=8,
     y_out=8,
     H=0.1,
     D=0.15,
+    T=4,
     input_dim=784,
     output_dim=10,
     batch_size=128,

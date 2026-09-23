@@ -1,4 +1,20 @@
-"""N3D 一期原型的通用工具层。
+"""N3D 通用工具层（**历史遗留**：四步闭环算子，当前纯球形分层 DAG 不调用）。
+
+⚠️ 调用现状（皋陶审查 info 项，已如实标注）
+------------------------------------------------
+本文件由一期 `n3d_proto/utils.py` 拷贝而来，其中**四步闭环的稀疏分组/构图算子
+在本模块当前的纯球形分层 DAG 架构中不被调用**：
+
+* **仍在用**：`set_seed`（固定全局随机源，`train.build_model_and_data` 调用）、
+  `get_device`、`log_info` / `log_warn` / `log_error`、`count_parameters`、
+  `tensor_grad_norms`（冒烟判据用；缺失梯度记为 -1.0）。
+* **不再调用**（保留原因：避免改动一期拷贝文件带来回归风险，且复现旧实验仍需）：
+  `segment_softmax`、`build_edge_index`、`build_edge_index_from_dist`、
+  `build_scatter_matrix`、`sparse_aggregate`、`sparse_broadcast`、
+  `connection_density`（及其同义别名 `connection_sparsity`）、`zero_ratio`。
+
+当前架构的连接聚合改为"按拓扑序 + 入边 CSR 区间"的稀疏实现，见 `model.py` 的
+`stage2_recurrence`；几何量（距离矩阵等）由 `model.py` 自行构造。
 
 职责
 ----
@@ -11,7 +27,7 @@
 * 参数与统计：`count_parameters` / `tensor_grad_norms` / `connection_sparsity`（连接密度，
   规格口径）/ `zero_ratio`（零元素占比，便于与"稀疏"一词的日常语义对照）
 
-设计约束（来自 current_spec.md）
+设计约束（历史，属一期四步闭环）
 --------------------------------
 1. 所有分组（segment）运算必须用 scatter 实现，禁止 Python for 循环遍历突触/神经元；
 2. 归一化方向固定为"对每个输出突触，在其连接的输入突触上做 softmax"；
@@ -209,7 +225,8 @@ def segment_softmax(
     参数
     ----
     values : torch.Tensor
-        形状 [E] 的边级 logits（= -edge_dist / tau + W_conn_sparse）。
+        形状 [E] 的边级 logits（历史实现中为"距离衰减项 + 可学习边权"的组合；
+        当前纯球形分层 DAG 架构不再调用本函数，连接聚合见 `model.py::stage2_recurrence`）。
     index : torch.Tensor
         形状 [E] 的组索引（int64），即 edge_index[0]。
     num_segments : int

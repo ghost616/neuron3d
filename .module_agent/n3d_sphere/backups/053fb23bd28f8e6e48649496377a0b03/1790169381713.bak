@@ -110,12 +110,12 @@ CHECKPOINT_PATH: str = os.path.join(CHECKPOINT_DIR, "model.pt")
 VERIFY_CHECKPOINT_DIR: str = os.path.join(CHECKPOINT_DIR, "_verify")
 
 # 新架构的冒烟判据清单（仅作文档与日志自检；实际判定在 run_smoke_test 内逐条构造）
-# 文案一律使用 ASCII 编号（不用 [1][2][3] 等圈号）：Windows GBK 控制台无法编码圈号，
+# ⚠️ 文案一律使用 ASCII 编号（不用 [1][2][3] 等圈号）：Windows GBK 控制台无法编码圈号，
 #    会让 --help/日志/退出码路径抛 UnicodeEncodeError（历史缺陷）。
 SMOKE_CRITERIA_DOC: Tuple[str, ...] = (
-    "1 前向输出形状 == [B, output_dim]（真实断言，非恒真）",
-    "2 反向无错误（全部可学习参数都有梯度；缺失梯度记为 -1.0）",
-    "3 参与 loss 的参数梯度范数 > 0（W_out 断言非零梯度列数 == |S_out|）",
+    "1 前向无 shape mismatch（成功返回 [B, output_dim]）",
+    "2 反向无错误（收集到全部可学习参数的梯度）",
+    "3 所有可学习参数梯度范数 > 0",
     "4 loss 非 NaN/Inf",
     "5 S_in 非空（阶段 1 真正被输入层驱动）",
     "6 S_out 非空（readout 真正有信号）",
@@ -125,70 +125,17 @@ SMOKE_CRITERIA_DOC: Tuple[str, ...] = (
     "10 球空间半径落在 [R_min, R_max] 内",
     "11 神经元级连接数 E > 0 且平均出度 > 0",
     "12 不存在 [N*y_out, N*y_in] 形状的权重张量（未 materialize dense 矩阵）",
-    "13 readout 严格口径：h 非零列都属于 S_out，且 h 逐位 == a_up 掩码积",
-    "14 阶段 2 递推顺序 == 流向轴升序（topo_matches_axis_order == 1）",
-    "15 CPU 单 batch 前向+反向耗时 < 120s",
+    "13 CPU 单 batch 前向+反向耗时 < 120s",
 )
 
 
-def smoke_fingerprint(config: Config) -> str:
-    """返回冒烟产物的配置指纹段（容量 + 几何 + 判据 + 训练规模维度）。
-
-    命名段：
-    `N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{axis}_is{scope}_rs{scope}`
-    `_bs{batch_size}[_R{space_radius}]_s{seed}`。
-
-    设计动机（皋陶审查 info 项）：冒烟产物原先只由 `flow_axis` / 两个 scope / `arch`
-    决定，改变 `N` / `y` / `H` / `D` / `seed` 会写同一文件而互相覆盖；后续把容量与几何
-    维度纳入指纹。
-
-    ⚠️ 历史缺陷（离朱第 10 轮 D1）：`is_default_smoke`（决定是否退化为 `smoke.pt`）已把
-    `batch_size` 与 `space_radius` 纳入判定，但指纹**未**包含这两个维度 —— 于是
-    `--batch-size 64`、`--space-radius 0.9`、以及两者同时覆盖的配置会落回**同一个文件名**
-    而互相覆盖（实测后者会重写前者的取证产物）。指纹必须与默认判定**维度严格对齐**：
-    默认判定包含的维度，指纹也必须包含。故此处补入 `batch_size`（始终）与
-    `space_radius`（非 0 时，0 表示取 R_min 且已由判定覆盖）。
-
-    参数
-    ----
-    config : Config
-        冒烟运行实际生效的配置。
-
-    返回
-    ----
-    str
-        指纹字符串（不含 arch，arch 由 `smoke_checkpoint_path` 单独拼接）。
-    """
-    radius_part = (
-        f"_R{config.space_radius:g}" if float(config.space_radius) > 0.0 else ""
-    )
-    return (
-        f"N{config.N}_y{config.y_in}x{config.y_out}"
-        f"_H{config.H:g}_D{config.D:g}"
-        f"_pl{config.placement}"
-        f"_ax{config.flow_axis}"
-        f"_is{scope_abbrev(config.input_scope)}"
-        f"_rs{scope_abbrev(config.readout_scope)}"
-        f"_bs{config.batch_size}"
-        f"{radius_part}"
-        f"_s{config.seed}"
-    )
-
-
 def smoke_checkpoint_path(
-    flow_axis: str,
-    input_scope: str,
-    readout_scope: str,
-    arch: str = "neuron3d",
-    fingerprint: str = "",
+    flow_axis: str, input_scope: str, readout_scope: str, arch: str = "neuron3d"
 ) -> str:
     """返回冒烟测试产物的路径（文件名含配置指纹，防止不同配置互覆）。
 
-    命名规则：
-    * 默认配置（`neuron3d` + `flow_axis=z` + 两个 `any_isolated` + 无指纹）退化为
-      历史文件名 `smoke.pt`（保持既有产物路径与既有验证脚本的可读性）；
-    * 其它情形：`smoke[_ar{arch}]_{fingerprint}_ax{axis}_is{scope[:3]}_rs{scope[:3]}.pt`
-      —— 传入 `fingerprint`（见 `smoke_fingerprint`）时容量与几何维度也进文件名。
+    命名规则：`smoke[_ar{arch}]_ax{flow_axis}_is{scope[:3]}_rs{scope[:3]}.pt`。
+    默认配置（`neuron3d` + z + 两个 `any_isolated`）退化为历史文件名 `smoke.pt`。
 
     **arch 维度**（离朱第 8 轮实测 M3，已修复）：冒烟产物名原先只由 flow_axis 与两个
     scope 决定，`--arch mlp` 与主模型会写同一个 `smoke.pt` 而互相覆盖（先跑 mlp 冒烟
@@ -205,8 +152,6 @@ def smoke_checkpoint_path(
         读出判据（any_isolated / all_isolated）。
     arch : str
         架构（`neuron3d` / `mlp`）；缺省 `neuron3d`，保持历史命名不变。
-    fingerprint : str
-        容量/几何维度指纹（通常来自 `smoke_fingerprint(config)`）；空串表示不附加。
 
     返回
     ----
@@ -218,13 +163,9 @@ def smoke_checkpoint_path(
         and input_scope == "any_isolated"
         and readout_scope == "any_isolated"
         and arch == "neuron3d"
-        and not fingerprint
     ):
         return os.path.join(VERIFY_CHECKPOINT_DIR, "smoke.pt")
     arch_part = "" if arch == "neuron3d" else f"_ar{arch}"
-    if fingerprint:
-        # 指纹本身已含 N/y/H/D/pl/ax/is/rs/s 全部维度，无需再拼接一遍
-        return os.path.join(VERIFY_CHECKPOINT_DIR, f"smoke{arch_part}_{fingerprint}.pt")
     return os.path.join(
         VERIFY_CHECKPOINT_DIR,
         f"smoke{arch_part}_ax{flow_axis}_is{input_scope[:3]}_rs{readout_scope[:3]}.pt",
@@ -295,6 +236,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="覆盖神经元数量 N（默认取预设值）",
+    )
+    parser.add_argument(
+        "--t-steps",
+        "--t",
+        dest="t_override",
+        type=int,
+        default=0,
+        help=(
+            "覆盖逐层传播轮数 T（默认取预设值；T 必须 >= 2，否则部分参数拿不到梯度）。"
+            "规范名为 --t-steps，--t 为同义别名（argparse 精确匹配优先，"
+            "因此 --t 不会被前缀匹配到 --threads）。"
+        ),
     )
     parser.add_argument(
         "--y-in",
@@ -517,7 +470,7 @@ def build_model_and_data(
     else:
         topo_stats = model.get_topology_stats()
         log_info(
-            f"模型装配完成：N={config.N}, y_in={config.y_in}, y_out={config.y_out}, "
+            f"模型装配完成：N={config.N}, y_in={config.y_in}, y_out={config.y_out}, T={config.T}, "
             f"placement={config.placement}, flow_axis={config.flow_axis}, "
             f"space_radius={config.effective_space_radius:.6f} "
             f"[R_min={config.min_space_radius:.6f}, R_max={config.max_space_radius:.6f}], "
@@ -596,7 +549,7 @@ def train_one_epoch(
     max_batches: int = 0,
     collect_grads: bool = False,
     grad_clip: float = 0.0,
-) -> Tuple[float, Dict[str, float], int, torch.Tensor, torch.Tensor]:
+) -> Tuple[float, Dict[str, float], int]:
     """训练一个 epoch。
 
     参数
@@ -620,10 +573,8 @@ def train_one_epoch(
 
     返回
     ----
-    Tuple[float, Dict[str, float], int, torch.Tensor, torch.Tensor]
-        (平均 loss, 梯度范数字典, 实际处理 batch 数, 末批输入 x, 末批 logits)。
-        未收集梯度（`collect_grads=False`）时字典为空、末批 x/logits 返回空张量
-        （阶段 A 用它们做"输出形状 == [B, output_dim]"的真实断言）。
+    Tuple[float, Dict[str, float], int]
+        (平均 loss, 梯度范数字典, 实际处理 batch 数)。未收集梯度时字典为空。
 
     异常
     ------
@@ -634,8 +585,6 @@ def train_one_epoch(
     total_loss = 0.0
     n_batches = 0
     grad_norms: Dict[str, float] = {}
-    last_logits: torch.Tensor = torch.empty(0)
-    last_x: torch.Tensor = torch.empty(0)
     for i, (x, y) in enumerate(loader):
         if max_batches > 0 and i >= max_batches:
             break
@@ -643,7 +592,7 @@ def train_one_epoch(
         y = y.to(device)
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(x)                        # 前向：阶段 1 -> 阶段 2（单遍逐层递推）-> readout
+        logits = model(x)                        # 前向：阶段 1 -> T 轮阶段 2 -> readout
         loss = F.cross_entropy(logits, y)         # 分类损失
         if not torch.isfinite(loss):
             raise RuntimeError(
@@ -661,13 +610,11 @@ def train_one_epoch(
             # 注意：若启用梯度裁剪，此处收集到的是**裁剪前**的原始梯度范数；
             # 阶段 A 默认不使用裁剪（HIGHACC 才用），故不影响验收语义。
             grad_norms = tensor_grad_norms(model)
-            last_logits = logits.detach()
-            last_x = x.detach()
         if (i + 1) % 100 == 0:
             log_info(f"epoch {epoch} | batch {i + 1} | running_loss={total_loss / n_batches:.4f}")
     if n_batches == 0:
         raise RuntimeError("训练集为空：没有任何 batch 被处理")
-    return total_loss / n_batches, grad_norms, n_batches, last_x, last_logits
+    return total_loss / n_batches, grad_norms, n_batches
 
 
 def validate_override_args(args: argparse.Namespace) -> None:
@@ -675,7 +622,7 @@ def validate_override_args(args: argparse.Namespace) -> None:
 
     语义（必须严格遵守，`0` = 不覆盖）
     ---------------------------------
-    * 取值范围型参数（`--n / --y-in / --y-out / --h / --d / --seed`）：
+    * 取值范围型参数（`--n / --t-steps(--t) / --y-in / --y-out / --h / --d / --seed`）：
       **负数一律 `raise ValueError`**（由 `main()` 捕获后以非 0 退出码结束）；
       `0` / `0.0` 表示"未提供、不覆盖"；
     * `--epochs` / `--lr` / `--batch-size` / `--threads` 同理；
@@ -698,6 +645,7 @@ def validate_override_args(args: argparse.Namespace) -> None:
     """
     rules: List[Tuple[str, float]] = [
         ("--n", args.n),
+        ("--t-steps/--t", args.t_override),
         ("--y-in", args.y_in),
         ("--y-out", args.y_out),
         ("--h", args.h),
@@ -765,6 +713,10 @@ def apply_overrides(
     if args.n > 0:
         overrides["N"] = args.n
         changed = True
+    if args.t_override > 0:
+        log_info(f"T 覆盖：{overrides['T']} -> {args.t_override}")
+        overrides["T"] = args.t_override
+        changed = True
     if args.y_in > 0:
         overrides["y_in"] = args.y_in
         changed = True
@@ -802,27 +754,9 @@ def apply_overrides(
         changed = True
     if not changed:
         return base
-    result = Config(**overrides)
-    if result == base:
-        # 显式给出的覆盖值与基线**逐字段完全相同**（值等价）：复用基线对象本身。
-        # 这不只是省一次构造 —— `torch.save` 的**字节**取决于 pickle 的记忆化（memo），
-        # 而 memo 依赖**对象身份**而非取值：
-        #   * 裸跑走 `SMALL_CONFIG` 单例时，`input_scope` 与 `readout_scope` 指向同一个
-        #     `"any_isolated"` 字符串对象，第二次出现被写成 memo 引用（`h\xfd`）；
-        #   * 显式传 `--input-scope any_isolated` 时，取值来自 argparse 构造的**等值新
-        #     字符串**，两个位置分别内联写出（`X\x0c\0\0\0any_isolated`）。
-        # 于是"语义完全相同"的两次运行产出**不同字节**的 `smoke.pt`（离朱第 11 轮 D1：
-        # data.pkl 4097 vs 4117 字节、1520 字节差异，而 loss/config/grad_norms/全部张量
-        # 逐位相等）。复用基线对象即让"同一语义配置 ⇒ 同一字节"，
-        # 使产物 SHA256 重新成为可靠的等价判据。
-        log_info(
-            "显式覆盖参数与基线取值逐字段一致（值等价）：复用基线配置对象，"
-            "不构造新对象（保证同语义配置产出同字节产物）"
-        )
-        return base
     if warn_message:
         log_warn(warn_message)
-    return result
+    return Config(**overrides)
 
 
 def build_smoke_config(args: argparse.Namespace) -> Config:
@@ -851,11 +785,12 @@ def build_smoke_config(args: argparse.Namespace) -> Config:
     if base is not SMALL_CONFIG:
         log_warn(
             f"冒烟测试基线已被 --preset {args.preset} 替换："
-            f"N={base.N}, batch_size={base.batch_size}（非 SMALL_CONFIG 规模）"
+            f"N={base.N}, T={base.T}, batch_size={base.batch_size}（非 SMALL_CONFIG 规模）"
         )
     explicit = (
         args.preset != "default"
         or args.n > 0
+        or args.t_override > 0
         or args.y_in > 0
         or args.y_out > 0
         or args.h > 0.0
@@ -879,9 +814,8 @@ def build_smoke_config(args: argparse.Namespace) -> Config:
         base,
         args,
         warn_message=(
-            "冒烟测试配置已被显式覆盖（--preset/--n/--y-in/--y-out/--h/--d/--seed/--lr/"
-            "--flow-axis/--space-radius/--input-scope/--readout-scope/--placement 之一）："
-            f"预设={args.preset}；阶段 A 的默认基线仅在默认组合下成立"
+            "冒烟测试配置已被显式覆盖（--preset/--n/--t/--y-in/--seed/--lr/--flow-axis/"
+            "--input-scope/... 之一）"
         ),
     )
 
@@ -938,7 +872,7 @@ def run_smoke_test(
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
     # ---- 阶段 A 约束：仅跑 1 个 batch 的前向 + 反向 ----
-    avg_loss, grad_norms, n_batches, x_last, last_logits = train_one_epoch(
+    avg_loss, grad_norms, n_batches = train_one_epoch(
         model, train_loader, optimizer, device, epoch=1, max_batches=1, collect_grads=True
     )
     elapsed = time.perf_counter() - t0
@@ -1005,77 +939,14 @@ def run_smoke_test(
 
     # ---- 逐条核对阶段 A 验收标准（新架构口径） ----
     checks: List[Tuple[str, bool, str]] = []
-    # [1] 真实断言：前向输出形状必须是 [B, output_dim]
-    logits_shape_ok = (
-        tuple(last_logits.shape) == (int(x_last.shape[0]), int(config.output_dim))
-    )
+    checks.append(("[1] 前向无 shape mismatch", True, "前向成功返回 [B, output_dim]"))
+    checks.append(("[2] 反向无错误", len(grad_norms) > 0, f"收集到 {len(grad_norms)} 个参数的梯度"))
+    zero_grads = [n for n, v in grad_norms.items() if not (v > GRAD_NORM_MIN)]
     checks.append(
         (
-            "[1] 前向输出形状 == [B, output_dim]",
-            logits_shape_ok,
-            f"logits.shape={tuple(last_logits.shape)}，期望 "
-            f"({int(x_last.shape[0])}, {int(config.output_dim)})",
-        )
-    )
-    # [2] 真实断言：全部可学习参数都必须拿到梯度（tensor_grad_norms 把缺失梯度记为 -1.0）
-    missing_grads = [n for n, v in grad_norms.items() if v < 0.0]
-    checks.append(
-        (
-            "[2] 反向无错误（全部可学习参数都有梯度）",
-            len(grad_norms) > 0 and not missing_grads,
-            f"收集到 {len(grad_norms)} 个参数的梯度"
-            + (f"；缺失梯度：{missing_grads}" if missing_grads else "，无缺失"),
-        )
-    )
-    # [3] 参与 loss 的参数梯度范数必须 > 0（**不绑定参数名**，两种 arch 通用）。
-    #     口径说明（严格 readout 的直接推论）：`h[n] = a_up[n]` 仅当 n ∈ S_out，否则
-    #     h[n] = 0，故 neuron3d 的 `W_out` **非 S_out 列**不参与计算图、梯度恒为 0。
-    #     因此判据分两部分：
-    #       (a) 输出层参数（neuron3d 为 `W_out` / MLP 为 `fc2.*`）至少有一个的梯度范数 > 0
-    #           —— 等价于"读出层真正参与了 loss"；
-    #       (b) 其余全部可学习参数的梯度范数 > 0。
-    #     ⚠️ 历史缺陷（离朱第 9 轮 M1）：判据原先硬编码 `grad_norms.get("W_out", -1.0)`，
-    #        而 `MLPBaseline` 的输出层参数名是 `fc2.weight` / `fc2.bias`，取不到就会拿到
-    #        哨兵 -1.0 而误判 FAIL（`--arch mlp` 冒烟退出码 1）。故改为按 arch 解析参数名。
-    #     ⚠️ 历史缺陷（皋陶第 2 轮 F9）：曾额外断言 neuron3d 的"W_out 非零梯度列数
-    #        == |S_out|"。该等式在"某 S_out 神经元的 pre-activation 在整个 batch 上全为负"
-    #        时不成立 —— 此时其 ReLU 输出为 0，`h` 的对应列合法地为 0，故该列不参与 loss、
-    #        梯度为 0（ReLU 的正常行为，spec 与 README 均已写明）。现改为**下界断言**：
-    #        非零梯度列数必须 >= 1（且必须 <= |S_out|，因为非 S_out 列结构性为 0）。
-    out_layer_names = ("W_out",) if is_neuron3d else ("fc2.weight", "fc2.bias")
-    out_layer_gnorms = [float(grad_norms.get(n, -1.0)) for n in out_layer_names]
-    other_gnorms = {
-        n: v for n, v in grad_norms.items() if n not in set(out_layer_names)
-    }
-    zero_others = [n for n, v in other_gnorms.items() if not (v > GRAD_NORM_MIN)]
-    out_layer_ok = any(v > GRAD_NORM_MIN for v in out_layer_gnorms)
-    # neuron3d 额外核对"非零梯度列数落在 [1, |S_out|]"（严格 readout 的结构性下界/上界）
-    out_col_participating = (
-        None
-        if not is_neuron3d
-        else int((model.W_out.grad.abs().sum(dim=0) > 0).sum().item())
-    )
-    grad_positive_ok = out_layer_ok and len(zero_others) == 0
-    if is_neuron3d:
-        s_out_size = int(topo_stats["num_out_scope"])
-        grad_positive_ok = grad_positive_ok and (
-            1 <= int(out_col_participating) <= s_out_size
-        )
-    checks.append(
-        (
-            "[3] 参与 loss 的参数梯度范数 > 0",
-            grad_positive_ok,
-            (
-                f"输出层参数 {dict(zip(out_layer_names, out_layer_gnorms))}；"
-                + (
-                    f"W_out 非零梯度列数={out_col_participating}"
-                    f"（须落在 [1, |S_out|={int(topo_stats['num_out_scope'])}]，"
-                    f"等式不成立是 ReLU 死神经元的正常行为）；"
-                    if is_neuron3d
-                    else ""
-                )
-                + f"其余参数梯度范数={'全部 > 0' if not zero_others else zero_others}"
-            ),
+            "[3] 所有可学习参数梯度范数 > 0",
+            len(zero_grads) == 0,
+            "全部 > 0" if not zero_grads else f"以下参数梯度范数为 0 或缺失：{zero_grads}",
         )
     )
     finite_loss = bool(avg_loss == avg_loss) and abs(avg_loss) != float("inf")
@@ -1154,49 +1025,6 @@ def run_smoke_test(
                 f"命中 {dense_weight_tensors} 个（应为 0；syn_dist 属几何 buffer，不计入）",
             )
         )
-        # [13] readout 严格口径的真实断言：h 的非零列集合必须恰为 S_out。
-        # 用一次真实前向的中间量取证（不依赖任何自报字段）。
-        with torch.no_grad():
-            _a_in_probe = model.stage1_input_driven(x_last)
-            _a_up_probe = model.stage2_recurrence(_a_in_probe)
-            _h_probe = model.readout_activations(_a_up_probe)
-        h_nonzero_cols = int((_h_probe.abs().sum(dim=0) > 0).sum().item())
-        s_out_size = int(model.out_scope_mask.sum().item())
-        # 口径（与 spec / README 完全一致）：
-        #   (a) **只断言子集方向**：h 的非零列必须都属于 S_out；
-        #   (b) "掩码机制正确"改为**直接结构核对**：h 必须逐位等于
-        #       `(a_up * out_scope_mask)` 的转置形式 —— 即掩码确实作用在 a_up 上；
-        #   (c) 下界：至少有一列非零（否则读出层完全无信号，S_out 形同虚设）。
-        # ⚠️ 历史缺陷（皋陶第 2 轮 F9）：曾断言 `h 非零列数 == |S_out|`。该等式在
-        #    "某 S_out 神经元的 pre-activation 在整个探针 batch 上全为负"时不成立 ——
-        #    此时其 ReLU 输出为 0，h 的对应列合法地为 0（ReLU 的正常行为，
-        #    spec 与 README 均已写明）。故删除等式断言，改为子集 + 结构核对 + 下界。
-        h_cols_subset = bool(
-            ((_h_probe.abs().sum(dim=0) > 0) & ~model.out_scope_mask).sum().item() == 0
-        )
-        h_struct_ok = bool(
-            torch.equal(
-                _h_probe,
-                (_a_up_probe * model.out_scope_mask.unsqueeze(1).to(_a_up_probe.dtype))
-                .transpose(0, 1),
-            )
-        )
-        checks.append(
-            (
-                "[13] readout 严格口径（h 非零列都属于 S_out，且 h 逐位 == a_up 掩码积）",
-                h_cols_subset and h_struct_ok and h_nonzero_cols >= 1,
-                f"h 非零列数={h_nonzero_cols}（须 >= 1 且 <= |S_out|={s_out_size}）；"
-                f"非 S_out 列被屏蔽={h_cols_subset}；"
-                f"h == (a_up * out_scope_mask) 逐位成立={h_struct_ok}",
-            )
-        )
-        checks.append(
-            (
-                "[14] 阶段 2 递推顺序 == 流向轴升序（topo_matches_axis_order == 1）",
-                int(selfcheck["topo_matches_axis_order"]) == 1,
-                f"topo_matches_axis_order={int(selfcheck['topo_matches_axis_order'])}",
-            )
-        )
     else:
         checks.append(
             (
@@ -1207,7 +1035,7 @@ def run_smoke_test(
             )
         )
     checks.append(
-        ("[15] CPU 单 batch 前向+反向耗时 < 120s", elapsed < SMOKE_TIME_MAX, f"实际 {elapsed:.2f}s")
+        ("[13] CPU 单 batch 前向+反向耗时 < 120s", elapsed < SMOKE_TIME_MAX, f"实际 {elapsed:.2f}s")
     )
 
     log_info("阶段 A 验收标准逐条核对（新架构判据集合）：")
@@ -1217,44 +1045,8 @@ def run_smoke_test(
         all_ok = all_ok and ok
 
     # ---- 冒烟测试产物写入独立目录，避免覆盖正式 checkpoint ----
-    # 命名规则（唯一事实来源 = `smoke_checkpoint_path`，本处只决定是否退化）：
-    #   * **完全默认组合**（neuron3d + SMALL_CONFIG 规模 + flow_axis=z + 两个
-    #     any_isolated）→ `_verify/smoke.pt`（保持历史语义，供 README/spec 与
-    #     `verify_sphere_dag.py` 的既有引用直接复核）；
-    #   * 其它任何组合（换 arch / 流向轴 / scope / **N、y、H、D、seed 被覆盖**）→
-    #     `_verify/smoke[_ar{arch}]_{完整配置指纹}.pt`，保证不同配置不互相覆盖。
-    # ⚠️ 历史缺陷（离朱第 9 轮 M2）：曾无条件传入指纹，使默认路径**永远不再写**
-    #    `smoke.pt`，而 README/spec 与 `verify_sphere_dag.py` 仍指向它 —— 于是读到
-    #    上一版代码留下的陈旧产物（数值与文档不符且含已删除字段）。
-    # ⚠️ 历史缺陷（皋陶第 2 轮 F12）：`is_default_smoke` 原先只比较 arch / flow_axis /
-    #    两个 scope，未纳入容量与 seed —— 于是 `--smoke-test --n 32`、`--preset default`、
-    #    `--seed 7` 等会**静默覆盖** `smoke.pt`（用一个不同配置的结果冒充默认产物）。
-    #    故现按 `SMALL_CONFIG` 的全部几何/容量维度逐一比对。
-    small = SMALL_CONFIG
-    is_default_smoke = (
-        arch == "neuron3d"
-        and int(config.N) == int(small.N)
-        and int(config.y_in) == int(small.y_in)
-        and int(config.y_out) == int(small.y_out)
-        and float(config.H) == float(small.H)
-        and float(config.D) == float(small.D)
-        and int(config.seed) == int(small.seed)
-        and config.flow_axis == small.flow_axis
-        and config.placement == small.placement
-        and config.input_scope == small.input_scope
-        and config.readout_scope == small.readout_scope
-        and float(config.space_radius) == float(small.space_radius)
-        # batch_size 进指纹粒度之外，但它直接影响探针 batch 的规模，故一并比对，
-        # 避免"几何相同但批大小不同"的配置覆盖默认产物
-        and int(config.batch_size) == int(small.batch_size)
-    )
-    fingerprint = "" if is_default_smoke else smoke_fingerprint(config)
     smoke_path = smoke_checkpoint_path(
-        config.flow_axis,
-        config.input_scope,
-        config.readout_scope,
-        arch,
-        fingerprint,
+        config.flow_axis, config.input_scope, config.readout_scope, arch
     )
     os.makedirs(VERIFY_CHECKPOINT_DIR, exist_ok=True)
     torch.save(
@@ -1312,7 +1104,7 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
     """生成限批验证产物的配置指纹文件名（保证不同配置互不覆盖）。
 
     命名格式：
-    `verify_<bpe>_N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{flow_axis}_is{scope}_rs{scope}_s{seed}[_<tag>].pt`
+    `verify_<bpe>_N{N}_y{y_in}x{y_out}_H{H}_D{D}_T{T}_ax{flow_axis}_is{scope}_rs{scope}_s{seed}[_<tag>].pt`
 
     * `_s{seed}`：种子影响突触采样（边集与边数随 seed 变），指纹必须含 seed，
       否则只改 `--seed` 的限批跑会互相覆盖；
@@ -1347,6 +1139,7 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
         f"_y{config.y_in}x{config.y_out}"
         f"_H{config.H:g}"
         f"_D{config.D:g}"
+        f"_T{config.T}"
         f"_pl{config.placement}"
         f"_ax{config.flow_axis}"
         f"_is{scope_abbrev(config.input_scope)}"
@@ -1362,7 +1155,7 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
     """生成正式全量产物的文件名（配置指纹，去掉限批语义前缀）。
 
     命名格式：
-    `full_N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{flow_axis}_is{...}_rs{...}_s{seed}[_tag].pt`
+    `full_N{N}_y{y_in}x{y_out}_H{H}_D{D}_T{T}_pl{placement}_ax{flow_axis}_is{...}_rs{...}_s{seed}[_tag].pt`
 
     历史缺陷（离朱第 2 轮 D4）：早期实现直接复用 `config_fingerprint`，产出
     `full_verify_0_...` 这种带限批前缀的误导性名字；此处独立构造、不带该前缀。
@@ -1384,6 +1177,7 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
         f"_y{config.y_in}x{config.y_out}"
         f"_H{config.H:g}"
         f"_D{config.D:g}"
+        f"_T{config.T}"
         f"_pl{config.placement}"
         f"_ax{config.flow_axis}"
         f"_is{scope_abbrev(config.input_scope)}"
@@ -1547,6 +1341,7 @@ def run_full_training(
     batch_size_override: int = 0,
     readout_bias_override: Optional[bool] = None,
     n_override: int = 0,
+    t_override: int = 0,
     y_in_override: int = 0,
     y_out_override: int = 0,
     h_override: float = 0.0,
@@ -1580,7 +1375,7 @@ def run_full_training(
     preset : str
         预设名（small / default / highacc）。默认 "default"。
     lr_override / weight_decay_override / batch_size_override / readout_bias_override /
-    n_override / y_in_override / y_out_override / h_override / d_override :
+    n_override / t_override / y_in_override / y_out_override / h_override / d_override :
         兼容模式（`config is None`）下的字段覆盖；哨兵语义与 CLI 一致。
     flow_axis_override / space_radius_override / input_scope_override /
     readout_scope_override / placement_override :
@@ -1623,6 +1418,8 @@ def run_full_training(
         overrides["readout_bias"] = bool(readout_bias_override)
     if n_override > 0:
         overrides["N"] = n_override
+    if t_override > 0:
+        overrides["T"] = t_override
     if y_in_override > 0:
         overrides["y_in"] = y_in_override
     if y_out_override > 0:
@@ -1713,7 +1510,7 @@ def _run_training_with_config(
     last_loss = float("nan")
     test_acc = 0.0
     for epoch in range(1, config.epochs + 1):
-        last_loss, _, n_batches, _, _ = train_one_epoch(
+        last_loss, _, n_batches = train_one_epoch(
             model,
             train_loader,
             optimizer,

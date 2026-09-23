@@ -1,0 +1,22 @@
+{
+  "plan_id": "plan_bc35acc4-22b7-45f5-a8f9-5a3d51f8dd9b",
+  "module_name": "n3d_sphere",
+  "development_plan": "# 模块 n3d_sphere 第三轮修复计划（针对皋陶第三轮审查：1 新 error + 3 warning + 1 info）\n\n## 背景\n第二轮修复（F9~F15）主体已被皋陶逐项独立复跑确认通过；本轮修复其第三轮列出的新问题——其中 error 是 F11 向量化**新引入**的设备回归。一期 n3d_proto 仍零改动。\n\n## 任务\n\n### F16（error）修复 level_groups 的设备回归\n- 问题：`model.py` 中 `self.level_edge_reach, self.level_nodes = self._build_level_groups(...)` **未 register_buffer**。`level_nodes` 是普通 Python list（元素为 CPU int64 张量），却被 forward 当索引张量用（`acc.index_select(0, nodes)`、`a_up.index_copy(0, nodes, ...)`）。`.to(device)` 搬不动普通 list → CUDA 前向会抛 RuntimeError；同批新增的 `edge_dst_in` 已正确注册，说明意图就是注册。旧版用 `device=a_up.device` 构造索引，属回归。\n- 修法：\n  1. **彻底去掉 `level_nodes` Python list**。层节点在拓扑序中是连续段，改为注册 `level_edge_reach [K,2]` 与 `level_node_reach [K,2]`（或直接复用 `topo_index`），`_iter_levels` 改为 **`self.topo_index[s:e]` 张量切片**（自动随 `.to(device)` 搬运）。\n  2. 新增**设备管理断言**：`level_*` 必须出现在 `named_buffers()` 与 `state_dict()`；forward 中所有索引张量的 device 必须等于 `a_up.device`。\n  3. 新增**设备回归取证**：本机无 GPU，以\"类型 + 注册状态 + 索引张量设备\"三处证据落盘（脚本化，纳入 verify_all），并在 README/spec 标注\"本机无 GPU，CUDA 路径为静态取证\"。\n  4. 回归：CPU 冒烟 `loss` 与向量化前**逐位不变**。\n\n### F17（warning）刷新 W_in 梯度登记值\n- F11 把逐节点 `sum` 改为整层 `index_add`，浮点求和次序变化使 `W_in` 梯度末位改变（`smoke.pt` 实测 `0.30047276616096497`，文档写 `0.30047274`）。\n- 重跑默认冒烟，把 `README.md` L308 与 `.module_agent/n3d_sphere/current_spec.md` L41 的 `W_in` 值刷新为产物实测值；或在表格下明确注明\"末位随实现求和次序可能微变，**以产物为准**\"。\n\n### F18（warning）重跑 F9 冒烟矩阵并刷新取证文件\n- 现有 `smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` 引用的 11 个产物名有 8 个已不存在（指纹后来加入 `_bs{batch_size}`）。\n- 用**当前代码**重跑 11 种组合（四 scope × seed 7/0/2024 × `--n 32` × `--preset default` × `--flow-axis x` × `--arch mlp`），刷新这两个文件，使其中**产物名与实际落盘一致**且全部可 `torch.load`。\n\n### F19（warning）按现跑更新 R5 / R5b / R5c 数字\n- spec/README 中 R5 / R5b / R5c 的实测值是 F3 之前的旧值。用同一脚本的一次真实运行更新，**必须覆盖 `flow_axis=x` 配置**：\n  - R5（dual）：max|Δa_up| = 0.941795(SMALL) / 0.866614(DEFAULT) / 0.918773(axis=x) / 0.866614(R=0.9)；受影响下游非 S_in 神经元 = 51 / 197 / 204 / 197；`d(sum a_up)/d(a_in)` 非零 = 166/192 / 713/768 / 711/768 / 713/768\n  - R5b：最大偏差实测 2.980e-08 / 5.960e-08 / **2.384e-07** / 5.960e-08；反例错配 180/181(0.74) / 892/903(0.7512) / 902/913(1.389)\n  - R5c：SMALL 0.0044 / DEFAULT 0.0034 / axis=x **0.007765**（README L124 与 spec 现只写\"最大变化 0.0034\"，未覆盖 axis=x）\n- 全部数字须可在文档中追溯到脚本与配置，并注明\"**以脚本即时输出为准**\"。\n\n### F20（info）verify_all 汇总计数与文档数字防线\n- `verify_all.py` 汇总行的 PASS/FAIL 计数改为同时匹配 `] PASS` / `] FAIL`（或只报退出码），使 `verify_sphere_dag.py` 等 `[R1] PASS` 格式的脚本不再恒显示 `PASS=0 FAIL=0`。\n- **新增系统性防线**：把 README/spec 中登记的实测值抽成一份机器可读 JSON（如 `_verify/doc_numbers.json`），由 `verify_all` **现跑比对**并报告不一致项，从机制上防止\"文档数字与实现脱节\"再次发生（本轮 F17/F19 的数字即作为首份内容）。\n\n### F21 验收\n- `python checkpoints/n3d_sphere/_verify/verify_all.py` 全绿（无 FAIL、全部退出码 0），且新增的 doc_numbers 比对与设备断言均纳入。\n- CPU 冒烟 `loss` 与上一轮向量化前**逐位不变**。\n- 文档登记数字与现跑**一一一致**（有交叉核对输出）。\n- **E5 一期回归**：`python n3d_proto/train.py --smoke-test` 9/9 PASS、退出码 0、`loss=2.419689`；`git status --porcelain -- n3d_proto` 为空；一期三件产物 SHA256 未变。\n\n## 硬约束\n- **禁止修改 `n3d_proto/` 下任何文件**（含 `.module_agent/n3d_proto/current_spec.md`）。\n- 报告中不得出现无工件支撑的实测数字；所有实测值须标注 seed、配置与产物路径。\n- 同 seed 内必须逐位可复现。\n- 本工作区为 exFAT 卷，`write` 工具不可用（EISDIR）；沿用 pwsh + .NET File.WriteAllText(UTF-8 无 BOM) 落盘、`edit` 做定点修改。\n\n## 完成后（必做，前三轮均遗漏）\n- 调用 module_agent_plan(action=\"plan_complete\", files=[...], test_passed=true) 标记计划完成，并确保执行总结已写入。",
+  "session_id": "b2fa162e-c0bf-4e74-bb6e-6a942dbe3a56",
+  "modified_files": [
+    "n3d_sphere/model.py",
+    "n3d_sphere/train.py",
+    "n3d_sphere/README.md",
+    ".module_agent/n3d_sphere/current_spec.md",
+    ".module_agent/n3d_sphere/module_definition.json",
+    "checkpoints/n3d_sphere/_verify/verify_device_regression.py",
+    "checkpoints/n3d_sphere/_verify/run_smoke_matrix.py",
+    "checkpoints/n3d_sphere/_verify/doc_numbers.json",
+    "checkpoints/n3d_sphere/_verify/sphere_dag_metrics.json",
+    "checkpoints/n3d_sphere/_verify/verify_sphere_dag.py",
+    "checkpoints/n3d_sphere/_verify/verify_all.py",
+    "checkpoints/n3d_sphere/_verify/smoke_matrix_f9.json",
+    "checkpoints/n3d_sphere/_verify/log_smoke_matrix_f9.txt",
+    "checkpoints/n3d_sphere/_verify/log_verify_all_f21.txt"
+  ]
+}

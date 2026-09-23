@@ -121,10 +121,8 @@ a_up[B] = ReLU( Σ_{A→B} w_{A→B} · ( a_up[A] + a_in[A] ) + b_B )
 > 感受野证据（`verify_sphere_dag.py` 的 R5c，两项可执行判定）：
 > ① 最深层神经元的祖先**覆盖全部层**（DEFAULT：9/9 层；flow_axis=x：10/10 层）；
 > ② 把**第 1 层**某神经元的 `a_in` 提高 1.0，**最深层**的 `a_up` 必须因此改变
-> —— 若递推被截断，跨整个深度的**影响将消失**。四组配置的实测最大变化（`[R5c]` 打印
-> 的 6 位小数）：SMALL `0.004414` / DEFAULT `0.003379` / **flow_axis=x `0.007765`** /
-> `space_radius=0.9` `0.003379`（**以脚本即时输出为准**，全精度值同时登记在
-> `_verify/doc_numbers.json` 并由 `verify_all.py` 现跑比对）。
+> （DEFAULT 实测最大变化 0.0034；SMALL 为 0.0044）—— 若递推被截断，跨整个深度的
+> 影响将消失。
 
 **双副本展开（关键语义）**：求和项 `(a_up[A] + a_in[A])` 表示神经元 `A` 的"上游版本输出"
 与"输入层版本输出"**都参与后续传播**，两种版本**共享同一套权重** `w_{A→B}`（每条神经元级
@@ -133,44 +131,9 @@ a_up[B] = ReLU( Σ_{A→B} w_{A→B} · ( a_up[A] + a_in[A] ) + b_B )
 > 实现要点：`a_in[A]` 项必须乘上同一套边权后进入**每一次**聚合（它是与层无关的常量项）；
 > 否则输入层副本会被"覆盖"而永不生效。`a_up` 的写入必须是**非原地**的
 > （`index_copy` 而非 `a_up[node] = ...`）—— 原地赋值会破坏 autograd。
-> 验证脚本 R5 用"零化 `a_in` 是否改变 `a_up`"与 `d(sum a_up)/d(a_in)` 两点直接取证。
-> 四组配置的实测值（`verify_sphere_dag.py` 的 R5，`[R5]` 即时输出，**以脚本输出为准**）：
->
-> | 配置（N=256/y=8×8/H=0.10/D=0.15/seed=42，除注明外） | 双副本神经元 | 零化 `a_in` 后 max\|Δ`a_up`\| | 受影响的下游非 `S_in` 神经元 | `d(sum a_up)/d(a_in)` 非零 |
-> |---|---|---|---|---|
-> | SMALL（N=64/y=4×4/H=0.15/D=0.25） | 7 | `0.941795` | 51 | 166/192 |
-> | DEFAULT（`flow_axis=z`） | 37 | `0.866614` | 197 | 713/768 |
-> | DEFAULT + `flow_axis=x` | 41 | `0.918773` | 204 | 711/768 |
-> | DEFAULT + `space_radius=0.9` | 37 | `0.866614` | 197 | 713/768 |
->
-> （历史登记值 `0.85 / 169 / 722/768` 是向量化（F11）之前的旧实现输出，已在 F19 按
-> 同一脚本的一次真实运行整体刷新；全精度值登记在 `_verify/doc_numbers.json`。）
-
-> **逐边数值正确性（R5b，M1 的回归判据）**：脚本**独立重建**阶段 2（按拓扑序逐节点、
-> 用原始边表精确递推），与生产实现对比。四组配置的实测最大偏差
-> （`[R5b]` 即时输出，**以脚本输出为准**）：
-> SMALL `2.980e-08`（E=181）/ DEFAULT `5.960e-08`（E=903）/
-> **flow_axis=x `2.384e-07`**（E=913）/ `space_radius=0.9` `5.960e-08`（E=903），
-> 全部远小于判据阈值 `1e-5`。
-> 同项还带**敏感性反例**：按历史 M1 形态（边已按 `edge_perm` 重排、源激活却按
-> `repeat_interleave` 槽位取样）构造的错误映射，实测错配边数
-> SMALL `180/181` / DEFAULT `892/903` / flow_axis=x `902/913`，且错配导致的结果差异为
-> `7.411e-01` / `7.512e-01` / `1.389` —— 证明该判据对这类缺陷**确实敏感**
-> （若反例退化，判据形同虚设；这正是皋陶第 2 轮 F13 的要求）。
-
-> **实现形态与设备契约（F16）**：阶段 2 采用**整层向量化**——`__init__` 预计算并
-> `register_buffer` 两张 `[K, 2]` 的 int64 下标表 `level_edge_reach`（每层在入边表中的
-> 连续区间）与 `level_node_reach`（每层在拓扑序中的连续区间），前向对每层只做一次
-> `index_add` + 一次非原地 `index_copy`，循环次数 = **层数**（DEFAULT 9 / SMALL 7），
-> 而不是神经元数 N。层节点集合由 `topo_index[s:e]` **张量切片**得到。
-> 历史缺陷（皋陶第三轮 error）：层节点曾用普通 Python `list` 保存 —— `nn.Module.to(device)`
-> **不会搬运普通 list 中的张量**，CUDA 前向必然抛 RuntimeError（CPU 上完全静默）。
-> 现在 `stage2_recurrence` 每次前向都调用 `_assert_index_device`，显式校验
-> **每一个索引张量都已注册为 buffer/parameter 且与激活同设备**，不一致即抛 RuntimeError。
-> 本机为 CPU-only（`torch.cuda.is_available() == False`），故 CUDA 路径采用**静态取证**：
-> `verify_device_regression.py` 用 `meta` 设备做搬运实验（注册的 buffer 会搬走、
-> 普通 Python list 里的张量搬不走）+ 两条守卫负例（设备不一致 / 未注册均必须抛错）；
-> 若在有 GPU 的机器上运行，该脚本会自动追加真实 `.cuda()` 前向与 CPU 结果比对。
+> 验证脚本 R5 用"零化 `a_in` 是否改变 `a_up`"与 `d(sum a_up)/d(a_in)` 两点直接取证
+> （DEFAULT 实测：零化后 `a_up` 最大变化 0.85、受影响的下游非 `S_in` 神经元 169 个、
+> `d(sum a_up)/d(a_in)` 在 722/768 个元素上非零）。
 
 ### 3.3 判据开关与读出
 
@@ -340,12 +303,12 @@ CLI 一览（几何相关部分）：
 ```
 python n3d_sphere/train.py --smoke-test          -> 退出码 0，15/15 PASS
 loss = 2.326995849609375（可 torch.load 复核 checkpoints/n3d_sphere/_verify/smoke.pt）
-单 batch 前向+反向耗时 = 5.62s（随机器负载波动，不作契约）；可学习参数 = 11077
-四个可学习参数的梯度范数（L2，**全精度、与产物逐位相等**）：
-  W_in         0.30047276616096497
-  edge_weight  0.06744416803121567
-  neuron_bias  0.16902117431163788
-  W_out        0.12903930246829987
+单 batch 前向+反向耗时 = 3.2s；可学习参数 = 11077
+四个可学习参数的梯度范数（L2）：
+  W_in         0.30047274
+  edge_weight  0.06744417
+  neuron_bias  0.16902117
+  W_out        0.12903930
 E=181，平均出度 2.8281，最大出度 5，层数 7，S_in=13，S_out=17，双副本神经元 7
 最近邻距 0.299999952（= 2H），R=0.663198 ∈ [R_min=0.663198, R_max=1.768527]
 config 中不含已删除字段（无迭代轮数维度）
@@ -354,25 +317,15 @@ config 中不含已删除字段（无迭代轮数维度）
 > 复核命令：`python -c "import torch; c=torch.load('checkpoints/n3d_sphere/_verify/smoke.pt',map_location='cpu',weights_only=False); print(c['loss'], c['grad_norms'])"`
 > —— 该命令对应当前代码，输出必须与上表逐位一致。
 >
-> **末位说明（F17）**：`W_in` 梯度范数的末位随实现中的**求和次序**可能微变 ——
-> F11 把阶段 2 的逐节点 `sum` 改为整层 `index_add` 后，`W_in` 梯度由旧登记的
-> `0.30047274…` 变为产物的 `0.30047276616096497`（差异在第 8 位小数之后）。
-> 因此本表**一律以产物实测值（全精度）为准**，同一 seed 内逐位可复现；该值同时登记在
-> `_verify/doc_numbers.json`，由 `verify_all.py` 现跑比对，任何偏移都会报 FAIL。
+> 其余三种 scope 组合的梯度范数（同样来自各自产物）：
+> `any/all`：W_in 0.16436030 / edge_weight 0.03765957 / neuron_bias 0.09283318 / W_out 0.08622522；
+> `all/any`：W_in 0.09831192 / edge_weight 0.04523439 / neuron_bias 0.18492448 / W_out 0.11581375；
+> `all/all`：W_in 0.02540598 / edge_weight 0.03929858 / neuron_bias 0.17323792 / W_out 0.07216692。
 >
-> 其余三种 scope 组合的梯度范数（同样来自各自产物，全精度）：
-> `any/all`：W_in `0.16436029970645905` / edge_weight `0.03765956684947014` /
-> neuron_bias `0.09283317625522614` / W_out `0.08622521907091141`；
-> `all/any`：W_in `0.09831191599369049` / edge_weight `0.04523438587784767` /
-> neuron_bias `0.18492448329925537` / W_out `0.11581374704837799`；
-> `all/all`：W_in `0.02540597878396511` / edge_weight `0.03929858282208443` /
-> neuron_bias `0.17323791980743408` / W_out `0.07216691970825195`。
->
-> `--arch mlp` 冒烟的实测：退出码 0、6/6 PASS（MLP 基线只有 6 条适用判据），产物
+> `--arch mlp` 冒烟的实测：退出码 0、15/15 PASS，产物
 > `smoke_armlp_N64_y4x4_H0.15_D0.25_plfcc_axz_isany_rsany_bs32_s42.pt`，
-> loss = `2.2989346981048584`（`fc1.weight` `6.219344139099121` /
-> `fc1.bias` `0.20135721564292908` / `fc2.weight` `4.08964204788208` /
-> `fc2.bias` `0.18698155879974365`）。
+> loss = 2.2989346981048584（`fc1.weight` 6.21934414 / `fc1.bias` 0.20135722 /
+> `fc2.weight` 4.08964205 / `fc2.bias` 0.18698156）。
 > 注：判据 3 按 arch 解析输出层参数名（neuron3d 为 `W_out`，MLP 为 `fc2.*`），两种架构通用。
 
 ---
@@ -415,9 +368,8 @@ config 中不含已删除字段（无迭代轮数维度）
 
 > **如实标注**：`input_scope=all_isolated` 时 `S_in` 只有 13 个神经元且其中没有神经元
 > 拥有上游连接，故"双副本展开"在该取值下**不触发**（双副本计数 = 0）。这是判据选择的
-> 自然结果，不是实现缺陷 —— 此时阶段 2 对 `a_in` 的依赖仍然存在：`d(sum a_up)/d(a_in)`
-> 在 `all/any` 下于 **480/512** 个元素上非零（`any/any` 为 **475/512**），见
-> `verify_scope_and_fingerprint.py` 的 S1-S3 即时输出（该脚本退出码 0、`[S1-S3] PASS`）。
+> 自然结果，不是实现缺陷 —— 此时阶段 2 对 `a_in` 的依赖仍然存在（`d(sum a_up)/d(a_in)`
+> 在 486/512 个元素上非零，见 `verify_scope_and_fingerprint.py` 的 S1-S3）。
 
 ### 7.1 跨模块回归（一期未被触碰）
 
@@ -459,42 +411,7 @@ python n3d_proto/train.py --smoke-test   -> 9/9 PASS、退出码 0、loss = 2.41
 | `connection_stats` | 神经元级连接统计（`num_edges` / 度分布 / `num_layers` / `num_in_scope` / `num_out_scope` / 孤立突触数） |
 | `topology_stats` | 几何指纹（`placement` / `flow_axis` / `space_radius` / `placement_radius` / `lattice_constant` / `nearest_neighbour_dist` / 神经元流向轴高度分布 / 判据编码 / `edge_dist_*` / `dual_copy_count`） |
 | `dag_selfcheck` | `dag_acyclic` / `all_edges_uphill` / `topo_covers_all` / `topo_matches_axis_order` |
-| `model_state_dict` 中的拓扑 buffer | `topo_index` / `edge_offset` / `edge_perm` / `edge_perm_in` / `neuron_in_edge_reach` / `edge_dst_in` / **`level_edge_reach` / `level_node_reach`** / `in_scope_mask` / `out_scope_mask` / 度分布 —— **全部 `register_buffer`**，故 `.to(device)` 与 `state_dict()` 都能搬运/持久化（F16 设备契约） |
 | 顶层 | `placement` / `flow_axis` / `space_radius` / `effective_space_radius` / `min_space_radius` / `max_space_radius` / `input_scope` / `readout_scope` / 训练超参 |
-
-### 8.2 字节确定性：SHA256 作为等价判据的前提（离朱第 11 轮 D1）
-
-**`torch.save` 产物的字节并不只由数值决定，还取决于 pickle 的记忆化（memo），而 memo
-依赖对象的身份（`id`）而非取值。** 因此"SHA256 相等"只有在**同一语义配置走同一代码路径**
-时才等价于"数值相同"。
-
-* 实测反例（D1）：`--smoke-test`（走 `SMALL_CONFIG` 单例）与
-  `--smoke-test --input-scope any_isolated --readout-scope any_isolated`（scope 取值来自
-  argparse 构造的**等值新字符串**）写出的 `smoke.pt` —— loss / `config` / `grad_norms` /
-  `model_state_dict` 全部张量**逐位相等**，但 `data.pkl` 为 4097 vs 4117 字节、
-  共 1520 字节不同：单例下两个 scope 字段指向同一个 `"any_isolated"` 字符串对象，
-  第二次出现被写成 pickle memo 引用；显式传参下两处分别内联写出。
-* **修复（根因侧）**：`train.py` 的 `apply_overrides` 在"显式覆盖值与基线**逐字段相同**"
-  时**复用基线对象本身**，使"同一语义配置 ⇒ 同一字节"。修复后 `--smoke-test` / 显式传等值
-  scope / `--space-radius 0.0` / `--preset default` / `--seed 0` 等路径写出的 `smoke.pt`
-  **SHA256 全部相同**（`1A9D68D8…43D7`）。
-  **日志出现的精确范围（离朱第 12 轮 D2 澄清）**：`apply_overrides` 的短路分支会打印一行
-  `显式覆盖参数与基线取值逐字段一致（值等价）：复用基线配置对象…`。因此**只有"显式给出
-  覆盖参数且其值与基线相同"的形式**才会打印该行 —— 实测为 3 条：
-  `--input-scope any_isolated`（或两个 scope 都显式传等值）与 `--space-radius 0.0`；
-  而**裸跑**、`--preset default`、`--seed 0` 这三种形式在 `build_smoke_config` 的
-  `if not explicit: return SMALL_CONFIG` 处就**提前返回**（它们按 CLI 约定本就不算"显式覆盖"），
-  根本不会进入 `apply_overrides`，故不打印该行 —— 但**产物字节与前者完全一致**
-  （都走 `SMALL_CONFIG` 单例）。反之，真正改变取值的覆盖仍打印
-  `冒烟测试配置已被显式覆盖…` 告警且不打印值等价行，语义边界正确。
-* **修复（判据侧）**：`run_smoke_matrix.py` 新增"**同一产物路径被多条组合写入时必须逐位
-  一致**"的断言，并在每条记录中追加 `artifact_sha256_at_end` / `artifact_sha256_stable` /
-  `artifact_shared_writers` 三个字段把该不变量固化 —— 实测 `smoke.pt` 被 3 条组合写入
-  （`scope any/any seed42` / `seed 0` / `preset default`）、SHA 去重后 1 种，
-  11/11 记录的 `artifact_sha256_at_end == artifact_sha256` 且与盘上文件实际 SHA 一致；
-  "取证记录里的 SHA 在矩阵结束后已不存在于盘上"这类**证据不自洽**不会再出现。
-* **结论**：引用产物 SHA256 时必须同时给出**配置与调用路径**；跨路径判断"数值等价"
-  应以 `torch.load` 后的张量比对（`torch.equal`）为准，而不是文件 SHA。
 
 ---
 
@@ -506,25 +423,18 @@ python n3d_proto/train.py --smoke-test   -> 9/9 PASS、退出码 0、loss = 2.41
 | `_verify/verify_scope_and_fingerprint.py` | S1-S3 判据语义与双副本随 scope 的行为、S4-S5 产物指纹维度与冒烟命名规则 |
 | `_verify/verify_config_contracts.py` | C1 半径公式、C2-C3 窗口校验与 FCC 容纳性、C4-C5 字段清理与取值域、C6 零残留断言 |
 | `_verify/verify_topology_snapshot.py` | 固定实验点 × 10 seed 的拓扑量快照（落盘 JSON，供报告引用时标注 seed） |
-| `_verify/verify_device_regression.py` | **D1-D7 设备契约（F16 回归取证）**：层拓扑量的类型/注册状态、`vars(model)` 通用扫描（不得存在搬不动的张量容器）、层切分等价性、`.to('meta')` 搬运实验 + 普通 Python list 搬不动的机制复现、两条守卫负例（必须抛 RuntimeError）、CUDA 实测（无 GPU 时自动 skip 并标注"静态取证"）、`state_dict` 往返逐位一致 |
-| `_verify/run_smoke_matrix.py` | 以当前代码重跑 **11 种冒烟配置组合**，从日志解析**实际落盘路径**并与独立预测的产物名比对、回读 config 与期望逐字段比对、断言 `smoke.pt` 未被非默认组合污染；刷新 `smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` |
-| `_verify/verify_all.py` | 一键依次执行上面全部命令（含一期回归）与**文档数字防线**（`doc_numbers.json` 现跑比对），汇总退出码 |
-| `_verify/doc_numbers.json` | **文档数字登记表**：README / spec 中出现的实测值（本轮 93 项 = 32 产物字段 + 54 全精度指标 + 7 文本计数），由 `verify_all.py` 现跑比对 |
-| `_verify/sphere_dag_metrics.json` | `verify_sphere_dag.py` 每次运行落盘的**全精度**指标（R1-R7b，111 条），供 `doc_numbers.json` 现跑比对取用 |
-| `_verify/smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` | 11 种冒烟组合的取证记录（产物名 / 退出码 / PASS / FAIL / loss / 梯度范数 / config 核对 / SHA256）与完整日志 |
+| `_verify/verify_all.py` | 一键依次执行上面全部命令（含一期回归），汇总退出码 |
 
 一键复现（也可直接 `verify_all.py` 一次跑完）：
 
 ```bash
-python checkpoints/n3d_sphere/_verify/verify_all.py                              # 全部退出码 0、文档数字全部一致
+python checkpoints/n3d_sphere/_verify/verify_all.py                              # 全部退出码 0
 python -m compileall -q n3d_sphere                                              # 退出码 0
 python n3d_sphere/train.py --smoke-test                                          # 退出码 0，15/15 PASS
-python checkpoints/n3d_sphere/_verify/verify_sphere_dag.py all                   # 退出码 0（R1-R7b）
-python checkpoints/n3d_sphere/_verify/verify_device_regression.py                # 退出码 0（D1-D7，D6 无 GPU 时 skip）
+python checkpoints/n3d_sphere/_verify/verify_sphere_dag.py all                   # 退出码 0
 python checkpoints/n3d_sphere/_verify/verify_scope_and_fingerprint.py            # 退出码 0
 python checkpoints/n3d_sphere/_verify/verify_config_contracts.py                 # 退出码 0
 python checkpoints/n3d_sphere/_verify/verify_topology_snapshot.py                # 退出码 0
-python checkpoints/n3d_sphere/_verify/run_smoke_matrix.py                        # 退出码 0（11/11 组合取证）
 python n3d_proto/train.py --smoke-test                                           # 9/9 PASS、loss=2.419689
 ```
 
@@ -544,20 +454,10 @@ python n3d_proto/train.py --smoke-test                                          
    （见第 8 节 arch 指纹）。
 5. **"坐标与 seed 无关"的边界**：仅神经元坐标如此（FCC 规则堆积 + 确定性字典序排序）。
    突触坐标、边集与可学习参数**都随 seed 变化**；报告引用任何拓扑数字时必须标注 seed。
-6. **本机为 CPU-only 环境**（实测 `torch.cuda.is_available() == False`，`torch 2.14.0+cpu`）：
-   所有实测数字都来自 CPU 运行；**CUDA 路径为静态取证**（`verify_device_regression.py`
-   的 D4 `meta` 搬运实验 + D5 守卫负例），该脚本在具备 GPU 的机器上会自动追加真实
-   `.cuda()` 前向与 CPU 结果比对。设备契约（所有索引张量必须注册为 buffer/parameter）
-   由 `stage2_recurrence` 每次前向的 `_assert_index_device` 强制。
-7. **`--seed 0` 按 CLI 约定表示"不覆盖"**（见 `--seed` 帮助与 `validate_overrides`），
-   `--preset default` 在冒烟路径下的基线即 `SMALL_CONFIG` —— 故这两种命令行写法在冒烟
-   矩阵中都与默认组合等价（产物同为 `smoke.pt` 且逐位相同）。矩阵记录逐条注明，
-   真正的额外 seed 覆盖由 `--seed 7` / `--seed 2024` 承担（见 `smoke_matrix_f9.json`）。
 
-### 10.1 第一/二轮修复的缺陷
+### 10.1 本轮修复的缺陷
 
-皋陶第一/二轮审查（1 error + 5 warning + info；2 error + 2 warning + 5 info）与离朱
-独立测试（3 项失败）共同暴露的缺陷：
+皋陶审查（1 error + 5 warning + info）与离朱独立测试（3 项失败）共同暴露的缺陷：
 
 | 编号 | 缺陷 | 严重度 | 修复 |
 |---|---|---|---|
@@ -573,28 +473,3 @@ python n3d_proto/train.py --smoke-test                                          
 > 脚本都未能捕获，只有**逐边数值核对**能发现 —— 这正是 R5b 的由来。F2 的影响同样隐蔽：
 > 旧的合并口径下 `readout_scope` 表面"生效"（`S_out` 规模变了），但 logits 完全不受影响；
 > 改为严格口径后，两个开关才真正改变前向结果。
-
-### 10.2 第三轮修复的缺陷（皋陶第三轮审查：1 error + 3 warning + 1 info；离朱第 11 轮独立测试：19/19 通过 + 1 项低severity 注记）
-
-| 编号 | 缺陷 | 严重度 | 修复 |
-|---|---|---|---|
-| **F16** | 阶段 2 向量化（F11）**新引入的设备回归**：`level_edge_reach, level_nodes = self._build_level_groups(...)` 未 `register_buffer`，`level_nodes` 是普通 Python `list`（元素为 CPU int64 张量），却被 forward 当索引张量用（`index_select` / `index_copy`）。`nn.Module.to(device)` **不搬运普通 list 中的张量** → CUDA 前向必然抛 RuntimeError；同批新增的 `edge_dst_in` 已正确注册，说明意图就是注册 | **error** | ① 彻底去掉 `level_nodes` Python list：`_build_level_groups` 改为返回两张 `[K,2]` int64 张量（`level_edge_reach` / `level_node_reach`），二者均 `register_buffer`；层节点集合由 **`topo_index[s:e]` 张量切片**得到（随 `.to(device)` 自动搬运）。② 新增 `_assert_index_device`：每次前向校验全部索引张量**已注册且与激活同设备**，违反即抛 RuntimeError。③ 新增 `verify_device_regression.py`（D1-D7，含 `meta` 搬运实验与两条守卫负例）纳入 `verify_all`。④ CPU 冒烟 `loss` 与向量化前**逐位不变**（`2.326995849609375`） |
-| F17 | README / spec 登记的 `W_in` 梯度范数是 F11 向量化**之前**的值（求和次序变化使末位改变，产物实测 `0.30047276616096497`） | warning | 重跑默认冒烟，把登记值刷新为**产物全精度实测值**（四个范数全部改为全精度），并在表下明确注明"末位随实现求和次序可能微变，**以产物为准**"；同时纳入 `doc_numbers.json` 由 `verify_all` 现跑比对 |
-| F18 | `smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` 引用的 11 个产物名有 **8 个已不存在**（指纹后来加入 `_bs{batch_size}`，取证文件未随之重跑） | warning | 新增 `run_smoke_matrix.py`：用**当前代码**重跑 11 种组合（子进程强制 `PYTHONIOENCODING=utf-8` 以免 GBK 管道编码把中文日志变乱码而无法解析），从日志解析**实际落盘路径**并与脚本独立预测的产物名比对，逐个 `torch.load` 复核 config / loss / 梯度范数 / SHA256，并断言 `smoke.pt` 在全矩阵前后**逐位且 config 均未被污染**；实测 **11/11 通过**，两个取证文件已按实际产物名刷新 |
-| F19 | README / spec 中 R5 / R5b / R5c 的实测值是 F3（单遍递推）之前的旧值，且**未覆盖 `flow_axis=x` 配置** | warning | 用**同一脚本的一次真实运行**整体刷新（R1-R7b 均在含 `flow_axis=x` 的 4 组配置上执行）：R5 `max\|Δa_up\|` = `0.941795`/`0.866614`/`0.918773`/`0.866614`，受影响下游非 `S_in` 神经元 = 51/197/204/197，`d(sum a_up)/d(a_in)` 非零 = 166/192、713/768、711/768、713/768；R5b 最大偏差 = `2.980e-08`/`5.960e-08`/`2.384e-07`/`5.960e-08`，反例错配 = 180/181、892/903、902/913；R5c = `0.004414`/`0.003379`/**`0.007765`**/`0.003379`。全部注明"**以脚本即时输出为准**"；`verify_sphere_dag.py` 新增落盘 `sphere_dag_metrics.json`（111 条全精度指标）供机器比对 |
-| F20 | `verify_all.py` 汇总行只统计 `[PASS]`/`[FAIL]` 字面量，而 `verify_sphere_dag.py` 等脚本格式为 `[R1] PASS` → 汇总恒显示 `PASS=0 FAIL=0`，掩盖真实判据数量；且**缺少"文档数字与实现脱节"的机制性防线** | info | ① 计数改为正则同时匹配 `[PASS]` / `] PASS` / `：PASS`（FAIL 同理），修正"恒为 0"的假象（现实测：R1-R7b=10、D1-D7=6、E2=15、E2b=6、E5=9）；② 新增**文档数字防线**：`_verify/doc_numbers.json` 登记 README / spec 中出现的实测值（本轮 **93 项** = 32 产物字段 + 54 全精度指标 + 7 文本计数），`verify_all.py` 在同一轮用**本次现跑的产物 + `sphere_dag_metrics.json` + 命令标准输出**逐项比对，任何不一致直接判失败；③ `verify_all` 命令集扩充为 **9 条**（新增 D1-D7 设备契约），子进程统一强制 UTF-8 输出 |
-| **F21** | 验收 | —— | `python checkpoints/n3d_sphere/_verify/verify_all.py`：9 条命令全部退出码 0、无 FAIL，文档数字 **93/93 一致、0 不一致、0 跳过**；CPU 冒烟 `loss` 与向量化前逐位不变；一期 `n3d_proto/train.py --smoke-test` 9/9 PASS、`loss=2.419689`、`git status --porcelain -- n3d_proto` 为空、一期三件产物 SHA256 未变 |
-| **D1**（离朱第 11 轮） | 显式传"与默认相同的 scope 值"会写出**语义相同但字节不同**的 `smoke.pt`：裸跑走 `SMALL_CONFIG` 单例时两个 scope 字段指向同一个 `"any_isolated"` 字符串对象（pickle 第二次出现写成 memo 引用），显式传参时取值来自 argparse 的**等值新字符串**（两处分别内联写出），于是 `data.pkl` 4097 vs 4117 字节；后果是矩阵记录 [0] 登记的 SHA 在矩阵结束后**已被同轮后续写入覆盖**，取证文件不自洽 | 低 | ① **根因侧**：`train.py` 的 `apply_overrides` 在"显式覆盖值与基线**逐字段相同**"时**复用基线对象本身**（打印一行"值等价、复用基线对象"日志），使"同一语义配置 ⇒ 同一字节"——修复后 5 条等值路径写出的 `smoke.pt` SHA256 全为 `1A9D68D8…43D7`；② **判据侧**：`run_smoke_matrix.py` 新增"同一产物路径被多条组合写入时必须逐位一致"的断言，记录中追加 `artifact_sha256_at_end` / `artifact_sha256_stable` / `artifact_shared_writers` 字段（实测 `smoke.pt` 被 3 条组合写入、SHA 去重后 1 种）；③ 文档中明确 **SHA256 等价判据只在"同语义同代码路径"下成立**（见第 8.2 节） |
-
-| **D2**（离朱第 12 轮） | 复测说明中把"值等价日志"写成"6 条等值命令形式均会打印"，实测只有进入 `apply_overrides` 的 3 条会打印（裸跑 / `--preset default` / `--seed 0` 在 `build_smoke_config` 的 `if not explicit: return SMALL_CONFIG` 处提前返回）—— 属**测试说明文字**与实现不一致，非代码缺陷（6 条形式的产物字节、loss、判据全部一致） | 低（文档） | 不改代码语义，只把"日志出现的精确范围"写进本文档第 8.2 节：明确列出会打印的 3 条形式与不打印的 3 条形式，并说明两者**产物字节一致**的原因（都走 `SMALL_CONFIG` 单例）；同时 D1 行中的通道口径同步更新为"3 条组合写入 `smoke.pt`、SHA 去重后 1 种" |
-
-> 第三轮的核心教训与前两轮同源：**"凡是在 CPU 上静默、只在其它设备/其它配置下爆发的
-> 不变量，必须写成可执行判据"**。F16 的普通 Python list 是典型例子 —— 所有 CPU 判据
-> 全绿、15/15 PASS，缺陷只在 CUDA 上显形；F18/F19 则说明**取证文件与文档数字会随实现
-> 演进而脱节**，因此本轮把"文档登记数字"本身变成一个由 `verify_all` 现跑比对的机器可读
-> 契约（`doc_numbers.json`），而不是继续依赖人工核对。
->
-> D1 补充了第三类教训：**"数值等价"与"字节等价"是两件事** —— `torch.save` 的字节受
-> pickle memo（对象身份）影响。因此（a）产物的 SHA256 只有在同语义同代码路径下才是等价
-> 判据，（b）凡是"证据文件里登记了某个文件的 SHA"的地方，都必须断言该 SHA 在同一轮运行
-> 结束后**仍然存在于盘上**（本轮已把这条写成 `run_smoke_matrix.py` 的可执行判据）。

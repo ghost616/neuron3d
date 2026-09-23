@@ -1,0 +1,673 @@
+"""n3d_sphere 纯球形分层 DAG 架构验证脚本（几何 / FCC / DAG / 双副本 / scope 自检）。
+
+本脚本**不改动** n3d_sphere 任何源码，只做「构造 + 断言 + 打印」，把架构不变量固定成可复现记录：
+
+* R1 几何：神经元在球内、突触在所属神经元 H 球内且严格落在流向轴正/负半球、体积均匀性；
+* R2 FCC：晶格常数 = 2*sqrt(2)*H、最近邻距 == 2H、放置半径 <= R_max、R 落在 [R_min, R_max]；
+* R3 DAG：Kahn 拓扑排序覆盖全部节点、每条边严格上行 z_A < z_B、层数与流向轴分层一致；
+* R4 去重：神经元级连接数 == 去重后的 (起点, 终点) 对数（同一神经元对只算一条连接）；
+* R5 双副本：S_in 且入度 > 0 的神经元，其"输入层版本"必须真正参与下游传播
+       （零化 a_in 会改变 a_up；d(sum a_up)/d(a_in) 非零）；
+* R6 scope：any_isolated / all_isolated 两种判据的 S_in / S_out 规模与集合包含关系；
+* R7 产物：任意 .pt 冒烟/全量产物可 torch.load 且关键字段自洽。
+
+用法（工程根目录下执行）::
+
+    python checkpoints/n3d_sphere/_verify/verify_sphere_dag.py all
+    python checkpoints/n3d_sphere/_verify/verify_sphere_dag.py geom
+    python checkpoints/n3d_sphere/_verify/verify_sphere_dag.py fcc
+    python checkpoints/n3d_sphere/_verify/verify_sphere_dag.py dag
+    python checkpoints/n3d_sphere/_verify/verify_sphere_dag.py dual
+    python checkpoints/n3d_sphere/_verify/verify_sphere_dag.py scope
+    python checkpoints/n3d_sphere/_verify/verify_sphere_dag.py artifact <path.pt>...
+退出码 0 = 全部 PASS。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import io
+from typing import Dict, List
+
+import torch
+
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, os.pardir)
+)
+for _p in (PROJECT_ROOT, os.path.join(PROJECT_ROOT, "n3d_sphere")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from n3d_sphere.config import Config, SMALL_CONFIG, SCOPE_CHOICES  # noqa: E402
+from n3d_sphere.model import ThreeDNeuronSpace  # noqa: E402
+
+# Windows GBK 控制台：日志与断言消息一律只输出 ASCII 可编码字符（避免 UnicodeEncodeError）
+try:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+except Exception:  # pragma: no cover
+    pass
+
+VERIFY_DIR = os.path.join(PROJECT_ROOT, "checkpoints", "n3d_sphere", "_verify")
+
+# 本脚本判据的固定配置（H/D 与预设一致；R 用公式下界 R_min）
+GEOM_CASES = (
+    ("SMALL_CONFIG (N=64/y=4x4/H=0.15/D=0.25)", SMALL_CONFIG),
+    (
+        "DEFAULT-scale (N=256/y=8x8/H=0.10/D=0.15)",
+        Config(N=256, y_in=8, y_out=8, H=0.10, D=0.15, seed=42),
+    ),
+    (
+        "DEFAULT-scale flow_axis=x (轴无关性)",
+        Config(N=256, y_in=8, y_out=8, H=0.10, D=0.15, seed=42, flow_axis="x"),
+    ),
+    (
+        "DEFAULT-scale space_radius=0.9 (显式窗口内)",
+        Config(N=256, y_in=8, y_out=8, H=0.10, D=0.15, seed=42, space_radius=0.9),
+    ),
+)
+
+
+def _build(cfg: Config) -> ThreeDNeuronSpace:
+    """按配置构造主模型（统一入口，便于几何/拓扑子命令复用）。"""
+    return ThreeDNeuronSpace(cfg)
+
+
+# ----------------------------------------------------------------------
+# R1 几何
+# ----------------------------------------------------------------------
+def check_geometry() -> bool:
+    """R1：球内分布 + 突触 H 球内 + 半球切分 + 体积均匀性（x/y/z 三轴均验证）。"""
+    print("=" * 78)
+    print("[R1] 球形几何断言")
+    ok = True
+    for tag, cfg in GEOM_CASES:
+        m = _build(cfg)
+        axis = m.flow_axis_index
+        y_in, y_out = m.y_in, m.y_out
+        rep_in = m.neuron_pos.repeat_interleave(y_in, dim=0)
+        rep_out = m.neuron_pos.repeat_interleave(y_out, dim=0)
+        d_in = (m.input_syn_pos - rep_in).norm(dim=1)
+        d_out = (m.output_syn_pos - rep_out).norm(dim=1)
+        H = float(cfg.H)
+        in_ball = bool((d_in <= H + 1e-6).all()) and bool((d_out <= H + 1e-6).all())
+        off_in = m.input_syn_pos[:, axis] - rep_in[:, axis]
+        off_out = m.output_syn_pos[:, axis] - rep_out[:, axis]
+        hemi = bool((off_in <= 1e-6).all()) and bool((off_out >= -1e-6).all())
+        # 体积均匀性：|p| / H 的立方根分布（同口径用于神经元半径）应接近 U(0,1)
+        # 这里用 (|delta| / H)^3 的均值检验：球内按体积均匀时该值 ~ U(0,1)，均值 0.5
+        u_out = (d_out / H).pow(3)
+        mean_u = float(u_out.mean())
+        vol_ok = abs(mean_u - 0.5) < 0.05
+        ok &= in_ball and hemi and vol_ok
+        print(
+            f"  {tag}\n"
+            f"      突触在 H={H} 球内: {in_ball}（输入 max={float(d_in.max()):.6f}, "
+            f"输出 max={float(d_out.max()):.6f}）\n"
+            f"      流向轴 {cfg.flow_axis} 半球切分: {hemi}"
+            f"（输入 max={float(off_in.max()):.3e}<=0, 输出 min={float(off_out.min()):.3e}>=0）\n"
+            f"      输出突触体积均匀性 (|d|/H)^3 均值={mean_u:.4f}（理论 0.5）: {vol_ok}"
+        )
+    print(f"[R1] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+# ----------------------------------------------------------------------
+# R2 FCC
+# ----------------------------------------------------------------------
+def check_fcc() -> bool:
+    """R2：FCC 规则堆积契约（晶格常数、最近邻距 = 2H、半径窗口、与 seed 无关）。"""
+    print("=" * 78)
+    print("[R2] FCC 规则堆积断言")
+    ok = True
+    for tag, cfg in GEOM_CASES:
+        m = _build(cfg)
+        t = m.get_topology_stats()
+        expect_a = 2.0 * (2.0 ** 0.5) * float(cfg.H)
+        expect_nn = 2.0 * float(cfg.H)
+        a_ok = abs(t["lattice_constant"] - expect_a) < 1e-9
+        nn_ok = abs(t["nearest_neighbour_dist"] - expect_nn) < 1e-5
+        r_ok = cfg.min_space_radius - 1e-9 <= cfg.effective_space_radius <= cfg.max_space_radius + 1e-9
+        pr_ok = t["placement_radius"] <= cfg.max_space_radius + 1e-9
+        ok &= a_ok and nn_ok and r_ok and pr_ok
+        print(
+            f"  {tag}\n"
+            f"      晶格常数 a={t['lattice_constant']:.9f}（期望 2*sqrt(2)*H={expect_a:.9f}）: {a_ok}\n"
+            f"      最近邻距={t['nearest_neighbour_dist']:.9f}（期望 2H={expect_nn:.9f}）: {nn_ok}\n"
+            f"      R={cfg.effective_space_radius:.6f} in [R_min={cfg.min_space_radius:.6f}, "
+            f"R_max={cfg.max_space_radius:.6f}]: {r_ok}；放置半径={t['placement_radius']:.6f}: {pr_ok}"
+        )
+    # 与 seed 无关：换 seed 后神经元坐标必须逐位相同（突触坐标则应当不同）
+    m42 = _build(Config(N=64, y_in=4, y_out=4, H=0.15, D=0.25, seed=42))
+    m7 = _build(Config(N=64, y_in=4, y_out=4, H=0.15, D=0.25, seed=7))
+    pos_same = bool(torch.equal(m42.neuron_pos, m7.neuron_pos))
+    syn_diff = not bool(torch.equal(m42.input_syn_pos, m7.input_syn_pos))
+    ok &= pos_same and syn_diff
+    print(
+        f"  seed 无关性：neuron_pos 逐位相同={pos_same}（FCC 确定性）；"
+        f"input_syn_pos 随 seed 变化={syn_diff}（突触采样由 seed 控制）"
+    )
+    print(f"[R2] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+# ----------------------------------------------------------------------
+# R3 DAG
+# ----------------------------------------------------------------------
+def check_dag() -> bool:
+    """R3：无环 DAG + 严格上行 + 拓扑序覆盖 + 分层结构与流向轴一致。"""
+    print("=" * 78)
+    print("[R3] DAG / 拓扑序 / 分层断言")
+    ok = True
+    for tag, cfg in GEOM_CASES:
+        m = _build(cfg)
+        sc = m.connectivity_selfcheck()
+        axis = m.flow_axis_index
+        z_src = m.neuron_pos.index_select(0, m.edge_src)[:, axis]
+        z_dst = m.neuron_pos.index_select(0, m.edge_dst)[:, axis]
+        uphill = bool((z_src < z_dst).all())
+        topo_ok = int(torch.unique(m.topo_index).numel()) == m.N
+        # 拓扑序必须是 0..N-1 的排列，且每条边的起点在拓扑序中严格早于终点
+        rank = torch.empty(m.N, dtype=torch.long)
+        rank[m.topo_index] = torch.arange(m.N)
+        order_ok = bool((rank.index_select(0, m.edge_src) < rank.index_select(0, m.edge_dst)).all())
+        layers = int(torch.unique(m.neuron_pos[:, axis]).numel())
+        ok &= uphill and topo_ok and order_ok
+        print(
+            f"  {tag}\n"
+            f"      每条边严格上行 z_A < z_B: {uphill}；拓扑序覆盖全部 N={m.N}: {topo_ok}\n"
+            f"      拓扑序早于关系（DAG 逐层可计算）: {order_ok}；流向轴层数={layers}\n"
+            f"      自检 dag_acyclic={int(sc['dag_acyclic'])}, all_edges_uphill="
+            f"{int(sc['all_edges_uphill'])}, E={int(m.num_edges)}"
+        )
+    print(f"[R3] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+# ----------------------------------------------------------------------
+# R4 去重
+# ----------------------------------------------------------------------
+def check_dedup() -> bool:
+    """R4：同一神经元对只保留一条连接（去重后神经元对数 == E）。"""
+    print("=" * 78)
+    print("[R4] 神经元对去重断言")
+    ok = True
+    for tag, cfg in GEOM_CASES:
+        m = _build(cfg)
+        keys = torch.stack([m.edge_src, m.edge_dst], dim=1).unique(dim=0)
+        dedup_ok = int(keys.shape[0]) == int(m.num_edges)
+        mask_ok = int(m.neuron_conn_mask.sum().item()) == int(m.num_edges)
+        rep_ok = bool(
+            (
+                m.syn_dist[m.representative_syn_out, m.representative_syn_input]
+                <= float(cfg.D) + 1e-6
+            ).all()
+        )
+        # 代表连接必须是该神经元对中间距最近的那一对：逐对复核（确定性抽样前 64 对）
+        # ⚠️ 必须用 (A, B) -> edge 行号的唯一映射取代表连接；若用
+        #    `nonzero(sel)[0]` 之类"取第一条"的写法，在边表按 (src,dst) 排序后会
+        #    取到相邻对的边，从而比较错对象（本脚本初版即踩此坑，R4 误报 FAIL）。
+        edge_lookup = {
+            (int(a), int(b)): k
+            for k, (a, b) in enumerate(zip(m.edge_src.tolist(), m.edge_dst.tolist()))
+        }
+        best_ok = True
+        for a, b in keys[:64].tolist():
+            blk = m.syn_dist[
+                a * m.y_out : (a + 1) * m.y_out, b * m.y_in : (b + 1) * m.y_in
+            ]
+            gi = edge_lookup[(a, b)]
+            got = float(
+                m.syn_dist[m.representative_syn_out[gi], m.representative_syn_input[gi]]
+            )
+            if abs(got - float(blk.min())) > 1e-6:
+                best_ok = False
+                break
+        ok &= dedup_ok and mask_ok and rep_ok and best_ok
+        print(
+            f"  {tag}\n"
+            f"      E={int(m.num_edges)}，去重后神经元对数={int(keys.shape[0])}：{dedup_ok}；"
+            f"连通掩码和={int(m.neuron_conn_mask.sum().item())}：{mask_ok}\n"
+            f"      代表连接间距 <= D: {rep_ok}；代表连接确为块内最近（抽查前 64 对）: {best_ok}"
+        )
+    print(f"[R4] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+# ----------------------------------------------------------------------
+# R5 双副本展开
+# ----------------------------------------------------------------------
+def check_dual_copy() -> bool:
+    """R5：双副本展开确为真（输入层版本真正下传，不被覆盖）。"""
+    print("=" * 78)
+    print("[R5] 双副本展开断言（输入层版本必须真正参与后续传播）")
+    ok = True
+    for tag, cfg in GEOM_CASES:
+        m = _build(cfg)
+        dual_idx = torch.nonzero(m.in_scope_mask & (m.in_degree > 0)).reshape(-1)
+        if dual_idx.numel() == 0:
+            print(f"  [SKIP] {tag}：无同时属于 S_in 且有上游连接的神经元（dual=0），本项不适用")
+            continue
+        gen = torch.Generator().manual_seed(int(cfg.seed) + 77)
+        x = torch.randn(3, int(cfg.input_dim), generator=gen)
+        with torch.no_grad():
+            a_in = m.stage1_input_driven(x)
+            a_up_with = m.stage2_recurrence(a_in)
+            a_up_without = m.stage2_recurrence(torch.zeros_like(a_in))
+        delta = float((a_up_with - a_up_without).abs().max().item())
+        # 需要存在"非 S_in 的下游神经元"也被输入层副本影响（证明真的传下去了）
+        changed = (a_up_with - a_up_without).abs().sum(dim=1) > 0
+        downstream_hit = int((changed & ~m.in_scope_mask).sum().item())
+        # 梯度：d(sum a_up) / d(a_in) 必须非零
+        a_in_g = a_in.clone().detach().requires_grad_(True)
+        a_up_g = m.stage2_recurrence(a_in_g)
+        a_up_g.sum().backward()
+        grad_nonzero = int((a_in_g.grad.abs() > 0).sum().item())
+        item_ok = (delta > 0.0) and (downstream_hit > 0) and (grad_nonzero > 0)
+        ok &= item_ok
+        print(
+            f"  {tag}\n"
+            f"      双副本神经元数（S_in 且入度>0）={int(dual_idx.numel())}\n"
+            f"      零化输入层副本后 max|a_up 变化|={delta:.6f}（须 > 0）\n"
+            f"      被输入层副本影响的下游神经元（不在 S_in）= {downstream_hit} 个（须 > 0）\n"
+            f"      d(sum a_up)/d(a_in) 非零元素={grad_nonzero}/{a_in_g.numel()}（须 > 0）：{item_ok}"
+        )
+    print(f"[R5] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+# ----------------------------------------------------------------------
+# R5b 逐边数值正确性（离朱第 8 轮 M1 的回归判据）
+# ----------------------------------------------------------------------
+def check_per_edge_numerics() -> bool:
+    """R5b：逐边核对阶段 2 的累加 —— 每条边必须读到它**自己起点**的激活。
+
+    背景（离朱第 8 轮实测高危缺陷 M1，已修复）：`stage2_propagate` 曾用
+    `repeat_interleave(arange(N), offset[1:]-offset[:-1])` 生成源激活槽位，而边已按
+    `edge_perm` 重排，导致每条边读到**错误源神经元**的激活（N=64 实测 174/181 条边
+    错配，与规格映射相差约 0.5 个 logit）。该缺陷不影响任何"梯度是否存在"的判据，
+    故必须用**逐边数值核对**才能捕获。本函数独立重建阶段 2（不调用 stage2_propagate）：
+
+    * `contrib_k = w_k * (a_up[src_k] + a_in[src_k])`，`src_k = edge_src[k]`；
+    * 按 `edge_dst` 做 index_add 得到 `total`，逐元素与 `stage2_propagate` 对比；
+    * 同时核对"错误槽位映射"（`repeat_interleave` 版）确实会给出不同结果，
+      以证明本判据对该缺陷**敏感**（反例检查）。
+
+    返回
+    ----
+    bool
+        全部配置逐位一致且反例确实可区分时返回 True。
+    """
+    print("=" * 78)
+    print("[R5b] 逐边数值正确性（阶段 2 必须按拓扑序读取每条边自己的起点激活）")
+    ok = True
+    for tag, cfg in GEOM_CASES:
+        m = _build(cfg)
+        gen = torch.Generator().manual_seed(int(cfg.seed) + 1234)
+        x = torch.randn(2, int(cfg.input_dim), generator=gen)
+        with torch.no_grad():
+            a_in = m.stage1_input_driven(x)
+            spec = m.stage2_recurrence(a_in)
+            # 独立重建：按拓扑序逐神经元、用**原始边表**取它的入边做精确递推
+            # （与生产实现共用同一套边，但索引路径完全独立：np-style 逐节点过滤）
+            ref = torch.zeros_like(a_in)
+            for node in m.topo_index.tolist():
+                inc = torch.nonzero(m.edge_dst == node).reshape(-1)
+                if inc.numel() > 0:
+                    s = m.edge_src.index_select(0, inc)
+                    ww = m.edge_weight.index_select(0, inc)
+                    val = (
+                        (ref.index_select(0, s) + a_in.index_select(0, s))
+                        * ww.unsqueeze(1)
+                    ).sum(dim=0)
+                else:
+                    val = torch.zeros(ref.shape[1])
+                ref = ref.index_copy(
+                    0,
+                    torch.tensor([node]),
+                    torch.relu(val + m.neuron_bias[node]).unsqueeze(0),
+                )
+            max_diff = float((spec - ref).abs().max().item())
+            # ---- 敏感性反例：复现历史 M1 缺陷的**真实形态** ----
+            # 历史实现（离朱第 8 轮）的错误是：边表已按 `edge_perm` 重排，但源槽位仍用
+            # `repeat_interleave(arange(N), counts)` 生成 —— 该槽位只能与"**原始边序**的
+            # 源神经元"对齐。因此反例必须两步构造：
+            #   ① 取重排后的边序 `perm`（与生产实现一致）；
+            #   ② 但源激活按"槽位"取样（错），而不是按 `edge_src[perm]`（对）。
+            # ⚠️ 皋陶第 2 轮 F13：早先的反例直接对**原始** `edge_src` 套 `bad_slot`，
+            #    而 `repeat_interleave` 按定义恰好重建原始 `edge_src`（恒等映射），
+            #    反例退化为"与正确实现相同"，敏感性声明形同虚设。
+            perm = m.edge_perm
+            src_ok = m.edge_src.index_select(0, perm)          # 正确：重排后的源
+            slot_bad = torch.repeat_interleave(
+                torch.arange(m.N), torch.bincount(m.edge_src, minlength=m.N)
+            )                                                   # 错误：按槽位映射
+            dst_perm = m.edge_dst.index_select(0, perm)         # 重排后的目标
+            w_perm = m.edge_weight.index_select(0, perm)
+            # 生产路径的等价写法（应逐位复现 spec）
+            acc_ok = a_in.new_zeros((m.N, a_in.shape[1]))
+            acc_ok = acc_ok.index_add(
+                0,
+                dst_perm,
+                a_in.index_select(0, src_ok) * w_perm.unsqueeze(1),
+            )
+            equ_ok = torch.relu(acc_ok + m.neuron_bias.unsqueeze(1))
+            # 错误写法（M1 形态，单层口径）：源激活按槽位取样
+            acc_bad = a_in.new_zeros((m.N, a_in.shape[1]))
+            acc_bad = acc_bad.index_add(
+                0,
+                dst_perm,
+                a_in.index_select(0, slot_bad) * w_perm.unsqueeze(1),
+            )
+            equ_bad = torch.relu(acc_bad + m.neuron_bias.unsqueeze(1))
+            slot_mismatch = int((slot_bad != src_ok).sum().item())
+            wrong_diff = float((equ_ok - equ_bad).abs().max().item())
+            # 判据：生产实现与独立重建一致（主断言）；且当槽位映射确实错配时，
+            # 反例必须与正确结果不同（敏感性），否则本项不成立。
+            item_ok = max_diff < 1e-5 and (slot_mismatch == 0 or wrong_diff > 1e-6)
+            ok &= item_ok
+            print(
+                f"  {tag}\n"
+                f"      E={int(m.num_edges)}；独立逐节点重建 vs stage2_recurrence 最大差异="
+                f"{max_diff:.3e}（须 < 1e-5）\n"
+                f"      M1 形态反例：重排后源槽位错配边数={slot_mismatch}/{int(m.num_edges)}；"
+                f"错配导致的结果差异={wrong_diff:.3e}（>1e-6 说明本判据对该缺陷敏感）"
+                f" -> {item_ok}"
+            )
+    print(f"[R5b] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+# ----------------------------------------------------------------------
+# R5c 感受野覆盖（递推不被任何固定跳数截断）
+# ----------------------------------------------------------------------
+def check_receptive_field() -> bool:
+    """R5c：阶段 2 按拓扑序单遍递推，感受野必须覆盖**全部层**（不被 T 截断）。
+
+    判定方式（可执行、不依赖任何自报字段）：
+    * 取最深层（流向轴坐标最大的层）的神经元，沿 DAG 反向回溯其祖先集合；
+    * 断言其祖先覆盖全部层（层数 = 流向轴坐标的不同取值数）；
+    * 另做**扰动实验**：把第一层某个源神经元的 `a_in` 提高 1.0，最深层的 a_up 必须因此
+      改变 —— 若递推被截断到固定跳数，跨越整个深度的影响将消失。
+
+    返回
+    ----
+    bool
+        所有配置的祖先层覆盖完整且扰动能传到最深层时返回 True。
+    """
+    print("=" * 78)
+    print("[R5c] 感受野覆盖（阶段 2 递推深度 == 全部层数）")
+    ok = True
+    for tag, cfg in GEOM_CASES:
+        m = _build(cfg)
+        axis = m.neuron_pos[:, m.flow_axis_index]
+        # 层号 = 流向轴坐标在"去重升序序列"中的下标（FCC 晶格的等坐标平面）
+        levels = torch.unique(axis, sorted=True)
+        n_levels = int(levels.numel())
+        level_id = torch.searchsorted(levels, axis.contiguous()).tolist()
+        # 反向祖先回溯（沿入边）
+        import collections
+        rev = collections.defaultdict(list)
+        for a, b in zip(m.edge_src.tolist(), m.edge_dst.tolist()):
+            rev[b].append(a)
+        deepest = [i for i in range(m.N) if level_id[i] == n_levels - 1]
+        covered = set()
+        for d in deepest:
+            seen, dq = {d}, collections.deque([d])
+            while dq:
+                n = dq.popleft()
+                for p in rev[n]:
+                    if p not in seen:
+                        seen.add(p)
+                        dq.append(p)
+            covered |= {level_id[x] for x in seen}
+        coverage_ok = len(covered) == n_levels
+        # 扰动实验：把第一层某个源神经元的 a_in 提高 1.0，看最深层 a_up 是否改变
+        first = [i for i in range(m.N) if level_id[i] == 0]
+        # 选一个第一层中"有出边"的神经元（否则扰动无意义）
+        src_first = [i for i in first if int(m.out_degree[i]) > 0]
+        pert_ok = True
+        perturb_info = "该配置第一层无出边神经元（跳过扰动实验）"
+        if src_first:
+            probe = src_first[0]
+            base_in = torch.zeros(m.N, 2)
+            pert_in = base_in.clone()
+            pert_in[probe] = 1.0
+            with torch.no_grad():
+                up_base = m.stage2_recurrence(base_in)
+                up_pert = m.stage2_recurrence(pert_in)
+            deepest_idx = torch.tensor(deepest)
+            delta = float(
+                (up_pert.index_select(0, deepest_idx) - up_base.index_select(0, deepest_idx))
+                .abs().max().item()
+            )
+            pert_ok = delta > 0.0
+            perturb_info = (
+                f"扰动第 1 层神经元 {probe} 的 a_in(+1.0) -> 最深层 a_up 最大变化="
+                f"{delta:.6f}（须 > 0）"
+            )
+        item_ok = coverage_ok and pert_ok
+        ok &= item_ok
+        print(
+            f"  {tag}\n"
+            f"      层数={n_levels}，最深层层号={n_levels - 1} 的神经元数={len(deepest)}；"
+            f"其祖先覆盖的层号集合大小={len(covered)}/{n_levels}：{coverage_ok}\n"
+            f"      {perturb_info}"
+        )
+    print(f"[R5c] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+# ----------------------------------------------------------------------
+# R7b readout_scope 两取值的结果差异（有可复核产物支撑）
+# ----------------------------------------------------------------------
+def check_readout_scope_effect() -> bool:
+    """R7b：`readout_scope` 两取值必须给出**不同**的读出结果，且有产物可复核。
+
+    判定方式：
+    * 构造同一 seed、仅 `readout_scope` 不同的两个模型，断言 `S_out` 集合不同；
+    * 用**同一批输入**前向，断言 logits 不相等（严格 readout 下只有 S_out 贡献，
+      故 S_out 不同必然导致 logits 不同）；
+    * 若对应冒烟产物存在（`--smoke-test` 跑过），额外核对两份产物的 `loss` 不同，
+      并打印产物路径（报告引用时可 torch.load 复核）。
+
+    返回
+    ----
+    bool
+        S_out 不同、logits 不同（且产物存在时 loss 不同）时返回 True。
+    """
+    print("=" * 78)
+    print("[R7b] readout_scope 两取值的结果差异")
+    ok = True
+    base = dict(N=256, y_in=8, y_out=8, H=0.10, D=0.15, seed=42)
+    ma = _build(Config(**base, readout_scope="any_isolated"))
+    mb = _build(Config(**base, readout_scope="all_isolated"))
+    sa = set(torch.nonzero(ma.out_scope_mask).reshape(-1).tolist())
+    sb = set(torch.nonzero(mb.out_scope_mask).reshape(-1).tolist())
+    sets_differ = sa != sb and len(sb) < len(sa)
+    gen = torch.Generator().manual_seed(4242)
+    x = torch.randn(8, int(ma.config.input_dim), generator=gen)
+    with torch.no_grad():
+        la = ma(x)
+        lb = mb(x)
+    logits_differ = not bool(torch.allclose(la, lb))
+    ok &= sets_differ and logits_differ
+    print(
+        f"  |S_out| any={len(sa)} / all={len(sb)}（子集关系 {sb < sa}）；"
+        f"同一输入下 logits 不同={logits_differ}"
+    )
+    print(f"  logits 最大差异={float((la - lb).abs().max()):.6f}")
+    # 若有冒烟产物，核对 loss 不同
+    a_path = os.path.join(VERIFY_DIR, "smoke.pt")
+    b_path = os.path.join(VERIFY_DIR, "smoke_N64_y4x4_H0.15_D0.25_plfcc_axz_isany_rsall_s42.pt")
+    if os.path.isfile(a_path) and os.path.isfile(b_path):
+        ca = torch.load(a_path, map_location="cpu", weights_only=False)
+        cb = torch.load(b_path, map_location="cpu", weights_only=False)
+        loss_differ = ca["loss"] != cb["loss"]
+        ok &= loss_differ
+        print(
+            f"  冒烟产物复核：\n"
+            f"    {os.path.basename(a_path)}: readout_scope="
+            f"{ca['config'].get('readout_scope')} loss={ca['loss']!r}\n"
+            f"    {os.path.basename(b_path)}: readout_scope="
+            f"{cb['config'].get('readout_scope')} loss={cb['loss']!r}\n"
+            f"    两产物 loss 不同={loss_differ}"
+        )
+    else:
+        print(
+            "  [SKIP] 冒烟产物不存在（需先跑 --smoke-test），本项仅核对集合与 logits 差异"
+        )
+    print(f"[R7b] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+# ----------------------------------------------------------------------
+# R6 scope 判据
+# ----------------------------------------------------------------------
+def check_scope() -> bool:
+    """R6：any_isolated / all_isolated 判据的集合包含关系与规模。"""
+    print("=" * 78)
+    print("[R6] input_scope / readout_scope 判据断言")
+    ok = True
+    base = dict(N=256, y_in=8, y_out=8, H=0.10, D=0.15, seed=42)
+    stats: Dict[str, Dict[str, int]] = {}
+    for s_in in SCOPE_CHOICES:
+        for s_out in SCOPE_CHOICES:
+            cfg = Config(**base, input_scope=s_in, readout_scope=s_out)
+            m = _build(cfg)
+            stats[f"{s_in}/{s_out}"] = {
+                "S_in": int(m.in_scope_mask.sum().item()),
+                "S_out": int(m.out_scope_mask.sum().item()),
+            }
+            print(f"  input_scope={s_in:<13} readout_scope={s_out:<13} "
+                  f"S_in={stats[f'{s_in}/{s_out}']['S_in']:>3d} S_out={stats[f'{s_in}/{s_out}']['S_out']:>3d}")
+    # 判据方向：all_isolated 是 any_isolated 的子集（集合包含关系必须成立）
+    ok &= stats["all_isolated/any_isolated"]["S_in"] <= stats["any_isolated/any_isolated"]["S_in"]
+    ok &= stats["any_isolated/all_isolated"]["S_out"] <= stats["any_isolated/any_isolated"]["S_out"]
+    # 全部四种组合的 S_in / S_out 都必须非空（否则冒烟判据 5/6 会失败）
+    nonempty = all(v["S_in"] > 0 and v["S_out"] > 0 for v in stats.values())
+    ok &= nonempty
+    print(f"  集合包含关系（all <= any）与四种组合均非空: {nonempty}")
+    # 读出口径（严格）：h[n] = a_up[n] 仅当 n in S_out，否则 0。
+    # 用真实前向的中间量核对：h 的非零列必须都是 S_out，且 |S_out| 列全覆盖。
+    cfg = Config(**base)
+    m = _build(cfg)
+    gen = torch.Generator().manual_seed(int(cfg.seed) + 999)
+    x = torch.randn(4, int(cfg.input_dim), generator=gen)
+    with torch.no_grad():
+        a_in = m.stage1_input_driven(x)
+        a_up = m.stage2_recurrence(a_in)
+        h = m.readout_activations(a_up)
+    # 可判定口径（**严格**，不受 ReLU 死神经元影响）：
+    #   (a) h 的非零列必须全部属于 S_out（非 S_out 一律被屏蔽）；
+    #   (b) 把 S_out 之外的神经元整体置零，h 必须**逐位不变**（等价于"只有 S_out 贡献"）。
+    # 注：不能断言"|S_out| 列全非零" —— S_out 中入度>0 的神经元若 pre-activation 非正，
+    #     ReLU 输出恰为 0，其在 h 中本来就是零列（ReLU 的正常行为，不是屏蔽错误）。
+    nz_cols = h.abs().sum(dim=0) > 0
+    subset = int((nz_cols & ~m.out_scope_mask).sum().item()) == 0
+    masked_up = a_up * m.out_scope_mask.unsqueeze(1).to(a_up.dtype)
+    identical = bool(torch.equal(h.transpose(0, 1), masked_up))
+    ok &= subset and identical
+    print(
+        f"  readout 严格口径：h 非零列={int(nz_cols.sum().item())}（其中非 S_out 列 "
+        f"{int((nz_cols & ~m.out_scope_mask).sum().item())} 个，须为 0），|S_out|="
+        f"{int(m.out_scope_mask.sum().item())}；屏蔽后逐位不变={identical}"
+    )
+    print(f"[R6] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+# ----------------------------------------------------------------------
+# R7 产物
+# ----------------------------------------------------------------------
+def check_artifacts(paths: List[str]) -> bool:
+    """R7：冒烟/全量产物可 torch.load，关键字段齐全且自洽。"""
+    print("=" * 78)
+    print("[R7] 产物可复核性")
+    ok = True
+    if not paths:
+        default = os.path.join(VERIFY_DIR, "smoke.pt")
+        paths = [default]
+    for rel in paths:
+        p = rel if os.path.isabs(rel) else os.path.join(PROJECT_ROOT, rel)
+        if not os.path.isfile(p):
+            print(f"  [SKIP] 产物不存在：{rel}")
+            continue
+        try:
+            ckpt = torch.load(p, map_location="cpu", weights_only=False)
+        except Exception as exc:  # pragma: no cover
+            print(f"  [FAIL] {rel} 无法 torch.load：{exc!r}")
+            ok = False
+            continue
+        cfg = ckpt.get("config", {}) or {}
+        stats = ckpt.get("connection_stats", {}) or {}
+        topo = ckpt.get("topology_stats", {}) or {}
+        dag = ckpt.get("dag_selfcheck", {}) or {}
+        need = (
+            "model_state_dict", "config", "connection_stats", "topology_stats",
+            "dag_selfcheck", "arch",
+        )
+        missing = [k for k in need if k not in ckpt]
+        cfg_need = (
+            "flow_axis", "space_radius", "placement", "input_scope", "readout_scope",
+        )
+        cfg_missing = [k for k in cfg_need if k not in cfg]
+        item_ok = not missing and not cfg_missing and int(dag.get("dag_acyclic", 0)) == 1
+        ok &= item_ok
+        print(
+            f"  {rel}\n"
+            f"      顶层缺键={missing}；config 缺键={cfg_missing}：{item_ok}\n"
+            f"      stage={ckpt.get('stage')} arch={ckpt.get('arch')} "
+            f"placement={cfg.get('placement')} flow_axis={cfg.get('flow_axis')} "
+            f"input_scope={cfg.get('input_scope')} readout_scope={cfg.get('readout_scope')}\n"
+            f"      E={int(stats.get('num_edges', 0))} avg_out_degree={stats.get('avg_out_degree')} "
+            f"S_in={int(stats.get('num_in_scope', 0))} S_out={int(stats.get('num_out_scope', 0))}\n"
+            f"      最近邻距={topo.get('nearest_neighbour_dist')} "
+            f"DAG 无环={dag.get('dag_acyclic')} loss={ckpt.get('loss')} "
+            f"test_acc={ckpt.get('test_acc')}"
+        )
+    print(f"[R7] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+def main(argv: List[str]) -> int:
+    """按子命令执行验证并返回退出码（0 = 全部 PASS）。"""
+    cmd = argv[1] if len(argv) > 1 else "all"
+    ok = True
+    if cmd in ("geom", "all"):
+        ok &= check_geometry()
+    if cmd in ("fcc", "all"):
+        ok &= check_fcc()
+    if cmd in ("dag", "all"):
+        ok &= check_dag()
+    if cmd in ("dedup", "all"):
+        ok &= check_dedup()
+    if cmd in ("dual", "all"):
+        ok &= check_dual_copy()
+    if cmd in ("peredge", "all"):
+        ok &= check_per_edge_numerics()
+    if cmd in ("scope", "all"):
+        ok &= check_scope()
+    if cmd in ("receptive", "all"):
+        ok &= check_receptive_field()
+    if cmd in ("readout", "all"):
+        ok &= check_readout_scope_effect()
+    if cmd in ("artifact", "all"):
+        ok &= check_artifacts(argv[2:] if cmd == "artifact" else [])
+    print(f"总体结论：{'全部 PASS' if ok else '存在 FAIL'}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

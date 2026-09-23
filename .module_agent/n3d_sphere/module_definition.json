@@ -3,11 +3,11 @@
   "files": [
     {
       "path": "n3d_sphere/__init__.py",
-      "description": "N3D 二期架构变体包声明。声明本包为与一期 n3d_proto 并列存档、自包含（不 import n3d_proto）的二期变体，并注明默认 topology=cube 时与一期逐位一致（--smoke-test loss=2.419689）。"
+      "description": "纯球形分层有向无环架构包声明。声明本模块为自包含（不 import n3d_proto）的纯球体几何模块：神经元按 FCC 规则堆积、突触按流向轴切分半球、连接严格上行构成 DAG；说明一期完整存档、默认行为与既有产物逐位不变（n3d_proto 冒烟 9/9 PASS、loss=2.419689），并给出冒烟/训练/验证的快速入口。"
     },
     {
       "path": "n3d_sphere/utils.py",
-      "description": "通用工具层，由一期 n3d_proto/utils.py 原样拷贝、未做任何修改。提供 set_seed / get_device / log_info·warn·error；segment_softmax（torch_scatter 优先，缺失时纯 PyTorch fallback：scatter_reduce(amax)+scatter_add）；build_edge_index / build_edge_index_from_dist（dense dist → mask/edge_index/edge_dist）；build_scatter_matrix / sparse_aggregate（2b，index_add_）/ sparse_broadcast（2d，index_select）；count_parameters / tensor_grad_norms / connection_density（规格口径=密度，connection_sparsity 为同义弃用别名）/ zero_ratio。"
+      "description": "通用工具层（历史遗留）：由一期 n3d_proto/utils.py 拷贝而来的四步闭环算子与统计工具，**当前纯球形分层 DAG 架构不调用**其中的稀疏分组/构图算子。现仍被使用的有 `set_seed`（全局随机源固定）、`get_device`、`log_info`/`log_warn`/`log_error`、`count_parameters` 与 `tensor_grad_norms`（冒烟判据用；后者把缺失梯度记为 -1.0）。未被调用的部分：`segment_softmax`（含 torch_scatter 优先与纯 PyTorch fallback）、`build_edge_index` / `build_edge_index_from_dist`、`build_scatter_matrix`、`sparse_aggregate`、`sparse_broadcast`、`connection_density` / 其别名 `connection_sparsity`、`zero_ratio` —— 保留原因：避免改动一期拷贝文件带来的回归风险，且后续若要复现旧实验仍需这些算子。文件头 docstring 已如实标注调用现状（在用/未调用清单）。"
     },
     {
       "path": "n3d_sphere/data.py",
@@ -15,31 +15,79 @@
     },
     {
       "path": "n3d_sphere/config.py",
-      "description": "超参配置层（二期变体）。在一期字段之上新增 topology（cube|sphere，默认 cube）、flow_axis（x|y|z，默认 z）、space_radius（默认 0.0=等体积球默认半径）三个拓扑字段，并提供 equivalent_sphere_radius()、effective_space_radius / flow_axis_index 便捷属性；新字段同步纳入 to_dict() 与 describe()（否则经 apply_overrides 的 Config(**overrides) 往返会被静默丢弃）；半径与 H 的关系校验**条件化**（仅 sphere 且 space_radius>0），避免默认值导致 SMALL/DEFAULT/HIGHACC 三预设导入期构造失败。三预设的二期字段一律取默认值，保证一期行为逐位不变。"
+      "description": "超参配置层（纯球形分层 DAG）。承载球半径窗口公式：R_min = H*(N/0.7405)^(1/3)、R_max = (H+D)*(N/0.7405)^(1/3)，space_radius 默认 0.0 取 R_min、显式值越界在构造期报错（仅作窗口校验与元数据，不改变放置与拓扑）；派生出 FCC 晶格常数 2*sqrt(2)*H、effective_space_radius 与 n_input_syn/n_output_syn；字段集合为 N / y_in / y_out / H / D / flow_axis / space_radius / placement（仅 fcc）/ input_scope / readout_scope / input_dim / output_dim / hidden_dim（仅 mlp 基线）/ 训练超参，全部纳入 to_dict() 与 describe()（否则 Config(**overrides) 往返会被静默丢弃）；取值域校验（flow_axis、两个 scope、placement、半径窗口）与三预设 SMALL/DEFAULT/HIGHACC。旧架构字段（几何类型字段、边长、温度初始化、残差系数、最小间距、采样重试上限、dropout、迭代轮数）与全部与球体无关的几何派生量均已删除；架构中**不存在任何迭代轮数参数**。"
     },
     {
       "path": "n3d_sphere/model.py",
-      "description": "二期核心模型。ThreeDNeuronSpace：坐标采样按 topology 分支——cube 分支**逐字保留**一期的立方体神经元 + H 半径球体内体积均匀突触；sphere 分支新增等体积球（R≈0.620）内体积均匀神经元、输入突触取流向轴负半球、输出突触取正半球（方向生成后翻转流向轴分量，测度保持、不消耗额外随机数）。四步闭环（2a masked softmax 稀疏连接 / 2b index_add_ scatter sum / 2c ReLU 阈值激活 / 2d index_select broadcast + 残差 + LayerNorm）与一期完全一致。统计接口：get_connection_stats() 保持一期 5 键不动；get_topology_stats() 返回逆向边占比、流向轴 gap 分布、神经元流向轴高度分布、2a 静态/动态覆盖、弱连通分量数与最大分量占比、几何指纹。动态 2a 覆盖用 O(1) 定长标量容器（sum / count / last）累计，由 reset_round_output_coverage() 做阶段隔离、round_output_coverage() 返回三键快照（轮数覆盖训练+评估两条路径的全部前向，口径 =(训练批数+评估批数)×epoch×T，docstring 已明确限定并附实测佐证）。全部拓扑量（含 edge_reverse_flag / neuron_component_id / connected_output_mask）在 __init__ 预计算并 register_buffer，forward 不重算。连通性由共用静态原语 _label_propagate（最小标签传播 scatter_reduce(amin) + 指针跳跃）实现；另含回归自检入口 connectivity_selfcheck() / _components_of_synthetic_graph() / _expected_components() / _component_stats_crosscheck()。另含 MLPBaseline 对照基线（同接口占位）。"
+      "description": "纯球形分层 DAG 核心模型。ThreeDNeuronSpace 的 __init__ 预计算并 register_buffer 全部拓扑量（forward 不重算）：① 神经元坐标按 FCC 规则堆积生成（晶格常数 a=2*sqrt(2)*H，取距球心最近 N 个格点，按 (流向轴坐标, 壳层名次) 显式字典序确定性排序使拓扑序 == 流向轴升序，故坐标与 seed 无关，并有“最近邻距==2H”断言）；② 突触坐标在各神经元 H 球内按体积均匀采样（方向球面均匀 + r=H*u^(1/3)），输入取流向轴负半球、输出取正半球（方向分量翻转实现半球切分，测度保持）；③ 神经元级连接 A→B ⟺ A≠B 且 z_A<z_B 且存在 o∈out(A),j∈in(B) 使 d(o,j)<=D（存在性判据必须用 amin 而非 amax），同一神经元对只保留间距最近的一对作为代表连接（representative_syn_out/input）；④ Kahn 拓扑排序（就绪集按 (轴坐标, 索引) 取最小，并断言“轴升序 == Kahn 结果”）+ 两套 CSR 边分组：出边表（edge_offset/edge_perm）与入边表（edge_perm_in/neuron_in_edge_reach，按目标拓扑位置分组，索引语义有逐节点契约断言）；⑤ 孤立突触掩码与 S_in/S_out 掩码；⑥ **分层表 level_edge_reach / level_node_reach**（两张 int64 [K,2] 张量，描述每层在入边表与拓扑序中的连续区间，由 _build_level_groups 构造并带三处契约断言；K 为流向轴层数），以及入边目标表 edge_dst_in。forward 实现两阶段 + 双副本展开：阶段 1 由 S_in 神经元从输入层算 a_in=ReLU(x@W_in+b)；**阶段 2 为按拓扑序单遍逐层递推**：a_up=ReLU(Σ_{A→B} w_{A→B}·(a_up[A]+a_in[A])+b)，**整层向量化**——_iter_levels 用 level_node_reach 对 topo_index 做张量切片取层节点，每层只做一次 index_add（该层入边消息按目标散加）与一次非原地 index_copy 写回（原地赋值会破坏 autograd），循环次数 = 层数而非 N，感受野覆盖全部层、架构中已无迭代轮数参数；**每次前向调用 _assert_index_device 强制设备契约**：全部索引张量必须已注册为 buffer/parameter 且与激活同设备，否则抛 RuntimeError（F16 设备回归防线）；readout 为**严格口径** h[n]=a_up[n]（仅当 n∈S_out）否则 0，logits=h@W_out.T(+bias)，故 W_out 非 S_out 列梯度恒为 0。参数为按连接构建的 W_in[input_dim,|S_in|] / edge_weight[E] / neuron_bias[N] / W_out[output_dim,N]（可选 W_out_bias），count_dense_weight_tensors() 断言不存在 [N*y_out,N*y_in] 形状权重张量。统计接口 get_connection_stats()（神经元级 E、度分布、层数、scope 规模、孤立突触数）与 get_topology_stats()（placement/flow_axis/space_radius/placement_radius/lattice_constant/nearest_neighbour_dist/神经元高度分布/判据编码/edge_dist_*/dual_copy_count）以及 connectivity_selfcheck()（dag_acyclic/all_edges_uphill/topo_covers_all/topo_matches_axis_order）；另含 MLPBaseline 对照基线（同接口占位）。"
     },
     {
       "path": "n3d_sphere/train.py",
-      "description": "训练入口。由一期 train.py 拷贝并扩展：新增 --topology / --flow-axis / --space-radius 三个 CLI（空串 / -1.0 哨兵语义，纳入 build_smoke_config 的 explicit 判定与 validate_override_args 校验，并同步进 apply_overrides 与 run_full_training 兼容模式；help 文案已清除 GBK 不可编码字符 U+2212，保证 --help 在 GBK 控制台退出码 0）；CHECKPOINT_DIR 改为 checkpoints/n3d_sphere/ 与一期产物物理隔离；冒烟产物按拓扑指纹命名 smoke_<topology>_<flow_axis>.pt；限批产物指纹加入 topology / flow_axis 维度；正式全量默认路径对非一期等价配置使用 full_N{N}_y{..}_H{..}_D{..}_T{T}_top{..}_ax{..}_s{seed}.pt；checkpoint 元数据新增 topology / flow_axis / space_radius / topology_stats / dynamic_coverage。另提供动态覆盖的阶段隔离与持久化入口：reset_dynamic_coverage(model) 与 dynamic_coverage_metadata(model)（后者以 .get(key, 默认值) 取键，三键接口契约为 out_nonzero_coverage_last / _mean / _rounds，缺键时返回 NaN / 0.0 而不抛 KeyError）。训练循环、数据管线、优化器/调度器/梯度裁剪、阶段 A 判据与日志格式与一期一致。"
+      "description": "训练入口与验证编排（n3d_sphere）。提供：① CLI 参数解析与校验（几何相关 --flow-axis / --space-radius / --input-scope / --readout-scope / --placement；--seed 采用“负数报错、0 表示不覆盖”的哨兵约定；validate_override_args 统一拒绝非法取值）；② 配置构造（PRESETS 三预设 + build_smoke_config 的冒烟基线规则 + apply_overrides 的显式覆盖语义）；③ 产物指纹与隔离（smoke_fingerprint 含 N/y/H/D/placement/axis/两个 scope/bs/[R]/seed；is_default_smoke 与指纹维度严格对齐；冒烟与限批产物一律写 _verify/，绝不覆盖正式产物）；④ 15 条冒烟判据（含判据 3 按 arch 解析输出层参数名与 [1,|S_out|] 区间断言、判据 13 readout 严格口径子集 + 掩码逐位相等）；⑤ train_one_epoch 返回 (loss, grad_norms, n_batches, last_x, last_logits)；⑥ checkpoint 保存与元数据（含全部拓扑 buffer 与 dag_selfcheck）；⑦ 限批验证与全量训练路径。**apply_overrides 值等价短路（离朱第 11 轮 D1）**：显式覆盖值与基线逐字段相同时复用基线对象本身，使“同一语义配置 ⇒ 同一字节”，消除 torch.save 因 pickle memo（对象身份）导致的字节不确定性。"
     },
     {
       "path": "n3d_sphere/README.md",
-      "description": "模块说明文档：明确标注本模块为二期架构变体（一期 n3d_proto 完整存档、默认不变）；给出 cube/sphere 两种几何定义与半球切分的实现原理；记录门槛 A/B、几何自检、拓扑与连通性实测表、参数快筛（H/D/space_radius，含未通过判据的如实记录）、一期产物 SHA256 未变化证据、全量对照结果与结论、产物命名规范。"
+      "description": "模块说明文档（纯球形分层 DAG）。内容：模块定位与一期关系（自包含、一期产物逐位不变）；球空间半径公式（φ=0.7405）与窗口校验（仅作校验与元数据、不改变放置与拓扑）、FCC 规则堆积（a=2√2·H，最近邻距=2H，与 seed 无关）、半球突触采样（球面均匀方向 + r=H·u^(1/3) 体积均匀、流向轴分量翻转实现半球切分）；神经元级连接规则（同一神经元对只算一条、代表连接取最近突触对、严格上行 DAG）与三处易错点（存在性判据须用 amin；4D 块视图不可直接 reshape 后按线性下标取值；入边 CSR 表按拓扑位置索引、必须用重排后的源数组）；两阶段前向（阶段 1 输入层驱动 + 阶段 2 按拓扑序**单遍逐层向量化递推**、层节点由 topo_index[s:e] 张量切片得到、感受野覆盖全部层、无迭代轮数参数）与双副本展开、**R5/R5b/R5c 四组配置实测表（含 flow_axis=x 与 space_radius=0.9 列）**、**设备契约与 meta 静态取证说明（F16）**、判据开关表与 **readout 严格口径**（h[n]=a_up[n] 仅当 n∈S_out 否则 0）、参数集合与禁止 materialize dense 权重矩阵、**W_out 非 S_out 列的零梯度作为已知参数开销与取舍**；文件说明；CLI 一览；**15 条冒烟判据**与 SMALL 规模实测值（四个梯度范数改为全精度并注明“末位随求和次序可能微变、以产物为准”）；DEFAULT 测点跨 10 seed 拓扑统计表（E=900~924、平均出度 3.5156~3.6094、最大出度除 seed=3 外均为 5、层数 9、S_in 40~52、S_out 44~50、双副本 27~39、可学习参数 35094~44489）与四种 scope 组合实测（含 loss 互不相同、各产物路径，以及 all/any 下 d(sum a_up)/d(a_in) 非零 480/512、any/any 475/512）；`--arch mlp` 冒烟实测（6/6 PASS、全精度梯度范数）；一期回归证据；产物命名/指纹维度/checkpoint 元数据表；**8.2 节“字节确定性与 SHA256 语义”**（torch.save 字节受 pickle memo 影响、D1 反例与两侧修复、引用 SHA 须同时给出配置与路径）；验证脚本清单（含 D1-D7 设备契约、11 组合矩阵与 doc_numbers 防线）与一键复现命令；已知边界与如实说明（含“本机为 CPU-only、CUDA 路径为静态取证”“--seed 0 表示不覆盖”两条）；第一/二轮与**第三轮（F16-F21 + 离朱第 11 轮 D1）**修复的缺陷表与两类教训总结。"
     },
     {
-      "path": "checkpoints/n3d_sphere/_verify/verify_n3d_sphere_phase2.py",
-      "description": "验证脚本（不属于模块源码，放在验证产物目录内）：只读取与构造模型、不做任何源码改动。子命令 proto（冒烟产物逐位等价 + 一期产物 SHA256 纪律）、geom（几何断言：球内/体积均匀/H 球内/半球切分 x·y·z/拓扑统计 + 连通性自检 + 一期与二期 cube 几何逐位对照）、probe（H/D/space_radius 连通性快筛，判据事先固定，每行附带合成分量图真值自检与并查集一致性）、artifact（任意产物 torch.load 复核）。"
+      "path": "checkpoints/n3d_sphere/_verify/verify_sphere_dag.py",
+      "description": "验证脚本（不属于模块源码，放在验证产物目录内）：只读取与构造模型、不做任何源码改动。子命令 all/geom/fcc/dag/dedup/dual/peredge/receptive/scope/readout/artifact。**R1/R2/R3/R4/R5/R5b/R5c 均在 4 组配置上执行**（SMALL_CONFIG、DEFAULT 规模 N=256/y=8×8/H=0.10/D=0.15/seed=42、DEFAULT+flow_axis=x 轴无关性、DEFAULT+space_radius=0.9），配置键 small/default/axis_x/radius_0.9。R1 几何：神经元在球内、突触在所属神经元 H 球内、严格落在流向轴正/负半球、输出突触体积均匀性 (|d|/H)^3 均值≈0.5；R2 FCC：晶格常数 == 2√2·H、最近邻距 == 2H（容差 1e-5）、放置半径 <= R_max、R ∈ [R_min,R_max]，并断言 neuron_pos 与 seed 无关而突触坐标随 seed 变化；R3 DAG：Kahn 拓扑序覆盖全部 N、每条边严格上行、拓扑序早于关系、流向轴层数；R4 去重：E == 去重后 (起点,终点) 对数、连通掩码和 == E、代表连接间距 <= D 且确为块内最近（用 (A,B)->行号唯一映射复核）；R5 双副本：零化输入层副本必须改变 a_up、受影响的下游（非 S_in）神经元数 > 0、d(sum a_up)/d(a_in) 非零元素 > 0（本轮实测四组配置 max|Δa_up| = 0.941795/0.866614/0.918773/0.866614，受影响下游 51/197/204/197，梯度非零 166/192、713/768、711/768、713/768）；**R5b 逐边数值正确性**（离朱 M1 回归）：用独立实现“按拓扑序逐节点、取该节点入边”重建阶段 2，与 stage2_recurrence 对比（本轮实测最大偏差 2.980e-08/5.960e-08/2.384e-07/5.960e-08，阈值 1e-5），并附 M1 形态“错误槽位映射”反例（错配 180/181、892/903、902/913，结果差异 0.741/0.7512/1.389）以证明判据敏感；**R5c 感受野覆盖**：最深层神经元的祖先覆盖全部层数（7/7、9/9、10/10、9/9），且第一层神经元的 a_in 扰动必须传到最深层（0.004414/0.003379/0.007765/0.003379）；R6 判据：四种 scope 组合的 S_in/S_out 规模（50/45、50/13、13/45、13/13）、all 是 any 的子集、E 与判据无关、readout 严格口径（h 非零列全部属于 S_out，且屏蔽后逐位不变）；**R7b readout_scope 生效性**：两取值给出不同 S_out（45/13）与不同 logits（最大差异 0.119461），并在冒烟产物存在时核对两份产物 loss 不同；R7 产物：任意 .pt 可 torch.load 且顶层/config 关键字段齐全、dag_acyclic==1。**每次运行把 111 条全精度指标落盘 _verify/sphere_dag_metrics.json**，供 verify_all.py 的 doc_numbers 现跑比对取用（F19/F20）。退出码 0 = 全部 PASS。"
     },
     {
-      "path": "checkpoints/n3d_sphere/_verify/verify_w1_dynamic_coverage.py",
-      "description": "审查缺陷 W1 专项回归脚本（不属于模块源码，放在验证产物目录内）：只读取产物 + 构造模型 + 断言，不改动任何源码。对每个冒烟产物（smoke.pt / smoke_sphere_z.pt）逐条断言：C1 动态 2a 覆盖容器为 O(1) 定长（不存在遗留的 _round_output_coverage 无界列表，任意多次前向后元素个数恒为 3）；C1b 累计轮数 == 前向次数 × T；C2 均值口径 mean == sum/count 且末轮取自 last；C3 checkpoint 的 topology_stats 与顶层 dynamic_coverage 两处同时含 out_nonzero_coverage_last/_mean/_rounds 且逐位一致（.pt 加载后内存态为 NaN 属预期，历史值改由显式字段复核）；C4 reset_round_output_coverage() 后快照恢复为 NaN / 0（阶段隔离）；C5 非持久化 buffer edge_axis_gap 与由 edge_index 重算的 gap 逐位相等、get_topology_stats 复用后统计一致、且不出现在 state_dict 中（一/二期键集增量仍恰为 3 个）。退出码 0 = 全部 PASS。"
+      "path": "checkpoints/n3d_sphere/_verify/verify_scope_and_fingerprint.py",
+      "description": "验证脚本（不属于模块源码）：S1-S3 判据语义与双副本行为——四种 scope 组合下模型均可构造、S_in/S_out 规模与集合包含关系正确、S_in 只由 input_scope 决定而 S_out 只由 readout_scope 决定、E 与判据选择无关；any/any 下双副本神经元数 > 0 且 d(sum a_up)/d(a_in) 非零、共享权重 edge_weight 梯度非零；all_isolated 下双副本数可为 0（判据选择结果）但 d(sum a_up)/d(a_in) 仍非零。S4-S5 产物指纹——六种配置变体（flow_axis/input_scope/readout_scope/seed/D）的限批名与全量名互不覆盖、指纹含 placement/axis/scope/seed 且无几何类型维度、全量名不带 verify 前缀（历史缺陷 D4）、冒烟命名默认组合退化为 smoke.pt 其它组合带 scope 指纹、非法 --tag 被拒绝。退出码 0 = 全部 PASS。"
     },
     {
-      "path": "checkpoints/n3d_sphere/_verify/verify_r4_round_count_scope.py",
-      "description": "轮数口径与健壮性取证脚本（不属于模块源码）：用真实训练+评估循环实测 out_nonzero_coverage_rounds 的口径构成（(训练批数+评估批数)×epoch×T，实测 rounds=24 = (3+3)×2×T=2；冒烟路径 = T），并验证阶段隔离（reset 后 rounds=0、末轮为 NaN）；验证 dynamic_coverage_metadata 的取值兜底三情形——无该统计能力（返回空字典 {}）、返回字典但缺键（NaN/0.0，不抛 KeyError）、返回非字典 None / list / 具名元组（按缺键路径降级为 NaN/NaN/0.0，不抛 AttributeError/TypeError）；验证正常路径三键与 round_output_coverage() 同名同义且逐位一致；验证删除非持久化 buffer edge_axis_gap 后 get_topology_stats() 的兜底重算不抛异常且 gap/逆向边四项与正常路径逐位一致；并新增**回写自愈专项断言**：兜底调用后缓存已回写、回写后 'edge_axis_gap' not in state_dict()（persistent=False 未泄漏）、state_dict 键集与基准完全一致（21 键）、第二次调用命中缓存且与前次逐位一致、回写内容 torch.equal 原始缓存、相对一期 18 键的增量恰为 edge_reverse_flag / neuron_component_id / connected_output_mask 三个。"
+      "path": "checkpoints/n3d_sphere/_verify/verify_config_contracts.py",
+      "description": "验证脚本（不属于模块源码）：C1 半径公式——R_min = H*(N/phi)^(1/3)、R_max = (H+D)*(N/phi)^(1/3)（phi=0.7405），R_max/R_min == (H+D)/H，默认 space_radius=0 取 R_min；C2-C3 space_radius 窗口——上下界内外两侧越界均抛 ValueError、合法值全接受，且 FCC 放置半径 <= R_max（三组 N/H/D）；C4-C5 字段清理与取值域——Config 不再含旧架构字段（旧几何类型与边长字段、温度初始化、残差系数、最小间距、采样重试上限、读出头 dropout、迭代轮数），必需字段齐全，to_dict 往返一致，flow_axis/input_scope/readout_scope/placement 非法取值均报错；C6 零残留断言——扫描范围覆盖 n3d_sphere 全部源文件（含 utils.py/data.py）+ README.md + .module_agent/n3d_sphere/current_spec.md + module_definition.json，禁用词含旧几何词汇、被删 CLI 开关与配置字段名、旧统计/缓存实现名，并豁免产物 schema 字段名、统计接口名以及“已删除/不存在/移除”等叙述性说明句；命中时打印文件与行号。退出码 0 = 全部 PASS。"
+    },
+    {
+      "path": "checkpoints/n3d_sphere/_verify/verify_topology_snapshot.py",
+      "description": "验证脚本（不属于模块源码）：6 个固定实验点（DEFAULT 规模的 any/any 与 all/all、flow_axis x/y/z、SMALL 规模的 any/any 与 all/all）× 可配置 seed 列表（默认 10 个 seed）逐点实时构造模型，打印并落盘每个组合的全部拓扑量（E、平均/最大出度、平均/最大入度、层数、S_in、S_out、双副本数、孤立输入/输出突触数、R_min/R_max/R_effective、放置半径、最近邻距、可学习参数、dense 权重张量数）到 topology_snapshot.json；落盘前自检每条记录满足 DAG 无环、严格上行、最近邻距 == 2H、dense 权重张量 == 0。供报告中引用拓扑数字时标注 seed。退出码 0 = 自检全 PASS。"
+    },
+    {
+      "path": "checkpoints/n3d_sphere/_verify/verify_all.py",
+      "description": "一键验证入口（不属于模块源码）：依次以子进程执行 **9 条命令** —— E1 compileall、E2 冒烟测试（15 条判据，含 readout 严格口径与递推顺序）、E2b `--arch mlp` 冒烟、verify_sphere_dag.py all（R1-R7b）、**verify_device_regression.py（D1-D7 设备契约，F16）**、verify_scope_and_fingerprint.py（S1-S5）、verify_config_contracts.py（C1-C6）、verify_topology_snapshot.py、以及一期回归 n3d_proto/train.py --smoke-test（9/9 PASS、loss=2.419689），逐条打印退出码与 PASS/FAIL 计数并汇总。**计数口径（F20）**：用正则同时匹配 `[PASS]` / `] PASS` / `：PASS`（FAIL 同理）—— 早期只统计字面量 `[PASS]`，对 `verify_sphere_dag.py` 等 `[R1] PASS` 格式恒显示 PASS=0 FAIL=0，掩盖真实判据数量（现实测：R1-R7b=10、D1-D7=6、E2=15、E2b=6、E5=9、snapshot=1）。子进程统一强制 PYTHONIOENCODING=utf-8。命令全部跑完后执行**文档数字防线**：读取 _verify/doc_numbers.json，把登记值与本轮现跑结果逐项比对（artifact 类 torch.load 产物字段并按贪心最长匹配下钻含点键名如 fc1.weight；metric 类取自本轮 sphere_dag_metrics.json；text 类对指定命令的标准输出做正则提取（支持 as_float / as_int）或命中计数（count_matches）），打印一致/不一致/跳过计数，任何不一致直接判失败（离朱第 11 轮已用篡改登记值的负向验证确认）。退出码 0 = 全部命令退出码 0、无 FAIL，且文档登记数字与现跑一一一致。"
+    },
+    {
+      "path": "checkpoints/n3d_sphere/_verify/log_proto_smoke_e5.txt",
+      "description": "取证日志（不属于模块源码）：本轮重写完成后一期 `python n3d_proto/train.py --smoke-test` 的真实终端输出（9/9 PASS、退出码 0、loss=2.419689），用于证明一期未被本轮变更触碰。"
+    },
+    {
+      "description": "拓扑快照数据（验证产物，不属于模块源码）：由 `verify_topology_snapshot.py` 生成的 JSON，包含 6 个固定实验点 × 10 个 seed 共 60 条记录，每条含该 (配置, seed) 的完整拓扑量（E、平均/最大出度、平均/最大入度、层数、S_in、S_out、双副本数、孤立输入/输出突触数、R_min/R_max/R_effective、放置半径、最近邻距、可学习参数数、dense 权重张量计数、DAG 自检字段）。报告中引用任何拓扑数字（如 DEFAULT 规模 E=900~924、可学习参数 35094~44489）时均以本文件为工件支撑并标注 seed。",
+      "path": "checkpoints/n3d_sphere/_verify/topology_snapshot.json"
+    },
+    {
+      "description": "冒烟实测汇总记录（验证产物）：四种 scope 组合（any/any、any/all、all/any、all/all）的 SMALL_CONFIG 冒烟结果 JSON，每条包含 input_scope / readout_scope / 产物文件名 / 退出码 / loss 原始值 / 四个可学习参数的梯度范数 / S_in / S_out。用于支撑\"readout_scope 两取值结果确实不同\"的判定（四种组合 loss 互不相同），README 第 6.1 节的表格即由此生成。",
+      "path": "checkpoints/n3d_sphere/_verify/smoke_scope_matrix.json"
+    },
+    {
+      "path": "checkpoints/n3d_sphere/_verify/log_smoke_matrix_f9.txt",
+      "description": "冒烟矩阵取证日志（验证产物，由 run_smoke_matrix.py 以当前代码重跑后刷新）：一轮跑完 11 种冒烟组合的完整终端输出与退出码——四种 scope 组合（any/all × any/all）、多 seed（7/0/2024）、多规模（--n 32 / --preset default）、其它几何（flow-axis=x）、以及 --arch mlp；每项记录命令行、exit code 与完整 stdout（子进程强制 UTF-8 输出，故中文日志可解析），并在首尾记录默认产物 smoke.pt 的 SHA256 与“未被其它组合覆盖”的结论。用于支撑“11 种组合全部退出码 0 且产物名与实际落盘一致”的验收声明（皋陶第 2 轮 F9/F12/F15、第三轮 F18）。"
+    },
+    {
+      "path": "checkpoints/n3d_sphere/_verify/smoke_matrix_f9.json",
+      "description": "冒烟矩阵结果汇总（验证产物，由 run_smoke_matrix.py 以当前代码重跑后刷新）：11 种冒烟组合的结构化记录（JSON），每条含 tag / args / note（如实标注 --seed 0 表示不覆盖、--preset default 在冒烟下基线即 SMALL_CONFIG）/ expected_artifact / exit / PASS / FAIL / artifact（实际落盘名）/ artifact_name_matches_prediction / artifact_exists / artifact_sha256 / torch_load_ok / arch / loss / grad_norms / S_in / S_out / num_edges / config_matches_expectation / item_ok，与 log_smoke_matrix_f9.txt 一一对应；本轮 11/11 全部 item_ok=true，产物名与独立预测逐一一致，默认产物 smoke.pt 未被非默认组合污染。"
+    },
+    {
+      "path": "checkpoints/n3d_sphere/_verify/verify_device_regression.py",
+      "description": "设备契约回归取证脚本（F16，不属于模块源码，只构造模型做断言与取证、不改源码）。背景：第三轮皋陶审查 error —— 阶段 2 向量化（F11）后 `self.level_edge_reach, self.level_nodes = self._build_level_groups(...)` 未 register_buffer，`level_nodes` 是普通 Python list（元素为 CPU int64 张量）却被 forward 当索引张量使用，而 nn.Module.to(device) 不搬运普通 list 中的张量 → CUDA 前向必然抛 RuntimeError（CPU 上完全静默）。脚本判据 D1-D7：D1 层拓扑量类型与注册状态（level_edge_reach / level_node_reach 必须是 int64 [K,2] 张量，且在 named_buffers() 与 state_dict() 中、不再是 Python list）；D2 通用扫描 vars(model)，不得存在未注册的 tensor 属性或含 tensor 的 list/tuple/dict 属性（后者正是 F16 缺陷形态）；D3 层切分等价性（_iter_levels 的 topo_index[s:e] 张量切片与按流向轴独立分层逐位一致、层节点并集覆盖 0..N-1、层边区间无缝覆盖 [0,E)）；D4 设备搬运取证（.to('meta') 后 10 项索引张量全部搬到 meta，对照的普通 Python list 中张量仍停留在 cpu，精确复现缺陷机制）；D5 守卫负例（把 level_node_reach 换成 CPU 张量、或删除 level_edge_reach，前向必须抛 RuntimeError 且消息含张力名/指明未注册）；D6 CUDA 实测（有 GPU 时做真实 .cuda() 前向并与 CPU 结果比对；本机无 GPU 时标注“CUDA 路径为静态取证”并 skip）；D7 state_dict 往返后前向逐位一致（拓扑量持久化完整）。退出码 0 = D1-D7 全部通过（D6 无 GPU 时按 skip 计）。"
+    },
+    {
+      "path": "checkpoints/n3d_sphere/_verify/run_smoke_matrix.py",
+      "description": "冒烟矩阵重跑与取证刷新脚本（F18，不属于模块源码）。背景：此前落盘的 smoke_matrix_f9.json / log_smoke_matrix_f9.txt 中 11 条记录有 8 条引用的产物名已不存在（指纹后来加入 _bs{batch_size}，取证文件未随之重跑）。脚本以当前代码真实执行 11 种冒烟组合（四 scope × --seed 7/0/2024 × --n 32 × --preset default × --flow-axis x × --arch mlp），子进程强制 PYTHONIOENCODING=utf-8（否则 Windows GBK 管道编码把中文日志变乱码而无法解析），从日志按 ASCII 锚点 `_verify\\...\\.pt` 解析实际落盘路径并与脚本独立预测的产物名逐条比对；逐个 torch.load 复核并回读 config/loss/梯度范数/S_in/S_out/SHA256，再与独立登记的期望 config（默认基线 + 本组合覆盖项）逐字段比对；断言默认产物 smoke.pt 在全矩阵前后 SHA256 与 config 均未被其它组合污染；**并新增“同一产物路径被多条组合写入时必须逐位一致”的断言（离朱第 11 轮 D1 回归判据）**，在每条记录追加 artifact_sha256_at_end / artifact_sha256_stable / artifact_shared_writers 三个字段（实测 smoke.pt 被 3 条组合写入、SHA 去重后 1 种）。如实标注两处“看似变体、实为同一基线”的组合（--seed 0 按 CLI 约定表示不覆盖；--preset default 在冒烟路径下的基线即 SMALL_CONFIG），并在文档字符串中记录 D1 的现象、根因（pickle memo 依赖对象身份）与修法。以实际产物名重写 smoke_matrix_f9.json 与 log_smoke_matrix_f9.txt。退出码 0 = 11 条组合全部通过取证。"
+    },
+    {
+      "path": "checkpoints/n3d_sphere/_verify/doc_numbers.json",
+      "description": "文档数字登记表（F20 文档数字防线，验证产物）：登记 README.md 与本模块功能说明中出现的每一个实测数字（本轮 90 项 = 32 项产物字段 + 54 项全精度指标 + 4 项文本计数），由 verify_all.py 在同一轮现跑中逐项比对，任何不一致直接判失败，从机制上防止“文档登记数字与实现脱节”。三类条目：artifact_checks（torch.load 产物并按下钻路径取字段，exact=true 表示文档给出全精度、要求逐位相等 —— 用于同 seed 逐位可复现的 loss 与梯度范数；required=false 的产物缺失记为 SKIP 并提示需先运行对应脚本）；metric_checks（取自 verify_sphere_dag.py 本轮落盘的 sphere_dag_metrics.json 全精度指标，含 R1/R2/R3/R5/R5b/R5c/R6/R7b，容差即文档显示精度，如 6 位小数取 abs_tol=1e-6）；text_checks（对指定验收命令的本轮标准输出做正则提取或命中计数，如一期 loss=2.419689、一期 9 项 [PASS]、冒烟 15 项 [PASS]）。每条含 doc 字段指明其对应的文档位置。"
+    },
+    {
+      "path": "checkpoints/n3d_sphere/_verify/sphere_dag_metrics.json",
+      "description": "R1-R7b 全精度实测指标落盘（验证产物，由 verify_sphere_dag.py 每次运行写出）：含 generated_by / command / configs（GEOM_KEYS 到配置说明的映射）与 metrics 字典，本轮共 111 条。metrics 键前缀 r1./r2./r3./r4./r5./r5b./r5c./r6./r7b.，后缀为四组配置键 small / default / axis_x / radius_0.9（即 SMALL_CONFIG、DEFAULT 规模、DEFAULT+flow_axis=x、DEFAULT+space_radius=0.9）；记录体积均匀性均值、晶格常数与最近邻距、放置半径与有效半径、E 与层数、去重神经元对数与代表连接最大间距、双副本神经元数与零化输入层副本后的 max|Δa_up|/受影响下游神经元数/梯度非零数与总数、逐边数值最大偏差与 M1 形态反例的错配边数与结果差异、感受野层覆盖与第一层扰动传至最深层的最大变化、四种 scope 组合的 S_in/S_out、readout_scope 两取值的 |S_out| 与 logits 最大差异。供 doc_numbers.json 现跑比对取用。"
+    },
+    {
+      "description": "F21 验收证据日志（验证产物）：`python checkpoints/n3d_sphere/_verify/verify_all.py` 的完整输出——9 条验收命令（E1 compileall、E2 冒烟、E2b `--arch mlp` 冒烟、R1-R7b、D1-D7 设备契约、S1-S5、C1-C6、拓扑快照、E5 一期回归）逐条退出码与 PASS/FAIL 计数（R1-R7b=10、D1-D7=6、E2=15、E2b=6、E5=9、snapshot=1、E1/C 类按实际），以及文档数字防线结果“一致 93 项 / 不一致 0 项 / 跳过 0 项”与总结句“全部命令退出码 0 且无 FAIL；文档数字 全部一致”。含离朱第 11 轮 D1 修复后的最终一轮输出（apply_overrides 值等价短路 + run_smoke_matrix 的同路径逐位一致断言均已在同轮生效）。",
+      "path": "checkpoints/n3d_sphere/_verify/log_verify_all_f21.txt"
     }
   ]
 }

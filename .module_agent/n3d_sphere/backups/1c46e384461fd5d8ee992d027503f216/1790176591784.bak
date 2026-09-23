@@ -216,15 +216,11 @@ class ThreeDNeuronSpace(nn.Module):
             self.edge_dst.index_select(0, edge_perm_in).to(torch.long),
             persistent=True,
         )
-        # 按流向轴分层后的"层边区间 + 层节点区间"（阶段 2 整层并行递推用；
-        # 循环次数 = 层数，DEFAULT 为 9；仍是 __init__ 预计算、forward 只读）。
-        # ⚠️ 两张表都必须 `register_buffer`：它们是被 forward 当索引张量使用的拓扑量，
-        #    注册后才能随 `.to(device)` / `state_dict()` 一起搬运与持久化（F16）。
-        level_edge_reach, level_node_reach = self._build_level_groups(
+        # 按流向轴分层后的"层边区间 + 层节点集合"（阶段 2 整层并行递推用；
+        # 循环次数 = 层数，DEFAULT 为 9；仍是 __init__ 预计算、forward 只读）
+        self.level_edge_reach, self.level_nodes = self._build_level_groups(
             topo_index, neuron_in_edge_reach
         )
-        self.register_buffer("level_edge_reach", level_edge_reach, persistent=True)
-        self.register_buffer("level_node_reach", level_node_reach, persistent=True)
 
         # ---------------- 判据掩码（S_in / S_out） ----------------
         # S_in：阶段 1 由输入层驱动的神经元集合（由 input_scope 判据决定）
@@ -680,7 +676,7 @@ class ThreeDNeuronSpace(nn.Module):
     @torch.no_grad()
     def _build_level_groups(
         self, topo_index: torch.Tensor, reach_in: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """把"入边表"按**流向轴分层**分组，供阶段 2 整层并行递推（向量化）。
 
         层的定义：拓扑序中流向轴坐标相同的连续段（FCC 晶格的等坐标平面）。
@@ -688,17 +684,8 @@ class ThreeDNeuronSpace(nn.Module):
         位于更小的层，因此"按层串行、层内并行"等价于"按拓扑序逐神经元串行"。
 
         这里把 `reach_in`（按拓扑位置索引的逐神经元入边区间）合并成"每层一个连续的
-        边区间 + 该层在拓扑序中的连续下标区间"，使阶段 2 的循环次数从 N 降到层数
-        （DEFAULT 为 9），且层内用一次 `index_add` + 一次 `index_copy` 完成，不再
-        逐神经元分配临时张量。
-
-        **设备契约（F16 修复要点）**：本函数**只返回张量**，且两张表的每一行都描述
-        拓扑序中的一个连续段，调用方因此可以只注册 `[K, 2]` 的下标表、在 forward 中
-        用 `topo_index[s:e]` 张量切片取层节点。此前版本返回 `List[torch.Tensor]` 的
-        层节点列表，`nn.Module.to(device)` **不会搬运普通 Python list 中的张量**，
-        导致 CUDA 前向把 CPU 索引张量传给 GPU `index_select` / `index_copy` 而抛
-        RuntimeError；同时旧实现用 `device=a_up.device` 现场构造索引，也与"拓扑量
-        一律 `__init__` 预计算并 `register_buffer`"的规范相悖。
+        边区间 + 该层的节点集合"，使阶段 2 的循环次数从 N 降到层数（DEFAULT 为 9），
+        且层内用一次 `index_add` + 一次 `index_copy` 完成，不再逐神经元分配临时张量。
 
         参数
         ----
@@ -709,10 +696,8 @@ class ThreeDNeuronSpace(nn.Module):
 
         返回
         ----
-        Tuple[torch.Tensor, torch.Tensor]
-            * `level_edge_reach`：形状 [K, 2]，每层在**入边表**中的连续区间 [lo, hi)；
-            * `level_node_reach`：形状 [K, 2]，每层在**拓扑序**中的连续区间 [s, e)，
-              层节点集合即 `topo_index[s:e]`。
+        Tuple[torch.Tensor, List[torch.Tensor]]
+            (每层边区间的 [K, 2] 起止张量, 每层节点集合的列表（长度 K）)。
         """
         axis = self.neuron_pos[:, self.flow_axis_index]
         axis_sorted = axis.index_select(0, topo_index)
@@ -721,26 +706,22 @@ class ThreeDNeuronSpace(nn.Module):
             new_level[1:] = axis_sorted[1:] != axis_sorted[:-1]
         starts = torch.nonzero(new_level, as_tuple=False).reshape(-1).tolist()
         ends = starts[1:] + [self.N]
-        edge_reach: List[List[int]] = []
-        node_reach: List[List[int]] = []
+        reach: List[List[int]] = []
+        nodes: List[torch.Tensor] = []
         for s, e in zip(starts, ends):
             # 该层在入边表中的连续区间：从首节点入边起点到末节点入边终点
             lo = int(reach_in[s, 0].item())
             hi = int(reach_in[e - 1, 1].item())
-            edge_reach.append([lo, hi])
-            node_reach.append([s, e])
-        # 契约自检：层区间必须覆盖全部边且各层节点区间必须无缝覆盖拓扑序
-        assert edge_reach[-1][1] == int(self.edge_src.numel()), (
-            f"[契约失败] 分层入边区间上界 {edge_reach[-1][1]} != E={int(self.edge_src.numel())}"
+            reach.append([lo, hi])
+            nodes.append(topo_index[s:e].clone())
+        # 契约自检：层区间必须覆盖全部边且各层节点并集恰为全部神经元
+        assert reach[-1][1] == int(self.edge_src.numel()), (
+            f"[契约失败] 分层入边区间上界 {reach[-1][1]} != E={int(self.edge_src.numel())}"
         )
-        node_reach_t = torch.tensor(node_reach, dtype=torch.long)
-        assert node_reach_t[0, 0].item() == 0 and node_reach_t[-1, 1].item() == self.N, (
-            "[契约失败] 分层节点区间未覆盖整个拓扑序"
+        assert sum(int(n.numel()) for n in nodes) == self.N, (
+            "[契约失败] 分层节点集合并未覆盖全部 N 个神经元"
         )
-        assert bool((node_reach_t[1:, 0] == node_reach_t[:-1, 1]).all()), (
-            "[契约失败] 分层节点区间之间存在空隙或重叠"
-        )
-        return torch.tensor(edge_reach, dtype=torch.long), node_reach_t
+        return torch.tensor(reach, dtype=torch.long), nodes
 
     def _build_scope_mask(self, isolated_mask: torch.Tensor, scope: str) -> torch.Tensor:
         """按 `any_isolated` / `all_isolated` 判据把突触级孤立掩码归约到神经元级掩码。
@@ -895,9 +876,6 @@ class ThreeDNeuronSpace(nn.Module):
                 f"设备不一致：a_in_driven 在 {a_in_driven.device}，模型参数在 "
                 f"{self.edge_weight.device}"
             )
-        # 设备契约自检（F16）：所有索引张量必须与激活同设备且必须已注册为
-        # buffer/parameter —— 保证 CUDA 路径不会因"普通 Python 容器搬不动"而崩溃
-        self._assert_index_device(a_in_driven)
         # 入边表：`edge_perm_in` 把边按"目标神经元"分组，每个神经元的入边落在
         # `neuron_in_edge_reach[pos]` 给出的连续区间内（按**拓扑位置**索引）。
         # ⚠️ 必须用重排后的源神经元下标与边权取值 —— 曾出现过的两个真实缺陷：
@@ -939,82 +917,17 @@ class ThreeDNeuronSpace(nn.Module):
     def _iter_levels(self):
         """按层迭代 (lo, hi, nodes)：层边区间与层节点集合（`__init__` 预计算）。
 
-        层节点集合由 `topo_index[s:e]` **张量切片**得到（`level_node_reach` 描述的
-        是拓扑序中的连续段），因此它天然跟随模型设备 —— `topo_index` 已
-        `register_buffer`，`.to(device)` 后切片结果也在目标设备上（F16）。
-
         返回
         ----
         Iterator[Tuple[int, int, torch.Tensor]]
             每层的 (入边区间起点, 终点, 该层节点索引张量)。
         """
-        edge_reach = self.level_edge_reach
-        node_reach = self.level_node_reach
-        topo = self.topo_index
-        assert edge_reach.shape[0] == node_reach.shape[0], (
-            f"[契约失败] 层数不一致：edge_reach={edge_reach.shape[0]}, "
-            f"node_reach={node_reach.shape[0]}"
-        )
-        for k in range(int(edge_reach.shape[0])):
-            s = int(node_reach[k, 0].item())
-            e = int(node_reach[k, 1].item())
-            yield int(edge_reach[k, 0].item()), int(edge_reach[k, 1].item()), topo[s:e]
-
-    def _assert_index_device(self, a_up: torch.Tensor) -> None:
-        """设备契约自检：参与索引的拓扑张量必须与 `a_up` 同设备（F16 防线）。
-
-        `stage2_recurrence` 中所有索引张量（`edge_perm_in` / `edge_src` /
-        `edge_dst_in` / `neuron_bias` / `topo_index` / `level_*`）都必须是 buffer 或
-        参数，从而随 `.to(device)` 一起搬运。本方法在**每次前向**显式校验，避免出现
-        "某些拓扑量是普通 Python 容器 / 现场构造的 CPU 张量"这类设备回归 —— 该回归
-        在 CPU 上完全静默，只在 CUDA 上抛 RuntimeError。
-
-        参数
-        ----
-        a_up : torch.Tensor
-            形状 [N, B] 的激活张量，其设备即本次前向的目标设备。
-
-        异常
-        ------
-        RuntimeError
-            任一索引张量的设备与 `a_up` 不一致，或任一拓扑量不在 `named_buffers()`
-            / `named_parameters()` 中（即无法被 `.to(device)` 搬运）时抛出。
-        """
-        device = a_up.device
-        movable = set(dict(self.named_buffers()))
-        movable |= set(dict(self.named_parameters()))
-        required = [
-            "topo_index",
-            "edge_perm_in",
-            "edge_dst_in",
-            "edge_src",
-            "edge_dst",
-            "neuron_bias",
-            "level_edge_reach",
-            "level_node_reach",
-        ]
-        if self.has_readout_bias:
-            required.append("W_out_bias")
-        for name in required:
-            if name not in movable:
-                raise RuntimeError(
-                    f"[设备契约失败] 拓扑量 {name!r} 未注册为 buffer/parameter，"
-                    "`.to(device)` 无法搬运它；请改用 register_buffer 注册"
-                )
-            tensor = getattr(self, name)
-            if tensor.device != device:
-                raise RuntimeError(
-                    f"[设备契约失败] 索引张量 {name!r} 在 {tensor.device}，"
-                    f"但本次前向的激活在 {device}"
-                )
-        # 层节点切片也必须落在目标设备（曾因普通 Python list 而失败）
-        node_reach = self.level_node_reach
-        s = int(node_reach[0, 0].item())
-        e = int(node_reach[0, 1].item())
-        if self.topo_index[s:e].device != device:
-            raise RuntimeError(
-                f"[设备契约失败] 层节点切片在 {self.topo_index[s:e].device}，"
-                f"但本次前向的激活在 {device}"
+        reach = self.level_edge_reach
+        for k in range(int(reach.shape[0])):
+            yield (
+                int(reach[k, 0].item()),
+                int(reach[k, 1].item()),
+                self.level_nodes[k],
             )
 
     def readout_activations(self, a_up: torch.Tensor) -> torch.Tensor:

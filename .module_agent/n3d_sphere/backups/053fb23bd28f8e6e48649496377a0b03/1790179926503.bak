@@ -802,27 +802,9 @@ def apply_overrides(
         changed = True
     if not changed:
         return base
-    result = Config(**overrides)
-    if result == base:
-        # 显式给出的覆盖值与基线**逐字段完全相同**（值等价）：复用基线对象本身。
-        # 这不只是省一次构造 —— `torch.save` 的**字节**取决于 pickle 的记忆化（memo），
-        # 而 memo 依赖**对象身份**而非取值：
-        #   * 裸跑走 `SMALL_CONFIG` 单例时，`input_scope` 与 `readout_scope` 指向同一个
-        #     `"any_isolated"` 字符串对象，第二次出现被写成 memo 引用（`h\xfd`）；
-        #   * 显式传 `--input-scope any_isolated` 时，取值来自 argparse 构造的**等值新
-        #     字符串**，两个位置分别内联写出（`X\x0c\0\0\0any_isolated`）。
-        # 于是"语义完全相同"的两次运行产出**不同字节**的 `smoke.pt`（离朱第 11 轮 D1：
-        # data.pkl 4097 vs 4117 字节、1520 字节差异，而 loss/config/grad_norms/全部张量
-        # 逐位相等）。复用基线对象即让"同一语义配置 ⇒ 同一字节"，
-        # 使产物 SHA256 重新成为可靠的等价判据。
-        log_info(
-            "显式覆盖参数与基线取值逐字段一致（值等价）：复用基线配置对象，"
-            "不构造新对象（保证同语义配置产出同字节产物）"
-        )
-        return base
     if warn_message:
         log_warn(warn_message)
-    return result
+    return Config(**overrides)
 
 
 def build_smoke_config(args: argparse.Namespace) -> Config:

@@ -1,11 +1,20 @@
-"""N3D 二期架构变体包（三维神经元空间 + 球形有向拓扑）。
+"""N3D 纯球形分层有向无环架构包（FCC 规则堆积 + 神经元级连接 + 两阶段双副本展开）。
 
-与一期 `n3d_proto` 的关系
--------------------------
-* 本包是**并列存档的二期变体**，自包含（不 import `n3d_proto` 的任何模块）；
-* 一期 `n3d_proto/` 完整存档、默认行为与既有产物逐位不变；
-* 本变体默认 `topology="cube"` 时的行为与一期**逐位一致**
-  （`python n3d_sphere/train.py --smoke-test` 的 `loss` 必须同为 2.419689）。
+模块定位
+--------
+* **纯球体几何**：神经元按 FCC（面心立方）规则堆积放置在球空间内，突触按流向轴
+  切分到正/负半球；网络上不存在其它几何分支，也不存在几何类型开关。
+* **自包含**：不 import 一期 `n3d_proto` 的任何模块；一期完整存档、默认行为与
+  既有产物逐位不变（`python n3d_proto/train.py --smoke-test` 仍须 9/9 PASS 且
+  `loss=2.419689`）。
+* 网络为**分层有向无环图**：连接规则强制 `z_A < z_B`（沿流向轴严格上行），
+  并按 z 升序逐层传播（阶段 2），输入层另设阶段 1 驱动 `S_in` 神经元。
+
+快速入口
+--------
+* 冒烟测试：``python n3d_sphere/train.py --smoke-test``（新架构判据集合，逐条打印 PASS/FAIL）
+* 正式训练：``python n3d_sphere/train.py``
+* 几何/拓扑验证：``python checkpoints/n3d_sphere/_verify/verify_sphere_dag.py all``
 """
 
 __all__ = ["config", "utils", "model", "data", "train"]
