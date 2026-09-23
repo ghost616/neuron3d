@@ -526,24 +526,38 @@ def dynamic_coverage_metadata(model: nn.Module) -> Dict[str, float]:
     返回
     ----
     Dict[str, float]
-        **接口契约（三个键）**：
+        **接口契约（三个键，与 `model.round_output_coverage()` 的三键同名同义）**：
         * `"out_nonzero_coverage_last"`：末轮非零列占比；从未跑过前向时为 NaN；
         * `"out_nonzero_coverage_mean"`：全程均值；从未跑过前向时为 NaN；
         * `"out_nonzero_coverage_rounds"`：已累计观测轮数；从未跑过前向时为 0.0。
 
-        **缺键行为（本轮健壮性修复）**：取快照一律用 `.get(key, 默认值)`，
-        因此**调用方若返回键不完整的字典（例如新增/裁剪字段的模型实现），
-        前两项返回 NaN、轮数返回 0.0，而不会抛 `KeyError`**。
-        该修复只改访问方式，正常路径（`ThreeDNeuronSpace.round_output_coverage()`
-        完整返回三键）的返回值与修复前**逐位相同**。
+        **键名与语义的一致性（重要）**：本函数返回的这三键与
+        `ThreeDNeuronSpace.round_output_coverage()` 的返回**同名同义**（只是取值加了
+        兜底），因此 `train.py` 写 checkpoint 时用
+        `topo_stats.update(dynamic_coverage)` **直接覆盖** `topology_stats` 内的同名字段。
+        下游读 `topology_stats["out_nonzero_coverage_*"]` 与读顶层
+        `dynamic_coverage[...]` 得到的是**同一口径**，不存在两套定义。
 
-        无该统计能力的模型（`getattr` 取不到可调用 `round_output_coverage`）
-        仍返回空字典 `{}`，表示"该模型没有这一维度"（与"有该维度但缺键"区分开）。
+        **三种情形的契约（第 4 轮补全）**：
+        1. **无该统计能力**：`getattr` 取不到可调用的 `round_output_coverage`
+           （如 `MLPBaseline`）-> 返回**空字典 `{}`**，表示"该模型没有这一维度"；
+        2. **有该维度但返回的字典缺键** -> 缺的键按默认值填充（前两项 NaN、轮数 0.0），
+           **不抛 `KeyError`**；
+        3. **getter 返回非字典**（`None` / `list` / 具名元组 / 其它对象）-> 视为
+           "拿不到可用快照"，按**与情形 2 相同的缺键路径降级**（NaN / NaN / 0.0），
+           **不抛 `AttributeError` / `TypeError`**。
+
+        设计初衷：本函数服务于"增量演进的调用方"，任何形态的异常返回都不应让
+        checkpoint 保存路径崩掉；异常形态一律降级为 NaN / 0.0。
     """
     getter = getattr(model, "round_output_coverage", None)
     if not callable(getter):
         return {}
-    snapshot = getter()
+    # `or {}` 兜住 None；再用 isinstance 兜住 list / 具名元组 / 其它非字典对象。
+    # 非字典一律走"缺键路径"降级（NaN / NaN / 0.0），不抛异常。
+    snapshot = getter() or {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
     # 健壮性（审查建议）：缺键时给默认值而非抛 KeyError，便于增量演进的调用方
     nan = float("nan")
     return {

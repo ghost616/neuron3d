@@ -205,14 +205,12 @@ class ThreeDNeuronSpace(nn.Module):
 
         # ---------------- 二期新增：静态拓扑统计（全部预计算为 buffer） ----------------
         # ① 逆向边：沿流向轴，"输出突触在输入突触**下方**"的边。
-        #    流向定义为 −axis → +axis（输入突触取负半球、输出突触取正半球），
-        #    因此 gap = 输出突触坐标 − 输入突触坐标 时：
+        #    流向定义为 -axis → +axis（输入突触取负半球、输出突触取正半球），
+        #    因此 gap = 输出突触坐标 - 输入突触坐标 时：
         #      gap > 0 → 沿 +axis 向上传播（正向边）；gap < 0 → 逆流向向下传播（逆向边）。
         pos_rows = output_syn_pos.index_select(0, edge_index[0])
         pos_cols = input_syn_pos.index_select(0, edge_index[1])
-        axis_gap = (
-            pos_rows[:, self.flow_axis_index] - pos_cols[:, self.flow_axis_index]
-        )
+        axis_gap = self._compute_edge_axis_gap(pos_rows, pos_cols)
         # 注意：一期/二期均**不裁剪**逆向边，这里只统计占比（保持与一期一致的构图规则）
         self.register_buffer(
             "edge_reverse_flag", (axis_gap < 0.0).to(torch.long), persistent=True
@@ -220,6 +218,8 @@ class ThreeDNeuronSpace(nn.Module):
         # ①' gap 张量缓存：供 get_topology_stats() 直接复用，避免每次调用都重算 O(E)。
         #     **非持久化 buffer**（persistent=False）：不进 state_dict，因此既不改变
         #     一/二期 state_dict 键集（逐位等价校验仍成立），又能随 .to(device) 搬设备。
+        #     与 W1 容器同类（内存态），故 get_topology_stats() 对该属性取兜底并在缺失时
+        #     用同一个 `_compute_edge_axis_gap` 重算，避免"两份实现分叉"。
         self.register_buffer("edge_axis_gap", axis_gap, persistent=False)
         # ② 弱连通分量（把每条边映射到"输出突触所属神经元 ↔ 输入突触所属神经元"）
         self.register_buffer(
@@ -277,6 +277,36 @@ class ThreeDNeuronSpace(nn.Module):
         # 数值契约：构造后立即验证 tau > 0
         tau = self.current_tau()
         assert tau > 0.0, f"[契约失败] tau 必须 > 0，当前 tau={tau}"
+
+    # ==================================================================
+    # 边间距（gap）计算：__init__ 与 get_topology_stats() 兜底路径**共用同一实现**
+    # ==================================================================
+    def _compute_edge_axis_gap(
+        self, pos_rows: torch.Tensor, pos_cols: torch.Tensor
+    ) -> torch.Tensor:
+        """计算沿流向轴的边间距 `gap = axis(输出突触坐标) - axis(输入突触坐标)`。
+
+        口径（全文统一，不做 Δz / δ 分解）：`gap > 0` 为沿 -axis → +axis 上行的
+        **正向边**，`gap < 0` 为逆流向的**逆向边**（见 `get_topology_stats`）。
+
+        **本方法是唯一实现**：`__init__` 预计算 `edge_axis_gap` 缓存时调用它，
+        `get_topology_stats()` 在缓存缺失（例如非标准加载路径绕过 `__init__`
+        重建 buffer）时也调用它重算并**回写缓存**（第 5 轮：使缓存语义自愈，
+        下次调用直接命中），从而**不存在两份可能分叉的实现**。
+
+        参数
+        ----
+        pos_rows : torch.Tensor
+            形状 [E, 3] 的边起点（输出突触）坐标，即 `output_syn_pos[edge_index[0]]`。
+        pos_cols : torch.Tensor
+            形状 [E, 3] 的边终点（输入突触）坐标，即 `input_syn_pos[edge_index[1]]`。
+
+        返回
+        ----
+        torch.Tensor
+            形状 [E] 的流向轴间距（与输入同 dtype）。
+        """
+        return pos_rows[:, self.flow_axis_index] - pos_cols[:, self.flow_axis_index]
 
     # ==================================================================
     # 坐标采样（仅在 __init__ 中调用）
@@ -1112,10 +1142,28 @@ class ThreeDNeuronSpace(nn.Module):
             raise ValueError(f"当前拓扑 E=0，无法统计拓扑指标（E={self.num_edges}）")
         axis = self.flow_axis_index
         # gap 口径（全文统一，不做 Δz / δ 分解）：
-        #   gap = axis(output_syn_pos) − axis(input_syn_pos)
-        # 修复审查次要项：直接复用 `__init__` 预计算的 edge_axis_gap（非持久化 buffer），
+        #   gap = axis(output_syn_pos) - axis(input_syn_pos)
+        # 正常路径直接复用 `__init__` 预计算的 edge_axis_gap（非持久化 buffer），
         # 不再每次调用都 index_select 重算 O(E)；数值与重算结果逐位相同。
-        gap = self.edge_axis_gap
+        # **兜底路径（第 4 轮加固 + 第 5 轮回写自愈）**：`edge_axis_gap` 是
+        # persistent=False 的内存态 buffer，与 W1 容器同类——任何绕过 `__init__`
+        # （例如直接从 state_dict 重建 buffer）的加载路径都会缺该属性。此时按与
+        # `__init__` **同一个** 计算逻辑（`_compute_edge_axis_gap`）重算，
+        # 避免抛 AttributeError、也避免两份实现分叉。
+        # 重算后**回写缓存**使缓存语义自愈（下次调用直接命中，不再重复 O(E) 重算）。
+        # ⚠️ 回写必须走 `register_buffer(..., persistent=False)`：
+        #   该名字在此路径下从未被 register 过，若直接写 `self._buffers[...]`
+        #   会漏掉 `_non_persistent_buffers_set` 登记，使其被当作**持久化** buffer
+        #   而泄漏进 `state_dict()`，破坏"state_dict 键集增量恰为 3 个"的不变量。
+        #   `register_buffer` 会正确登记非持久化集合。helper 从 `self.output_syn_pos` /
+        #   `self.input_syn_pos` 重算，结果本身即在目标设备上。
+        gap = getattr(self, "edge_axis_gap", None)
+        if gap is None:
+            gap = self._compute_edge_axis_gap(
+                self.output_syn_pos.index_select(0, self.edge_index[0]),
+                self.input_syn_pos.index_select(0, self.edge_index[1]),
+            )
+            self.register_buffer("edge_axis_gap", gap, persistent=False)
         n_rev = int(self.edge_reverse_flag.sum().item())
         rev_ratio = float(n_rev) / float(self.num_edges)
 

@@ -118,6 +118,8 @@ python n3d_sphere/train.py --smoke-test
 
 # 阶段 A 冒烟测试（球形有向拓扑，产物名含拓扑指纹，不与 cube 冒烟产物互覆）
 python n3d_sphere/train.py --smoke-test --topology sphere --flow-axis z
+#   -> sphere 冒烟的 loss 与 cube 的 2.419689 不同（几何改变的必然结果，
+#      不参与 2.419689 基线判定）。实测值与复核命令见「6.2 sphere 冒烟 loss 的唯一记录处」。
 
 # 阶段 B 全量训练（球形有向拓扑，与一期 highacc 控制变量完全对齐）
 python n3d_sphere/train.py --preset highacc --epochs 12 --topology sphere --flow-axis z \
@@ -130,6 +132,14 @@ python n3d_sphere/train.py --preset highacc --epochs 6 --max-batches 150 \
 # 其它拓扑参数
 python n3d_sphere/train.py --smoke-test --topology sphere --flow-axis x --space-radius 0.8
 ```
+
+> **关于 sphere 冒烟的 loss（勿误判为回归）**：`--smoke-test --topology sphere --flow-axis z`
+> 的 loss 与默认 cube 路径的 `2.419689` **不同**——这是**正确且必然**的：sphere 几何改变了
+> 坐标采样（等体积球 + 半球切分），而 `2.419689` 这一基线**只对默认 cube 路径成立**。
+> **sphere 冒烟仅用于验证「9/9 判据全 PASS」与「几何确实生效」（配置回显 `topology=sphere`、
+> 产物名含拓扑指纹），其 loss 不参与 `2.419689` 基线判定。**
+> 该 loss 的**实测值与 `torch.load` 复核命令统一记录在「6.2 sphere 冒烟 loss 的唯一记录处」**，
+> 此处不再重复硬编码，避免数值多处漂移。
 
 新增 CLI 的哨兵语义（与一期一致：`0` / 空串 / `-1` = 未提供）：
 
@@ -338,6 +348,37 @@ verify_<bpe>_N{N}_y{y_in}x{y_out}_H{H}_D{D}_T{T}_top{topology}_ax{flow_axis}_s{s
   `checkpoints/n3d_sphere/model.pt`；其它几何/容量配置自动使用
   `full_<指纹>.pt`，保证每个实验点独立留痕、可 `torch.load` 复核。
 
+### 6.1 产物 schema 版本说明（**重要，勿误读**）
+
+`dynamic_coverage`（顶层字段）与 `topology_stats["out_nonzero_coverage_rounds"]`
+是**第 3 轮才新增的元数据**（W1 修复的一部分）。因此：
+
+| 产物 | 产出轮次 | 含 `dynamic_coverage` 顶层字段？ | 含 `out_nonzero_coverage_*` 三键？ |
+| --- | --- | --- | --- |
+| `checkpoints/n3d_sphere/_verify/smoke.pt` / `smoke_sphere_z.pt` | 第 3 轮（已重跑） | ✅ 是 | ✅ 是（三键齐全） |
+| `checkpoints/n3d_sphere/full_sphere_z_N256_y8x8_H0.1_D0.15_T4_topsphere_axz_s42.pt` | **第 2 轮（旧 schema）** | ❌ **否** | ❌ **否**（只有 `out_nonzero_coverage_last/mean` 两键） |
+
+**旧 schema 产物中的数值依然有效**：其 `test_acc=0.9783`、`epochs=12`、
+`num_edges=61503`、`sparsity=0.014663`、`reverse_edge_ratio=0.385006`、
+`weak_components=1.0`、`largest_component_ratio=1.0` 等**均不受影响**，仍可 `torch.load`
+直接复核（第 7 节的对照结论即基于该产物）。缺的只是两个**新增的元数据字段**，
+不是数值错误。如需 schema 完整（含 `dynamic_coverage` 与轮数），**需用第 3 轮及以后
+的代码重跑一次全量**——本模块未自动重跑（是否重跑由使用方决定，避免覆盖既有对照产物）。
+
+### 6.2 sphere 冒烟 loss 的唯一记录处（第 5 轮收敛）
+
+sphere 几何改变了坐标采样，其冒烟 loss 与 cube 的 `2.419689` 必然不同——**sphere 冒烟
+只用于验证「9/9 判据全 PASS」与「几何确实生效」，其 loss 不参与 `2.419689` 基线判定**。
+该实测值在本 README 中**只记录这一处**（第 4 节示例只给指引，不重复硬编码，避免数值多处漂移）：
+
+| 产物 | 实测 loss | 复核命令 |
+| --- | --- | --- |
+| `checkpoints/n3d_sphere/_verify/smoke_sphere_z.pt`（sphere 冒烟） | **`3.064222574234009`** | `torch.load(...)['loss']` |
+| `checkpoints/n3d_sphere/_verify/smoke.pt`（cube 冒烟，基线） | `2.419689416885376` | `torch.load(...)['loss']` |
+
+> **该值绑定当前 `SMALL_CONFIG` 与球面采样实现**；如采样实现（方向翻转 / 半径口径）
+> 发生变化，**需同步重跑冒烟并更新本值及本节复核记录**（否则该常量会静默过期）。
+
 ---
 
 ## 7. 阶段 3：全量对照（12 epoch，全量 60000）
@@ -480,8 +521,15 @@ python n3d_sphere/train.py --preset highacc --epochs 12 --topology sphere --flow
   末轮值 / 全程均值 / 累计轮数（`out_nonzero_coverage_rounds`）会作为**显式字段**
   随 checkpoint 落盘（`topology_stats` 与顶层 `dynamic_coverage`），
   `.pt` 加载后可直接 `torch.load` 复核，无需依赖内存态容器；
+  **注意（第 3 轮新增，勿误读为"所有产物均已带三键"）**：该两个字段是第 3 轮才加入的
+  schema；既有 `checkpoints/n3d_sphere/full_sphere_z_*.pt` 为**旧 schema**，
+  不含 `dynamic_coverage` 顶层字段与 `out_nonzero_coverage_rounds` 键
+  （其 `test_acc` / E / 拓扑统计等数值仍有效，详见 **6.1 产物 schema 版本说明**）；
   `gap` 张量在 `__init__` 缓存为**非持久化 buffer** `edge_axis_gap`（不进 state_dict，
   不改变一/二期 state_dict 键集），`get_topology_stats()` 直接复用、不再重算 O(E)；
+  该 buffer 属内存态，若加载路径绕过 `__init__` 而缺失，`get_topology_stats()` 会按
+  **同一份** `_compute_edge_axis_gap()` 逻辑重算兜底（数值与复用缓存逐位相同，
+  已实测验证），不抛 `AttributeError`；
 * 仍然**禁止 materialize dense `[N*y_out, N*y_in]` 权重矩阵**：连接权重是边级参数
   `W_conn_sparse` [E]，冒烟测试的「附加①边级参数数 == E」「附加②无该形状权重张量」
   两条判据在二期同样 PASS。

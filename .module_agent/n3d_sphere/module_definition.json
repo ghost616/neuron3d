@@ -38,8 +38,8 @@
       "description": "审查缺陷 W1 专项回归脚本（不属于模块源码，放在验证产物目录内）：只读取产物 + 构造模型 + 断言，不改动任何源码。对每个冒烟产物（smoke.pt / smoke_sphere_z.pt）逐条断言：C1 动态 2a 覆盖容器为 O(1) 定长（不存在遗留的 _round_output_coverage 无界列表，任意多次前向后元素个数恒为 3）；C1b 累计轮数 == 前向次数 × T；C2 均值口径 mean == sum/count 且末轮取自 last；C3 checkpoint 的 topology_stats 与顶层 dynamic_coverage 两处同时含 out_nonzero_coverage_last/_mean/_rounds 且逐位一致（.pt 加载后内存态为 NaN 属预期，历史值改由显式字段复核）；C4 reset_round_output_coverage() 后快照恢复为 NaN / 0（阶段隔离）；C5 非持久化 buffer edge_axis_gap 与由 edge_index 重算的 gap 逐位相等、get_topology_stats 复用后统计一致、且不出现在 state_dict 中（一/二期键集增量仍恰为 3 个）。退出码 0 = 全部 PASS。"
     },
     {
-      "description": "轮数口径与缺键健壮性取证脚本（不属于模块源码）：用真实训练+评估循环实测 out_nonzero_coverage_rounds 的口径构成（(训练批数+评估批数)×epoch×T，实测 rounds=24 = (3+3)×2×T=2；冒烟路径 = T），并验证阶段隔离（reset 后 rounds=0、末轮为 NaN）、dynamic_coverage_metadata 的缺键健壮性（传入只含 1 个键的桩模型时不抛 KeyError，返回 NaN / 0.0）、以及正常路径与 round_output_coverage() 逐位一致。",
-      "path": "checkpoints/n3d_sphere/_verify/verify_r4_round_count_scope.py"
+      "path": "checkpoints/n3d_sphere/_verify/verify_r4_round_count_scope.py",
+      "description": "轮数口径与健壮性取证脚本（不属于模块源码）：用真实训练+评估循环实测 out_nonzero_coverage_rounds 的口径构成（(训练批数+评估批数)×epoch×T，实测 rounds=24 = (3+3)×2×T=2；冒烟路径 = T），并验证阶段隔离（reset 后 rounds=0、末轮为 NaN）；验证 dynamic_coverage_metadata 的取值兜底三情形——无该统计能力（返回空字典 {}）、返回字典但缺键（NaN/0.0，不抛 KeyError）、返回非字典 None / list / 具名元组（按缺键路径降级为 NaN/NaN/0.0，不抛 AttributeError/TypeError）；验证正常路径三键与 round_output_coverage() 同名同义且逐位一致；验证删除非持久化 buffer edge_axis_gap 后 get_topology_stats() 的兜底重算不抛异常且 gap/逆向边四项与正常路径逐位一致；并新增**回写自愈专项断言**：兜底调用后缓存已回写、回写后 'edge_axis_gap' not in state_dict()（persistent=False 未泄漏）、state_dict 键集与基准完全一致（21 键）、第二次调用命中缓存且与前次逐位一致、回写内容 torch.equal 原始缓存、相对一期 18 键的增量恰为 edge_reverse_flag / neuron_component_id / connected_output_mask 三个。"
     }
   ]
 }

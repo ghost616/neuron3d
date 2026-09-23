@@ -164,8 +164,55 @@ rounds = (训练批数 + 评估批数) × epoch 数 × T
 `torch.save` 之前取**显式快照**写入 checkpoint 的 `topology_stats` 与顶层 `dynamic_coverage`，
 使 `.pt` 加载后可脱离内存态复核历史动态覆盖。
 
-**接口契约（三键）**：`out_nonzero_coverage_last`（末轮，未跑前向为 NaN）、
-`out_nonzero_coverage_mean`（全程均值，未跑前向为 NaN）、`out_nonzero_coverage_rounds`
-（累计轮数，未跑前向为 0.0）。取快照一律用 `.get(key, 默认值)`：**调用方返回键不完整的
-字典时返回 NaN / 0.0 而非抛 `KeyError`**；`getattr` 取不到 `round_output_coverage` 的模型
-（如 `MLPBaseline`）返回空字典 `{}`，以区分"无该维度"与"有该维度但缺键"。
+**接口契约（三键，与 `model.round_output_coverage()` 同名同义）**：
+`out_nonzero_coverage_last`（末轮，未跑前向为 NaN）、`out_nonzero_coverage_mean`
+（全程均值，未跑前向为 NaN）、`out_nonzero_coverage_rounds`（累计轮数，未跑前向为 0.0）。
+
+**取值兜底（三轮加固后的完整契约）**：写 checkpoint 时用
+`topo_stats.update(dynamic_coverage)` 覆盖同名字段，下游读 `topology_stats` 与读顶层
+`dynamic_coverage` 是**同一口径**。异常形态一律降级、**绝不抛异常**：
+
+| 情形 | 行为 |
+| --- | --- |
+| `getattr` 取不到可调用的 `round_output_coverage`（如 `MLPBaseline`） | 返回空字典 `{}`（表示"无该维度"） |
+| 返回字典但缺键 | 缺的键填默认值（前两项 NaN、轮数 0.0），不抛 `KeyError` |
+| 返回**非字典**（`None` / `list` / 具名元组 / 其它对象） | 按缺键路径降级（NaN / NaN / 0.0），不抛 `AttributeError` / `TypeError` |
+
+实测佐证（`None` / `list [1.0, 1.0, 8.0]` / 具名元组 `_NamedCoords(last=1.0)` 三形态均返回
+NaN / NaN / 0.0 且未抛异常；正常路径与 `round_output_coverage()` 三键逐位一致）。
+
+### 产物 schema 版本（勿误读）
+`dynamic_coverage` 顶层字段与 `topology_stats["out_nonzero_coverage_rounds"]` 是**第 3 轮新增
+元数据**。既有 `checkpoints/n3d_sphere/full_sphere_z_*.pt` 为**旧 schema**（无该顶层字段、
+`out_nonzero_coverage_*` 三键不全），但其 `test_acc=0.9783`、`E=61503`、`sparsity=0.014663`、
+`reverse_edge_ratio=0.385006`、`weak_components=1.0`、`largest_component_ratio=1.0` 等数值
+**仍然有效**且可 `torch.load` 复核；如需 schema 完整需用第 3 轮及以后代码重跑一次全量。
+
+### 内存态缓存的兜底
+`edge_axis_gap` 是 `persistent=False` 的非持久化 buffer（不进 `state_dict`、随 `.to(device)`
+搬设备），与 W1 容器同类属"内存态"。gap 计算抽为**唯一实现**
+`_compute_edge_axis_gap(pos_rows, pos_cols)`，`__init__` 与 `get_topology_stats()` 的兜底路径
+共用（杜绝两份实现分叉）；`get_topology_stats()` 用
+`gap = getattr(self, "edge_axis_gap", None)`，为 `None` 时按同一逻辑重算，
+**绕过 `__init__` 的加载路径也不会抛 `AttributeError`**，且数值与复用缓存逐位一致（已实测）。
+### 内存态缓存的兜底与回写自愈
+`edge_axis_gap` 是 `persistent=False` 的非持久化 buffer（**不进 `state_dict`**、随 `.to(device)`
+搬设备），与 W1 容器同类属"内存态"。gap 计算抽为**唯一实现**
+`_compute_edge_axis_gap(pos_rows, pos_cols)`，`__init__` 与 `get_topology_stats()` 的兜底路径
+共用（杜绝两份实现分叉）。
+
+`get_topology_stats()` 用 `gap = getattr(self, "edge_axis_gap", None)`；为 `None` 时按同一逻辑
+重算并**回写缓存**（`self.register_buffer("edge_axis_gap", gap, persistent=False)`），使缓存
+语义自愈——**绕过 `__init__` 的加载路径也不会抛 `AttributeError`**，且下次调用直接命中、
+不再重复 O(E) 重算。
+
+**持久化陷阱（必须遵守）**：回写**不得**用 `self._buffers["edge_axis_gap"] = gap` 直接赋值。
+该名字在此路径下从未被 `register_buffer` 过，直接写 `_buffers` 不会登记到
+`_non_persistent_buffers_set`，会使其被当作**持久化** buffer 泄漏进 `state_dict()`，
+破坏「state_dict 键集增量恰为 3 个（`edge_reverse_flag` / `neuron_component_id` /
+`connected_output_mask`）」这一不变量。必须走 `register_buffer(..., persistent=False)`。
+
+**实测断言**（`verify_r4_round_count_scope.py`）：回写后缓存属性存在且 shape 与原始一致；
+`"edge_axis_gap" not in model.state_dict()` 为真（未泄漏）；`state_dict` 键集与基准完全一致
+（21 键）；第二次调用与前次返回逐位一致（命中缓存）；回写内容与原始缓存张量 `torch.equal`；
+相对一期 18 键的增量恰为上述三个键。
