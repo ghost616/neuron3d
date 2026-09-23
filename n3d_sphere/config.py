@@ -1,0 +1,470 @@
+"""N3D 二期架构变体（三维神经元空间 + 球形有向拓扑）超参数配置层。
+
+本模块由一期 `n3d_proto/config.py` 拷贝而来，只承载超参数与常量，不含任何计算逻辑。
+在一期字段之上**新增三个拓扑字段**（`topology` / `flow_axis` / `space_radius`），
+其默认值（`cube` / `z` / `0.0`）使既有行为**逐位不变**。
+
+设计要点
+--------
+* 立方体路径（默认）：三维空间为边长 L 的立方体 [0, L)^3，神经元在其中均匀分布，
+  突触在其所属神经元周围 H 半径的球体内按体积均匀采样 —— 与一期完全一致；
+* 球体路径（`topology="sphere"`）：神经元在以原点为球心、与立方体**等体积**的球内
+  按体积均匀采样；输入突触限制在全局流向的**负半球**、输出突触限制在**正半球**，
+  从而用几何结构注入方向性与层次性；
+* 仅当输出突触 i 与输入突触 j 的距离 dist[i, j] <= D 时才建立连接边。
+
+关键约束（二期新增校验必须**条件化**）
+--------------------------------------
+新增的"球半径与 H 的关系"校验只在 `topology == "sphere"` 且 `space_radius > 0`
+时才执行。若写成无条件校验，`SMALL_CONFIG` / `DEFAULT_CONFIG` / `HIGHACC_CONFIG`
+会在**导入期**构造失败（它们都使用默认 `space_radius=0.0`）。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+__all__ = [
+    "Config",
+    "SMALL_CONFIG",
+    "DEFAULT_CONFIG",
+    "HIGHACC_CONFIG",
+    "TOPOLOGY_CHOICES",
+    "FLOW_AXIS_CHOICES",
+    "equivalent_sphere_radius",
+]
+
+# 拓扑类型：cube = 一期立方体（默认，逐位不变）；sphere = 二期球形有向拓扑
+TOPOLOGY_CHOICES = ("cube", "sphere")
+# 全局流向轴：输入突触取负半球、输出突触取正半球
+FLOW_AXIS_CHOICES = ("x", "y", "z")
+
+
+def equivalent_sphere_radius(L: float) -> float:
+    """返回与边长 L 的立方体**等体积**的球体半径。
+
+    用于"球形拓扑下保持神经元密度与一期一致"这一设计目标。
+
+    参数
+    ----
+    L : float
+        立方体边长（一期空间为 [0, L)^3）。
+
+    返回
+    ----
+    float
+        等体积球半径 `L * (3 / (4π))^(1/3)`；L=1.0 时约为 0.62035。
+
+    异常
+    ------
+    ValueError
+        `L <= 0` 时抛出。
+    """
+    if not (L > 0.0):
+        raise ValueError(f"立方体边长 L 必须 > 0，当前 L={L}")
+    # 立方体体积 L^3 = 球体积 (4/3)πr^3  =>  r = L * (3/(4π))^(1/3)
+    return float(L * (3.0 / (4.0 * 3.141592653589793)) ** (1.0 / 3.0))
+
+
+@dataclass
+class Config:
+    """N3D 二期变体的完整超参数集合（一期字段 + 三个拓扑字段）。
+
+    参数
+    ----
+    N : int
+        神经元数量。默认 256。
+    y_in : int
+        每个神经元的输入突触数量。默认 8。
+    y_out : int
+        每个神经元的输出突触数量。默认 8。
+    H : float
+        突触相对所属神经元坐标的分布半径（球体内均匀采样）。默认 0.1。
+        在 `topology="sphere"` 下，输入/输出突触的采样范围是该球体与相应半球的交集。
+    D : float
+        连接距离阈值：输出突触与输入突触距离 <= D 才建边。默认 0.15。
+    L : float
+        三维空间边长（立方体 [0, L)^3；球形拓扑下用于推导等体积球半径）。默认 1.0。
+    T : int
+        四步闭环的迭代轮数。**验收/生产场景要求 T >= 2**（T=1 时末轮的 LayerNorm 与
+        阈值不会进入输出通路，其梯度恒为 None，无法满足"所有可学习参数梯度范数 > 0"）。
+        字段级校验仅强制 T >= 1，T >= 2 由 SMALL_CONFIG / DEFAULT_CONFIG 保证。默认 3。
+    input_dim : int
+        输入维度（MNIST 展平为 784）。默认 784。
+    output_dim : int
+        输出类别数（MNIST 为 10）。默认 10。
+    batch_size : int
+        批大小。默认 64。
+    lr : float
+        学习率。默认 1e-3。
+    epochs : int
+        正式训练轮数。默认 10。
+    seed : int
+        全局随机种子，控制坐标采样、权重初始化与数据打乱。默认 42。
+    device : str
+        计算设备，cpu / cuda / auto（auto 表示自动选择）。默认 auto。
+    tau_init : float
+        tau_raw 参数的初始值，tau = softplus(tau_raw) + 0.01。默认 0.2。
+    alpha : float
+        四步闭环 2d 的残差系数，s_in_next = LN(s_in_new + alpha * s_in)。默认 0.1。
+    min_neuron_dist : float
+        神经元坐标采样的最小间距，用于实现空间内稀疏分布。默认 0.08。
+    max_sample_tries : int
+        神经元坐标拒绝采样的最大尝试轮数（防止死循环）。默认 50。
+    data_root : str
+        MNIST 数据根目录（工程内已存在的 IDX 文件所在目录）。默认 data/mnist。
+    num_workers : int
+        DataLoader 工作进程数（Windows 下建议 0）。默认 0。
+        **可复现性前提**：> 0 时由 `data._worker_init_fn` 按 (seed, worker_id)
+        为每个 worker 独立播种（base_seed = torch.initial_seed()），因此固定 `seed`
+        即可复现多进程取数顺序；= 0 时完全由主进程 `generator`（seed 控制）决定顺序。
+        注意：per-worker 播种的基种子取自父进程的 `torch.initial_seed()`，因此
+        **必须先调用 `utils.set_seed(config.seed)`**（`train.build_model_and_data`
+        已自动完成），该 seed 才会生效。
+    log_interval : int
+        训练日志打印间隔（按 batch 计）。默认 100。
+
+    # ---- 二期新增：拓扑字段（默认值必须使既有行为逐位不变） ----
+    topology : str
+        拓扑类型：`"cube"`（默认，一期立方体几何，逐位不变）/ `"sphere"`（球形有向几何）。
+    flow_axis : str
+        全局流向轴：`"x"` / `"y"` / `"z"`（默认 `"z"`）。
+        **仅对 `topology="sphere"` 生效**；`cube` 路径不读取该字段，因此不影响随机流。
+    space_radius : float
+        球形拓扑下神经元所在球体的半径；`0.0`（默认）表示使用与立方体**等体积**的
+        默认半径 `L * (3/(4π))^(1/3)`（L=1.0 时约 0.62035）。仅 `sphere` 路径读取。
+
+    # ---- 可选训练增强（默认值必须保持既有行为逐位不变） ----
+    weight_decay : float
+        AdamW 的权重衰减系数；> 0 时优化器切换为 AdamW。默认 0.0（= 用 Adam，行为不变）。
+    dropout : float
+        输出突触信号 s_out 送入 W_out 之前的 dropout 概率。默认 0.0。
+        **为 0.0 时使用 `nn.Identity` 且不消耗随机数**，保证关闭时数值逐位不变。
+    readout_bias : bool
+        是否为输出层 W_out 增加 bias。默认 False（不创建 bias，前向不加）。
+    lr_schedule : str
+        学习率调度，仅允许 "none" / "cosine"。默认 "none"（不做调度）。
+    grad_clip : float
+        梯度范数裁剪阈值；> 0 时在 backward 与 step 之间执行 clip_grad_norm_。
+        默认 0.0（不裁剪）。
+
+    关键不变量
+    ----------
+    * N > 0、y_in > 0、y_out > 0、T >= 1（验收场景要求 T >= 2）；
+    * H > 0、D > 0、L > 0 且 H < L；
+    * alpha >= 0；tau_init 为任意实数（经 softplus 后保证 tau > 0）；
+    * topology ∈ {"cube", "sphere"}、flow_axis ∈ {"x", "y", "z"}、space_radius >= 0；
+    * **条件化校验**：仅当 topology == "sphere" 且 space_radius > 0 时，
+      才校验 space_radius 与 H 的关系（否则默认值会让三个预设构造失败）。
+    """
+
+    # ---- 拓扑规模 ----
+    N: int = 256
+    y_in: int = 8
+    y_out: int = 8
+
+    # ---- 三维空间 ----
+    H: float = 0.1
+    D: float = 0.15
+    L: float = 1.0
+
+    # ---- 二期新增：拓扑字段 ----
+    topology: str = "cube"
+    flow_axis: str = "z"
+    space_radius: float = 0.0
+
+    # ---- 迭代与网络 ----
+    T: int = 3
+    input_dim: int = 784
+    output_dim: int = 10
+    hidden_dim: int = 2048  # 仅 `--arch mlp` 对照基线使用（主模型不使用该字段）
+
+    # ---- 训练 ----
+    batch_size: int = 64
+    lr: float = 1e-3
+    epochs: int = 10
+    seed: int = 42
+    device: str = "auto"
+
+    # ---- 数值参数 ----
+    tau_init: float = 0.2
+    alpha: float = 0.1
+
+    # ---- 采样与数据 ----
+    min_neuron_dist: float = 0.08
+    max_sample_tries: int = 50
+    data_root: str = "data/mnist"
+    num_workers: int = 0
+    log_interval: int = 100
+
+    # ---- 可选训练增强（默认值必须保持既有行为逐位不变） ----
+    weight_decay: float = 0.0
+    dropout: float = 0.0
+    readout_bias: bool = False
+    lr_schedule: str = "none"
+    grad_clip: float = 0.0
+
+    # ---- 派生量（不参与构造，供便捷访问） ----
+    _derived: dict = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """构造后校验超参合法性，并预计算派生规模量。
+
+        异常
+        ----
+        ValueError
+            任一超参越界时抛出，并附带具体数值上下文。
+        """
+        # 显式校验：把错误暴露在构造期，而不是等到张量 shape mismatch
+        if self.N <= 0:
+            raise ValueError(f"Config.N 必须为正整数，当前 N={self.N}")
+        if self.y_in <= 0:
+            raise ValueError(f"Config.y_in 必须为正整数，当前 y_in={self.y_in}")
+        if self.y_out <= 0:
+            raise ValueError(f"Config.y_out 必须为正整数，当前 y_out={self.y_out}")
+        if self.T < 1:
+            raise ValueError(f"Config.T 必须 >= 1，当前 T={self.T}")
+        if not (self.H > 0.0):
+            raise ValueError(f"Config.H 必须 > 0，当前 H={self.H}")
+        if not (self.D > 0.0):
+            raise ValueError(f"Config.D 必须 > 0，当前 D={self.D}")
+        if not (self.L > 0.0):
+            raise ValueError(f"Config.L 必须 > 0，当前 L={self.L}")
+        if not (self.H < self.L):
+            raise ValueError(
+                f"Config.H 必须小于空间边长 L，当前 H={self.H}, L={self.L}"
+            )
+        if self.alpha < 0.0:
+            raise ValueError(f"Config.alpha 必须 >= 0，当前 alpha={self.alpha}")
+        if self.batch_size <= 0:
+            raise ValueError(
+                f"Config.batch_size 必须为正整数，当前 batch_size={self.batch_size}"
+            )
+        if self.lr <= 0.0:
+            raise ValueError(f"Config.lr 必须 > 0，当前 lr={self.lr}")
+        if self.hidden_dim <= 0:
+            raise ValueError(f"Config.hidden_dim 必须为正整数，当前 hidden_dim={self.hidden_dim}")
+
+        # ---- 二期新增拓扑字段校验（无条件部分：取值域） ----
+        if self.topology not in TOPOLOGY_CHOICES:
+            raise ValueError(
+                f"Config.topology 仅允许 {TOPOLOGY_CHOICES}，当前 topology={self.topology!r}"
+            )
+        if self.flow_axis not in FLOW_AXIS_CHOICES:
+            raise ValueError(
+                f"Config.flow_axis 仅允许 {FLOW_AXIS_CHOICES}，当前 flow_axis={self.flow_axis!r}"
+            )
+        if self.space_radius < 0.0:
+            raise ValueError(
+                f"Config.space_radius 必须 >= 0（0 表示使用等体积球默认半径），"
+                f"当前 space_radius={self.space_radius}"
+            )
+        # 条件化校验：只有球形拓扑 + 显式指定半径时才检查几何可行性。
+        # 若写成无条件校验，默认 cube / space_radius=0.0 的三个预设会在导入期构造失败。
+        if self.topology == "sphere" and self.space_radius > 0.0:
+            if not (self.space_radius > self.H):
+                raise ValueError(
+                    f"球形拓扑要求 space_radius > H（突触分布半径必须落在神经元球内），"
+                    f"当前 space_radius={self.space_radius}, H={self.H}"
+                )
+
+        # ---- 可选训练增强字段校验 ----
+        if self.lr_schedule not in ("none", "cosine"):
+            raise ValueError(
+                f"Config.lr_schedule 仅允许 'none' 或 'cosine'，当前 lr_schedule={self.lr_schedule!r}"
+            )
+        if not (0.0 <= self.dropout < 1.0):
+            raise ValueError(f"Config.dropout 必须落在 [0, 1)，当前 dropout={self.dropout}")
+        if self.weight_decay < 0.0:
+            raise ValueError(
+                f"Config.weight_decay 必须 >= 0，当前 weight_decay={self.weight_decay}"
+            )
+        if self.grad_clip < 0.0:
+            raise ValueError(f"Config.grad_clip 必须 >= 0，当前 grad_clip={self.grad_clip}")
+
+        # 派生规模量：输入/输出突触总数（池内全局索引空间）
+        # 同时派生出"球形拓扑实际使用的半径"，避免在前向/采样中重复计算
+        self._derived = {
+            "n_input_syn": self.N * self.y_in,
+            "n_output_syn": self.N * self.y_out,
+            "effective_space_radius": (
+                float(self.space_radius)
+                if self.space_radius > 0.0
+                else equivalent_sphere_radius(float(self.L))
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # 便捷属性
+    # ------------------------------------------------------------------
+    @property
+    def n_input_syn(self) -> int:
+        """输入突触总数 N * y_in（即 s_in 的宽度）。"""
+        return self._derived["n_input_syn"]
+
+    @property
+    def n_output_syn(self) -> int:
+        """输出突触总数 N * y_out（即 s_out 的宽度）。"""
+        return self._derived["n_output_syn"]
+
+    @property
+    def effective_space_radius(self) -> float:
+        """球形拓扑下实际使用的神经元球半径（`space_radius=0` 时为等体积球半径）。"""
+        return float(self._derived["effective_space_radius"])
+
+    @property
+    def flow_axis_index(self) -> int:
+        """全局流向轴对应的坐标分量下标（x->0, y->1, z->2）。"""
+        return FLOW_AXIS_CHOICES.index(self.flow_axis)
+
+    def to_dict(self) -> dict:
+        """返回超参字典（不含内部派生字段），便于日志打印与 checkpoint 存档。
+
+        **必须包含二期新增的 `topology` / `flow_axis` / `space_radius`**：
+        `train.apply_overrides` 经由 ``Config(**base.to_dict())`` 往返构造配置，
+        若这三个字段缺席，会被静默丢弃（覆盖其它字段时拓扑配置丢失）。
+        """
+        return {
+            "N": self.N,
+            "y_in": self.y_in,
+            "y_out": self.y_out,
+            "H": self.H,
+            "D": self.D,
+            "L": self.L,
+            "T": self.T,
+            "input_dim": self.input_dim,
+            "output_dim": self.output_dim,
+            "hidden_dim": self.hidden_dim,
+            "batch_size": self.batch_size,
+            "lr": self.lr,
+            "epochs": self.epochs,
+            "seed": self.seed,
+            "device": self.device,
+            "tau_init": self.tau_init,
+            "alpha": self.alpha,
+            "min_neuron_dist": self.min_neuron_dist,
+            "max_sample_tries": self.max_sample_tries,
+            "data_root": self.data_root,
+            "num_workers": self.num_workers,
+            # 二期新增拓扑字段（缺席会在 Config(**overrides) 往返时被静默丢弃）
+            "topology": self.topology,
+            "flow_axis": self.flow_axis,
+            "space_radius": self.space_radius,
+            # 可选训练增强（默认值保持既有行为不变）
+            "weight_decay": self.weight_decay,
+            "dropout": self.dropout,
+            "readout_bias": self.readout_bias,
+            "lr_schedule": self.lr_schedule,
+            "grad_clip": self.grad_clip,
+        }
+
+    def describe(self) -> str:
+        """返回人类可读的超参摘要字符串（单行多段，便于终端输出）。"""
+        parts = [
+            f"N={self.N}",
+            f"y_in={self.y_in}",
+            f"y_out={self.y_out}",
+            f"H={self.H}",
+            f"D={self.D}",
+            f"L={self.L}",
+            f"T={self.T}",
+            f"input_dim={self.input_dim}",
+            f"output_dim={self.output_dim}",
+            f"batch_size={self.batch_size}",
+            f"lr={self.lr}",
+            f"epochs={self.epochs}",
+            f"seed={self.seed}",
+            f"device={self.device}",
+            f"tau_init={self.tau_init}",
+            f"alpha={self.alpha}",
+            # 二期新增拓扑字段：配置回显必须能看到，否则无法从日志确认实际生效的几何
+            f"topology={self.topology}",
+            f"flow_axis={self.flow_axis}",
+            f"space_radius={self.space_radius}",
+            f"weight_decay={self.weight_decay}",
+            f"dropout={self.dropout}",
+            f"readout_bias={self.readout_bias}",
+            f"lr_schedule={self.lr_schedule}",
+            f"grad_clip={self.grad_clip}",
+        ]
+        return "Config(" + ", ".join(parts) + ")"
+
+
+# ----------------------------------------------------------------------
+# 预设
+# ----------------------------------------------------------------------
+# SMALL_CONFIG：阶段 A 冒烟测试专用，规模小、CPU 友好
+#   N=64, y_in=4, y_out=4, T=2, batch_size=32
+# 说明：T 必须 >= 2。四步闭环中 2d 的输出（经 LayerNorm 的 s_in_next）只有在"下一轮"
+# 才会进入输出通路；若 T=1，末轮的 ln_s_in / neuron_threshold 不参与 loss 计算，
+# 其 .grad 恒为 None，无法满足"所有可学习参数梯度范数 > 0"的验收条款。
+# 注意：topology 等二期字段一律取默认值（cube / z / 0.0），保证一期逐位不变。
+SMALL_CONFIG = Config(
+    N=64,
+    y_in=4,
+    y_out=4,
+    H=0.15,
+    D=0.25,
+    L=1.0,
+    T=2,
+    input_dim=784,
+    output_dim=10,
+    batch_size=32,
+    lr=1e-3,
+    epochs=1,
+    seed=42,
+    device="auto",
+    tau_init=0.2,
+    alpha=0.1,
+)
+
+# DEFAULT_CONFIG：正式训练默认配置
+#   N=256, y_in=8, y_out=8, T=3, batch_size=64
+DEFAULT_CONFIG = Config(
+    N=256,
+    y_in=8,
+    y_out=8,
+    H=0.1,
+    D=0.15,
+    L=1.0,
+    T=3,
+    input_dim=784,
+    output_dim=10,
+    batch_size=64,
+    lr=1e-3,
+    epochs=10,
+    seed=42,
+    device="auto",
+    tau_init=0.2,
+    alpha=0.1,
+)
+
+# HIGHACC_CONFIG：高精度冲刺配置（一期目标 MNIST test_acc > 99%，实测 97.84%）
+#   相比 DEFAULT_CONFIG 的变化：T 3->4（更深的闭环迭代）、batch 64->128、
+#   lr 1e-3->2e-3、epochs 10->20，并启用 AdamW(weight_decay=1e-4)、
+#   dropout=0.1、输出层 bias、cosine 学习率调度、梯度裁剪 1.0。
+#   注意：这些可选项在 SMALL_CONFIG / DEFAULT_CONFIG 中均取默认值（关闭），
+#   因此两者的计算图与数值结果保持逐位不变。
+HIGHACC_CONFIG = Config(
+    N=256,
+    y_in=8,
+    y_out=8,
+    H=0.1,
+    D=0.15,
+    L=1.0,
+    T=4,
+    input_dim=784,
+    output_dim=10,
+    batch_size=128,
+    lr=2e-3,
+    epochs=20,
+    seed=42,
+    device="auto",
+    tau_init=0.2,
+    alpha=0.1,
+    weight_decay=1e-4,
+    dropout=0.1,
+    readout_bias=True,
+    lr_schedule="cosine",
+    grad_clip=1.0,
+)

@@ -1,1 +1,18 @@
-[]
+[
+  {
+    "plan_id": "plan_fad78a7d-0753-44e5-8cb8-878f3b6329f0",
+    "plan_summary": "新建 n3d_sphere 二期架构变体模块（自包含拷贝 + 球形有向拓扑 + 产物隔离），完成等价性门槛与全量对照",
+    "starter_session_id": "session-b621cbb4-c477-42a0-ade8-0d178c6f45bb",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_d605272d-9e69-408d-b5f1-f63d869ecbbe",
+    "plan_summary": "n3d_sphere 二期架构变体：球形有向拓扑实现 + 等价性门槛 + 全量对照 + 文档与回归",
+    "starter_session_id": "session-b621cbb4-c477-42a0-ade8-0d178c6f45bb",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": false
+  }
+]

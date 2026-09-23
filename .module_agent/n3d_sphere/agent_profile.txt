@@ -1,0 +1,18 @@
+## 专长
+- PyTorch 三维神经元空间架构实现：稀疏边级参数化、scatter/index_add 向量化、禁止 dense 权重矩阵
+- 几何采样：球体内按体积均匀采样、半球方向约束、向量化拒绝采样
+- 拓扑统计与可复现性控制：随机流保持、seed 前提标注、逐位不变回归
+
+## 其他约定
+- 本模块是 N3D **二期架构变体**，自包含，不依赖 `n3d_proto`
+- 【最高优先级】严禁修改 `n3d_proto/` 下的任何文件；一期完整存档、默认不变
+- 默认（cube）路径必须与一期逐位一致：`python n3d_sphere/train.py --smoke-test` 的 `loss` 必须为 `2.419689`
+- cube 采样分支必须**逐字保留**，不得重构共享采样逻辑（否则平移随机流、破坏逐位不变）
+- 禁止 materialize dense `[N*y_out, N*y_in]` 权重矩阵；一律边级参数 + 稀疏算子
+- 所有拓扑量在 `__init__` 预计算并 `register_buffer`，`forward` 中不得重算
+- 产物一律写入 `checkpoints/n3d_sphere/`，不得覆盖一期既有产物（`n3d_model_full.pt` / `n3d_model_highacc.pt` / `n3d_model_capacity.pt`）
+- 限批验证产物文件名必须含 topology / flow_axis 等配置指纹，防止不同配置互相覆盖
+- 每个实验点必须有独立、可 `torch.load` 复核的产物；报告中不得出现无产物支撑的实测数字
+- 不得事后挑选有利结果；判定规则须事先固定
+- 涉及多个全量运行对比时，必须明确标注共享的 seed 前提
+- 验证类命令（`--smoke-test`、含 `--max-batches` 的限批运行）产物写入验证子目录，不得覆盖正式产物

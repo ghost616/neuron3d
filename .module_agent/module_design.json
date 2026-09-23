@@ -48,6 +48,40 @@
           "description": "阶段 A 冒烟测试（SMALL_CONFIG，1 epoch，校验梯度范数/loss/稀疏度/tau）；阶段 B 正式训练（DEFAULT_CONFIG，10 epoch，保存 checkpoints/model.pt）"
         }
       ]
+    },
+    {
+      "name": "n3d_sphere",
+      "description": "N3D 二期架构变体：球形有向拓扑（球体神经元分布 + 半球切分突触 + 全局流向）的自包含实现",
+      "responsibilities": [
+        "提供球形有向拓扑的全部超参配置（topology / flow_axis / space_radius，默认值保证一期行为逐位不变）",
+        "构建并固定球形与立方体两种形态下的神经元与突触三维坐标，预计算 dist / mask / edge_index / edge_dist",
+        "实现四步闭环稀疏前向传播（空间连接 → scatter 聚合 → 神经元激活 → broadcast + 残差 + LayerNorm），与一期算法一致",
+        "提供拓扑方向性与连通性统计（逆向边占比、流向轴高度分布、2a 非零覆盖比例、弱连通分量数、最大分量占比）",
+        "提供自包含训练入口与产物隔离（checkpoints/n3d_sphere/），支持 cube / sphere 两条路径与配置指纹命名"
+      ],
+      "dependencies": [],
+      "functions": [
+        {
+          "name": "拓扑配置与形态开关",
+          "description": "在 Config 中新增 topology（cube|sphere）、flow_axis（x|y|z）、space_radius 三个字段，默认值使既有行为逐位不变；同步纳入 to_dict/describe；新增校验条件化（仅 sphere 且 space_radius>0 时校验半径关系）"
+        },
+        {
+          "name": "球形有向几何采样",
+          "description": "神经元在以原点为球心的等体积球内按体积均匀采样（保留 min_neuron_dist 拒绝采样）；输入突触限制在全局流向负半球、输出突触限制在正半球，均在半径 H 球内按体积均匀；cube 分支逐字保留"
+        },
+        {
+          "name": "稀疏前向传播",
+          "description": "输入编码后做 T 轮四步闭环迭代（masked softmax 稀疏传播、scatter sum、ReLU 激活、broadcast + 残差 + LayerNorm），末轮输出突触信号接输出层得到 logits；禁止 dense 权重矩阵"
+        },
+        {
+          "name": "拓扑方向性与连通性统计",
+          "description": "扩展 get_connection_stats 返回字典（不改既有键），输出逆向边占比、流向轴神经元高度分布、每轮 2a 非零覆盖比例、弱连通分量数与最大分量占比"
+        },
+        {
+          "name": "训练入口与产物隔离",
+          "description": "新增 --topology / --flow-axis / --space-radius CLI（未提供哨兵语义），产物指纹含 topology / flow_axis 维度，CHECKPOINT_DIR 隔离到 checkpoints/n3d_sphere/，支持冒烟测试与全量训练"
+        }
+      ]
     }
   ]
 }
