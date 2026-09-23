@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-__all__ = ["Config", "SMALL_CONFIG", "DEFAULT_CONFIG", "HIGHACC_CONFIG"]
+__all__ = ["Config", "SMALL_CONFIG", "DEFAULT_CONFIG"]
 
 
 @dataclass
@@ -75,20 +75,6 @@ class Config:
     log_interval : int
         训练日志打印间隔（按 batch 计）。默认 100。
 
-    # ---- 可选训练增强（默认值必须保持既有行为逐位不变） ----
-    weight_decay : float
-        AdamW 的权重衰减系数；> 0 时优化器切换为 AdamW。默认 0.0（= 用 Adam，行为不变）。
-    dropout : float
-        输出突触信号 s_out 送入 W_out 之前的 dropout 概率。默认 0.0。
-        **为 0.0 时使用 `nn.Identity` 且不消耗随机数**，保证关闭时数值逐位不变。
-    readout_bias : bool
-        是否为输出层 W_out 增加 bias。默认 False（不创建 bias，前向不加）。
-    lr_schedule : str
-        学习率调度，仅允许 "none" / "cosine"。默认 "none"（不做调度）。
-    grad_clip : float
-        梯度范数裁剪阈值；> 0 时在 backward 与 step 之间执行 clip_grad_norm_。
-        默认 0.0（不裁剪）。
-
     关键不变量
     ----------
     * N > 0、y_in > 0、y_out > 0、T >= 1（验收场景要求 T >= 2）；
@@ -110,7 +96,6 @@ class Config:
     T: int = 3
     input_dim: int = 784
     output_dim: int = 10
-    hidden_dim: int = 2048  # 仅 `--arch mlp` 对照基线使用（主模型不使用该字段）
 
     # ---- 训练 ----
     batch_size: int = 64
@@ -129,13 +114,6 @@ class Config:
     data_root: str = "data/mnist"
     num_workers: int = 0
     log_interval: int = 100
-
-    # ---- 可选训练增强（默认值必须保持既有行为逐位不变） ----
-    weight_decay: float = 0.0
-    dropout: float = 0.0
-    readout_bias: bool = False
-    lr_schedule: str = "none"
-    grad_clip: float = 0.0
 
     # ---- 派生量（不参与构造，供便捷访问） ----
     _derived: dict = field(default_factory=dict, init=False, repr=False)
@@ -175,22 +153,6 @@ class Config:
             )
         if self.lr <= 0.0:
             raise ValueError(f"Config.lr 必须 > 0，当前 lr={self.lr}")
-        if self.hidden_dim <= 0:
-            raise ValueError(f"Config.hidden_dim 必须为正整数，当前 hidden_dim={self.hidden_dim}")
-
-        # ---- 可选训练增强字段校验 ----
-        if self.lr_schedule not in ("none", "cosine"):
-            raise ValueError(
-                f"Config.lr_schedule 仅允许 'none' 或 'cosine'，当前 lr_schedule={self.lr_schedule!r}"
-            )
-        if not (0.0 <= self.dropout < 1.0):
-            raise ValueError(f"Config.dropout 必须落在 [0, 1)，当前 dropout={self.dropout}")
-        if self.weight_decay < 0.0:
-            raise ValueError(
-                f"Config.weight_decay 必须 >= 0，当前 weight_decay={self.weight_decay}"
-            )
-        if self.grad_clip < 0.0:
-            raise ValueError(f"Config.grad_clip 必须 >= 0，当前 grad_clip={self.grad_clip}")
 
         # 派生规模量：输入/输出突触总数（池内全局索引空间）
         self._derived = {
@@ -224,7 +186,6 @@ class Config:
             "T": self.T,
             "input_dim": self.input_dim,
             "output_dim": self.output_dim,
-            "hidden_dim": self.hidden_dim,
             "batch_size": self.batch_size,
             "lr": self.lr,
             "epochs": self.epochs,
@@ -236,12 +197,6 @@ class Config:
             "max_sample_tries": self.max_sample_tries,
             "data_root": self.data_root,
             "num_workers": self.num_workers,
-            # 可选训练增强（默认值保持既有行为不变）
-            "weight_decay": self.weight_decay,
-            "dropout": self.dropout,
-            "readout_bias": self.readout_bias,
-            "lr_schedule": self.lr_schedule,
-            "grad_clip": self.grad_clip,
         }
 
     def describe(self) -> str:
@@ -263,17 +218,12 @@ class Config:
             f"device={self.device}",
             f"tau_init={self.tau_init}",
             f"alpha={self.alpha}",
-            f"weight_decay={self.weight_decay}",
-            f"dropout={self.dropout}",
-            f"readout_bias={self.readout_bias}",
-            f"lr_schedule={self.lr_schedule}",
-            f"grad_clip={self.grad_clip}",
         ]
         return "Config(" + ", ".join(parts) + ")"
 
 
 # ----------------------------------------------------------------------
-# 预设
+# 两套预设
 # ----------------------------------------------------------------------
 # SMALL_CONFIG：阶段 A 冒烟测试专用，规模小、CPU 友好
 #   N=64, y_in=4, y_out=4, T=2, batch_size=32
@@ -318,34 +268,4 @@ DEFAULT_CONFIG = Config(
     device="auto",
     tau_init=0.2,
     alpha=0.1,
-)
-
-# HIGHACC_CONFIG：高精度冲刺配置（目标 MNIST test_acc > 99%）
-#   相比 DEFAULT_CONFIG 的变化：T 3->4（更深的闭环迭代）、batch 64->128、
-#   lr 1e-3->2e-3、epochs 10->20，并启用 AdamW(weight_decay=1e-4)、
-#   dropout=0.1、输出层 bias、cosine 学习率调度、梯度裁剪 1.0。
-#   注意：这些可选项在 SMALL_CONFIG / DEFAULT_CONFIG 中均取默认值（关闭），
-#   因此两者的计算图与数值结果保持逐位不变。
-HIGHACC_CONFIG = Config(
-    N=256,
-    y_in=8,
-    y_out=8,
-    H=0.1,
-    D=0.15,
-    L=1.0,
-    T=4,
-    input_dim=784,
-    output_dim=10,
-    batch_size=128,
-    lr=2e-3,
-    epochs=20,
-    seed=42,
-    device="auto",
-    tau_init=0.2,
-    alpha=0.1,
-    weight_decay=1e-4,
-    dropout=0.1,
-    readout_bias=True,
-    lr_schedule="cosine",
-    grad_clip=1.0,
 )

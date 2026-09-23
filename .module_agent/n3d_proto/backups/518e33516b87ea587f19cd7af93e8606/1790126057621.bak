@@ -50,7 +50,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from .config import Config, DEFAULT_CONFIG, HIGHACC_CONFIG, SMALL_CONFIG
     from .data import get_mnist_loaders
-    from .model import MLPBaseline, ThreeDNeuronSpace
+    from .model import ThreeDNeuronSpace
     from .utils import (
         count_parameters,
         get_device,
@@ -68,7 +68,7 @@ except ImportError:  # pragma: no cover
         SMALL_CONFIG,
     )
     from data import get_mnist_loaders  # type: ignore
-    from model import MLPBaseline, ThreeDNeuronSpace  # type: ignore
+    from model import ThreeDNeuronSpace  # type: ignore
     from utils import (  # type: ignore
         count_parameters,
         get_device,
@@ -119,17 +119,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--smoke-test",
         action="store_true",
         help="仅执行阶段 A 冒烟测试（SMALL_CONFIG，1 个 batch 的前向+反向验收）",
-    )
-    parser.add_argument(
-        "--arch",
-        type=str,
-        default="neuron3d",
-        choices=["neuron3d", "mlp"],
-        help=(
-            "架构：neuron3d（默认，四步闭环主模型）/ mlp（对照基线 784->hidden->10）。"
-            "mlp 走**完全相同**的训练循环、优化器、调度器、梯度裁剪与评估代码，"
-            "仅替换模型构造，用于判定瓶颈在架构还是在数据。"
-        ),
     )
     parser.add_argument(
         "--preset",
@@ -208,16 +197,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="覆盖连接距离阈值 D（> 0；越大多连接越多、边数 E 越大；默认取预设值）",
     )
     parser.add_argument(
-        "--seed",
-        dest="seed_override",
-        type=int,
-        default=0,
-        help=(
-            "覆盖随机种子（默认沿用预设的 seed=42）。种子决定三维坐标采样与参数初始化，"
-            "因此**不同种子意味着不同拓扑**（边数 E 与 test_acc 都会变）；负数报错、0 表示不覆盖。"
-        ),
-    )
-    parser.add_argument(
         "--tag",
         type=str,
         default="",
@@ -290,8 +269,7 @@ def build_model_and_data(
     config: Config,
     device: torch.device,
     max_batches: int = 0,
-    arch: str = "neuron3d",
-) -> Tuple[nn.Module, DataLoader, DataLoader]:
+) -> Tuple[ThreeDNeuronSpace, DataLoader, DataLoader]:
     """按配置构建模型与数据加载器（统一的装配入口，保证两阶段行为一致）。
 
     参数
@@ -302,14 +280,10 @@ def build_model_and_data(
         目标设备。
     max_batches : int
         仅用于日志提示（0 表示使用全量数据）。
-    arch : str
-        架构选择：`"neuron3d"`（默认，四步闭环主模型）或 `"mlp"`（对照基线）。
-        **这是全流程中唯一按 arch 分支的地方**——训练循环、优化器、调度器、
-        梯度裁剪与评估代码在两条路径下完全共用同一份实现。
 
     返回
     ----
-    Tuple[nn.Module, DataLoader, DataLoader]
+    Tuple[ThreeDNeuronSpace, DataLoader, DataLoader]
         (model, train_loader, test_loader)。
 
     实现说明（设备探针的代价）
@@ -334,11 +308,7 @@ def build_model_and_data(
         （把设备问题暴露在命令行入口附近，而不是等到反向传播深处）。
     """
     set_seed(config.seed)
-    # ---- 唯一按 arch 分支的地方：模型构造（训练循环/优化器/评估代码完全共用） ----
-    if arch == "mlp":
-        model: nn.Module = MLPBaseline(config).to(device)
-    else:
-        model = ThreeDNeuronSpace(config).to(device)
+    model = ThreeDNeuronSpace(config).to(device)
     train_loader, test_loader = get_mnist_loaders(
         batch_size=config.batch_size,
         data_root=config.data_root,
@@ -369,20 +339,13 @@ def build_model_and_data(
     )
 
     stats = model.get_connection_stats()
-    if arch == "mlp":
-        log_info(
-            f"模型装配完成（arch=mlp 对照基线）：input_dim={config.input_dim}, "
-            f"hidden_dim={config.hidden_dim}, output_dim={config.output_dim}, "
-            f"dropout={config.dropout}, 可学习参数={model.count_parameters()}, 设备={device}"
-        )
-    else:
-        log_info(
-            f"模型装配完成：N={config.N}, y_in={config.y_in}, y_out={config.y_out}, T={config.T}, "
-            f"E={int(stats['num_edges'])}, 连接密度(sparsity)={stats['sparsity']:.6f}, "
-            f"零元素占比(zero_ratio)={stats['zero_ratio']:.6f}, "
-            f"avg_out_degree={stats['avg_out_degree']:.2f}, tau={stats['tau']:.6f}, "
-            f"可学习参数={model.count_parameters()}, 设备={device}"
-        )
+    log_info(
+        f"模型装配完成：N={config.N}, y_in={config.y_in}, y_out={config.y_out}, T={config.T}, "
+        f"E={int(stats['num_edges'])}, 连接密度(sparsity)={stats['sparsity']:.6f}, "
+        f"零元素占比(zero_ratio)={stats['zero_ratio']:.6f}, "
+        f"avg_out_degree={stats['avg_out_degree']:.2f}, tau={stats['tau']:.6f}, "
+        f"可学习参数={model.count_parameters()}, 设备={device}"
+    )
     if max_batches > 0:
         log_info(f"本轮每 epoch 仅处理前 {max_batches} 个 batch（--max-batches 限制）")
     return model, train_loader, test_loader
@@ -509,165 +472,19 @@ def train_one_epoch(
         raise RuntimeError("训练集为空：没有任何 batch 被处理")
     return total_loss / n_batches, grad_norms, n_batches
 
-def validate_override_args(args: argparse.Namespace) -> None:
-    """校验全部"覆盖类"命令行参数的取值范围（**唯一校验入口**）。
-
-    语义（必须严格遵守，`0` = 不覆盖）
-    ---------------------------------
-    * 取值范围型参数（`--n / --t-steps(--t) / --y-in / --y-out / --h / --d / --seed`）：
-      **负数一律 `raise ValueError`**（由 `main()` 捕获后以非 0 退出码结束）；
-      `0` / `0.0` 表示"未提供、不覆盖"（保持既有哨兵语义，不得改变）；
-    * `--epochs` 同理（负数报错、0 表示不覆盖）；
-    * `--lr`（负数报错、0 表示不覆盖）、`--weight-decay` 与 `--dropout`（**负值报错**、
-      0 表示覆盖为 0，与既有语义一致）、`--batch-size`（负数报错、0 表示不覆盖）、
-      `--threads`（负数报错、0 表示不干预）。
-
-    历史缺陷（皋陶实测复现）
-    ------------------------
-    此前这些参数统一写成 `if x > 0: 覆盖`，负值会落入"未提供"分支被**静默忽略**
-    （例如 `--y-in -1` 退出码 0 且沿用预设 y_in=8）。现在先判 `< 0` 报错、再判 `0` 跳过。
-
-    参数
-    ----
-    args : argparse.Namespace
-        `parse_args()` 的返回值。
-
-    返回
-    ----
-    None
-
-    异常
-    ------
-    ValueError
-        任一覆盖参数为负数时抛出，消息含具体选项名与数值。
-    """
-    # 取值范围型参数（哨兵值 0/0.0 = 未提供）：负数一律报错
-    rules: List[Tuple[str, float]] = [
-        ("--n", args.n),
-        ("--t-steps/--t", args.t_override),
-        ("--y-in", args.y_in),
-        ("--y-out", args.y_out),
-        ("--h", args.h),
-        ("--d", args.d),
-        ("--seed", args.seed_override),
-        ("--epochs", args.epochs),
-        ("--lr", args.lr),
-        ("--batch-size", args.batch_size),
-        ("--threads", args.threads),
-    ]
-    for name, value in rules:
-        if value < 0:
-            raise ValueError(
-                f"{name} 不能为负（0 表示不覆盖/不干预），当前 {name}={value}"
-            )
-    # --weight-decay / --dropout 的哨兵是 -1.0（表示"未提供"），
-    # 因此只拒绝**小于** -1.0 的取值；-1.0 本身合法（= 不覆盖），0 是合法覆盖值。
-    for name, value in (("--weight-decay", args.weight_decay), ("--dropout", args.dropout)):
-        if value < -1.0:
-            raise ValueError(
-                f"{name} 不能为负（-1 表示不覆盖、0 表示覆盖为 0），当前 {name}={value}"
-            )
-    if args.dropout >= 1.0:
-        raise ValueError(f"--dropout 必须落在 [0, 1)，当前 --dropout={args.dropout}")
-
-
-def apply_overrides(
-    base: Config,
-    args: argparse.Namespace,
-    warn_message: Optional[str] = None,
-) -> Config:
-    """把命令行覆盖应用到基线配置上（**唯一覆盖实现**）。
-
-    参数
-    ----
-    base : Config
-        基线配置（冒烟路径传 `SMALL_CONFIG`，正式训练传 `PRESETS[args.preset]`）。
-    args : argparse.Namespace
-        `parse_args()` 的返回值（调用前应已通过 `validate_override_args`）。
-    warn_message : Optional[str]
-        非 None 时，在**确实发生覆盖**时打印该告警（用于冒烟路径提示基线漂移）。
-
-    返回
-    ----
-    Config
-        覆盖后的配置对象；无任何覆盖时返回 `base` 本身（保证逐位不变）。
-
-    说明
-    ----
-    `--threads` **不计入"显式覆盖"判定**：它只影响 CPU 并行度，不改变任何超参与数值结果。
-    """
-    overrides = base.to_dict()
-    changed = False
-    if args.device:
-        overrides["device"] = args.device
-        changed = True
-    if args.epochs > 0:
-        overrides["epochs"] = args.epochs
-        changed = True
-    if args.lr > 0.0:
-        overrides["lr"] = args.lr
-        changed = True
-    # --weight-decay / --dropout 的哨兵是 -1.0（表示不覆盖），0 是合法覆盖值
-    if args.weight_decay >= 0.0:
-        overrides["weight_decay"] = args.weight_decay
-        changed = True
-    if args.dropout >= 0.0:
-        overrides["dropout"] = args.dropout
-        changed = True
-    if args.batch_size > 0:
-        overrides["batch_size"] = args.batch_size
-        changed = True
-    if args.n > 0:
-        overrides["N"] = args.n
-        changed = True
-    if args.t_override > 0:
-        log_info(f"T 覆盖：{overrides['T']} -> {args.t_override}")
-        overrides["T"] = args.t_override
-        changed = True
-    if args.y_in > 0:
-        overrides["y_in"] = args.y_in
-        changed = True
-    if args.y_out > 0:
-        overrides["y_out"] = args.y_out
-        changed = True
-    if args.h > 0.0:
-        overrides["H"] = args.h
-        changed = True
-    if args.d > 0.0:
-        overrides["D"] = args.d
-        changed = True
-    if args.seed_override > 0:
-        log_info(f"seed 覆盖：{overrides['seed']} -> {args.seed_override}")
-        overrides["seed"] = args.seed_override
-        changed = True
-    if args.readout_bias is not None:
-        overrides["readout_bias"] = bool(args.readout_bias)
-        changed = True
-    if not changed:
-        return base
-    if warn_message:
-        log_warn(warn_message)
-    return Config(**overrides)
-
-
 def build_smoke_config(args: argparse.Namespace) -> Config:
     """构造冒烟测试（阶段 A）使用的配置。
 
     默认契约（**必须逐位保持**）
     --------------------------
     不加任何覆盖参数（`--preset` 缺省且无 `--n/--t/--lr/...`）时，返回的配置与
-    `SMALL_CONFIG` **逐字段相同**（同一对象），从而保证 `--smoke-test` 的
-    `loss=2.419689` 不变。
+    `SMALL_CONFIG` **逐字段相同**，从而保证 `--smoke-test` 的 `loss=2.419689` 不变。
 
     覆盖语义
     --------
-    仅当用户**显式**给出 `--preset` / `--n` / `--t-steps(--t)` / `--y-in` / `--y-out` /
-    `--h` / `--d` / `--seed` / `--lr` / `--weight-decay` / `--dropout` / `--batch-size` /
-    `--readout-bias` / `--device` 时才覆盖，并通过日志提示"冒烟测试配置已被覆盖"。
-
-    **基线规则**：冒烟路径固定以 `SMALL_CONFIG` 为基线，只有当显式指定**非 default**
-    预设时才换基线。否则"只想改一个字段"（如 `--device cpu`）会把整个配置静默放大到
-    `DEFAULT_CONFIG` 规模（N=256/T=3/batch=64），破坏冒烟测试的轻量语义。
+    仅当用户**显式**给出 `--preset` / `--n` / `--t` / `--lr` / `--weight-decay` /
+    `--dropout` / `--batch-size` / `--readout-bias` / `--device` 时才覆盖，
+    并通过日志明确提示"冒烟测试配置已被覆盖"，避免静默忽略。
 
     参数
     ----
@@ -679,24 +496,10 @@ def build_smoke_config(args: argparse.Namespace) -> Config:
     Config
         冒烟测试最终生效的配置。
     """
-    base = PRESETS[args.preset] if args.preset != "default" else SMALL_CONFIG
-    if base is not SMALL_CONFIG:
-        # --preset 的作用体现在"换基线"而非字段覆盖，故 apply_overrides 的字段级告警不会触发。
-        # 这里显式提示，避免用户在 --smoke-test 下静默跑到 DEFAULT/HIGHACC 规模上。
-        log_warn(
-            f"冒烟测试基线已被 --preset {args.preset} 替换："
-            f"N={base.N}, T={base.T}, batch_size={base.batch_size}（非 SMALL_CONFIG 规模）；"
-            "阶段 A 的 `loss=2.419689` 基线仅在默认 SMALL_CONFIG 下成立"
-        )
     explicit = (
         args.preset != "default"
         or args.n > 0
         or args.t_override > 0
-        or args.y_in > 0
-        or args.y_out > 0
-        or args.h > 0.0
-        or args.d > 0.0
-        or args.seed_override > 0
         or args.lr > 0.0
         or args.weight_decay >= 0.0
         or args.dropout >= 0.0
@@ -706,21 +509,38 @@ def build_smoke_config(args: argparse.Namespace) -> Config:
     )
     if not explicit:
         return SMALL_CONFIG
-    return apply_overrides(
-        base,
-        args,
-        warn_message=(
-            "冒烟测试配置已被显式覆盖（--preset/--n/--t/--y-in/--seed/--lr/... 之一）："
-            f"预设={args.preset}；阶段 A 的 `loss=2.419689` 基线仅在默认 SMALL_CONFIG 下成立"
-        ),
+    # 基线：冒烟路径固定以 SMALL_CONFIG 为基线；仅当显式指定非 default 预设时才换基线。
+    # 否则「只想改一个字段」（例如 --device cpu / --n 80）会把整个配置静默放大到
+    # DEFAULT_CONFIG 的规模（N 256 / T 3 / batch 64），破坏冒烟测试的"轻量"语义。
+    base = PRESETS[args.preset] if args.preset != "default" else SMALL_CONFIG
+    overrides = base.to_dict()
+    if args.device:
+        overrides["device"] = args.device
+    if args.lr > 0.0:
+        overrides["lr"] = args.lr
+    if args.weight_decay >= 0.0:
+        overrides["weight_decay"] = args.weight_decay
+    if args.dropout >= 0.0:
+        overrides["dropout"] = args.dropout
+    if args.batch_size > 0:
+        overrides["batch_size"] = args.batch_size
+    if args.n > 0:
+        overrides["N"] = args.n
+    if args.t_override > 0:
+        overrides["T"] = args.t_override
+    if args.readout_bias is not None:
+        overrides["readout_bias"] = bool(args.readout_bias)
+    log_warn(
+        "冒烟测试配置已被显式覆盖（--preset/--n/--t/--lr/... 之一）："
+        f"预设={args.preset}；阶段 A 的 `loss=2.419689` 基线仅在默认 SMALL_CONFIG 下成立"
     )
+    return Config(**overrides)
 
 
 def run_smoke_test(
     device_override: str = "",
     criterion_conflict: bool = False,
     config_override: Optional[Config] = None,
-    arch: str = "neuron3d",
 ) -> bool:
     """阶段 A 冒烟测试：验证前向/反向跑通并逐条核对验收标准。
 
@@ -757,17 +577,13 @@ def run_smoke_test(
     device = get_device(config.device)
 
     log_info("=" * 78)
-    # 日志如实打印**实际生效**的规模标签，避免"写着 SMALL_CONFIG、跑着 DEFAULT 规模"的误导
-    log_info(
-        "阶段 A 冒烟测试开始"
-        f"（{'SMALL_CONFIG' if config is SMALL_CONFIG else '已覆盖/已换预设的配置'}）"
-    )
+    log_info("阶段 A 冒烟测试开始（SMALL_CONFIG）")
     log_info(f"配置：{config.describe()}")
     log_info(f"实际设备：{device}（torch_scatter 可用性见 utils.HAS_TORCH_SCATTER）")
     log_info("=" * 78)
 
     t0 = time.perf_counter()
-    model, train_loader, _ = build_model_and_data(config, device, max_batches=1, arch=arch)
+    model, train_loader, _ = build_model_and_data(config, device, max_batches=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
     # ---- 阶段 A 约束：仅跑 1 个 batch 的前向 + 反向 ----
@@ -796,32 +612,19 @@ def run_smoke_test(
         f"avg_out_degree={stats['avg_out_degree']:.3f}, tau={stats['tau']:.6f}"
     )
     # ---- dense 对照诊断：证明"未 materialize dense [N*y_out, N*y_in] 权重矩阵" ----
-    # arch 专属统计量：MLP 无稀疏连接概念，用 0 占位并跳过相应判据
-    is_neuron3d = arch == "neuron3d"
-    if is_neuron3d:
-        total_pairs = model.n_out_syn * model.n_in_syn
-        conn_param = int(model.W_conn_sparse.numel())
-    else:
-        total_pairs = 0
-        conn_param = 0
+    total_pairs = model.n_out_syn * model.n_in_syn
+    conn_param = int(model.W_conn_sparse.numel())
     dense_weight_tensors = model.count_dense_weight_tensors()
-    if is_neuron3d:
-        log_info(
-            f"稀疏性实测：E={int(stats['num_edges'])} / 可能连接对 {total_pairs} "
-            f"(连接密度 {100.0 * stats['sparsity']:.4f}%，零元素占比 "
-            f"{100.0 * stats['zero_ratio']:.4f}%)，"
-            f"稠密矩阵元素数={total_pairs}，边级参数数={conn_param}"
-        )
-        log_info(
-            f"  -> 若把连接权重 materialize 成稠密矩阵，参数将从 {param_total} 膨胀到 "
-            f"{param_total - conn_param + total_pairs}（{total_pairs / max(conn_param, 1):.0f}x）"
-        )
-    else:
-        log_info(
-            f"arch=mlp 对照基线：无稀疏连接概念（输入 {config.input_dim} -> "
-            f"hidden {config.hidden_dim} -> 输出 {config.output_dim}），"
-            f"可学习参数 {param_total}"
-        )
+    log_info(
+        f"稀疏性实测：E={int(stats['num_edges'])} / 可能连接对 {total_pairs} "
+        f"(连接密度 {100.0 * stats['sparsity']:.4f}%，零元素占比 "
+        f"{100.0 * stats['zero_ratio']:.4f}%)，"
+        f"稠密矩阵元素数={total_pairs}，边级参数数={conn_param}"
+    )
+    log_info(
+        f"  -> 若把连接权重 materialize 成稠密矩阵，参数将从 {param_total} 膨胀到 "
+        f"{param_total - conn_param + total_pairs}（{total_pairs / max(conn_param, 1):.0f}x）"
+    )
     log_info("=" * 78)
 
     # ---- 逐条核对阶段 A 验收标准 ----
@@ -838,43 +641,31 @@ def run_smoke_test(
     )
     finite_loss = bool(avg_loss == avg_loss) and abs(avg_loss) != float("inf")
     checks.append(("loss 非 NaN/Inf", finite_loss, f"loss={avg_loss:.6f}"))
-    if is_neuron3d:
-        # 规格口径：连接稀疏度 = E/(N*y_out*N*y_in)（密度定义），要求 < 0.1
-        checks.append(
-            (
-                "连接稀疏度（密度 E/(N*y_out*N*y_in)）< 0.1",
-                stats["sparsity"] < SPARSITY_MAX,
-                f"sparsity={stats['sparsity']:.6f}（阈值 < {SPARSITY_MAX}）",
-            )
+    # 规格口径：连接稀疏度 = E/(N*y_out*N*y_in)（密度定义），要求 < 0.1
+    checks.append(
+        (
+            "连接稀疏度（密度 E/(N*y_out*N*y_in)）< 0.1",
+            stats["sparsity"] < SPARSITY_MAX,
+            f"sparsity={stats['sparsity']:.6f}（阈值 < {SPARSITY_MAX}）",
         )
-        checks.append(("tau > 0", stats["tau"] > 0.0, f"tau={stats['tau']:.6f}"))
-    else:
-        # MLP 对照基线：连接类判据不适用，改为结构性判据
-        checks.append(
-            (
-                "arch=mlp 结构正确（784 -> hidden -> 10）",
-                int(config.input_dim) == 784 and int(config.output_dim) == 10,
-                f"input_dim={config.input_dim}, hidden_dim={config.hidden_dim}, "
-                f"output_dim={config.output_dim}",
-            )
-        )
+    )
+    checks.append(("tau > 0", stats["tau"] > 0.0, f"tau={stats['tau']:.6f}"))
     checks.append(("CPU 单 batch 耗时 < 120s", elapsed < 120.0, f"实际 {elapsed:.2f}s"))
-    if is_neuron3d:
-        # ---- 附加断言：语义等价的"未 materialize dense"判据（皋陶建议） ----
-        checks.append(
-            (
-                "附加①：边级参数数 == E",
-                conn_param == int(stats["num_edges"]),
-                f"W_conn_sparse.numel()={conn_param}，E={int(stats['num_edges'])}",
-            )
+    # ---- 附加断言：语义等价的"未 materialize dense"判据（皋陶建议） ----
+    checks.append(
+        (
+            "附加①：边级参数数 == E",
+            conn_param == int(stats["num_edges"]),
+            f"W_conn_sparse.numel()={conn_param}，E={int(stats['num_edges'])}",
         )
-        checks.append(
-            (
-                "附加②：不存在 [N*y_out, N*y_in] 形状的权重张量",
-                dense_weight_tensors == 0,
-                f"命中 {dense_weight_tensors} 个（应为 0；dist/mask 属拓扑 buffer，不计入）",
-            )
+    )
+    checks.append(
+        (
+            "附加②：不存在 [N*y_out, N*y_in] 形状的权重张量",
+            dense_weight_tensors == 0,
+            f"命中 {dense_weight_tensors} 个（应为 0；dist/mask 属拓扑 buffer，不计入）",
         )
+    )
 
     log_info("阶段 A 验收标准逐条核对：")
     all_ok = True
@@ -915,16 +706,12 @@ def run_smoke_test(
 def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
     """生成限批验证产物的配置指纹文件名（保证不同配置互不覆盖）。
 
-    命名格式：`verify_<bpe>_N{N}_y{y_in}x{y_out}_H{H}_D{D}_T{T}_s{seed}[_<tag>].pt`
-
-    `_s{seed}` 是第 6 轮补上的指纹维度：种子决定三维坐标采样，**不同 seed 即不同拓扑**，
-    若指纹不含 seed，则只改 `--seed` 的限批跑会写入同名文件并互相覆盖（离朱第 6 轮
-    实测报告该缺口）。
+    命名格式：`verify_<bpe>_N{N}_y{y_in}x{y_out}_H{H}_D{D}_T{T}[_<tag>].pt`
 
     参数
     ----
     config : Config
-        本次运行实际生效的配置（用于提取容量维度与 seed）。
+        本次运行实际生效的配置（用于提取容量维度）。
     max_batches : int
         每 epoch 的最大 batch 数（`bpe` = batches per epoch）。
     tag : str
@@ -957,7 +744,6 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
         f"_H{config.H:g}"
         f"_D{config.D:g}"
         f"_T{config.T}"
-        f"_s{config.seed}"
     )
     if tag:
         name = f"{name}_{tag}"
@@ -1049,6 +835,85 @@ def backup_existing_checkpoint(path: str, enabled: bool = True) -> Optional[str]
     return backup_path
 
 
+def build_config_from_args(args: argparse.Namespace) -> Config:
+    """由命令行参数构造最终配置（预设 + 可选覆盖）。
+
+    规则
+    ----
+    * 以 `PRESETS[args.preset]` 为基线（缺省 default，行为与改动前一致）；
+    * `--device/--epochs/--lr/--weight-decay/--dropout/--batch-size/--readout-bias/`
+      `--n/--t-steps(--t)/--y-in/--y-out/--h/--d` 仅在**显式给出**时覆盖
+      （哨兵值：空串 / 0 / 0.0 / -1.0 / None）；
+    * 覆盖后重新经过 `Config.__post_init__` 校验（H<L、D>0、y_in/y_out>0 等）。
+
+    参数
+    ----
+    args : argparse.Namespace
+        `parse_args()` 的返回值。
+
+    返回
+    ----
+    Config
+        最终生效的配置对象。
+
+    说明
+    ----
+    `--threads` **不计入"显式覆盖"判定**：它只影响 CPU 并行度（`torch.set_num_threads`），
+    不改变任何超参与数值结果，故不属于配置覆盖。
+    """
+    base = PRESETS[args.preset]
+    overrides = base.to_dict()
+    if args.device:
+        overrides["device"] = args.device
+    if args.epochs > 0:
+        overrides["epochs"] = args.epochs
+    if args.lr > 0.0:
+        overrides["lr"] = args.lr
+    if args.weight_decay >= 0.0:
+        overrides["weight_decay"] = args.weight_decay
+    if args.dropout >= 0.0:
+        overrides["dropout"] = args.dropout
+    if args.batch_size > 0:
+        overrides["batch_size"] = args.batch_size
+    # 容量维度覆盖（--n / --t-steps / --y-in / --y-out / --h / --d）。
+    # 此前 --n/--t 的写回曾遗漏，导致直接调用本函数会静默拿到预设值。
+    n_override = getattr(args, "n", 0)
+    t_override = getattr(args, "t_override", 0)
+    y_in_override = getattr(args, "y_in", 0)
+    y_out_override = getattr(args, "y_out", 0)
+    h_override = getattr(args, "h", 0.0)
+    d_override = getattr(args, "d", 0.0)
+    if n_override > 0:
+        overrides["N"] = n_override
+    if t_override > 0:
+        log_info(f"T 覆盖：{overrides['T']} -> {t_override}")
+        overrides["T"] = t_override
+    if y_in_override > 0:
+        if y_in_override <= 0:
+            raise ValueError(f"--y-in 必须为正整数，当前 {y_in_override}")
+        overrides["y_in"] = y_in_override
+    if y_out_override > 0:
+        if y_out_override <= 0:
+            raise ValueError(f"--y-out 必须为正整数，当前 {y_out_override}")
+        overrides["y_out"] = y_out_override
+    if h_override > 0.0:
+        overrides["H"] = h_override
+    if d_override > 0.0:
+        overrides["D"] = d_override
+    if args.readout_bias is not None:
+        overrides["readout_bias"] = bool(args.readout_bias)
+    # 显式负值/零值的非法输入要在 Config 校验前给出可读错误
+    if getattr(args, "y_in", 0) < 0:
+        raise ValueError(f"--y-in 不能为负，当前 {args.y_in}")
+    if getattr(args, "y_out", 0) < 0:
+        raise ValueError(f"--y-out 不能为负，当前 {args.y_out}")
+    if getattr(args, "h", 0.0) < 0.0:
+        raise ValueError(f"--h 不能为负，当前 {args.h}")
+    if getattr(args, "d", 0.0) < 0.0:
+        raise ValueError(f"--d 不能为负，当前 {args.d}")
+    return Config(**overrides)
+
+
 def apply_threads(threads: int) -> None:
     """按 `--threads` 设置 CPU 线程数并打印生效信息。
 
@@ -1084,7 +949,6 @@ def apply_threads(threads: int) -> None:
 
 
 def run_full_training(
-    config: Optional[Config] = None,
     device_override: str = "",
     epochs_override: int = 0,
     max_batches: int = 0,
@@ -1103,15 +967,11 @@ def run_full_training(
     h_override: float = 0.0,
     d_override: float = 0.0,
     tag: str = "",
-    arch: str = "neuron3d",
 ) -> Dict[str, float]:
     """阶段 B 正式训练：按预设配置训练若干 epoch 并保存 checkpoint。
 
     参数
     ----
-    config : Optional[Config]
-        **CLI 路径应传入已构造好的配置**（由 `validate_override_args` +
-        `apply_overrides` 生成），本函数不再自行处理覆盖。
     device_override : str
         设备覆盖（空串表示使用预设的 device）。
     epochs_override : int
@@ -1154,22 +1014,14 @@ def run_full_training(
     ----
     Dict[str, float]
         最终统计：{"test_acc": ..., "loss": ..., "sparsity": ..., "zero_ratio": ...,
-        "tau": ..., "num_edges": ..., "params": ..., "checkpoint": ..., "elapsed_s": ...}。
+        "tau": ..., "num_edges": ..., "params": ...}。
 
     说明
     ----
-    **覆盖与校验的唯一入口是 `apply_overrides` / `validate_override_args`**
-    （`main()` 传入的 `config`）。本函数不再自行处理覆盖，避免出现两套并存实现。
-    当 `config is None` 时，退回到"由各 `*_override` 参数拼装"的兼容模式，
-    以便程序化调用（非 CLI 路径）仍可使用。
+    训练结束后保存 checkpoint（含 model_state_dict、config、连接统计、test_acc、
+    epochs、lr_schedule 等），并打印最终参数统计。写入路径由 `resolve_checkpoint_path` 决定。
     优化器：`weight_decay > 0` 用 AdamW，否则用 Adam（默认路径保持 Adam 不变）。
     """
-    if config is not None:
-        # CLI 路径：配置已由 validate_override_args + apply_overrides 构造完毕
-        return _run_training_with_config(
-            config, preset, max_batches, checkpoint_path, backup, tag, arch
-        )
-    # 兼容模式：程序化调用时由各 *_override 参数拼装（哨兵值语义与 CLI 一致）
     base = PRESETS[preset]
     overrides = base.to_dict()
     if device_override:
@@ -1198,55 +1050,18 @@ def run_full_training(
         overrides["H"] = h_override
     if d_override > 0.0:
         overrides["D"] = d_override
-    return _run_training_with_config(
-        Config(**overrides), preset, max_batches, checkpoint_path, backup, tag, arch
-    )
-
-
-def _run_training_with_config(
-    config: Config,
-    preset: str,
-    max_batches: int,
-    checkpoint_path: str,
-    backup: bool,
-    tag: str,
-    arch: str = "neuron3d",
-) -> Dict[str, float]:
-    """以**已构造好的配置**执行阶段 B 训练（`run_full_training` 的内部实现）。
-
-    参数
-    ----
-    config : Config
-        已生效的完整配置（由调用方负责覆盖与校验）。
-    preset : str
-        预设名（仅用于日志与 checkpoint 元数据）。
-    max_batches : int
-        每个 epoch 最多处理的 batch 数（0 表示全量）。
-    checkpoint_path : str
-        checkpoint 保存路径（空串表示默认路径）。
-    backup : bool
-        覆盖已有 checkpoint 前是否先备份为 `<path>.bak`。
-    tag : str
-        限批验证产物名标签。
-
-    返回
-    ----
-    Dict[str, float]
-        最终统计字典（含 checkpoint 绝对路径与总耗时）。
-    """
+    config = Config(**overrides)
     # 设备解析：auto -> 有 CUDA 用 CUDA，否则 CPU
     device = get_device(config.device)
 
     log_info("=" * 78)
-    log_info(f"阶段 B 正式训练开始（preset={preset}, arch={arch}）")
+    log_info(f"阶段 B 正式训练开始（preset={preset}）")
     log_info(f"配置：{config.describe()}")
     log_info(f"实际设备：{device}")
     log_info("=" * 78)
 
     t0 = time.perf_counter()
-    model, train_loader, test_loader = build_model_and_data(
-        config, device, max_batches, arch
-    )
+    model, train_loader, test_loader = build_model_and_data(config, device, max_batches)
     # 优化器：weight_decay > 0 时用 AdamW，否则维持既有 Adam（默认路径逐位不变）
     if config.weight_decay > 0.0:
         optimizer: torch.optim.Optimizer = torch.optim.AdamW(
@@ -1306,7 +1121,6 @@ def _run_training_with_config(
             "epochs": config.epochs,
             "batches_per_epoch": (max_batches if max_batches > 0 else None),
             "preset": preset,
-            "arch": arch,
             "lr_schedule": config.lr_schedule,
             "weight_decay": config.weight_decay,
             "dropout": config.dropout,
@@ -1326,7 +1140,6 @@ def _run_training_with_config(
     # ---- 最终参数统计 ----
     log_info("-" * 78)
     log_info("最终参数统计：")
-    log_info(f"  架构                 ：{arch}")
     log_info(f"  可学习参数总数       ：{model.count_parameters()}")
     log_info(f"  连接稀疏度(密度)     ：{stats['sparsity']:.6f}")
     log_info(f"  零元素占比(zero_ratio)：{stats['zero_ratio']:.6f}")
@@ -1355,7 +1168,7 @@ def _run_training_with_config(
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """命令行入口：``--smoke-test`` 只跑阶段 A，否则跑阶段 B 正式训练。
+    """命令行入口：--smoke-test 只跑阶段 A，否则跑阶段 B 正式训练。
 
     参数
     ----
@@ -1365,43 +1178,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     返回
     ----
     int
-        进程退出码：
-        * `0` 成功（阶段 A 全部判据通过，或阶段 B 正常结束）；
-        * `1` 阶段 A 验收失败；
-        * `2` 命令行参数非法（`validate_override_args` 抛出的 `ValueError`，
-          例如 `--y-in -1`）。
-
-    说明
-    ----
-    覆盖类参数的校验与构造统一走 `validate_override_args` + `apply_overrides`，
-    两条路径（冒烟 / 正式训练）共用同一实现，避免出现两套并存逻辑。
+        进程退出码：0 表示成功，1 表示冒烟测试验收失败。
     """
     args = parse_args(argv)
-    try:
-        # 唯一校验入口：负数等非法取值必须**显式报错并以非 0 退出码结束**
-        validate_override_args(args)
-        # 线程设置：在构建模型/数据之前生效，使线程数影响全部后续计算
-        apply_threads(args.threads)
-        if args.smoke_test:
-            ok = run_smoke_test(
-                device_override=args.device,
-                criterion_conflict=args.criterion_conflict,
-                config_override=build_smoke_config(args),
-                arch=args.arch,
-            )
-            return 0 if ok else 1
-        run_full_training(
-            config=apply_overrides(PRESETS[args.preset], args),
-            preset=args.preset,
-            max_batches=args.max_batches,
-            checkpoint_path=args.checkpoint,
-            backup=args.backup,
-            tag=args.tag,
-            arch=args.arch,
+    # 线程设置：在构建模型/数据之前生效，使线程数影响全部后续计算
+    apply_threads(args.threads)
+    if args.smoke_test:
+        ok = run_smoke_test(
+            device_override=args.device,
+            criterion_conflict=args.criterion_conflict,
+            config_override=build_smoke_config(args),
         )
-    except ValueError as exc:
-        log_error(f"参数校验失败：{exc}")
-        return 2
+        return 0 if ok else 1
+    run_full_training(
+        device_override=args.device,
+        epochs_override=args.epochs,
+        max_batches=args.max_batches,
+        checkpoint_path=args.checkpoint,
+        backup=args.backup,
+        preset=args.preset,
+        lr_override=args.lr,
+        weight_decay_override=args.weight_decay,
+        dropout_override=args.dropout,
+        batch_size_override=args.batch_size,
+        readout_bias_override=args.readout_bias,
+        n_override=args.n,
+        t_override=args.t_override,
+        y_in_override=args.y_in,
+        y_out_override=args.y_out,
+        h_override=args.h,
+        d_override=args.d,
+        tag=args.tag,
+    )
     return 0
 
 

@@ -16,7 +16,6 @@
 | neuron_threshold         | [N]                   | Parameter |
 | W_in                     | [input_dim, N*y_in]   | Parameter |
 | W_out                    | [N*y_out, output_dim] | Parameter |
-| W_out_bias（可选）        | [output_dim]          | Parameter（仅 readout_bias=True 时创建） |
 | scatter_out_to_neuron    | [N, N*y_out]          | buffer    |
 | broadcast_neuron_to_in   | [N*y_in, N]           | buffer    |
 
@@ -66,7 +65,7 @@ except ImportError:  # pragma: no cover
         sparse_broadcast,
     )
 
-__all__ = ["ThreeDNeuronSpace", "MLPBaseline", "NEURON_THRESHOLD_INIT"]
+__all__ = ["ThreeDNeuronSpace", "NEURON_THRESHOLD_INIT"]
 
 # 神经元阈值初始值（正偏置）：保证 2c 的 ReLU 在训练初期不会被完全抑制，
 # 避免 neuron_threshold / ln_s_in 参数梯度为 0（初期激活通过率约 40%~60%）。
@@ -160,22 +159,10 @@ class ThreeDNeuronSpace(nn.Module):
         )
         self.W_in = nn.Parameter(torch.empty(config.input_dim, self.n_in_syn))
         self.W_out = nn.Parameter(torch.empty(self.n_out_syn, config.output_dim))
-        # 可选输出层偏置：readout_bias=False 时**不创建**该参数（保持参数集与数值逐位不变）
-        self.readout_bias_enabled: bool = bool(config.readout_bias)
-        if self.readout_bias_enabled:
-            self.W_out_bias = nn.Parameter(torch.zeros(config.output_dim))
         self._init_parameters()
 
         # 输入突触信号的层归一化：抑制纯线性迭代导致的信号坍缩/爆炸
         self.ln_s_in = nn.LayerNorm(self.n_in_syn)
-
-        # 可选 dropout（作用在 s_out 送入 W_out 之前）。
-        # 关键契约：dropout=0.0 时使用 nn.Identity —— 既不改变数值，也**不消耗任何随机数**，
-        # 从而保证 SMALL_CONFIG / DEFAULT_CONFIG 的默认路径逐位不变、可复现性不受影响。
-        self.dropout_p: float = float(config.dropout)
-        self.readout_dropout: nn.Module = (
-            nn.Dropout(p=self.dropout_p) if self.dropout_p > 0.0 else nn.Identity()
-        )
 
         # 数值契约：构造后立即验证 tau > 0
         tau = self.current_tau()
@@ -296,43 +283,10 @@ class ThreeDNeuronSpace(nn.Module):
             self.W_conn_sparse.zero_()
             self.neuron_threshold.fill_(NEURON_THRESHOLD_INIT)
             self.tau_raw.fill_(float(c.tau_init))
-            if self.readout_bias_enabled:
-                # 输出层偏置零初始化：初始前向与无 bias 时完全一致
-                self.W_out_bias.zero_()
 
     def current_tau(self) -> float:
         """返回当前 tau 的数值（= softplus(tau_raw) + 0.01 > 0）。"""
         return float((F.softplus(self.tau_raw) + 0.01).item())
-
-    @property
-    def has_readout_bias(self) -> bool:
-        """输出层是否带 bias（由 `Config.readout_bias` 决定）。"""
-        return bool(getattr(self, "readout_bias_enabled", False))
-
-    def apply_readout(self, s_out: torch.Tensor) -> torch.Tensor:
-        """输出汇总：可选 dropout -> 线性读出（可选 bias）。
-
-        参数
-        ----
-        s_out : torch.Tensor
-            形状 [B, N*y_out] 的最终轮输出突触信号。
-
-        返回
-        ----
-        torch.Tensor
-            形状 [B, output_dim] 的 logits。
-
-        默认路径不变性
-        --------------
-        `dropout=0.0` 时 `readout_dropout` 为 `nn.Identity`（不消耗随机数、恒等映射）；
-        `readout_bias=False` 时不加 bias。因此默认配置下本方法等价于原来的
-        `s_out @ W_out`，数值逐位一致。
-        """
-        h = self.readout_dropout(s_out)
-        logits = h @ self.W_out
-        if self.has_readout_bias:
-            logits = logits + self.W_out_bias
-        return logits
     # ==================================================================
     # 步骤 2a：稀疏空间连接（masked softmax）
     # ==================================================================
@@ -465,9 +419,8 @@ class ThreeDNeuronSpace(nn.Module):
             s_in = self.ln_s_in(s_in_new + self.alpha * s_in)
 
         # ---- 3. 输出汇总：使用最终轮 2a 的输出突触信号 ----
-        # apply_readout = 可选 dropout -> s_out @ W_out（可选 + bias）
-        # 默认路径下 dropout 为 Identity、无 bias，故与原来的 `s_out @ W_out` 逐位一致
-        return self.apply_readout(s_out)
+        logits = s_out @ self.W_out
+        return logits
 
     # ==================================================================
     # 统计接口
@@ -536,97 +489,4 @@ class ThreeDNeuronSpace(nn.Module):
             "zero_ratio": float(1.0 - density),
             "avg_out_degree": float(self.num_edges) / float(self.n_out_syn),
             "tau": self.current_tau(),
-        }
-
-
-class MLPBaseline(nn.Module):
-    """对照实验用的普通 MLP 基线（**不是** N3D 模型，仅用于瓶颈归因）。
-
-    结构：`784 -> hidden -> 10`，隐藏层后接 ReLU，可选 dropout。
-
-    存在的意义
-    ----------
-    此前六轮已证明容量维度（N / y_in,y_out / D / T）与拓扑种子都无法把 MNIST test_acc
-    推过 99%（最佳 97.84%@seed42 / 97.90%@seed2024）。为判定"瓶颈在架构还是在数据"，
-    需要一个**参数量同量级、优化器/epoch/预处理完全相同**的普通 MLP 作对照：
-    若 MLP 明显更高，说明四步闭环在损失信息（瓶颈在架构）；若两者接近，
-    说明是数据/任务本身的上限（瓶颈在数据侧）。
-
-    接口兼容
-    --------
-    为让**同一份训练循环代码**（`train.train_one_epoch` / `evaluate` /
-    `_run_training_with_config`）无需分支地驱动它，本类提供与 `ThreeDNeuronSpace`
-    同名的以下方法：`count_parameters()`、`count_dense_weight_tensors()`、
-    `get_connection_stats()`。其中连接类指标（边数/稀疏度/平均出度/tau）对 MLP
-    不适用，统一以 `0.0` 占位，由调用方（train.py）在 `arch == "mlp"` 时跳过相关判据。
-
-    参数
-    ----
-    config : Config
-        超参配置；使用 `input_dim`、`output_dim`、`hidden_dim`、`dropout` 与 `seed`。
-
-    关键不变量
-    ----------
-    * 参数量与主模型（`HIGHACC_CONFIG` 下 1,691,730）同量级；
-    * 初始化由 `config.seed` 派生的 `torch.Generator` 控制，与主模型同样可复现。
-    """
-
-    def __init__(self, config: Config = DEFAULT_CONFIG) -> None:
-        super().__init__()
-        self.config = config
-        self.fc1 = nn.Linear(int(config.input_dim), int(config.hidden_dim))
-        self.dropout: nn.Module = (
-            nn.Dropout(float(config.dropout)) if config.dropout > 0.0 else nn.Identity()
-        )
-        self.fc2 = nn.Linear(int(config.hidden_dim), int(config.output_dim))
-        # 用 config.seed 派生的局部生成器初始化，保证与主模型一致的可复现语义
-        gen = torch.Generator(device="cpu").manual_seed(int(config.seed) + 1)
-        with torch.no_grad():
-            # fc1：Kaiming 均匀（fan_in=784, a=sqrt(5) 为 nn.Linear 默认），与主模型
-            # W_in 的 LeCun 风格同属"按 fan_in 缩放"，量级可比；
-            # fc2：Xavier 均匀，与主模型 W_out 完全一致。
-            nn.init.kaiming_uniform_(self.fc1.weight, a=math.sqrt(5), generator=gen)
-            bound1 = 1.0 / math.sqrt(float(config.input_dim))
-            self.fc1.bias.uniform_(-bound1, bound1, generator=gen)
-            fan_in, fan_out = int(config.hidden_dim), int(config.output_dim)
-            bound2 = math.sqrt(6.0 / float(fan_in + fan_out))
-            self.fc2.weight.uniform_(-bound2, bound2, generator=gen)
-            self.fc2.bias.zero_()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """`[B, input_dim] -> [B, output_dim]`：`fc1 -> ReLU -> dropout -> fc2`。
-
-        参数
-        ----
-        x : torch.Tensor
-            形状 [B, input_dim] 的输入特征。
-
-        返回
-        ----
-        torch.Tensor
-            形状 [B, output_dim] 的 logits。
-        """
-        h = F.relu(self.fc1(x))
-        h = self.dropout(h)
-        return self.fc2(h)
-
-    # ------------------------------------------------------------------
-    # 与 ThreeDNeuronSpace 同名的方法（供训练循环无分支调用）
-    # ------------------------------------------------------------------
-    def count_parameters(self) -> int:
-        """返回可学习参数总数。"""
-        return int(sum(p.numel() for p in self.parameters() if p.requires_grad))
-
-    def count_dense_weight_tensors(self) -> int:
-        """MLP 无稀疏连接约束，恒返回 0（保持与主模型调用方兼容）。"""
-        return 0
-
-    def get_connection_stats(self) -> Dict[str, float]:
-        """连接类指标对 MLP 不适用，统一返回 0.0 占位。"""
-        return {
-            "num_edges": 0.0,
-            "sparsity": 0.0,
-            "zero_ratio": 0.0,
-            "avg_out_degree": 0.0,
-            "tau": 0.0,
         }

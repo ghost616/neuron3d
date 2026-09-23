@@ -66,7 +66,7 @@ except ImportError:  # pragma: no cover
         sparse_broadcast,
     )
 
-__all__ = ["ThreeDNeuronSpace", "MLPBaseline", "NEURON_THRESHOLD_INIT"]
+__all__ = ["ThreeDNeuronSpace", "NEURON_THRESHOLD_INIT"]
 
 # 神经元阈值初始值（正偏置）：保证 2c 的 ReLU 在训练初期不会被完全抑制，
 # 避免 neuron_threshold / ln_s_in 参数梯度为 0（初期激活通过率约 40%~60%）。
@@ -536,97 +536,4 @@ class ThreeDNeuronSpace(nn.Module):
             "zero_ratio": float(1.0 - density),
             "avg_out_degree": float(self.num_edges) / float(self.n_out_syn),
             "tau": self.current_tau(),
-        }
-
-
-class MLPBaseline(nn.Module):
-    """对照实验用的普通 MLP 基线（**不是** N3D 模型，仅用于瓶颈归因）。
-
-    结构：`784 -> hidden -> 10`，隐藏层后接 ReLU，可选 dropout。
-
-    存在的意义
-    ----------
-    此前六轮已证明容量维度（N / y_in,y_out / D / T）与拓扑种子都无法把 MNIST test_acc
-    推过 99%（最佳 97.84%@seed42 / 97.90%@seed2024）。为判定"瓶颈在架构还是在数据"，
-    需要一个**参数量同量级、优化器/epoch/预处理完全相同**的普通 MLP 作对照：
-    若 MLP 明显更高，说明四步闭环在损失信息（瓶颈在架构）；若两者接近，
-    说明是数据/任务本身的上限（瓶颈在数据侧）。
-
-    接口兼容
-    --------
-    为让**同一份训练循环代码**（`train.train_one_epoch` / `evaluate` /
-    `_run_training_with_config`）无需分支地驱动它，本类提供与 `ThreeDNeuronSpace`
-    同名的以下方法：`count_parameters()`、`count_dense_weight_tensors()`、
-    `get_connection_stats()`。其中连接类指标（边数/稀疏度/平均出度/tau）对 MLP
-    不适用，统一以 `0.0` 占位，由调用方（train.py）在 `arch == "mlp"` 时跳过相关判据。
-
-    参数
-    ----
-    config : Config
-        超参配置；使用 `input_dim`、`output_dim`、`hidden_dim`、`dropout` 与 `seed`。
-
-    关键不变量
-    ----------
-    * 参数量与主模型（`HIGHACC_CONFIG` 下 1,691,730）同量级；
-    * 初始化由 `config.seed` 派生的 `torch.Generator` 控制，与主模型同样可复现。
-    """
-
-    def __init__(self, config: Config = DEFAULT_CONFIG) -> None:
-        super().__init__()
-        self.config = config
-        self.fc1 = nn.Linear(int(config.input_dim), int(config.hidden_dim))
-        self.dropout: nn.Module = (
-            nn.Dropout(float(config.dropout)) if config.dropout > 0.0 else nn.Identity()
-        )
-        self.fc2 = nn.Linear(int(config.hidden_dim), int(config.output_dim))
-        # 用 config.seed 派生的局部生成器初始化，保证与主模型一致的可复现语义
-        gen = torch.Generator(device="cpu").manual_seed(int(config.seed) + 1)
-        with torch.no_grad():
-            # fc1：Kaiming 均匀（fan_in=784, a=sqrt(5) 为 nn.Linear 默认），与主模型
-            # W_in 的 LeCun 风格同属"按 fan_in 缩放"，量级可比；
-            # fc2：Xavier 均匀，与主模型 W_out 完全一致。
-            nn.init.kaiming_uniform_(self.fc1.weight, a=math.sqrt(5), generator=gen)
-            bound1 = 1.0 / math.sqrt(float(config.input_dim))
-            self.fc1.bias.uniform_(-bound1, bound1, generator=gen)
-            fan_in, fan_out = int(config.hidden_dim), int(config.output_dim)
-            bound2 = math.sqrt(6.0 / float(fan_in + fan_out))
-            self.fc2.weight.uniform_(-bound2, bound2, generator=gen)
-            self.fc2.bias.zero_()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """`[B, input_dim] -> [B, output_dim]`：`fc1 -> ReLU -> dropout -> fc2`。
-
-        参数
-        ----
-        x : torch.Tensor
-            形状 [B, input_dim] 的输入特征。
-
-        返回
-        ----
-        torch.Tensor
-            形状 [B, output_dim] 的 logits。
-        """
-        h = F.relu(self.fc1(x))
-        h = self.dropout(h)
-        return self.fc2(h)
-
-    # ------------------------------------------------------------------
-    # 与 ThreeDNeuronSpace 同名的方法（供训练循环无分支调用）
-    # ------------------------------------------------------------------
-    def count_parameters(self) -> int:
-        """返回可学习参数总数。"""
-        return int(sum(p.numel() for p in self.parameters() if p.requires_grad))
-
-    def count_dense_weight_tensors(self) -> int:
-        """MLP 无稀疏连接约束，恒返回 0（保持与主模型调用方兼容）。"""
-        return 0
-
-    def get_connection_stats(self) -> Dict[str, float]:
-        """连接类指标对 MLP 不适用，统一返回 0.0 占位。"""
-        return {
-            "num_edges": 0.0,
-            "sparsity": 0.0,
-            "zero_ratio": 0.0,
-            "avg_out_degree": 0.0,
-            "tau": 0.0,
         }

@@ -50,7 +50,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from .config import Config, DEFAULT_CONFIG, HIGHACC_CONFIG, SMALL_CONFIG
     from .data import get_mnist_loaders
-    from .model import MLPBaseline, ThreeDNeuronSpace
+    from .model import ThreeDNeuronSpace
     from .utils import (
         count_parameters,
         get_device,
@@ -68,7 +68,7 @@ except ImportError:  # pragma: no cover
         SMALL_CONFIG,
     )
     from data import get_mnist_loaders  # type: ignore
-    from model import MLPBaseline, ThreeDNeuronSpace  # type: ignore
+    from model import ThreeDNeuronSpace  # type: ignore
     from utils import (  # type: ignore
         count_parameters,
         get_device,
@@ -119,17 +119,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--smoke-test",
         action="store_true",
         help="仅执行阶段 A 冒烟测试（SMALL_CONFIG，1 个 batch 的前向+反向验收）",
-    )
-    parser.add_argument(
-        "--arch",
-        type=str,
-        default="neuron3d",
-        choices=["neuron3d", "mlp"],
-        help=(
-            "架构：neuron3d（默认，四步闭环主模型）/ mlp（对照基线 784->hidden->10）。"
-            "mlp 走**完全相同**的训练循环、优化器、调度器、梯度裁剪与评估代码，"
-            "仅替换模型构造，用于判定瓶颈在架构还是在数据。"
-        ),
     )
     parser.add_argument(
         "--preset",
@@ -290,8 +279,7 @@ def build_model_and_data(
     config: Config,
     device: torch.device,
     max_batches: int = 0,
-    arch: str = "neuron3d",
-) -> Tuple[nn.Module, DataLoader, DataLoader]:
+) -> Tuple[ThreeDNeuronSpace, DataLoader, DataLoader]:
     """按配置构建模型与数据加载器（统一的装配入口，保证两阶段行为一致）。
 
     参数
@@ -302,14 +290,10 @@ def build_model_and_data(
         目标设备。
     max_batches : int
         仅用于日志提示（0 表示使用全量数据）。
-    arch : str
-        架构选择：`"neuron3d"`（默认，四步闭环主模型）或 `"mlp"`（对照基线）。
-        **这是全流程中唯一按 arch 分支的地方**——训练循环、优化器、调度器、
-        梯度裁剪与评估代码在两条路径下完全共用同一份实现。
 
     返回
     ----
-    Tuple[nn.Module, DataLoader, DataLoader]
+    Tuple[ThreeDNeuronSpace, DataLoader, DataLoader]
         (model, train_loader, test_loader)。
 
     实现说明（设备探针的代价）
@@ -334,11 +318,7 @@ def build_model_and_data(
         （把设备问题暴露在命令行入口附近，而不是等到反向传播深处）。
     """
     set_seed(config.seed)
-    # ---- 唯一按 arch 分支的地方：模型构造（训练循环/优化器/评估代码完全共用） ----
-    if arch == "mlp":
-        model: nn.Module = MLPBaseline(config).to(device)
-    else:
-        model = ThreeDNeuronSpace(config).to(device)
+    model = ThreeDNeuronSpace(config).to(device)
     train_loader, test_loader = get_mnist_loaders(
         batch_size=config.batch_size,
         data_root=config.data_root,
@@ -369,20 +349,13 @@ def build_model_and_data(
     )
 
     stats = model.get_connection_stats()
-    if arch == "mlp":
-        log_info(
-            f"模型装配完成（arch=mlp 对照基线）：input_dim={config.input_dim}, "
-            f"hidden_dim={config.hidden_dim}, output_dim={config.output_dim}, "
-            f"dropout={config.dropout}, 可学习参数={model.count_parameters()}, 设备={device}"
-        )
-    else:
-        log_info(
-            f"模型装配完成：N={config.N}, y_in={config.y_in}, y_out={config.y_out}, T={config.T}, "
-            f"E={int(stats['num_edges'])}, 连接密度(sparsity)={stats['sparsity']:.6f}, "
-            f"零元素占比(zero_ratio)={stats['zero_ratio']:.6f}, "
-            f"avg_out_degree={stats['avg_out_degree']:.2f}, tau={stats['tau']:.6f}, "
-            f"可学习参数={model.count_parameters()}, 设备={device}"
-        )
+    log_info(
+        f"模型装配完成：N={config.N}, y_in={config.y_in}, y_out={config.y_out}, T={config.T}, "
+        f"E={int(stats['num_edges'])}, 连接密度(sparsity)={stats['sparsity']:.6f}, "
+        f"零元素占比(zero_ratio)={stats['zero_ratio']:.6f}, "
+        f"avg_out_degree={stats['avg_out_degree']:.2f}, tau={stats['tau']:.6f}, "
+        f"可学习参数={model.count_parameters()}, 设备={device}"
+    )
     if max_batches > 0:
         log_info(f"本轮每 epoch 仅处理前 {max_batches} 个 batch（--max-batches 限制）")
     return model, train_loader, test_loader
@@ -720,7 +693,6 @@ def run_smoke_test(
     device_override: str = "",
     criterion_conflict: bool = False,
     config_override: Optional[Config] = None,
-    arch: str = "neuron3d",
 ) -> bool:
     """阶段 A 冒烟测试：验证前向/反向跑通并逐条核对验收标准。
 
@@ -767,7 +739,7 @@ def run_smoke_test(
     log_info("=" * 78)
 
     t0 = time.perf_counter()
-    model, train_loader, _ = build_model_and_data(config, device, max_batches=1, arch=arch)
+    model, train_loader, _ = build_model_and_data(config, device, max_batches=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
     # ---- 阶段 A 约束：仅跑 1 个 batch 的前向 + 反向 ----
@@ -796,32 +768,19 @@ def run_smoke_test(
         f"avg_out_degree={stats['avg_out_degree']:.3f}, tau={stats['tau']:.6f}"
     )
     # ---- dense 对照诊断：证明"未 materialize dense [N*y_out, N*y_in] 权重矩阵" ----
-    # arch 专属统计量：MLP 无稀疏连接概念，用 0 占位并跳过相应判据
-    is_neuron3d = arch == "neuron3d"
-    if is_neuron3d:
-        total_pairs = model.n_out_syn * model.n_in_syn
-        conn_param = int(model.W_conn_sparse.numel())
-    else:
-        total_pairs = 0
-        conn_param = 0
+    total_pairs = model.n_out_syn * model.n_in_syn
+    conn_param = int(model.W_conn_sparse.numel())
     dense_weight_tensors = model.count_dense_weight_tensors()
-    if is_neuron3d:
-        log_info(
-            f"稀疏性实测：E={int(stats['num_edges'])} / 可能连接对 {total_pairs} "
-            f"(连接密度 {100.0 * stats['sparsity']:.4f}%，零元素占比 "
-            f"{100.0 * stats['zero_ratio']:.4f}%)，"
-            f"稠密矩阵元素数={total_pairs}，边级参数数={conn_param}"
-        )
-        log_info(
-            f"  -> 若把连接权重 materialize 成稠密矩阵，参数将从 {param_total} 膨胀到 "
-            f"{param_total - conn_param + total_pairs}（{total_pairs / max(conn_param, 1):.0f}x）"
-        )
-    else:
-        log_info(
-            f"arch=mlp 对照基线：无稀疏连接概念（输入 {config.input_dim} -> "
-            f"hidden {config.hidden_dim} -> 输出 {config.output_dim}），"
-            f"可学习参数 {param_total}"
-        )
+    log_info(
+        f"稀疏性实测：E={int(stats['num_edges'])} / 可能连接对 {total_pairs} "
+        f"(连接密度 {100.0 * stats['sparsity']:.4f}%，零元素占比 "
+        f"{100.0 * stats['zero_ratio']:.4f}%)，"
+        f"稠密矩阵元素数={total_pairs}，边级参数数={conn_param}"
+    )
+    log_info(
+        f"  -> 若把连接权重 materialize 成稠密矩阵，参数将从 {param_total} 膨胀到 "
+        f"{param_total - conn_param + total_pairs}（{total_pairs / max(conn_param, 1):.0f}x）"
+    )
     log_info("=" * 78)
 
     # ---- 逐条核对阶段 A 验收标准 ----
@@ -838,43 +797,31 @@ def run_smoke_test(
     )
     finite_loss = bool(avg_loss == avg_loss) and abs(avg_loss) != float("inf")
     checks.append(("loss 非 NaN/Inf", finite_loss, f"loss={avg_loss:.6f}"))
-    if is_neuron3d:
-        # 规格口径：连接稀疏度 = E/(N*y_out*N*y_in)（密度定义），要求 < 0.1
-        checks.append(
-            (
-                "连接稀疏度（密度 E/(N*y_out*N*y_in)）< 0.1",
-                stats["sparsity"] < SPARSITY_MAX,
-                f"sparsity={stats['sparsity']:.6f}（阈值 < {SPARSITY_MAX}）",
-            )
+    # 规格口径：连接稀疏度 = E/(N*y_out*N*y_in)（密度定义），要求 < 0.1
+    checks.append(
+        (
+            "连接稀疏度（密度 E/(N*y_out*N*y_in)）< 0.1",
+            stats["sparsity"] < SPARSITY_MAX,
+            f"sparsity={stats['sparsity']:.6f}（阈值 < {SPARSITY_MAX}）",
         )
-        checks.append(("tau > 0", stats["tau"] > 0.0, f"tau={stats['tau']:.6f}"))
-    else:
-        # MLP 对照基线：连接类判据不适用，改为结构性判据
-        checks.append(
-            (
-                "arch=mlp 结构正确（784 -> hidden -> 10）",
-                int(config.input_dim) == 784 and int(config.output_dim) == 10,
-                f"input_dim={config.input_dim}, hidden_dim={config.hidden_dim}, "
-                f"output_dim={config.output_dim}",
-            )
-        )
+    )
+    checks.append(("tau > 0", stats["tau"] > 0.0, f"tau={stats['tau']:.6f}"))
     checks.append(("CPU 单 batch 耗时 < 120s", elapsed < 120.0, f"实际 {elapsed:.2f}s"))
-    if is_neuron3d:
-        # ---- 附加断言：语义等价的"未 materialize dense"判据（皋陶建议） ----
-        checks.append(
-            (
-                "附加①：边级参数数 == E",
-                conn_param == int(stats["num_edges"]),
-                f"W_conn_sparse.numel()={conn_param}，E={int(stats['num_edges'])}",
-            )
+    # ---- 附加断言：语义等价的"未 materialize dense"判据（皋陶建议） ----
+    checks.append(
+        (
+            "附加①：边级参数数 == E",
+            conn_param == int(stats["num_edges"]),
+            f"W_conn_sparse.numel()={conn_param}，E={int(stats['num_edges'])}",
         )
-        checks.append(
-            (
-                "附加②：不存在 [N*y_out, N*y_in] 形状的权重张量",
-                dense_weight_tensors == 0,
-                f"命中 {dense_weight_tensors} 个（应为 0；dist/mask 属拓扑 buffer，不计入）",
-            )
+    )
+    checks.append(
+        (
+            "附加②：不存在 [N*y_out, N*y_in] 形状的权重张量",
+            dense_weight_tensors == 0,
+            f"命中 {dense_weight_tensors} 个（应为 0；dist/mask 属拓扑 buffer，不计入）",
         )
+    )
 
     log_info("阶段 A 验收标准逐条核对：")
     all_ok = True
@@ -1103,7 +1050,6 @@ def run_full_training(
     h_override: float = 0.0,
     d_override: float = 0.0,
     tag: str = "",
-    arch: str = "neuron3d",
 ) -> Dict[str, float]:
     """阶段 B 正式训练：按预设配置训练若干 epoch 并保存 checkpoint。
 
@@ -1167,7 +1113,7 @@ def run_full_training(
     if config is not None:
         # CLI 路径：配置已由 validate_override_args + apply_overrides 构造完毕
         return _run_training_with_config(
-            config, preset, max_batches, checkpoint_path, backup, tag, arch
+            config, preset, max_batches, checkpoint_path, backup, tag
         )
     # 兼容模式：程序化调用时由各 *_override 参数拼装（哨兵值语义与 CLI 一致）
     base = PRESETS[preset]
@@ -1199,7 +1145,7 @@ def run_full_training(
     if d_override > 0.0:
         overrides["D"] = d_override
     return _run_training_with_config(
-        Config(**overrides), preset, max_batches, checkpoint_path, backup, tag, arch
+        Config(**overrides), preset, max_batches, checkpoint_path, backup, tag
     )
 
 
@@ -1210,7 +1156,6 @@ def _run_training_with_config(
     checkpoint_path: str,
     backup: bool,
     tag: str,
-    arch: str = "neuron3d",
 ) -> Dict[str, float]:
     """以**已构造好的配置**执行阶段 B 训练（`run_full_training` 的内部实现）。
 
@@ -1238,15 +1183,13 @@ def _run_training_with_config(
     device = get_device(config.device)
 
     log_info("=" * 78)
-    log_info(f"阶段 B 正式训练开始（preset={preset}, arch={arch}）")
+    log_info(f"阶段 B 正式训练开始（preset={preset}）")
     log_info(f"配置：{config.describe()}")
     log_info(f"实际设备：{device}")
     log_info("=" * 78)
 
     t0 = time.perf_counter()
-    model, train_loader, test_loader = build_model_and_data(
-        config, device, max_batches, arch
-    )
+    model, train_loader, test_loader = build_model_and_data(config, device, max_batches)
     # 优化器：weight_decay > 0 时用 AdamW，否则维持既有 Adam（默认路径逐位不变）
     if config.weight_decay > 0.0:
         optimizer: torch.optim.Optimizer = torch.optim.AdamW(
@@ -1306,7 +1249,6 @@ def _run_training_with_config(
             "epochs": config.epochs,
             "batches_per_epoch": (max_batches if max_batches > 0 else None),
             "preset": preset,
-            "arch": arch,
             "lr_schedule": config.lr_schedule,
             "weight_decay": config.weight_decay,
             "dropout": config.dropout,
@@ -1326,7 +1268,6 @@ def _run_training_with_config(
     # ---- 最终参数统计 ----
     log_info("-" * 78)
     log_info("最终参数统计：")
-    log_info(f"  架构                 ：{arch}")
     log_info(f"  可学习参数总数       ：{model.count_parameters()}")
     log_info(f"  连接稀疏度(密度)     ：{stats['sparsity']:.6f}")
     log_info(f"  零元素占比(zero_ratio)：{stats['zero_ratio']:.6f}")
@@ -1387,7 +1328,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 device_override=args.device,
                 criterion_conflict=args.criterion_conflict,
                 config_override=build_smoke_config(args),
-                arch=args.arch,
             )
             return 0 if ok else 1
         run_full_training(
@@ -1397,7 +1337,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             checkpoint_path=args.checkpoint,
             backup=args.backup,
             tag=args.tag,
-            arch=args.arch,
         )
     except ValueError as exc:
         log_error(f"参数校验失败：{exc}")
