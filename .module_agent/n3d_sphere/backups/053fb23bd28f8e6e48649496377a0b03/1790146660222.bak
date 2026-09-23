@@ -270,8 +270,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default="",
         help=(
             "全局流向轴 x / y / z（默认取预设值 z）。仅 topology=sphere 生效："
-            "输入突触取负半球 (-axis)、输出突触取正半球 (+axis)；"
-            "即流向定义为从 -axis 指向 +axis。"
+            "输入突触取负半球（−axis）、输出突触取正半球（+axis）。"
             "缺省（空串）表示沿用预设值，不计入显式覆盖判定。"
         ),
     )
@@ -334,9 +333,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=str,
         default="",
         help=(
-            "checkpoint 保存路径（默认 checkpoints/n3d_sphere/model.pt）。"
+            "checkpoint 保存路径（默认 checkpoints/model.pt）。"
             "冒烟测试与 --max-batches 限批模式不会写入该路径，"
-            "而是写入 checkpoints/n3d_sphere/_verify/ 下，避免覆盖正式产物。"
+            "而是写入 checkpoints/_verify/ 下，避免覆盖正式产物。"
         ),
     )
     parser.add_argument(
@@ -481,78 +480,6 @@ def build_model_and_data(
     if max_batches > 0:
         log_info(f"本轮每 epoch 仅处理前 {max_batches} 个 batch（--max-batches 限制）")
     return model, train_loader, test_loader
-
-
-def reset_dynamic_coverage(model: nn.Module) -> None:
-    """重置模型的"动态 2a 覆盖"累计容器（若模型支持）。
-
-    背景（修复审查缺陷 W1）
-    ----------------------
-    二期统计"每轮 2a 输出非零列占比"原用无界 `List[float]` 累加，且不随
-    `state_dict` / `model.to(device)` 重置：多阶段训练（先 `--max-batches` 限批
-    快筛、再全量）会把两段统计混在一起。现在容器为 O(1) 定长（见
-    `ThreeDNeuronSpace.reset_round_output_coverage`），本函数在**每次训练开始时**
-    调用，保证阶段隔离。
-
-    参数
-    ----
-    model : nn.Module
-        训练模型；`MLPBaseline` 等无该统计的模型自动跳过（不报错）。
-
-    返回
-    ----
-    None
-    """
-    reset = getattr(model, "reset_round_output_coverage", None)
-    if callable(reset):
-        reset()
-
-
-def dynamic_coverage_metadata(model: nn.Module) -> Dict[str, float]:
-    """取"动态 2a 覆盖"的显式快照，用于写入 checkpoint 元数据。
-
-    修复要点（审查缺陷 W1 的持久化部分）
-    ----------------------------------
-    该统计在内存中只保留 O(1) 定长累加器，**不随 state_dict 持久化**；为让
-    `.pt` 加载后无需重建模型即可复核历史运行的动态覆盖，这里把末轮值 / 全程均值 /
-    累计轮数作为**显式字段**写入 checkpoint（见 `topology_stats` 与顶层
-    `dynamic_coverage`）。调用方必须保证在 torch.save 之前取快照。
-
-    参数
-    ----
-    model : nn.Module
-        已跑过前向的模型；无该统计的模型（如 `MLPBaseline`）返回空字典。
-
-    返回
-    ----
-    Dict[str, float]
-        **接口契约（三个键）**：
-        * `"out_nonzero_coverage_last"`：末轮非零列占比；从未跑过前向时为 NaN；
-        * `"out_nonzero_coverage_mean"`：全程均值；从未跑过前向时为 NaN；
-        * `"out_nonzero_coverage_rounds"`：已累计观测轮数；从未跑过前向时为 0.0。
-
-        **缺键行为（本轮健壮性修复）**：取快照一律用 `.get(key, 默认值)`，
-        因此**调用方若返回键不完整的字典（例如新增/裁剪字段的模型实现），
-        前两项返回 NaN、轮数返回 0.0，而不会抛 `KeyError`**。
-        该修复只改访问方式，正常路径（`ThreeDNeuronSpace.round_output_coverage()`
-        完整返回三键）的返回值与修复前**逐位相同**。
-
-        无该统计能力的模型（`getattr` 取不到可调用 `round_output_coverage`）
-        仍返回空字典 `{}`，表示"该模型没有这一维度"（与"有该维度但缺键"区分开）。
-    """
-    getter = getattr(model, "round_output_coverage", None)
-    if not callable(getter):
-        return {}
-    snapshot = getter()
-    # 健壮性（审查建议）：缺键时给默认值而非抛 KeyError，便于增量演进的调用方
-    nan = float("nan")
-    return {
-        "out_nonzero_coverage_last": float(snapshot.get("out_nonzero_coverage_last", nan)),
-        "out_nonzero_coverage_mean": float(snapshot.get("out_nonzero_coverage_mean", nan)),
-        "out_nonzero_coverage_rounds": float(
-            snapshot.get("out_nonzero_coverage_rounds", 0.0)
-        ),
-    }
 
 
 def evaluate(
@@ -973,8 +900,6 @@ def run_smoke_test(
 
     t0 = time.perf_counter()
     model, train_loader, _ = build_model_and_data(config, device, max_batches=1, arch=arch)
-    # 修复 W1：新一次训练开始时重置"动态 2a 覆盖"累计容器（跨阶段/跨加载不混统计）
-    reset_dynamic_coverage(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
     # ---- 阶段 A 约束：仅跑 1 个 batch 的前向 + 反向 ----
@@ -1112,18 +1037,12 @@ def run_smoke_test(
     # 二期：文件名含拓扑指纹（cube+z 退化为 smoke.pt），防止不同拓扑的冒烟产物互相覆盖
     smoke_path = smoke_checkpoint_path(config.topology, config.flow_axis)
     os.makedirs(VERIFY_CHECKPOINT_DIR, exist_ok=True)
-    # 修复 W1：动态 2a 覆盖不再依赖内存态列表，显式落盘（.pt 加载后可直接复核）
-    dynamic_coverage = dynamic_coverage_metadata(model)
-    if dynamic_coverage and topo_stats:
-        topo_stats = dict(topo_stats)
-        topo_stats.update(dynamic_coverage)
     torch.save(
         {
             "model_state_dict": model.state_dict(),
             "config": config.to_dict(),
             "connection_stats": stats,
             "topology_stats": topo_stats,
-            "dynamic_coverage": dynamic_coverage,
             "stage": "smoke",
             "arch": arch,
             "loss": float(avg_loss),
@@ -1420,10 +1339,9 @@ def run_full_training(
         覆盖 epoch 数（0 表示使用预设的 epochs）。
     max_batches : int
         每个 epoch 最多处理的 batch 数（0 表示全量）。> 0 时 checkpoint 会写入
-        `checkpoints/n3d_sphere/_verify/`，避免覆盖正式产物。
+        `checkpoints/_verify/`，避免覆盖正式产物。
     checkpoint_path : str
-        checkpoint 保存路径（空串表示使用默认
-        `checkpoints/n3d_sphere/model.pt`）。
+        checkpoint 保存路径（空串表示使用默认 `checkpoints/model.pt`）。
     backup : bool
         覆盖已有 checkpoint 前是否先备份为 `<path>.bak`。默认 True。
     preset : str
@@ -1564,9 +1482,6 @@ def _run_training_with_config(
     model, train_loader, test_loader = build_model_and_data(
         config, device, max_batches, arch
     )
-    # 修复 W1：新一次训练开始时重置"动态 2a 覆盖"累计容器，
-    # 避免多阶段训练（先限批快筛、再全量）把两段统计混在一起。
-    reset_dynamic_coverage(model)
     # 优化器：weight_decay > 0 时用 AdamW，否则维持既有 Adam（默认路径逐位不变）
     if config.weight_decay > 0.0:
         optimizer: torch.optim.Optimizer = torch.optim.AdamW(
@@ -1617,21 +1532,14 @@ def _run_training_with_config(
     if backup_path:
         log_info(f"[产物保护] 覆盖前已备份既有 checkpoint：{backup_path}")
     stats = model.get_connection_stats()
-    # 二期拓扑统计（含 forward 逐轮累计的动态 2a 覆盖；MLP 路径返回空字典）
+    # 二期拓扑统计（含 forward 逐轮记录的动态 2a 覆盖；MLP 路径返回空字典）
     topo_stats = model.get_topology_stats() if arch == "neuron3d" else {}
-    # 修复 W1：把动态 2a 覆盖（末轮 / 全程均值 / 累计轮数）作为**显式字段**写入
-    # checkpoint，使 `.pt` 加载后可脱离内存态直接复核历史运行（容器本身不持久化）。
-    dynamic_coverage = dynamic_coverage_metadata(model)
-    if dynamic_coverage and topo_stats:
-        topo_stats = dict(topo_stats)
-        topo_stats.update(dynamic_coverage)
     torch.save(
         {
             "model_state_dict": model.state_dict(),
             "config": config.to_dict(),
             "connection_stats": stats,
             "topology_stats": topo_stats,
-            "dynamic_coverage": dynamic_coverage,
             "test_acc": test_acc,
             "epochs": config.epochs,
             "batches_per_epoch": (max_batches if max_batches > 0 else None),

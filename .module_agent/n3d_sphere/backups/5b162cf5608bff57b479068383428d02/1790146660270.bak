@@ -36,12 +36,8 @@
 | 连接规则 | 输出突触与输入突触的欧氏距离 ≤ D 才建边（**与一期同一份代码**） | 同左 |
 
 > **设计说明更正（重要）**：一期突触采样**不是**「H 立方体」，而是「神经元周围
-> **H 半径球体**内按体积均匀」（`_sample_synapse_positions`：方向在单位球面上均匀 +
-> 半径 `r = H·u^(1/3)`，其中 `u ~ U(0,1)`、`u^(1/3)` 是 **u 的立方根**，代码写作
-> `H * u.pow(1.0 / 3.0)`）。立方根使采样点在球体内**按体积均匀**，**不是**半径线性
-> 采样（线性采样会让点向球心聚集）；神经元球半径同理取 `R·u^(1/3)`。该口径与
-> `model.py` 顶部 docstring、两个采样方法 docstring 以及 `config.py` 完全一致。
-> 二期**没有**把 cube 采样改成球体，cube 分支逐字保留。
+> **H 半径球体**内按体积均匀」（`_sample_synapse_positions`：方向球面均匀 +
+> `r = H·u^(1/3)`）。二期**没有**把 cube 采样改成球体，cube 分支逐字保留。
 > 等体积球半径保证神经元**密度与一期一致**（`N/L³ = N/((4/3)πR³)`）。
 
 ### 2.2 半球切分的实现（为什么不是拒绝采样）
@@ -64,23 +60,17 @@ radius = H * u.pow(1.0 / 3.0)                           # 体积均匀
 
 ### 2.3 关键几何性质：**上行偏置，而非严格 DAG**（如实报告）
 
-本节只用**代码口径**描述流向轴边间距 `gap`（与 `model.py` 的实现完全一致）：
+设神经元沿流向轴的间距为 Δz，输入突触偏移 δ_in ∈ [−H, 0)、输出突触偏移 δ_out ∈ (0, H]，
+则边的流向轴间距为
 
 ```
-gap = axis(output_syn_pos) − axis(input_syn_pos)
+gap = z_out_syn − z_in_syn = Δz + δ_out − δ_in ,   δ_out − δ_in ∈ (0, 2H]
 ```
-
-其中 `axis` 是由 `flow_axis` 决定的坐标分量（`flow_axis_index`，取值 x/y/z）。
-即 gap 直接取「输出突触坐标 − 输入突触坐标」在流向轴上的分量。
-
-> **文档更正**：早期版本此处写成 `gap = Δz + δ_out − δ_in` 且 `δ_out − δ_in ∈ (0, 2H]`，
-> 与代码不符且两式自相矛盾——实现里并不存在单独的 Δz / δ 分解，仅计算上述坐标差。
-> 该表述已删除，统一为上面的代码口径（`model.py` 顶部 docstring 已同步）。
 
 - `gap > 0` = 沿 −axis → +axis 向上传播的**正向边**；
 - `gap < 0` = 逆流向下传播的**逆向边**；
-- 因输入突触取 −axis 半球、输出突触取 +axis 半球，gap 的分布相对立方体**明显右偏**：
-  各向同性（cube）时正向/逆向 ≈ 50%（实测 0.5009 / 0.4991），sphere 实测正向 ≈ 61.5%。
+- 因 `|gap| ≤ D`，可形成正向边的神经元间距区间为 `Δz ∈ [−2H, D]`（H=0.1/D=0.15 时
+  即 `[−0.2, 0.15]`）——**Δz 为负（神经元在下）时也能形成正向边**，反之亦然。
 
 因此半球切分只保证「每个神经元的出边朝上、入边朝下」，**并不能保证整图是 DAG**。
 实测（N=256 / y=8×8 / H=0.1 / D=0.15 / 等体积球 / seed=42）：
@@ -472,16 +462,7 @@ python n3d_sphere/train.py --preset highacc --epochs 12 --topology sphere --flow
   二期新增指标一律放入 `get_topology_stats()`，不破坏既有键的解析；
 * 全部拓扑量（含二期新增的 `edge_reverse_flag` / `neuron_component_id` /
   `connected_output_mask`）均在 `__init__` 预计算并 `register_buffer`，
-  `forward` 中不重算；`forward` 只额外累计 2a 的非零覆盖标量（不参与计算图）；
-* 动态 2a 覆盖为 **O(1) 定长累计容器**（`sum` / `count` / `last` 三个 Python 标量，
-  见 `ThreeDNeuronSpace.reset_round_output_coverage()`），不再是随轮数无界增长的
-  `List[float]`；每次训练开始时由 `train.py::reset_dynamic_coverage()` 重置，
-  避免多阶段训练（先 `--max-batches` 快筛、再全量）把两段统计混在一起；
-  末轮值 / 全程均值 / 累计轮数（`out_nonzero_coverage_rounds`）会作为**显式字段**
-  随 checkpoint 落盘（`topology_stats` 与顶层 `dynamic_coverage`），
-  `.pt` 加载后可直接 `torch.load` 复核，无需依赖内存态容器；
-  `gap` 张量在 `__init__` 缓存为**非持久化 buffer** `edge_axis_gap`（不进 state_dict，
-  不改变一/二期 state_dict 键集），`get_topology_stats()` 直接复用、不再重算 O(E)；
+  `forward` 中不重算；`forward` 只额外记录 2a 的非零覆盖标量（不参与计算图）；
 * 仍然**禁止 materialize dense `[N*y_out, N*y_in]` 权重矩阵**：连接权重是边级参数
   `W_conn_sparse` [E]，冒烟测试的「附加①边级参数数 == E」「附加②无该形状权重张量」
   两条判据在二期同样 PASS。

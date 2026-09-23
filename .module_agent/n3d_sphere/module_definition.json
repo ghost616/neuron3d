@@ -19,11 +19,11 @@
     },
     {
       "path": "n3d_sphere/model.py",
-      "description": "二期核心模型。ThreeDNeuronSpace：坐标采样按 topology 分支——cube 分支**逐字保留**一期的立方体神经元 + H 半径球体内体积均匀突触；sphere 分支新增等体积球（R≈0.620）内体积均匀神经元、输入突触取流向轴负半球、输出突触取正半球（方向生成后翻转流向轴分量，测度保持、不消耗额外随机数）。四步闭环（2a masked softmax 稀疏连接 / 2b index_add_ scatter sum / 2c ReLU 阈值激活 / 2d index_select broadcast + 残差 + LayerNorm）与一期完全一致。统计接口：get_connection_stats() 保持一期 5 键不动；get_topology_stats() 返回逆向边占比、流向轴 gap 分布、神经元流向轴高度分布、2a 静态/动态覆盖、弱连通分量数与最大分量占比、几何指纹。全部拓扑量（含 edge_reverse_flag / neuron_component_id / connected_output_mask）在 __init__ 预计算并 register_buffer，forward 不重算。连通性由共用静态原语 _label_propagate（最小标签传播 scatter_reduce(amin) + 指针跳跃，单调收敛到真值）实现；另含连通性回归自检入口 connectivity_selfcheck() / _components_of_synthetic_graph() / _expected_components() / _component_stats_crosscheck()（7 个真值已知合成图 + 真实拓扑与独立并查集的划分比对，不参与训练）。另含 MLPBaseline 对照基线（同接口占位）。"
+      "description": "二期核心模型。ThreeDNeuronSpace：坐标采样按 topology 分支——cube 分支**逐字保留**一期的立方体神经元 + H 半径球体内体积均匀突触；sphere 分支新增等体积球（R≈0.620）内体积均匀神经元、输入突触取流向轴负半球、输出突触取正半球（方向生成后翻转流向轴分量，测度保持、不消耗额外随机数）。四步闭环（2a masked softmax 稀疏连接 / 2b index_add_ scatter sum / 2c ReLU 阈值激活 / 2d index_select broadcast + 残差 + LayerNorm）与一期完全一致。统计接口：get_connection_stats() 保持一期 5 键不动；get_topology_stats() 返回逆向边占比、流向轴 gap 分布、神经元流向轴高度分布、2a 静态/动态覆盖、弱连通分量数与最大分量占比、几何指纹。动态 2a 覆盖用 O(1) 定长标量容器（sum / count / last）累计，由 reset_round_output_coverage() 做阶段隔离、round_output_coverage() 返回三键快照（轮数覆盖训练+评估两条路径的全部前向，口径 =(训练批数+评估批数)×epoch×T，docstring 已明确限定并附实测佐证）。全部拓扑量（含 edge_reverse_flag / neuron_component_id / connected_output_mask）在 __init__ 预计算并 register_buffer，forward 不重算。连通性由共用静态原语 _label_propagate（最小标签传播 scatter_reduce(amin) + 指针跳跃）实现；另含回归自检入口 connectivity_selfcheck() / _components_of_synthetic_graph() / _expected_components() / _component_stats_crosscheck()。另含 MLPBaseline 对照基线（同接口占位）。"
     },
     {
       "path": "n3d_sphere/train.py",
-      "description": "二期训练入口。由一期 train.py 拷贝并扩展：新增 --topology / --flow-axis / --space-radius 三个 CLI（空串 / -1.0 哨兵语义，纳入 build_smoke_config 的 explicit 判定与 validate_override_args 校验，并同步进 apply_overrides 与 run_full_training 兼容模式）；CHECKPOINT_DIR 改为 checkpoints/n3d_sphere/ 与一期产物物理隔离；冒烟产物按拓扑指纹命名 smoke_<topology>_<flow_axis>.pt；限批产物指纹加入 topology / flow_axis 维度；正式全量默认路径对非一期等价配置自动使用 full_<指纹>.pt；checkpoint 元数据新增 topology / flow_axis / space_radius / topology_stats。训练循环、数据管线、优化器/调度器/梯度裁剪、阶段 A 判据与日志格式与一期一致。"
+      "description": "训练入口。由一期 train.py 拷贝并扩展：新增 --topology / --flow-axis / --space-radius 三个 CLI（空串 / -1.0 哨兵语义，纳入 build_smoke_config 的 explicit 判定与 validate_override_args 校验，并同步进 apply_overrides 与 run_full_training 兼容模式；help 文案已清除 GBK 不可编码字符 U+2212，保证 --help 在 GBK 控制台退出码 0）；CHECKPOINT_DIR 改为 checkpoints/n3d_sphere/ 与一期产物物理隔离；冒烟产物按拓扑指纹命名 smoke_<topology>_<flow_axis>.pt；限批产物指纹加入 topology / flow_axis 维度；正式全量默认路径对非一期等价配置使用 full_N{N}_y{..}_H{..}_D{..}_T{T}_top{..}_ax{..}_s{seed}.pt；checkpoint 元数据新增 topology / flow_axis / space_radius / topology_stats / dynamic_coverage。另提供动态覆盖的阶段隔离与持久化入口：reset_dynamic_coverage(model) 与 dynamic_coverage_metadata(model)（后者以 .get(key, 默认值) 取键，三键接口契约为 out_nonzero_coverage_last / _mean / _rounds，缺键时返回 NaN / 0.0 而不抛 KeyError）。训练循环、数据管线、优化器/调度器/梯度裁剪、阶段 A 判据与日志格式与一期一致。"
     },
     {
       "path": "n3d_sphere/README.md",
@@ -32,6 +32,14 @@
     {
       "path": "checkpoints/n3d_sphere/_verify/verify_n3d_sphere_phase2.py",
       "description": "验证脚本（不属于模块源码，放在验证产物目录内）：只读取与构造模型、不做任何源码改动。子命令 proto（冒烟产物逐位等价 + 一期产物 SHA256 纪律）、geom（几何断言：球内/体积均匀/H 球内/半球切分 x·y·z/拓扑统计 + 连通性自检 + 一期与二期 cube 几何逐位对照）、probe（H/D/space_radius 连通性快筛，判据事先固定，每行附带合成分量图真值自检与并查集一致性）、artifact（任意产物 torch.load 复核）。"
+    },
+    {
+      "path": "checkpoints/n3d_sphere/_verify/verify_w1_dynamic_coverage.py",
+      "description": "审查缺陷 W1 专项回归脚本（不属于模块源码，放在验证产物目录内）：只读取产物 + 构造模型 + 断言，不改动任何源码。对每个冒烟产物（smoke.pt / smoke_sphere_z.pt）逐条断言：C1 动态 2a 覆盖容器为 O(1) 定长（不存在遗留的 _round_output_coverage 无界列表，任意多次前向后元素个数恒为 3）；C1b 累计轮数 == 前向次数 × T；C2 均值口径 mean == sum/count 且末轮取自 last；C3 checkpoint 的 topology_stats 与顶层 dynamic_coverage 两处同时含 out_nonzero_coverage_last/_mean/_rounds 且逐位一致（.pt 加载后内存态为 NaN 属预期，历史值改由显式字段复核）；C4 reset_round_output_coverage() 后快照恢复为 NaN / 0（阶段隔离）；C5 非持久化 buffer edge_axis_gap 与由 edge_index 重算的 gap 逐位相等、get_topology_stats 复用后统计一致、且不出现在 state_dict 中（一/二期键集增量仍恰为 3 个）。退出码 0 = 全部 PASS。"
+    },
+    {
+      "description": "轮数口径与缺键健壮性取证脚本（不属于模块源码）：用真实训练+评估循环实测 out_nonzero_coverage_rounds 的口径构成（(训练批数+评估批数)×epoch×T，实测 rounds=24 = (3+3)×2×T=2；冒烟路径 = T），并验证阶段隔离（reset 后 rounds=0、末轮为 NaN）、dynamic_coverage_metadata 的缺键健壮性（传入只含 1 个键的桩模型时不抛 KeyError，返回 NaN / 0.0）、以及正常路径与 round_output_coverage() 逐位一致。",
+      "path": "checkpoints/n3d_sphere/_verify/verify_r4_round_count_scope.py"
     }
   ]
 }

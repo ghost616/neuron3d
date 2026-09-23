@@ -1,0 +1,9 @@
+{
+  "plan_id": "plan_3461dc13-9ccc-4794-9d29-334e0923cbc1",
+  "module_name": "framework",
+  "development_plan": "# 开发计划（framework）：.gitignore 忽略原始 MNIST 数据集\n\n## 背景\n`n3d_sphere/data.py`（与一期 `n3d_proto/data.py` 相同逻辑）在复用工程内 MNIST IDX 文件时，会把 4 个原始文件复制到 torchvision 期望的布局 `<data_root>/MNIST/raw/`，即 `data/mnist/MNIST/`。该目录为 **4 个文件、11.06 MB** 的原始数据集，属于运行时副作用产物，不应纳入版本控制。\n\n当前 `.gitignore` 只覆盖了 `/checkpoints/`、`/logs/` 等运行产物，**未覆盖 `data/mnist/MNIST/`**，导致 `git status` 中始终出现 `?? data/mnist/MNIST/`，易被误提交。\n\n## 任务\n1. 在 `.gitignore` 中新增忽略项，覆盖原始 MNIST 二进制数据的自动复制目录：`data/mnist/MNIST/`\n   - 保持与文件既有的分节风格一致（现有分节含「H-STDN 运行产物」「Lizhu test env」等），可新增一节如「---- 数据集原始文件（运行时复制，不入库）----」\n   - 注意：不要忽略 `data/mnist/` 本身已有的、可能被跟踪的内容；只忽略 `data/mnist/MNIST/` 这一自动复制目录\n2. 同步更新 `README.md`？—— **不需要**。本计划仅涉及 `.gitignore`，除非 README 中已有明确描述数据目录布局的段落与本改动冲突；如确有冲突，仅做最小必要补充。\n\n## 硬约束\n1. 【最小改动】只允许修改 `.gitignore`（如需，可对 README 做最小必要补充）。不得改动 `requirements.txt`、不得改动任何 `n3d_proto/` 或 `n3d_sphere/` 下的文件。\n2. 【不得删除数据】只做忽略，**不得删除** `data/mnist/MNIST/` 下的文件，也不得删除 `data/mnist/` 下任何既有文件。\n3. 【验证必须真实执行并粘贴终端输出】\n   - `git status --short` → 不再出现 `?? data/mnist/MNIST/`\n   - `git check-ignore -v data/mnist/MNIST/` → 能报出命中的 `.gitignore` 行\n   - `git status --porcelain -- n3d_proto n3d_sphere` → 输出为空（未误伤既有模块）\n   - 确认 `data/mnist/` 下原文件仍在（列出文件名与大小）\n\n## 交付物\n- 修改：`.gitignore`\n- 更新模块元数据：`current_spec.md` 与 `change_history.log`（如模块定义中 `.gitignore` 的 description 需要补充该职责，一并更新）\n\n## 预算\n约 5 分钟",
+  "session_id": "d13f8c26-ffab-4a93-b336-59cb814a2f25",
+  "modified_files": [
+    ".gitignore"
+  ]
+}

@@ -46,9 +46,3 @@ Thumbs.db
 
 # ---- Lizhu test env (local generated, not committed) ----
 .lizhu_env/
-
-# ---- 数据集原始文件（运行时复制，不入库）----
-# data/mnist/ 下的原始 IDX 文件由版本控制跟踪；首次运行时 data.py 会把它们
-# 复制到 torchvision 期望的布局 data/mnist/MNIST/raw/（4 个文件、约 11 MB）。
-# 该目录是运行时副作用产物，只忽略它本身，不影响 data/mnist/ 下已跟踪的文件。
-data/mnist/MNIST/
