@@ -239,13 +239,6 @@ class ThreeDNeuronSpace(nn.Module):
         self.register_buffer("in_degree", torch.bincount(edge_dst, minlength=self.N).to(torch.long), persistent=True)
         self.register_buffer("out_degree", torch.bincount(edge_src, minlength=self.N).to(torch.long), persistent=True)
 
-        # ---------------- 连通性下限校验（G3：拒绝"图退化"的配置） ----------------
-        # 构图已完成（E / 分层 / 两个 scope 掩码都在上面算好），此处一次性核验图是否仍然
-        # "可用"：平均出度 >= 1、层数 >= 2、S_in / S_out 均非空。任一不满足都说明该配置
-        # （尤其在 D <= H 的新约束下 D 取过小）已经退化成几乎无连接或无法传播的图，
-        # 此时静默生成模型只会得到无意义的训练结果，故**直接抛异常**。
-        self.connectivity_floor: Dict[str, float] = self.check_connectivity_floor()
-
         # ---------------- 可学习参数（按连接构建，禁止 dense 权重矩阵） ----------------
         self.num_in_scope: int = int(in_scope_mask.sum().item())
         self.num_out_scope: int = int(out_scope_mask.sum().item())
@@ -778,74 +771,6 @@ class ThreeDNeuronSpace(nn.Module):
         raise ValueError(
             f"scope 仅允许 'any_isolated' 或 'all_isolated'，当前 scope={scope!r}"
         )
-
-    # ==================================================================
-    # 连通性下限校验（G3）
-    # ==================================================================
-    @torch.no_grad()
-    def check_connectivity_floor(self) -> Dict[str, float]:
-        """校验图未退化（连通性下限），不满足即抛异常（`__init__` 末尾调用）。
-
-        判据（任一不满足即视为"图退化"）
-        --------------------------------
-        * `E >= N`：平均出度 `E / N >= 1`（每个神经元平均至少有一条出边）；
-        * 层数 `K >= 2`：至少两个流向轴层，否则阶段 2 的递推没有任何跨层传播；
-        * `|S_in| >= 1`：至少一个神经元被输入层驱动（否则阶段 1 恒为全零）；
-        * `|S_out| >= 1`：至少一个神经元进入 `S_out`（否则 readout 恒为全零）。
-
-        动机：在 `D <= H` 的硬约束（G1）下，`D` 取过小会让连接几乎消失
-        （实测 DEFAULT 规模 H=0.10：D=0.05 → E=146、E/N=0.57；D=0.03 → E=17、
-        E/N=0.07；D=0.02 → E=1、E/N=0.004）。这类配置不该静默生成一个几乎无连接的
-        模型去训练，而应在构造期就被拦下。
-
-        返回
-        ----
-        Dict[str, float]
-            实测的连通性指标（`num_edges` / `num_neurons` / `edges_per_neuron` /
-            `num_layers` / `num_in_scope` / `num_out_scope` / `H` / `D`），
-            供日志与验证脚本引用。
-
-        异常
-        ------
-        ValueError
-            任一判据不满足时抛出，消息含实测的 `E / N / (E÷N) / 层数K / |S_in| /
-            |S_out| / H / D` 与具体违反项。
-        """
-        n = int(self.N)
-        e = int(self.num_edges)
-        layers = int(self.level_node_reach.shape[0])
-        s_in = int(self.in_scope_mask.sum().item())
-        s_out = int(self.out_scope_mask.sum().item())
-        per_neuron = e / float(n)
-        stats: Dict[str, float] = {
-            "num_edges": float(e),
-            "num_neurons": float(n),
-            "edges_per_neuron": per_neuron,
-            "num_layers": float(layers),
-            "num_in_scope": float(s_in),
-            "num_out_scope": float(s_out),
-            "H": float(self.config.H),
-            "D": float(self.config.D),
-        }
-        problems: List[str] = []
-        if e < n:
-            problems.append(f"E={e} < N={n}（平均出度 E/N={per_neuron:.4f} < 1）")
-        if layers < 2:
-            problems.append(f"层数 K={layers} < 2（阶段 2 无跨层传播）")
-        if s_in < 1:
-            problems.append(f"|S_in|={s_in} < 1（阶段 1 无神经元被输入层驱动）")
-        if s_out < 1:
-            problems.append(f"|S_out|={s_out} < 1（readout 无信号）")
-        if problems:
-            raise ValueError(
-                "[连通性下限校验失败] 该配置生成的图已退化，拒绝构造模型："
-                + "；".join(problems)
-                + f"。实测指标：E={e}, N={n}, E/N={per_neuron:.4f}, 层数K={layers}, "
-                f"|S_in|={s_in}, |S_out|={s_out}, H={self.config.H}, D={self.config.D}"
-                f"（input_scope={self.input_scope}, readout_scope={self.readout_scope}, "
-                f"seed={self.config.seed}）。请增大 D（硬约束 D <= H）或调整 N/H/scope。"
-            )
-        return stats
 
     # ==================================================================
     # 参数初始化与数值量

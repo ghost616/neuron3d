@@ -17,16 +17,7 @@
 * `space_radius` 默认取 `R_min`；用户显式传入时必须落在 `[R_min, R_max]` 内，
   越界在构造期报错。
 
-**连接半径硬约束 `D <= H`**：连接判据是"起点神经元的输出突触 `o` 与终点神经元的输入
-突触 `j` 的距离 `<= D`"，而 `o` / `j` 各自落在所属神经元的 `H` 半径球内，故 `D` 不得
-超过接收/发送范围半径 `H`。本模块三个预设一律取 `D = H`；`D > H` 在构造期直接报错
-（见 `Config.__post_init__` 的硬校验与 `checkpoints/n3d_sphere/_verify/verify_dh_constraint.py`
-的 H1 负例）。此外图还有**连通性下限**（`E >= N`、层数 `K >= 2`、`|S_in| >= 1`、
-`|S_out| >= 1`），由 `ThreeDNeuronSpace.__init__` 的 `check_connectivity_floor()` 把关。
-
-参考值（合法组合 `N=256, H=0.10, D=0.10`，即 DEFAULT/HIGHACC 预设口径）：
-`R_min = 0.701840`、`R_max = 1.403681`（`R_max/R_min = 2.0 = (H+D)/H`）。
-对照：SMALL 预设口径 `N=64, H=0.15, D=0.15` → `R_min = 0.663198`、`R_max = 1.326395`。
+参考值（N=256, H=0.10, D=0.15）：`R_min = 0.701840`、`R_max = 1.754601`。
 
 神经元放置
 ----------
@@ -38,12 +29,9 @@
 ----------
 * `N > 0`、`y_in > 0`、`y_out > 0`；
 * `H > 0`、`D > 0`；
-* **`D <= H`**（连接半径不得超过接收/发送范围半径；本模块三个预设取 `D = H`）；
 * `flow_axis ∈ {"x", "y", "z"}`；
 * `input_scope ∈ {"any_isolated", "all_isolated"}`、`readout_scope` 同理；
-* `space_radius == 0.0`（默认，表示取 R_min）或 `space_radius ∈ [R_min, R_max]`；
-* 可学习参数的**连通性下限**（`E >= N`、层数 `K >= 2`、`|S_in| >= 1`、`|S_out| >= 1`）
-  在 `ThreeDNeuronSpace.__init__` 中校验，不满足即抛异常。
+* `space_radius == 0.0`（默认，表示取 R_min）或 `space_radius ∈ [R_min, R_max]`。
 """
 
 from __future__ import annotations

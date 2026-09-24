@@ -1,0 +1,269 @@
+"""n3d_sphere 配置契约验证脚本（半径窗口公式 / 字段校验 / 零 cube 残留）。
+
+* C1 半径公式：R_min = H*(N/phi)^(1/3)、R_max = (H+D)*(N/phi)^(1/3)（phi=0.7405），
+     并对 N=256/H=0.10/D=0.15 打印参考值（本脚本以实时计算为准，不硬编码）；
+* C2 space_radius 窗口校验：默认 0.0 -> R_min；显式值落在 [R_min, R_max] 内通过、
+     越界（含 R_min 下界与 R_max 上界两侧）必须抛 ValueError；
+* C3 FCC 所需半径：由公式给出的 R_min 必须足以容纳 N 个 FCC 格点（R_placement <= R_max）；
+* C4 字段清理：Config 不得再有 topology / L / tau_init / alpha / min_neuron_dist /
+     max_sample_tries / dropout 字段；to_dict/describe 必须含新字段；
+* C5 取值域：flow_axis / input_scope / readout_scope / placement 非法取值必须报错；
+* C6 零 cube 残留：源码 / README / spec 中不得出现 cube / 立方体 / --topology（grep 断言）。
+
+用法（工程根目录下执行）::
+
+    python checkpoints/n3d_sphere/_verify/verify_config_contracts.py
+退出码 0 = 全部 PASS。
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import sys
+from typing import List
+
+import torch
+
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, os.pardir)
+)
+for _p in (PROJECT_ROOT, os.path.join(PROJECT_ROOT, "n3d_sphere")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from n3d_sphere.config import (  # noqa: E402
+    PACKING_PHI,
+    Config,
+    SMALL_CONFIG,
+    max_space_radius,
+    min_space_radius,
+)
+from n3d_sphere.model import ThreeDNeuronSpace  # noqa: E402
+
+try:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+except Exception:  # pragma: no cover
+    pass
+
+MODULE_DIR = os.path.join(PROJECT_ROOT, "n3d_sphere")
+# 旧架构字段（必须已删除）
+REMOVED_FIELDS = (
+    "topology", "L", "tau_init", "alpha", "min_neuron_dist", "max_sample_tries",
+    "dropout", "T",
+)
+# 必须存在的新字段
+REQUIRED_FIELDS = (
+    "N", "y_in", "y_out", "H", "D", "flow_axis", "space_radius", "placement",
+    "input_scope", "readout_scope", "seed",
+)
+
+
+def check_radius_formula() -> bool:
+    """C1：半径公式与参考值（实时计算）。"""
+    print("=" * 78)
+    print("[C1] 球空间半径公式")
+    ok = True
+    cases = ((256, 0.10, 0.15), (64, 0.15, 0.25), (256, 0.10, 0.20))
+    for n, h, d in cases:
+        rmin = min_space_radius(n, h)
+        rmax = max_space_radius(n, h, d)
+        cfg = Config(N=n, y_in=8 if n == 256 else 4, y_out=8 if n == 256 else 4,
+                     H=h, D=d, seed=42)
+        formula_ok = (
+            abs(cfg.min_space_radius - h * (n / PACKING_PHI) ** (1.0 / 3.0)) < 1e-12
+            and abs(cfg.max_space_radius - (h + d) * (n / PACKING_PHI) ** (1.0 / 3.0)) < 1e-12
+        )
+        default_ok = abs(cfg.effective_space_radius - rmin) < 1e-12
+        ratio_ok = abs(rmax / rmin - (h + d) / h) < 1e-12
+        ok &= formula_ok and default_ok and ratio_ok
+        print(
+            f"  N={n} H={h} D={d} (phi={PACKING_PHI}): R_min={rmin:.6f} R_max={rmax:.6f} "
+            f"R_max/R_min={rmax / rmin:.6f}（期望 (H+D)/H={(h + d) / h:.6f}）\n"
+            f"      公式一致={formula_ok} 默认取 R_min={default_ok}"
+        )
+    print(f"[C1] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+def check_radius_window() -> bool:
+    """C2/C3：space_radius 窗口校验与 FCC 容纳性。"""
+    print("=" * 78)
+    print("[C2-C3] space_radius 窗口校验与 FCC 容纳性")
+    ok = True
+    base = dict(N=256, y_in=8, y_out=8, H=0.10, D=0.15, seed=42)
+    rmin, rmax = min_space_radius(256, 0.10), max_space_radius(256, 0.10, 0.15)
+    accepted: List[float] = []
+    rejected: List[float] = []
+    for r in (0.0, rmin, (rmin + rmax) / 2.0, rmax):
+        try:
+            Config(**base, space_radius=r)
+            accepted.append(r)
+        except ValueError:
+            rejected.append(r)
+    for r in (rmin * 0.99, rmin - 1e-6, rmax * 1.01, rmax + 1e-6, -0.5):
+        try:
+            Config(**base, space_radius=r)
+            rejected.append(r)
+        except ValueError:
+            accepted.append(r)
+    window_ok = not rejected and len(accepted) == 9
+    ok &= window_ok
+    print(f"  合法值全部接受、越界值全部拒绝: {window_ok}")
+    print(f"      接受={[round(v, 6) for v in accepted]}；被拒（应为空）={rejected}")
+    # FCC 容纳性：R_min 足够容纳 N 个 FCC 格点（放置半径 <= R_max）
+    feasible = True
+    for n, h, d, y in ((256, 0.10, 0.15, 8), (64, 0.15, 0.25, 4), (256, 0.06, 0.09, 8)):
+        cfg = Config(N=n, y_in=y, y_out=y, H=h, D=d, seed=42)
+        m = ThreeDNeuronSpace(cfg)
+        t = m.get_topology_stats()
+        item = t["placement_radius"] <= cfg.max_space_radius + 1e-9
+        feasible &= item
+        print(f"  N={n} H={h} D={d}: R_min={cfg.min_space_radius:.6f} 放置半径="
+              f"{t['placement_radius']:.6f} <= R_max={cfg.max_space_radius:.6f}: {item}")
+    ok &= feasible
+    print(f"[C2-C3] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+def check_config_fields() -> bool:
+    """C4/C5：字段清理与取值域校验。"""
+    print("=" * 78)
+    print("[C4-C5] 配置字段清理与取值域")
+    ok = True
+    d = Config().to_dict()
+    leftover = [f for f in REMOVED_FIELDS if f in d or hasattr(Config, f)]
+    missing = [f for f in REQUIRED_FIELDS if f not in d]
+    ok &= not leftover and not missing
+    print(f"  旧字段残留（应为空）={leftover}；必需字段缺失（应为空）={missing}")
+    desc = Config().describe()
+    desc_ok = all(tok in desc for tok in ("flow_axis", "space_radius", "placement",
+                                          "input_scope", "readout_scope"))
+    round_trip_ok = Config(**Config(**d).to_dict()).to_dict() == d
+    ok &= desc_ok and round_trip_ok
+    print(f"  describe 含新字段={desc_ok}；to_dict 往返一致={round_trip_ok}")
+    domain_cases = (
+        ("flow_axis", "w"),
+        ("input_scope", "some_isolated"),
+        ("readout_scope", "none_isolated"),
+        ("placement", "random"),
+    )
+    for field_name, bad in domain_cases:
+        kw = dict(N=64, y_in=4, y_out=4, H=0.15, D=0.25)
+        kw[field_name] = bad
+        try:
+            Config(**kw)
+            domain_ok = False
+        except ValueError:
+            domain_ok = True
+        ok &= domain_ok
+        print(f"  {field_name}={bad!r} 被拒绝: {domain_ok}")
+    print(f"[C4-C5] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+def check_no_cube() -> bool:
+    """C6：零残留断言（源码 + README + 模块规格 + 文件定义）。
+
+    扫描范围（皋陶审查要求扩展）：
+    * `n3d_sphere` 全部源文件（`__init__.py` / `config.py` / `model.py` / `train.py` /
+      `utils.py` / `data.py`）+ `n3d_sphere/README.md`；
+    * `.module_agent/n3d_sphere/current_spec.md`（模块功能说明）；
+    * `.module_agent/n3d_sphere/module_definition.json`（文件职责定义）。
+
+    禁用词口径（与计划 E3 一致）：
+    * `cube` / `Cube` / `CUBE` / `立方体`：任何几何残留（含注释与文档）；
+    * `--topology` / `topology=` / `topology:`：被删除的 CLI 开关与配置字段；
+    * `round_output_coverage` / `out_nonzero_coverage` / `edge_axis_gap` /
+      `neuron_component_id` / `dynamic_coverage`：旧架构的统计与缓存实现（已移除）。
+    白名单：`topology_stats`（产物 schema 字段名）、`get_topology_stats()`（统计接口名）、
+    以及"已删除/不存在"这类说明句中的词（通过整行白名单关键字排除）。
+
+    返回
+    ----
+    bool
+        全部目标文件均无禁用词时返回 True；否则打印命中文件与行号并返回 False。
+    """
+    print("=" * 78)
+    print("[C6] 零残留断言（源码 + README + current_spec.md + module_definition.json）")
+    ok = True
+    banned = (
+        "cube", "Cube", "CUBE", "立方体", "--topology", "topology=", "topology:",
+        "round_output_coverage", "out_nonzero_coverage", "edge_axis_gap",
+        "neuron_component_id", "dynamic_coverage",
+        # 旧架构的配置字段/参数名（**允许出现在"已删除 / 旧架构"说明句中**）
+        "tau_init", "min_neuron_dist", "max_sample_tries", "W_conn_sparse",
+        "equivalent_sphere_radius", "readout_in_mask", "stage2_propagate",
+    )
+    whitelist = ("topology_stats", "get_topology_stats")
+    # 明确上下文豁免词：仅当**同一行同时出现**这些词时才视为"叙述性说明"而豁免。
+    # 口径（皋陶第 2 轮 F13）：先按禁用词命中，再看上下文豁免；豁免行**计数并打印**，
+    # 便于复核（原先"整行只要有说明词就跳过"，会连带放过同行的真实残留）。
+    context_tokens = ("已删除", "不存在", "不再提供", "已移除", "旧架构", "已随架构失效",
+                      "历史", "旧实现", "旧设计", "旧字段", "旧参数", "已被替换")
+    targets: List[str] = [
+        os.path.join(MODULE_DIR, name)
+        for name in (
+            "__init__.py", "config.py", "model.py", "train.py", "utils.py",
+            "data.py", "README.md",
+        )
+    ]
+    targets.append(os.path.join(PROJECT_ROOT, ".module_agent", "n3d_sphere", "current_spec.md"))
+    targets.append(
+        os.path.join(PROJECT_ROOT, ".module_agent", "n3d_sphere", "module_definition.json")
+    )
+    total_hits = 0
+    total_exempt = 0
+    for path in targets:
+        rel = os.path.relpath(path, PROJECT_ROOT)
+        if not os.path.isfile(path):
+            print(f"  [SKIP] 文件不存在：{rel}")
+            continue
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        hits: List[str] = []
+        exempt: List[str] = []
+        for lineno, line in enumerate(lines, start=1):
+            stripped = line
+            for token in whitelist:
+                stripped = stripped.replace(token, "")
+            matched = [b for b in banned if b in stripped]
+            if not matched:
+                continue
+            if any(tok in stripped for tok in context_tokens):
+                exempt.append(f"L{lineno}:{','.join(matched)}")
+                continue
+            hits.append(f"L{lineno}:{','.join(matched)}")
+        item = not hits
+        ok &= item
+        total_hits += len(hits)
+        total_exempt += len(exempt)
+        shown = hits[:6]
+        print(
+            f"  {rel:<52} 命中（应为空）={shown}{'...' if len(hits) > 6 else ''}"
+            + (f"；上下文豁免 {len(exempt)} 行" if exempt else "")
+        )
+        if exempt:
+            print(f"      豁免明细（叙述性说明，已确认非残留）：{exempt[:4]}"
+                  f"{'...' if len(exempt) > 4 else ''}")
+    print(f"  [C6] 汇总：真实命中 {total_hits} 行、上下文豁免 {total_exempt} 行")
+    print(f"[C6] {'PASS' if ok else 'FAIL'}")
+    print("=" * 78)
+    return ok
+
+
+def main() -> int:
+    """执行全部配置契约检查并返回退出码（0 = 全部 PASS）。"""
+    ok = check_radius_formula()
+    ok &= check_radius_window()
+    ok &= check_config_fields()
+    ok &= check_no_cube()
+    print(f"总体结论：{'全部 PASS' if ok else '存在 FAIL'}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

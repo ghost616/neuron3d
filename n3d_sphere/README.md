@@ -27,6 +27,59 @@ R_max = (H + D) · (N / φ)^(1/3)
 * `R_max`：保证每个神经元的 `D` 邻域仍完整落在球空间内的上界（神经元最远距球心 `R`，
   其突触云再外扩 `H`，连接判据再看 `D`）。
 
+### 1.2 `D <= H` 硬约束（连接半径不得超过接收/发送范围半径）
+
+**约束**：连接半径 `D` 不得超过**接收/发送范围半径** `H`。
+
+几何含义：连接判据是"起点神经元的输出突触 `o` 与终点神经元的输入突触 `j` 的距离
+`<= D`"，而 `o` / `j` 各自落在**所属神经元的 `H` 半径球**内（且分别在流向轴正/负半球）。
+`D > H` 意味着**连接半径超过突触云自身的尺度**，连接不再受"接收/发送范围"约束，属越界
+配置 —— 故 `Config.__post_init__` 直接抛 `ValueError`（G1），不留给下游去发现。
+
+* 落地口径：**硬校验 + 三个预设一律取 `D = H`**（G2）——
+  `SMALL` `H=0.15/D=0.15`、`DEFAULT` `H=0.10/D=0.10`、`HIGHACC` `H=0.10/D=0.10`；
+  数据类字段默认值亦为 `D = H = 0.1`。
+* CLI `--d` 的帮助文本已注明 `D <= H`；判据与负例取证见
+  `_verify/verify_dh_constraint.py` 的 **H1-H4**（`D=0.15>H=0.10`、`D=0.25>H=0.15`
+  均必须报错；`D == H` 与 `D < H` 正常构造）。
+* **连带影响**：`R_max = (H+D)·(N/φ)^(1/3)` 在 `D = H` 时降为改造前的一半
+  （DEFAULT：`1.754601 → 1.403681`；SMALL：`1.768527 → 1.326395`）。FCC 放置半径
+  （`0.721110` / `0.670820`）仍远小于新的 `R_max`，故 C3 的容纳性断言依旧成立。
+
+### 1.3 连通性下限校验（防止 `D <= H` 下取过小的 `D` 造成图退化）
+
+`D` 变小会显著减少连接：实测（N=256/y=8×8/H=0.10/seed=42/any-any，`verify_dh_constraint.py`
+的 H4 现跑）——
+
+| H | D | E | E/N | 层数 K | \|S_in\| | \|S_out\| | 结论 |
+|---|---|---|---|---|---|---|---|
+| 0.10 | **0.10**（本轮预设口径） | **736** | **2.8750** | 9 | 193 | 187 | 通过下限校验 |
+| 0.10 | 0.05 | 146 | 0.5703 | 9 | 256 | 256 | **被下限校验拦下** |
+| 0.10 | 0.03 | 17 | 0.0664 | 9 | 256 | 256 | **被下限校验拦下** |
+| 0.10 | 0.02 | 1 | 0.0039 | 9 | 256 | 256 | **被下限校验拦下** |
+
+因此 `ThreeDNeuronSpace.__init__` 在构图完成后执行**连通性下限校验（G3）**，
+任一不满足即抛 `ValueError`（消息含实测的 `E / N / (E÷N) / 层数K / |S_in| / |S_out| / H / D`）：
+
+* `E >= N`（平均出度 `E/N >= 1`）；
+* 层数 `K >= 2`（阶段 2 至少要有跨层传播）；
+* `|S_in| >= 1` 且 `|S_out| >= 1`（阶段 1 有驱动、readout 有信号）。
+
+### 1.4 `D = H` 改造前后对照（同一测点：N=256/y=8×8/seed=42/any-any）
+
+| 配置 | \|S_in\| | \|S_out\| | E | 层 K | E/N | params |
+|---|---|---|---|---|---|---|
+| 改造前 `H=0.10/D=0.15`（**违反 `D <= H`**，现已不可构造） | 50 | 45 | 903 | 9 | 3.53 | 42,919 |
+| 改造后 `H=0.10/D=0.10`（本轮预设口径） | **193** | **187** | **736** | 9 | **2.88** | **154,864** |
+| 改造前 SMALL `H=0.15/D=0.25`（**违反 `D <= H`**，现已不可构造） | 13 | 17 | 181 | 7 | 2.83 | 11,077 |
+| 改造后 SMALL `H=0.15/D=0.15`（本轮预设口径） | **55** | **53** | **106** | 7 | **1.66** | **43,930** |
+
+> “改造前”两行由 `_verify/legacy_dh_baseline.json` 固化（来源为其登记的改造前产物与 10-seed
+> 快照及其 SHA256；这些配置因 `D > H` 现已无法由 `Config` 构造，故必须留档）；
+> “改造后”两行来自 `_verify/verify_dh_constraint.py` 的 H3 现跑。
+> `|S_in|` 从 50 涨到 193 会连带把 `W_in` 从 `784×50` 撑到 `784×193`，DEFAULT 参数量因此
+> 从 42,919 涨到 **154,864（约 ×3.6）** —— 这是本约束最直接的成本。
+
 `space_radius` 默认取 `0.0`，表示**使用 `R_min`**；显式传入时必须落在 `[R_min, R_max]`
 内，越界在 `Config` 构造期直接报错（两侧越界均有断言，见
 `_verify/verify_config_contracts.py` 的 C2）。
@@ -35,11 +88,12 @@ R_max = (H + D) · (N / φ)^(1/3)
 
 | N | H | D | R_min | R_max | R_max/R_min | 期望 (H+D)/H |
 |---|---|---|---|---|---|---|
-| 256 | 0.10 | 0.15 | 0.701840 | 1.754601 | 2.500000 | 2.500000 |
-| 256 | 0.10 | 0.20 | 0.701840 | 2.105521 | 3.000000 | 3.000000 |
-| 64 | 0.15 | 0.25 | 0.663198 | 1.768527 | 2.666667 | 2.666667 |
+| 256 | 0.10 | 0.10 | 0.701840 | 1.403681 | 2.000000 | 2.000000 |
+| 256 | 0.10 | 0.05 | 0.701840 | 1.052760 | 1.500000 | 1.500000 |
+| 64 | 0.15 | 0.15 | 0.663198 | 1.326395 | 2.000000 | 2.000000 |
+| 256 | 0.06 | 0.06 | 0.421104 | 0.842208 | 2.000000 | 2.000000 |
 
-### 1.2 神经元放置 = FCC 规则堆积（确定性，与 seed 无关）
+### 1.5 神经元放置 = FCC 规则堆积（确定性，与 seed 无关）
 
 晶格常数 `a = 2√2·H`，基元 `{(0,0,0), (½,½,0), (½,0,½), (0,½,½)}`，因此**最近邻距恰为
 `a/√2 = 2H`**：相邻神经元的 `H` 半径突触云恰好**相切、不重叠**。实现取距离球心最近的
@@ -51,7 +105,7 @@ R_max = (H + D) · (N / φ)^(1/3)
 * 实测最近邻距 = `0.299999952`（N=64/H=0.15，期望 `2H = 0.3`）、`0.199999914`
   （N=256/H=0.10，期望 `0.2`），在容差 `1e-5` 内相等。
 
-### 1.3 突触采样（半球内按体积均匀）
+### 1.6 突触采样（半球内按体积均匀）
 
 每个神经元的突触在**它自己的 `H` 半径球内**按体积均匀采样：方向在单位球面上均匀
 （正态归一化），半径 `r = H · u^(1/3)`（`u ~ U(0,1)`，`u^(1/3)` 是 **u 的立方根**，
@@ -122,8 +176,9 @@ a_up[B] = ReLU( Σ_{A→B} w_{A→B} · ( a_up[A] + a_in[A] ) + b_B )
 > ① 最深层神经元的祖先**覆盖全部层**（DEFAULT：9/9 层；flow_axis=x：10/10 层）；
 > ② 把**第 1 层**某神经元的 `a_in` 提高 1.0，**最深层**的 `a_up` 必须因此改变
 > —— 若递推被截断，跨整个深度的**影响将消失**。四组配置的实测最大变化（`[R5c]` 打印
-> 的 6 位小数）：SMALL `0.004414` / DEFAULT `0.003379` / **flow_axis=x `0.007765`** /
-> `space_radius=0.9` `0.003379`（**以脚本即时输出为准**，全精度值同时登记在
+> 的 6 位小数）：SMALL `0.000079` / DEFAULT `0.000250` / **flow_axis=x `0.000262`** /
+> `space_radius=0.9` `0.000250`（`D = H` 后路径变少，故该量比改造前（D>H）小 1~2 个数量级，
+> 但**仍严格 > 0**；**以脚本即时输出为准**，全精度值同时登记在
 > `_verify/doc_numbers.json` 并由 `verify_all.py` 现跑比对）。
 
 **双副本展开（关键语义）**：求和项 `(a_up[A] + a_in[A])` 表示神经元 `A` 的"上游版本输出"
@@ -136,27 +191,28 @@ a_up[B] = ReLU( Σ_{A→B} w_{A→B} · ( a_up[A] + a_in[A] ) + b_B )
 > 验证脚本 R5 用"零化 `a_in` 是否改变 `a_up`"与 `d(sum a_up)/d(a_in)` 两点直接取证。
 > 四组配置的实测值（`verify_sphere_dag.py` 的 R5，`[R5]` 即时输出，**以脚本输出为准**）：
 >
-> | 配置（N=256/y=8×8/H=0.10/D=0.15/seed=42，除注明外） | 双副本神经元 | 零化 `a_in` 后 max\|Δ`a_up`\| | 受影响的下游非 `S_in` 神经元 | `d(sum a_up)/d(a_in)` 非零 |
+> | 配置（N=256/y=8×8/H=0.10/D=0.10/seed=42，除注明外） | 双副本神经元 | 零化 `a_in` 后 max\|Δ`a_up`\| | 受影响的下游非 `S_in` 神经元 | `d(sum a_up)/d(a_in)` 非零 |
 > |---|---|---|---|---|
-> | SMALL（N=64/y=4×4/H=0.15/D=0.25） | 7 | `0.941795` | 51 | 166/192 |
-> | DEFAULT（`flow_axis=z`） | 37 | `0.866614` | 197 | 713/768 |
-> | DEFAULT + `flow_axis=x` | 41 | `0.918773` | 204 | 711/768 |
-> | DEFAULT + `space_radius=0.9` | 37 | `0.866614` | 197 | 713/768 |
+> | SMALL（N=64/y=4×4/H=0.15/D=0.15） | 44 | `1.047723` | 9 | 132/192 |
+> | DEFAULT（`flow_axis=z`） | 180 | `2.259184` | 59 | 653/768 |
+> | DEFAULT + `flow_axis=x` | 180 | `1.702276` | 61 | 643/768 |
+> | DEFAULT + `space_radius=0.9` | 180 | `2.259184` | 59 | 653/768 |
 >
-> （历史登记值 `0.85 / 169 / 722/768` 是向量化（F11）之前的旧实现输出，已在 F19 按
-> 同一脚本的一次真实运行整体刷新；全精度值登记在 `_verify/doc_numbers.json`。）
+> （历史登记值 `0.85 / 169 / 722/768`（F11 向量化前）与 `0.941795 / 51 / 166` 等
+> （`D > H` 旧预设）均已被本轮 `D = H` 改造后的实测整体替换；全精度值登记在
+> `_verify/doc_numbers.json`，由 `verify_all.py` 现跑比对。）
 
 > **逐边数值正确性（R5b，M1 的回归判据）**：脚本**独立重建**阶段 2（按拓扑序逐节点、
 > 用原始边表精确递推），与生产实现对比。四组配置的实测最大偏差
 > （`[R5b]` 即时输出，**以脚本输出为准**）：
-> SMALL `2.980e-08`（E=181）/ DEFAULT `5.960e-08`（E=903）/
-> **flow_axis=x `2.384e-07`**（E=913）/ `space_radius=0.9` `5.960e-08`（E=903），
+> SMALL `5.960e-08`（E=106）/ DEFAULT `2.384e-07`（E=736）/
+> **flow_axis=x `5.960e-08`**（E=730）/ `space_radius=0.9` `2.384e-07`（E=736），
 > 全部远小于判据阈值 `1e-5`。
 > 同项还带**敏感性反例**：按历史 M1 形态（边已按 `edge_perm` 重排、源激活却按
 > `repeat_interleave` 槽位取样）构造的错误映射，实测错配边数
-> SMALL `180/181` / DEFAULT `892/903` / flow_axis=x `902/913`，且错配导致的结果差异为
-> `7.411e-01` / `7.512e-01` / `1.389` —— 证明该判据对这类缺陷**确实敏感**
-> （若反例退化，判据形同虚设；这正是皋陶第 2 轮 F13 的要求）。
+> SMALL `106/106` / DEFAULT `727/736` / flow_axis=x `716/730`，且错配导致的结果差异为
+> `8.437e-01` / `1.655e+00` / `1.703e+00` / `1.655e+00` —— 证明该判据对这类缺陷
+> **确实敏感**（若反例退化，判据形同虚设；这正是皋陶第 2 轮 F13 的要求）。
 
 > **实现形态与设备契约（F16）**：阶段 2 采用**整层向量化**——`__init__` 预计算并
 > `register_buffer` 两张 `[K, 2]` 的 int64 下标表 `level_edge_reach`（每层在入边表中的
@@ -191,8 +247,9 @@ logits = h @ W_out.T  (+ b)
 
 非 `S_out` 神经元被读出头整体屏蔽 —— 其 `W_out` 列不参与计算图、梯度恒为 0（该口径的
 直接推论，冒烟判据据此区分"参数是否拿到梯度"与"是否参与 loss"）。`readout_scope` 由此
-**真正生效**：两取值给出不同的 `S_out`，实测同一输入下 logits 最大差异 0.119461
-（`verify_sphere_dag.py` 的 R7b），四种 scope 组合的冒烟 `loss` 互不相同（见第 6 节）。
+**真正生效**：两取值给出不同的 `S_out`（DEFAULT 规模 seed=42：`any`=187 / `all`=14），
+实测同一输入下 logits 最大差异 `0.858180`（`verify_sphere_dag.py` 的 R7b），四种 scope
+组合的冒烟 `loss` 互不相同（见第 6 节）。
 
 ### 3.4 参数集合
 
@@ -273,6 +330,7 @@ CLI 一览（几何相关部分）：
 | --- | --- | --- |
 | `--flow-axis` | `x` / `y` / `z` | 全局流向轴：输入突触取负半球、输出突触取正半球 |
 | `--space-radius` | 浮点 | 球空间半径；缺省/`0` = `R_min`；显式值须落在 `[R_min, R_max]`。**仅作半径窗口校验与元数据**，不改变神经元放置与拓扑（实际 `placement_radius` 允许略超 `R_min`，因为 FCC 格点是离散的） |
+| `--d` | 浮点 | 连接距离阈值 `D`；缺省取预设值（本轮三预设均为 `D = H`）。**硬约束 `D <= H`**，`D > H` 在构造配置时直接报错；`D` 过小（`E < N`）会触发连通性下限校验（见第 1.2 / 1.3 节） |
 | `--input-scope` | `any_isolated` / `all_isolated` | 输入层驱动判据 |
 | `--readout-scope` | `any_isolated` / `all_isolated` | 读出判据（严格口径，见 3.3 节） |
 | `--placement` | `fcc` | 神经元放置方式（当前唯一取值） |
@@ -313,15 +371,16 @@ CLI 一览（几何相关部分）：
 
 ### 6.1 四种 scope 组合的实测（每行都有独立可 `torch.load` 复核的产物）
 
-`SMALL_CONFIG`（N=64 / y=4×4 / H=0.15 / D=0.25 / batch=32 / seed=42），产物位于
-`checkpoints/n3d_sphere/_verify/`，汇总记录见同目录 `smoke_scope_matrix.json`：
+`SMALL_CONFIG`（N=64 / y=4×4 / **H=0.15 / D=0.15** / batch=32 / seed=42），产物位于
+`checkpoints/n3d_sphere/_verify/`，汇总记录见同目录 `smoke_scope_matrix.json`
+（由 `run_smoke_matrix.py` 从矩阵的四条 scope 记录重建）：
 
 | `input_scope` | `readout_scope` | `S_in` | `S_out` | loss（原始值） | 产物文件 | 退出码 |
 |---|---|---|---|---|---|---|
-| `any_isolated` | `any_isolated` | 13 | 17 | `2.326995849609375` | `smoke.pt` | 0 |
-| `any_isolated` | `all_isolated` | 13 | 7 | `2.299027681350708` | `smoke_N64_y4x4_H0.15_D0.25_plfcc_axz_isany_rsall_bs32_s42.pt` | 0 |
-| `all_isolated` | `any_isolated` | 6 | 17 | `2.2900023460388184` | `smoke_N64_y4x4_H0.15_D0.25_plfcc_axz_isall_rsany_bs32_s42.pt` | 0 |
-| `all_isolated` | `all_isolated` | 6 | 7 | `2.283543109893799` | `smoke_N64_y4x4_H0.15_D0.25_plfcc_axz_isall_rsall_bs32_s42.pt` | 0 |
+| `any_isolated` | `any_isolated` | 55 | 53 | `2.1496479511260986` | `smoke.pt` | 0 |
+| `any_isolated` | `all_isolated` | 55 | 16 | `2.236379623413086` | `smoke_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsall_bs32_s42.pt` | 0 |
+| `all_isolated` | `any_isolated` | 11 | 53 | `2.2899417877197266` | `smoke_N64_y4x4_H0.15_D0.15_plfcc_axz_isall_rsany_bs32_s42.pt` | 0 |
+| `all_isolated` | `all_isolated` | 11 | 16 | `2.337554454803467` | `smoke_N64_y4x4_H0.15_D0.15_plfcc_axz_isall_rsall_bs32_s42.pt` | 0 |
 
 四种组合均 **15/15 PASS、退出码 0**，且 **loss 互不相同** —— 这直接证明
 `input_scope` 与 `readout_scope` 两个开关都真正生效（`S_out` 不同 → 严格 readout 下
@@ -339,84 +398,87 @@ CLI 一览（几何相关部分）：
 
 ```
 python n3d_sphere/train.py --smoke-test          -> 退出码 0，15/15 PASS
-loss = 2.326995849609375（可 torch.load 复核 checkpoints/n3d_sphere/_verify/smoke.pt）
-单 batch 前向+反向耗时 = 5.62s（随机器负载波动，不作契约）；可学习参数 = 11077
+loss = 2.1496479511260986（可 torch.load 复核 checkpoints/n3d_sphere/_verify/smoke.pt）
+单 batch 前向+反向耗时 = 3.41s（随机器负载波动，不作契约）；可学习参数 = 43930
 四个可学习参数的梯度范数（L2，**全精度、与产物逐位相等**）：
-  W_in         0.30047276616096497
-  edge_weight  0.06744416803121567
-  neuron_bias  0.16902117431163788
-  W_out        0.12903930246829987
-E=181，平均出度 2.8281，最大出度 5，层数 7，S_in=13，S_out=17，双副本神经元 7
-最近邻距 0.299999952（= 2H），R=0.663198 ∈ [R_min=0.663198, R_max=1.768527]
+  W_in         1.5796021223068237
+  edge_weight  0.2537662386894226
+  neuron_bias  0.18929001688957214
+  W_out        0.49458175897598267
+E=106，平均出度 1.6562，最大出度 4，层数 7，S_in=55，S_out=53，双副本神经元 44
+最近邻距 0.299999952（= 2H），R=0.663198 ∈ [R_min=0.663198, R_max=1.326395]
 config 中不含已删除字段（无迭代轮数维度）
 ```
 
 > 复核命令：`python -c "import torch; c=torch.load('checkpoints/n3d_sphere/_verify/smoke.pt',map_location='cpu',weights_only=False); print(c['loss'], c['grad_norms'])"`
 > —— 该命令对应当前代码，输出必须与上表逐位一致。
 >
-> **末位说明（F17）**：`W_in` 梯度范数的末位随实现中的**求和次序**可能微变 ——
-> F11 把阶段 2 的逐节点 `sum` 改为整层 `index_add` 后，`W_in` 梯度由旧登记的
-> `0.30047274…` 变为产物的 `0.30047276616096497`（差异在第 8 位小数之后）。
-> 因此本表**一律以产物实测值（全精度）为准**，同一 seed 内逐位可复现；该值同时登记在
+> **数值随配置口径变化的说明（D≤H 改造）**：本轮把三个预设改为 `D = H` 后，SMALL 冒烟的
+> 拓扑与 loss 全部改变（`E 181→106`、`|S_in| 13→55`、`|S_out| 17→53`、参数 `11077→43930`、
+> `loss 2.326995849609375 → 2.1496479511260986`）；表格与 `doc_numbers.json` 均按新产物
+> 整体刷新。**末位说明（F17）**：`W_in` 梯度范数的末位随实现中的**求和次序**可能微变，
+> 故本表**一律以产物实测值（全精度）为准**，同一 seed 内逐位可复现；该值同时登记在
 > `_verify/doc_numbers.json`，由 `verify_all.py` 现跑比对，任何偏移都会报 FAIL。
 >
 > 其余三种 scope 组合的梯度范数（同样来自各自产物，全精度）：
-> `any/all`：W_in `0.16436029970645905` / edge_weight `0.03765956684947014` /
-> neuron_bias `0.09283317625522614` / W_out `0.08622521907091141`；
-> `all/any`：W_in `0.09831191599369049` / edge_weight `0.04523438587784767` /
-> neuron_bias `0.18492448329925537` / W_out `0.11581374704837799`；
-> `all/all`：W_in `0.02540597878396511` / edge_weight `0.03929858282208443` /
-> neuron_bias `0.17323791980743408` / W_out `0.07216691970825195`。
+> `any/all`：W_in `1.0119041204452515` / edge_weight `0.1697416603565216` /
+> neuron_bias `0.1355101466178894` / W_out `0.39588287472724915`；
+> `all/any`：W_in `0.6916628479957581` / edge_weight `0.1618543416261673` /
+> neuron_bias `0.2808758020401001` / W_out `0.32272979617118835`；
+> `all/all`：W_in `0.2666252553462982` / edge_weight `0.0700279250741005` /
+> neuron_bias `0.17869356274604797` / W_out `0.15432971715927124`。
 >
 > `--arch mlp` 冒烟的实测：退出码 0、6/6 PASS（MLP 基线只有 6 条适用判据），产物
-> `smoke_armlp_N64_y4x4_H0.15_D0.25_plfcc_axz_isany_rsany_bs32_s42.pt`，
+> `smoke_armlp_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_bs32_s42.pt`，
 > loss = `2.2989346981048584`（`fc1.weight` `6.219344139099121` /
 > `fc1.bias` `0.20135721564292908` / `fc2.weight` `4.08964204788208` /
 > `fc2.bias` `0.18698155879974365`）。
-> 注：判据 3 按 arch 解析输出层参数名（neuron3d 为 `W_out`，MLP 为 `fc2.*`），两种架构通用。
+> 注：判据 3 按 arch 解析输出层参数名（neuron3d 为 `W_out`，MLP 为 `fc2.*`），两种架构通用；
+> MLP 基线不使用 `D`（`hidden_dim=2048` 全连接），故其 loss 与改造前逐位相同。
 
 ---
 
 ## 7. 实测拓扑统计（全部标注 seed，可由脚本复现）
 
-`DEFAULT` 规模（N=256 / y=8×8 / H=0.10 / D=0.15 / `flow_axis=z` /
+`DEFAULT` 规模（N=256 / y=8×8 / **H=0.10 / D=0.10** / `flow_axis=z` /
 `input_scope=readout_scope=any_isolated`，`space_radius` 取默认 `R_min=0.701840`）：
 
-| seed | E | 平均出度 | 最大出度 | 平均入度 | 最大入度 | 层数 | S_in | S_out | 双副本 | 孤立输入突触 | 孤立输出突触 |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 42 | 903 | 3.5273 | 5 | 3.5273 | 5 | 9 | 50 | 45 | 37 | 173 | 160 |
-| 7 | 912 | 3.5625 | 5 | 3.5625 | 5 | 9 | 48 | 47 | 35 | 162 | 158 |
-| 2024 | 924 | 3.6094 | 5 | 3.6094 | 5 | 9 | 48 | 44 | 35 | 166 | 165 |
-| 123 | 906 | 3.5391 | 5 | 3.5391 | 5 | 9 | 49 | 50 | 36 | 171 | 179 |
-| 0 | 912 | 3.5625 | 5 | 3.5625 | 5 | 9 | 43 | 46 | 30 | 163 | 163 |
-| 1 | 900 | 3.5156 | 5 | 3.5156 | 5 | 9 | 44 | 45 | 31 | 159 | 167 |
-| 2 | 915 | 3.5742 | 5 | 3.5742 | 5 | 9 | 46 | 47 | 33 | 165 | 167 |
-| 3 | 910 | 3.5547 | 6 | 3.5547 | 5 | 9 | 50 | 49 | 37 | 183 | 176 |
-| 4 | 918 | 3.5859 | 5 | 3.5859 | 5 | 9 | 40 | 47 | 27 | 150 | 179 |
-| 5 | 905 | 3.5352 | 5 | 3.5352 | 5 | 9 | 52 | 48 | 39 | 168 | 171 |
+| seed | E | 平均出度 | 最大出度 | 平均入度 | 最大入度 | 层数 | S_in | S_out | 双副本 | 孤立输入突触 | 孤立输出突触 | params |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 42 | 736 | 2.8750 | 4 | 2.8750 | 4 | 9 | 193 | 187 | 180 | 605 | 555 | 154864 |
+| 7 | 736 | 2.8750 | 4 | 2.8750 | 4 | 9 | 192 | 196 | 178 | 573 | 602 | 154080 |
+| 2024 | 740 | 2.8906 | 5 | 2.8906 | 5 | 9 | 194 | 185 | 178 | 537 | 563 | 155652 |
+| 123 | 750 | 2.9297 | 5 | 2.9297 | 5 | 9 | 192 | 191 | 177 | 580 | 542 | 154094 |
+| 0 | 738 | 2.8828 | 4 | 2.8828 | 5 | 9 | 197 | 189 | 182 | 580 | 570 | 158002 |
+| 1 | 727 | 2.8398 | 5 | 2.8398 | 5 | 9 | 205 | 190 | 192 | 602 | 586 | 164263 |
+| 2 | 738 | 2.8828 | 5 | 2.8828 | 5 | 9 | 195 | 190 | 180 | 593 | 568 | 156434 |
+| 3 | 735 | 2.8711 | 4 | 2.8711 | 5 | 9 | 195 | 192 | 179 | 602 | 597 | 156431 |
+| 4 | 729 | 2.8477 | 5 | 2.8477 | 5 | 9 | 187 | 203 | 173 | 543 | 622 | 150153 |
+| 5 | 733 | 2.8633 | 4 | 2.8633 | 4 | 9 | 182 | 197 | 167 | 562 | 576 | 146237 |
 
-* **E 的跨 seed 区间 = 900 ~ 924**（均值 ≈ 910.5），平均出度 3.5156 ~ 3.6094；
-* 最大出度在 10 个 seed 中除 seed=3（6）外均为 **5**；最大入度恒为 5；
+* **E 的跨 seed 区间 = 727 ~ 750**（均值 ≈ 736.2），平均出度 2.8398 ~ 2.9297；
+* 最大出度与最大入度在 10 个 seed 中均为 **4 或 5**（不再出现改造前的 6）；
 * 层数恒为 9（流向轴 FCC 分层）；
-* 可学习参数随 `|S_in|` 变化（**35094 ~ 44489**，取自 `_verify/topology_snapshot.json` 中
-  **默认测点 `default_any_any_z`（N=256/y=8×8/H=0.10/D=0.15/z）的 10 个 seed** 记录），
-  这是"按连接构建"的必然结果；
+* 可学习参数随 `|S_in|` 变化（**146237 ~ 164263**，取自 `_verify/topology_snapshot.json` 中
+  **默认测点 `default_any_any_z`（N=256/y=8×8/H=0.10/D=0.10/z）的 10 个 seed** 记录），
+  这是"按连接构建"的必然结果；`|S_in|` 因 `D=H` 而从改造前的 40~52 涨到 **182 ~ 205**，
+  参数量随之从 35094~44489 涨到 146237~164263（约 ×3.3~3.7）；
 * 复现脚本：`python checkpoints/n3d_sphere/_verify/verify_topology_snapshot.py`
-  （60 条记录落盘 `_verify/topology_snapshot.json`）。
+  （60 条记录落盘 `_verify/topology_snapshot.json`；全部 6 个测点均为 `D = H`）。
 
-**判据开关实测**（同 `DEFAULT` 规模，seed=42；`E` 与判据无关，恒为 903）：
+**判据开关实测**（同 `DEFAULT` 规模，seed=42；`E` 与判据无关，恒为 736）：
 
 | `input_scope` | `readout_scope` | `S_in` | `S_out` | 双副本神经元数 |
 |---|---|---|---|---|
-| `any_isolated` | `any_isolated` | 50 | 45 | 37 |
-| `any_isolated` | `all_isolated` | 50 | 13 | 37 |
-| `all_isolated` | `any_isolated` | 13 | 45 | **0** |
-| `all_isolated` | `all_isolated` | 13 | 13 | **0** |
+| `any_isolated` | `any_isolated` | 193 | 187 | 180 |
+| `any_isolated` | `all_isolated` | 193 | 14 | 180 |
+| `all_isolated` | `any_isolated` | 13 | 187 | **0** |
+| `all_isolated` | `all_isolated` | 13 | 14 | **0** |
 
 > **如实标注**：`input_scope=all_isolated` 时 `S_in` 只有 13 个神经元且其中没有神经元
 > 拥有上游连接，故"双副本展开"在该取值下**不触发**（双副本计数 = 0）。这是判据选择的
 > 自然结果，不是实现缺陷 —— 此时阶段 2 对 `a_in` 的依赖仍然存在：`d(sum a_up)/d(a_in)`
-> 在 `all/any` 下于 **480/512** 个元素上非零（`any/any` 为 **475/512**），见
+> 在 `all/any` 下于 **479/512** 个元素上非零（`any/any` 为 **439/512**），见
 > `verify_scope_and_fingerprint.py` 的 S1-S3 即时输出（该脚本退出码 0、`[S1-S3] PASS`）。
 
 ### 7.1 跨模块回归（一期未被触碰）
@@ -477,7 +539,8 @@ python n3d_proto/train.py --smoke-test   -> 9/9 PASS、退出码 0、loss = 2.41
 * **修复（根因侧）**：`train.py` 的 `apply_overrides` 在"显式覆盖值与基线**逐字段相同**"
   时**复用基线对象本身**，使"同一语义配置 ⇒ 同一字节"。修复后 `--smoke-test` / 显式传等值
   scope / `--space-radius 0.0` / `--preset default` / `--seed 0` 等路径写出的 `smoke.pt`
-  **SHA256 全部相同**（`1A9D68D8…43D7`）。
+  **SHA256 全部相同**（本轮 `D = H` 改造后为 `4E11F12F…6A71`；改造前为 `1A9D68D8…43D7`，
+  同一路径不同轮次的 SHA 不可跨轮比较）。
   **日志出现的精确范围（离朱第 12 轮 D2 澄清）**：`apply_overrides` 的短路分支会打印一行
   `显式覆盖参数与基线取值逐字段一致（值等价）：复用基线配置对象…`。因此**只有"显式给出
   覆盖参数且其值与基线相同"的形式**才会打印该行 —— 实测为 3 条：
@@ -503,15 +566,18 @@ python n3d_proto/train.py --smoke-test   -> 9/9 PASS、退出码 0、loss = 2.41
 | 脚本 | 覆盖内容 |
 | --- | --- |
 | `_verify/verify_sphere_dag.py` | R1 几何（球内/半球/体积均匀）、R2 FCC（晶格常数、最近邻距=2H、seed 无关性）、R3 DAG（无环/严格上行/拓扑序）、R4 去重（神经元对数==E、代表连接为块内最近）、R5 双副本（零化 `a_in` 改变 `a_up`、`d(a_up)/d(a_in)` 非零）、**R5b 逐边数值正确性**（独立重建阶段 2 累加，核对每条边必须读到自己起点的激活；并含"错误槽位映射"反例以证明判据敏感）、R6 判据（包含关系/独立性/互斥）、R7 产物可 `torch.load` |
+| `_verify/verify_dh_constraint.py` | **H1-H4 `D <= H` 硬约束与连通性下限（G1/G3 回归取证与负例）**：H1 `Config(D > H)` 必须抛 `ValueError`（含 `H=0.15/D=0.25`、`H=0.10/D=0.15` 两条负例，另含 `D == H` / `D < H` 的边界正例）；H2 三预设满足 `D = H` 且 `describe()` / `to_dict()` 往返一致；H3 三预设通过连通性下限并报出 `E / N / E÷N / 层数K / |S_in| / |S_out| / H / D`，D 过小必须被拦下；H4 用"临时停用下限校验"取出被拒配置的**真实拓扑量**（H=0.10 下 D=0.05/0.03/0.02 → E=146/17/1）证明拦下的确是退化图 |
 | `_verify/verify_scope_and_fingerprint.py` | S1-S3 判据语义与双副本随 scope 的行为、S4-S5 产物指纹维度与冒烟命名规则 |
 | `_verify/verify_config_contracts.py` | C1 半径公式、C2-C3 窗口校验与 FCC 容纳性、C4-C5 字段清理与取值域、C6 零残留断言 |
-| `_verify/verify_topology_snapshot.py` | 固定实验点 × 10 seed 的拓扑量快照（落盘 JSON，供报告引用时标注 seed） |
+| `_verify/verify_topology_snapshot.py` | 固定实验点 × 10 seed 的拓扑量快照（落盘 JSON，供报告引用时标注 seed；6 个测点均为 `D = H`） |
 | `_verify/verify_device_regression.py` | **D1-D7 设备契约（F16 回归取证）**：层拓扑量的类型/注册状态、`vars(model)` 通用扫描（不得存在搬不动的张量容器）、层切分等价性、`.to('meta')` 搬运实验 + 普通 Python list 搬不动的机制复现、两条守卫负例（必须抛 RuntimeError）、CUDA 实测（无 GPU 时自动 skip 并标注"静态取证"）、`state_dict` 往返逐位一致 |
-| `_verify/run_smoke_matrix.py` | 以当前代码重跑 **11 种冒烟配置组合**，从日志解析**实际落盘路径**并与独立预测的产物名比对、回读 config 与期望逐字段比对、断言 `smoke.pt` 未被非默认组合污染；刷新 `smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` |
+| `_verify/run_smoke_matrix.py` | 以当前代码重跑 **11 种冒烟配置组合**，从日志解析**实际落盘路径**并与独立预测的产物名比对、回读 config 与期望逐字段比对、断言 `smoke.pt` 未被非默认组合污染且**同一路径多次写入逐位一致**；刷新 `smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt`，并由四条 scope 记录重建 `smoke_scope_matrix.json` |
 | `_verify/verify_all.py` | 一键依次执行上面全部命令（含一期回归）与**文档数字防线**（`doc_numbers.json` 现跑比对），汇总退出码 |
-| `_verify/doc_numbers.json` | **文档数字登记表**：README / spec 中出现的实测值（本轮 93 项 = 32 产物字段 + 54 全精度指标 + 7 文本计数），由 `verify_all.py` 现跑比对 |
+| `_verify/doc_numbers.json` | **文档数字登记表**：README / spec 中出现的实测值（本轮 **174 项** = 49 产物字段 + 111 全精度指标 + 14 文本计数），由 `verify_all.py` 现跑比对 |
+| `_verify/legacy_dh_baseline.json` | **`D = H` 改造前的历史基线**（`D > H`，现已不可由 `Config` 构造）：登记改造前 `default_any_any_z` / `small_any_any_z` 的 E / 层数 / `S_in` / `S_out` / params，以及来源产物与快照的路径与 SHA256 |
 | `_verify/sphere_dag_metrics.json` | `verify_sphere_dag.py` 每次运行落盘的**全精度**指标（R1-R7b，111 条），供 `doc_numbers.json` 现跑比对取用 |
-| `_verify/smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` | 11 种冒烟组合的取证记录（产物名 / 退出码 / PASS / FAIL / loss / 梯度范数 / config 核对 / SHA256）与完整日志 |
+| `_verify/smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` | 11 种冒烟组合的取证记录（产物名 / 退出码 / PASS / FAIL / loss / 梯度范数 / config 核对 / SHA256 一致性字段）与完整日志 |
+| `_verify/log_verify_all_f21.txt` / `log_verify_all_g5.txt` / `log_verify_all_h3.txt` | 三轮（F21 / G5 / H3）`verify_all.py` 的完整验收输出：10 条命令的退出码与判据计数、文档数字防线结果与总结句 |
 
 一键复现（也可直接 `verify_all.py` 一次跑完）：
 
@@ -520,6 +586,7 @@ python checkpoints/n3d_sphere/_verify/verify_all.py                             
 python -m compileall -q n3d_sphere                                              # 退出码 0
 python n3d_sphere/train.py --smoke-test                                          # 退出码 0，15/15 PASS
 python checkpoints/n3d_sphere/_verify/verify_sphere_dag.py all                   # 退出码 0（R1-R7b）
+python checkpoints/n3d_sphere/_verify/verify_dh_constraint.py                    # 退出码 0（H1-H4，D<=H 与连通性下限）
 python checkpoints/n3d_sphere/_verify/verify_device_regression.py                # 退出码 0（D1-D7，D6 无 GPU 时 skip）
 python checkpoints/n3d_sphere/_verify/verify_scope_and_fingerprint.py            # 退出码 0
 python checkpoints/n3d_sphere/_verify/verify_config_contracts.py                 # 退出码 0
@@ -555,6 +622,10 @@ python n3d_proto/train.py --smoke-test                                          
    真正的额外 seed 覆盖由 `--seed 7` / `--seed 2024` 承担（见 `smoke_matrix_f9.json`）。
 
 ### 10.1 第一/二轮修复的缺陷
+
+> **阅读提示**：§10.1 / §10.2 的表格是**历史记录** —— 其中的数字是**该轮当时的实测值**，
+> 后续轮次（尤其本轮的 `D = H` 改造）已把它们整体刷新，故不应与第 1～9 节的当前值混用；
+> 当前值一律以第 1～9 节（及 `_verify/doc_numbers.json` 登记的现跑值）为准。
 
 皋陶第一/二轮审查（1 error + 5 warning + info；2 error + 2 warning + 5 info）与离朱
 独立测试（3 项失败）共同暴露的缺陷：
@@ -598,3 +669,42 @@ python n3d_proto/train.py --smoke-test                                          
 > pickle memo（对象身份）影响。因此（a）产物的 SHA256 只有在同语义同代码路径下才是等价
 > 判据，（b）凡是"证据文件里登记了某个文件的 SHA"的地方，都必须断言该 SHA 在同一轮运行
 > 结束后**仍然存在于盘上**（本轮已把这条写成 `run_smoke_matrix.py` 的可执行判据）。
+
+### 10.3 本轮变更：`D <= H` 约束 + 预设 `D = H` + 连通性下限（G1~G5）
+
+| 编号 | 变更 | 落地内容 |
+|---|---|---|
+| **G1** | `D <= H` **硬校验** | `n3d_sphere/config.py::Config.__post_init__` 在 `D > H` 时抛 `ValueError`，消息含当前 `H`、`D`、`D/H` 与"**连接半径 D 不得超过接收/发送范围半径 H**"的说明；CLI `--d` 的帮助文本同步注明该硬约束与连通性下限。**负例取证**：`Config(H=0.10, D=0.15)` 与 `Config(H=0.15, D=0.25)` 均报错（`verify_dh_constraint.py` 的 H1 逐条打印异常消息） |
+| **G2** | 三预设改为 **`D = H`** | `DEFAULT_CONFIG` D `0.15 → 0.10`、`HIGHACC_CONFIG` D `0.15 → 0.10`、`SMALL_CONFIG` D `0.25 → 0.15`；`Config` 数据类字段默认值 `D = H = 0.1`。三预设均能构造，`describe()` 含 H/D，`Config(**cfg.to_dict()) == cfg` 往返一致（H2 取证）。连带 `R_max` 降为改造前的一半（DEFAULT `1.403681`、SMALL `1.326395`），FCC 放置半径仍远小于它，C3 容纳性断言照旧成立 |
+| **G3** | **连通性下限校验** | `ThreeDNeuronSpace.__init__` 构图完成后调用新增的 `check_connectivity_floor()`：要求 `E >= N`、层数 `K >= 2`、`|S_in| >= 1`、`|S_out| >= 1`，任一不满足即抛 `ValueError`（消息含实测 `E / N / (E÷N) / 层数K / |S_in| / |S_out| / H / D` 与具体违反项），并把通过时的指标挂在 `model.connectivity_floor` 供日志/脚本引用。**负例取证**：`Config(H=0.10, D=0.05)` 被拦下（实测 `E=146 < N=256`，`E/N=0.5703`），**不是**静默生成退化模型 |
+| **G4** | 全量重跑刷新数字与取证 | 重跑冒烟矩阵（11 组合）、`verify_sphere_dag.py`（R1-R7b，4 组配置）、`verify_topology_snapshot.py`（6 测点 × 10 seed）、`verify_scope_and_fingerprint.py`、`verify_config_contracts.py`、`verify_device_regression.py`、`verify_all.py`；刷新 `smoke_scope_matrix.json` / `smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` / `sphere_dag_metrics.json` / `topology_snapshot.json` / `doc_numbers.json`（174 项）；README / `current_spec.md` / `module_definition.json` 中全部受影响的 E、`|S_in|`/`|S_out|`、层数、**参数区间（35094~44489 → 146237~164263）**、R5/R5b/R5c、冒烟 loss 与四个梯度范数、10-seed 拓扑表、产物命名示例按新实测整体刷新；改造前（`D > H`）的基线固化在 `legacy_dh_baseline.json` 并在第 1.4 节给出对照 |
+| **G5** | 验收 | `python checkpoints/n3d_sphere/_verify/verify_all.py` 全绿（**10 条命令**全部退出码 0、无 FAIL），`doc_numbers.json` 现跑比对全部一致（174/174）；三预设均通过 `D <= H` 与连通性下限；两条负例（`D > H`、`D = 0.05` 过小）均按预期报错并有取证；CPU 冒烟 15/15 PASS，四种 scope 组合均通过且 loss 互异；一期 `n3d_proto` 零改动 |
+| **G6**（离朱第 13 轮先行捕获） | **元数据更新破坏了 C6 零残留扫描**：C6 的扫描目标包含 `.module_agent/n3d_sphere/module_definition.json` **它自己**，而我在最后一次 `update_definition` 中把旧架构字段名（`tau_init` / `min_neuron_dist` / `max_sample_tries`）逐字写进了 `verify_config_contracts.py` 的**文件描述**，且**在该次元数据更新之后没有再跑 `verify_all`** → `[C6] 真实命中 1 行`、`[C6] FAIL`（离朱第 13 轮的先行探针 `r13_c6.txt` 捕获，我随后复现确认） | 低（流程/元数据） | ① 重写该文件描述，改为"以脚本内的 `REMOVED_FIELDS` 清单为准"而**不逐字列举被禁词**，使"扫描目标"与"扫描词表"互不污染；② 复跑 `verify_config_contracts.py` → `真实命中 0 行、上下文豁免 4 行`、`[C6] PASS`；③ **流程加固**：`update_definition` 会改动 C6 的扫描对象，故**元数据更新必须排在最终 `verify_all` 之前**（本轮已按此顺序重跑验证并留证据） |
+
+### 10.4 收尾修复（皋陶第 4 轮遗留的 2 个小项，H1~H4）
+
+| 编号 | 问题 | 严重度 | 修复 |
+|---|---|---|---|
+| **H1** | `n3d_sphere/config.py` 模块 docstring 的"参考值"仍写 `N=256, H=0.10, D=0.15 → R_min=0.701840, R_max=1.754601` —— 这是**已被本模块 `D <= H` 硬校验拒绝的非法组合**，且该 `R_max` 已不对应任何预设；"关键不变量"清单也只写了 `H > 0` / `D > 0`，缺 `D <= H` | warning（文档） | ① 参考值改为**合法组合** `N=256, H=0.10, D=0.10`（DEFAULT/HIGHACC 口径）→ `R_min = 0.701840`、`R_max = 1.403681`（`R_max/R_min = 2.0 = (H+D)/H`），并补一行 SMALL 口径 `N=64, H=0.15, D=0.15 → 0.663198 / 1.326395` 作对照；② "关键不变量"补入 **`D <= H`** 与连通性下限（`E >= N`、层数 `K >= 2`、`|S_in| >= 1`、`|S_out| >= 1`，由 `check_connectivity_floor()` 把关）；③ 新增一段"连接半径硬约束 `D <= H`"说明（含几何理由与负例脚本指向）；④ 全文复查后确认除三个预设的合法取值外，已无其它 `D=0.15` / `D=0.25` 非法示例值 |
+| **H2** | `module_definition.json` 未登记本轮 G5 的验收证据日志 `checkpoints/n3d_sphere/_verify/log_verify_all_g5.txt`（上一轮同类文件 `log_verify_all_f21.txt` 已登记） | info | 补登记 `log_verify_all_g5.txt`，并同时登记 H3 的验收证据日志 `log_verify_all_h3.txt`；README §9 与 `current_spec.md` 的取证文件清单同步列出三轮验收日志（F21 / G5 / H3） |
+| **H3** | 因 H2 改动了**被 C6 扫描的元数据**，必须按"先改元数据、后跑验收"的顺序重跑 | —— | `verify_all.py` 退出码 0：10 条命令全部退出码 0、无 FAIL，`doc_numbers` 一致 174 / 不一致 0 / 跳过 0，C6 真实命中 0 行（证据 `_verify/log_verify_all_h3.txt`）；一期回归：`git status --porcelain -- n3d_proto` 为空、proto 9/9 PASS、`loss=2.419689`、三件产物 SHA256 未变 |
+| **H4** | 收尾 | —— | 写入执行总结并 `plan_complete`（**不**自行启动离朱，由风后统一启动） |
+| **H5**（本轮自查发现） | 上一轮 G6 修复时我用 `update_spec(mode="add")` 追加"验证脚本清单"，导致 `current_spec.md` 中该 `###` 子标题**重复出现两次**（同一 heading 两个副本） | 低（文档结构） | 改为 `mode="set"` 重写整节，合并两份清单为一节；复核标题总数 25、**无重复 heading** |
+
+> **第六类教训（来自 H1/H5）**：**"改一处语义，必须回头扫一遍同一语义的所有载体"**。
+> `D <= H` 落到 `Config` 与 README 之后，`config.py` 的模块 docstring 仍是旧世界的描述；
+> 而 `update_spec(mode="add")` 会**无脑追加**而不是替换，容易制造重复 heading。
+> 可执行结论：**结构性改动后必须跑一次"载体一致性扫描"**（本项目已把它固化为
+> C6（禁用词）、`doc_numbers.json`（现跑数字）、以及"标题唯一性"三项检查）。
+
+> **本轮教训（第四类）**：**"几何约束必须在构造期闭环，而不是靠下游发现"**。
+> `D > H` 此前在三个预设里长期存在却无人校验；更隐蔽的是"`D` 合法但过小"——
+> `D = 0.05` 时 `E/N` 只有 `0.57`，模型仍能构造、能训练，只是**图已经退化**。
+> 因此本轮把约束拆成两道：`Config` 期校验 `D <= H`（G1），`ThreeDNeuronSpace` 期校验
+> 图连通性下限（G3），并为两者各写可执行负例（H1/H3/H4）。
+>
+> **本轮教训（第五类，来自 G6）**：**"当判据扫描的元数据本身可被判据之外的流程改写时，
+> 写入顺序就是一种不变量"**。C6 会扫描 `module_definition.json`，而 `update_definition`
+> 会改写该文件 —— 因此"先跑验收、再改元数据"必然留下**未被验证的状态**。
+> 可执行结论：**任何元数据 / 文档更新之后，必须以一次完整的 `verify_all`（含 C6）收尾**，
+> 不得复用更新前的结论。

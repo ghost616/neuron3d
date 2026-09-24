@@ -17,16 +17,7 @@
 * `space_radius` 默认取 `R_min`；用户显式传入时必须落在 `[R_min, R_max]` 内，
   越界在构造期报错。
 
-**连接半径硬约束 `D <= H`**：连接判据是"起点神经元的输出突触 `o` 与终点神经元的输入
-突触 `j` 的距离 `<= D`"，而 `o` / `j` 各自落在所属神经元的 `H` 半径球内，故 `D` 不得
-超过接收/发送范围半径 `H`。本模块三个预设一律取 `D = H`；`D > H` 在构造期直接报错
-（见 `Config.__post_init__` 的硬校验与 `checkpoints/n3d_sphere/_verify/verify_dh_constraint.py`
-的 H1 负例）。此外图还有**连通性下限**（`E >= N`、层数 `K >= 2`、`|S_in| >= 1`、
-`|S_out| >= 1`），由 `ThreeDNeuronSpace.__init__` 的 `check_connectivity_floor()` 把关。
-
-参考值（合法组合 `N=256, H=0.10, D=0.10`，即 DEFAULT/HIGHACC 预设口径）：
-`R_min = 0.701840`、`R_max = 1.403681`（`R_max/R_min = 2.0 = (H+D)/H`）。
-对照：SMALL 预设口径 `N=64, H=0.15, D=0.15` → `R_min = 0.663198`、`R_max = 1.326395`。
+参考值（N=256, H=0.10, D=0.15）：`R_min = 0.701840`、`R_max = 1.754601`。
 
 神经元放置
 ----------
@@ -38,12 +29,9 @@
 ----------
 * `N > 0`、`y_in > 0`、`y_out > 0`；
 * `H > 0`、`D > 0`；
-* **`D <= H`**（连接半径不得超过接收/发送范围半径；本模块三个预设取 `D = H`）；
 * `flow_axis ∈ {"x", "y", "z"}`；
 * `input_scope ∈ {"any_isolated", "all_isolated"}`、`readout_scope` 同理；
-* `space_radius == 0.0`（默认，表示取 R_min）或 `space_radius ∈ [R_min, R_max]`；
-* 可学习参数的**连通性下限**（`E >= N`、层数 `K >= 2`、`|S_in| >= 1`、`|S_out| >= 1`）
-  在 `ThreeDNeuronSpace.__init__` 中校验，不满足即抛异常。
+* `space_radius == 0.0`（默认，表示取 R_min）或 `space_radius ∈ [R_min, R_max]`。
 """
 
 from __future__ import annotations
@@ -164,9 +152,7 @@ class Config:
         （`u ~ U(0,1)`，`u^(1/3)` 为 **u 的立方根**，保证半球内**按体积均匀**，
         而非半径线性采样）。默认 0.1。
     D : float
-        连接距离阈值：输出突触与输入突触距离 `<= D` 才可能建立连接。
-        **硬约束 `D <= H`**（连接半径不得超过接收/发送范围半径），
-        违反时 `__post_init__` 抛 `ValueError`。默认 0.1（= `H`）。
+        连接距离阈值：输出突触与输入突触距离 `<= D` 才可能建立连接。默认 0.15。
     flow_axis : str
         全局流向轴 `x` / `y` / `z`（默认 `z`）。输入突触取负半球（−axis）、
         输出突触取正半球（+axis），合法连接要求起点神经元的流向轴坐标低于终点。
@@ -234,7 +220,7 @@ class Config:
 
     # ---- 球体几何 ----
     H: float = 0.1
-    D: float = 0.1  # 硬约束 D <= H（见 __post_init__）；默认取 D = H
+    D: float = 0.15
     flow_axis: str = "z"
     space_radius: float = 0.0
     placement: str = "fcc"
@@ -288,18 +274,6 @@ class Config:
             raise ValueError(f"Config.H 必须 > 0，当前 H={self.H}")
         if not (self.D > 0.0):
             raise ValueError(f"Config.D 必须 > 0，当前 D={self.D}")
-        # ---- 连接半径硬约束：D <= H（G1）----
-        # 几何含义：连接判据是"起点神经元的输出突触 o 与终点神经元的输入突触 j 的距离
-        # <= D"，而 o / j 各自落在所属神经元的 H 半径球内（且分别在流向轴正 / 负半球）。
-        # `D > H` 表示**连接半径超过接收/发送范围半径** —— 此时连接不再受"突触云尺度"
-        # 约束，等于把阈值放到比神经元本身还大，属越界配置，故在构造期直接拒绝，
-        # 而不是留给下游生成拓扑才发现。
-        if float(self.D) > float(self.H):
-            raise ValueError(
-                f"Config.D 不得超过 Config.H：连接半径 D 不得超过接收/发送范围半径 H，"
-                f"当前 H={self.H}, D={self.D}（D/H={float(self.D) / float(self.H):.3f}）。"
-                f"请令 D <= H（本模块三个预设 DEFAULT/HIGHACC/SMALL 均取 D = H）。"
-            )
         if self.batch_size <= 0:
             raise ValueError(
                 f"Config.batch_size 必须为正整数，当前 batch_size={self.batch_size}"
@@ -476,13 +450,12 @@ class Config:
 # ----------------------------------------------------------------------
 # SMALL_CONFIG：阶段 A 冒烟测试专用，规模小、CPU 友好
 #   N=64, y_in=4, y_out=4, batch_size=32
-#   D = H = 0.15（硬约束 D <= H，见 Config.__post_init__）
 SMALL_CONFIG = Config(
     N=64,
     y_in=4,
     y_out=4,
     H=0.15,
-    D=0.15,
+    D=0.25,
     input_dim=784,
     output_dim=10,
     batch_size=32,
@@ -494,14 +467,13 @@ SMALL_CONFIG = Config(
 
 # DEFAULT_CONFIG：正式训练默认配置
 #   N=256, y_in=8, y_out=8, batch_size=64
-#   D = H = 0.10（硬约束 D <= H）
 #   space_radius 取默认 0.0 -> R_min = 0.701840（N=256, H=0.10, φ=0.7405）
 DEFAULT_CONFIG = Config(
     N=256,
     y_in=8,
     y_out=8,
     H=0.1,
-    D=0.1,
+    D=0.15,
     input_dim=784,
     output_dim=10,
     batch_size=64,
@@ -514,13 +486,12 @@ DEFAULT_CONFIG = Config(
 # HIGHACC_CONFIG：高精度冲刺配置
 #   相比 DEFAULT_CONFIG 的变化：batch 64->128、lr 1e-3->2e-3、epochs 10->20，
 #   并启用 AdamW(weight_decay=1e-4)、输出层 bias、cosine 学习率调度、梯度裁剪 1.0。
-#   D = H = 0.10（硬约束 D <= H）
 HIGHACC_CONFIG = Config(
     N=256,
     y_in=8,
     y_out=8,
     H=0.1,
-    D=0.1,
+    D=0.15,
     input_dim=784,
     output_dim=10,
     batch_size=128,

@@ -1,31 +1,15 @@
 [
   {
-    "plan_id": "plan_8a0ca807-2247-4b4f-8aef-09a4b79349eb",
-    "plan_summary": "n3d_sphere 完全重写为纯球形分层有向无环架构：纯球化（删 cube/topology/L）、球空间半径按最优堆积公式确定、FCC 规则堆积、神经元级去重连接、两阶段前向（输入层驱动 + 按 z 逐层）并采用双副本展开、readout 只取孤立输出突触命中神经元；同步清理 cube 专属脚本产物并重写文档与验收判据。",
+    "plan_id": "plan_d49675e8-b7af-4b2a-a2ea-a78bcc2c9587",
+    "plan_summary": "新增 D ≤ H 硬校验、三个预设改为 D=H（DEFAULT/HIGHACC 0.10、SMALL 0.15）、增加连通性下限校验（E≥N、层数≥2、S_in/S_out 非空）防图退化；并连带全量重跑刷新冒烟矩阵、R1-R7b、拓扑快照、doc_numbers.json 与 README/spec/module_definition 中所有受影响数字（|S_in| 50→193、DEFAULT 参数 42,919→154,864）；最后重跑 verify_all 与一期 E5 回归。",
     "starter_session_id": "session-abe38eb5-a63b-4ab1-8a50-4a5711fcb0c3",
     "code_reviewed": true,
     "plan_completed": true,
     "test_passed": true
   },
   {
-    "plan_id": "plan_c50a6b7e-e50a-41ae-a5fc-5282d31140b4",
-    "plan_summary": "修复皋陶审查的 1 error + 5 warning 及相关 info：冒烟实测数字重测更正、readout 严格只取 S_out、阶段 2 改为单遍逐层递推（取消 T 轮同步并删 T）、current_spec.md 彻底重写并消除重复 heading、零残留断言扩展到 spec、参数区间更正，另修 6 项可维护性问题；修完重跑 verify_all 与一期 E5 回归后重新提交审查。",
-    "starter_session_id": "session-abe38eb5-a63b-4ab1-8a50-4a5711fcb0c3",
-    "code_reviewed": true,
-    "plan_completed": true,
-    "test_passed": true
-  },
-  {
-    "plan_id": "plan_10e992f9-4d2a-41cb-bd72-0500b179dfa4",
-    "plan_summary": "第二轮修复皋陶审查的 2 error + 2 warning + 5 info：修正冒烟判据 13 的不成立等式断言（改为子集方向 + 结构核对，消除 seed=7/preset default 下的误报 FAIL）、清除 current_spec.md 与 module_definition 的旧数字与互斥结论、stage2_recurrence 按层向量化以消除神经元级 Python for 循环、冒烟产物指纹与默认判定修正、验证脚本 R5b/R5c/C6 与文案清理；修完重跑 verify_all 与一期 E5 回归并重新提交审查。",
-    "starter_session_id": "session-abe38eb5-a63b-4ab1-8a50-4a5711fcb0c3",
-    "code_reviewed": true,
-    "plan_completed": true,
-    "test_passed": true
-  },
-  {
-    "plan_id": "plan_bc35acc4-22b7-45f5-a8f9-5a3d51f8dd9b",
-    "plan_summary": "第三轮修复皋陶审查的 1 新 error + 3 warning + 1 info：修复 F11 向量化引入的设备回归（level_nodes 普通 list 未注册为 buffer，CUDA 前向会报错）并补设备断言与静态取证、刷新 W_in 梯度登记值、用当前代码重跑并刷新 F9 冒烟矩阵取证文件、按现跑更新 R5/R5b/R5c 数字（覆盖 flow_axis=x）、修正 verify_all 汇总计数并新增\"文档数字 ↔ 现跑\"自动比对防线；修完重跑 verify_all 与一期 E5 回归并重新提交审查。",
+    "plan_id": "plan_88510012-7256-4cc9-a000-4eb3c783f960",
+    "plan_summary": "修复皋陶第 4 轮审查遗留的 2 个小项：config.py 模块 docstring 的非法参考值（D=0.15 → D=0.10，R_max 1.754601 → 1.403681）并补齐\"关键不变量\"中的 D ≤ H；module_definition.json 补登记 G5 取证日志；随后重跑 verify_all（含 C6 零残留与 doc_numbers 174/0/0）与一期 E5 回归，并调用 plan_complete 收尾。",
     "starter_session_id": "session-abe38eb5-a63b-4ab1-8a50-4a5711fcb0c3",
     "code_reviewed": true,
     "plan_completed": true,

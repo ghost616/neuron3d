@@ -1,0 +1,13 @@
+{
+  "plan_id": "plan_88510012-7256-4cc9-a000-4eb3c783f960",
+  "module_name": "n3d_sphere",
+  "development_plan": "# 模块 n3d_sphere 收尾修复（H1~H4）：皋陶第 4 轮审查遗留的 2 个小项\n\n## 背景\n本轮 `D ≤ H` 约束改造（G1~G5）已由皋陶审查**通过**，遗留 1 warning + 1 info 两个小项，均不影响功能正确性。本计划修复这两项并复跑验收。一期 n3d_proto 仍零改动。\n\n## 任务\n\n### H1（warning）config.py 模块 docstring 与不变量清单同步\n- 问题：`n3d_sphere/config.py` 模块 docstring 的\"参考值\"仍写 `N=256, H=0.10, D=0.15 → R_min=0.701840, R_max=1.754601`，这是**已被本模块 `D ≤ H` 硬校验拒绝的非法组合**，且 `R_max=1.754601` 已不对应任何预设。\n- 修法：\n  1. 把该参考值改为**合法组合**：`N=256, H=0.10, D=0.10 → R_min=0.701840, R_max=1.403681`（或直接引用 README §1.2 的改造前后对照写法）。\n  2. 在 `config.py` 的\"关键不变量\"清单中补入 **`D ≤ H`**（当前只写了 `H > 0`、`D > 0`）。\n  3. 全文检查 `config.py` 内是否还有其它残留的 `D=0.15` / `D=0.25` 非法示例值，一并修正。\n\n### H2（info）module_definition.json 补登记\n- 在 `.module_agent/n3d_sphere/module_definition.json` 中补登记本轮 G5 取证日志 `checkpoints/n3d_sphere/_verify/log_verify_all_g5.txt`（本轮 plan 的 modified_files 已含该文件、且它是 G5 的验收证据；上一轮同类文件 `log_verify_all_f21.txt` 已登记）。\n\n### H3 复跑验收（因 H2 改动了被 C6 扫描的元数据，必须重跑）\n- 运行 `python checkpoints/n3d_sphere/_verify/verify_all.py`：10 条命令（E1 / E2 / E2b / R1-R7b / H1-H4 / D1-D7 / S1-S5 / C1-C6 / snapshot / E5）全部退出码 0、无 FAIL。\n- `doc_numbers.json` 现跑比对须为「一致 174 / 不一致 0 / 跳过 0」。\n- **C6 零残留扫描必须真实命中 0 行**（H2 改动过 `module_definition.json`，务必确认没有把禁用词写进描述）。\n- 一期回归：`git status --porcelain -- n3d_proto` 为空；`python n3d_proto/train.py --smoke-test` 9/9 PASS、退出码 0、`loss=2.419689`；一期三件产物 SHA256 未变。\n- 留取证日志（如 `checkpoints/n3d_sphere/_verify/log_verify_all_h3.txt`），并登记进 `doc_numbers.json` / `module_definition.json`（若适用）。\n\n### H4 收尾\n- 调用 `module_agent_plan(action=\"plan_complete\", files=[...], test_passed=true)` 标记计划完成，并写入执行总结。\n- **不要**自行启动离朱：风后会在本计划完成后统一启动离朱独立测试。\n\n## 硬约束\n- **禁止修改 `n3d_proto/` 下任何文件**（含 `.module_agent/n3d_proto/current_spec.md`）。\n- 报告中不得出现无工件支撑的实测数字；所有实测值须标注 seed、配置与产物路径。\n- 同 seed 内必须逐位可复现。\n- 本工作区为 exFAT 卷，`write` 工具不可用（EISDIR）；沿用 pwsh + .NET File.WriteAllText(UTF-8 无 BOM) 落盘、`edit` 做定点修改。\n- 任何元数据/文档更新之后必须以一次完整的 `verify_all`（含 C6）收尾，不得复用更新前的结论。",
+  "session_id": "b2fa162e-c0bf-4e74-bb6e-6a942dbe3a56",
+  "modified_files": [
+    "n3d_sphere/config.py",
+    "n3d_sphere/README.md",
+    ".module_agent/n3d_sphere/current_spec.md",
+    ".module_agent/n3d_sphere/module_definition.json",
+    "checkpoints/n3d_sphere/_verify/log_verify_all_h3.txt"
+  ]
+}

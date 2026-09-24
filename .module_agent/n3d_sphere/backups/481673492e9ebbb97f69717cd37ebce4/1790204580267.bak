@@ -1,0 +1,268 @@
+"""n3d_sphere 一键验证入口：依次执行全部验收命令、汇总退出码，并现跑比对文档数字。
+
+依次执行 **9** 条命令（与 README 第 9 节「验证脚本」一致）：
+
+1. `python -m compileall -q n3d_sphere`                      —— E1 编译
+2. `python n3d_sphere/train.py --smoke-test`                 —— E2 冒烟（**15 条判据**）
+3. `python n3d_sphere/train.py --smoke-test --arch mlp`      —— E2b 对照基线冒烟
+4. `verify_sphere_dag.py all`                                —— **R1-R7b** 几何/FCC/DAG/去重/双副本/逐边数值/感受野/判据/产物
+5. `verify_device_regression.py`                             —— **D1-D7** 设备契约（F16 回归取证）
+6. `verify_scope_and_fingerprint.py`                         —— S1-S5 判据语义与产物指纹
+7. `verify_config_contracts.py`                              —— C1-C6 半径公式/窗口/字段/零残留
+8. `verify_topology_snapshot.py`                             —— 拓扑量快照（落盘 JSON）
+9. `python n3d_proto/train.py --smoke-test`                  —— E5 一期未被触碰（9/9 PASS、loss=2.419689）
+
+随后执行 **文档数字防线**（F20）：读取 `_verify/doc_numbers.json` 中登记的
+README / current_spec 实测值，与**本次现跑**产生的产物（`torch.load`）、
+`_verify/sphere_dag_metrics.json`（R1-R7b 全精度指标）、以及本次命令的标准输出
+逐项比对，任何不一致都直接判失败。
+
+计数口径（F20 修复）
+--------------------
+早期实现只统计 `[PASS]` / `[FAIL]` 字面量，而 `verify_sphere_dag.py` 等脚本的格式是
+`[R1] PASS`，导致汇总行恒显示 `PASS=0 FAIL=0`，掩盖了真实判据数量。现改为正则同时匹配
+`[PASS]` / `] PASS` / `：PASS`（`[FAIL]` / `] FAIL` / `：FAIL` 同理）。`总体结论：全部 PASS`
+这类脚本总结句不会命中（冒号与 PASS 之间隔着其它字），故不会被重复计入。
+注：`E1 compileall` 与 `snapshot` 的计数天然为 0/少量（前者成功时无输出，后者只有一行
+`自检（...）：PASS`）；判定仍以**退出码与 FAIL 计数**为准。
+
+用法（工程根目录下执行）::
+
+    python checkpoints/n3d_sphere/_verify/verify_all.py
+退出码 0 = 全部命令退出码 0、无 FAIL，且文档登记数字与现跑一一一致。
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+from typing import Any, Dict, List, Tuple
+
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, os.pardir)
+)
+VERIFY_DIR = os.path.join(PROJECT_ROOT, "checkpoints", "n3d_sphere", "_verify")
+DOC_NUMBERS_PATH = os.path.join(VERIFY_DIR, "doc_numbers.json")
+DAG_METRICS_PATH = os.path.join(VERIFY_DIR, "sphere_dag_metrics.json")
+
+try:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+except Exception:  # pragma: no cover
+    pass
+
+COMMANDS: Tuple[Tuple[str, List[str]], ...] = (
+    ("E1 compileall", ["-m", "compileall", "-q", "n3d_sphere"]),
+    ("E2 smoke", ["n3d_sphere/train.py", "--smoke-test"]),
+    ("E2b smoke_mlp", ["n3d_sphere/train.py", "--smoke-test", "--arch", "mlp"]),
+    ("R1-R7b sphere_dag", ["checkpoints/n3d_sphere/_verify/verify_sphere_dag.py", "all"]),
+    ("D1-D7 device", ["checkpoints/n3d_sphere/_verify/verify_device_regression.py"]),
+    ("S1-S5 scope_fp", ["checkpoints/n3d_sphere/_verify/verify_scope_and_fingerprint.py"]),
+    ("C1-C6 config", ["checkpoints/n3d_sphere/_verify/verify_config_contracts.py"]),
+    ("snapshot", ["checkpoints/n3d_sphere/_verify/verify_topology_snapshot.py"]),
+    ("E5 proto_smoke", ["n3d_proto/train.py", "--smoke-test"]),
+)
+
+# 判据计数：同时兼容三种打印格式（F20）
+#   `[PASS]`（train.py 的冒烟判据）、`[R1] PASS`（verify_sphere_dag.py）、
+#   `自检（...）：PASS`（verify_topology_snapshot.py，中文冒号或 ASCII 冒号）
+# 注意：`总体结论：全部 PASS` 这类汇总句不会命中（冒号与 PASS 之间隔着"全部"），
+# 避免把脚本自己的总结句重复计入判据数。
+_PASS_RE = re.compile(r"\[PASS\]|\]\s*PASS\b|[：:]\s*PASS\b")
+_FAIL_RE = re.compile(r"\[FAIL\]|\]\s*FAIL\b|[：:]\s*FAIL\b")
+
+
+def run_commands() -> Tuple[bool, Dict[str, str]]:
+    """执行全部验收命令，打印退出码与判据计数，返回 (是否全通过, 命令名->stdout)。"""
+    all_ok = True
+    outputs: Dict[str, str] = {}
+    for name, args in COMMANDS:
+        env = dict(os.environ)
+        # 子进程强制 UTF-8 输出：Windows 默认 GBK 管道编码会把中文日志变成乱码，
+        # 使任何基于日志文本的核对（doc_numbers 的 text 类判据）失去可解析性
+        env["PYTHONIOENCODING"] = "utf-8"
+        res = subprocess.run(
+            [sys.executable] + args, capture_output=True, cwd=PROJECT_ROOT, env=env
+        )
+        out = res.stdout.decode("utf-8", "replace")
+        outputs[name] = out
+        passes = len(_PASS_RE.findall(out))
+        fails = len(_FAIL_RE.findall(out))
+        all_ok &= res.returncode == 0 and fails == 0
+        print(f"  {name:<20} exit={res.returncode} PASS={passes:<3} FAIL={fails}")
+        if res.returncode != 0:
+            print("      STDERR tail:", res.stderr.decode("utf-8", "replace").strip()[-300:])
+    return all_ok, outputs
+
+
+def _dotted(obj: Any, path: str) -> Any:
+    """按 `a.b.c` 形式取嵌套字典字段；缺键抛 KeyError（由调用方记为失败）。
+
+    键名本身可能含 `.`（例如 MLP 基线产物的 `grad_norms` 键就是 `fc1.weight`），
+    故采用**贪心最长匹配**：先按整段尝试，失败再把后面的段并入当前键名。
+    """
+    parts = path.split(".")
+    cur = obj
+    i = 0
+    while i < len(parts):
+        if not isinstance(cur, dict):
+            raise KeyError(f"字段 {path!r} 无法在 {type(cur).__name__} 上继续下钻")
+        matched = False
+        for j in range(len(parts), i, -1):
+            key = ".".join(parts[i:j])
+            if key in cur:
+                cur = cur[key]
+                i = j
+                matched = True
+                break
+        if not matched:
+            raise KeyError(f"字段 {path!r} 中的 {parts[i]!r} 不存在")
+    return cur
+
+
+def _match(got: Any, ent: Dict[str, Any]) -> bool:
+    """按登记值的比较口径判断实测值是否一致。
+
+    * `exact: true` —— 逐位相等（用于产物中的 loss / 梯度范数等必须位级复现的量）；
+    * 数值 —— `|got - value| <= abs_tol + rel_tol * |value|`（文档中以有限位小数展示的量，
+      容差即该展示精度）；
+    * 其余 —— 字符串相等。
+    """
+    exp = ent["value"]
+    if ent.get("exact"):
+        return got == exp
+    if isinstance(exp, bool) or isinstance(exp, str):
+        return str(got) == str(exp)
+    return abs(float(got) - float(exp)) <= float(ent.get("abs_tol", 0.0)) + float(
+        ent.get("rel_tol", 0.0)
+    ) * abs(float(exp))
+
+
+def check_doc_numbers(outputs: Dict[str, str]) -> Tuple[bool, int, int, int]:
+    """把 `doc_numbers.json` 登记的数字与本次现跑结果逐项比对（F20 文档数字防线）。
+
+    参数
+    ----
+    outputs : Dict[str, str]
+        `run_commands()` 返回的"命令名 -> 标准输出"映射（text 类判据现场比对）。
+
+    返回
+    ----
+    Tuple[bool, int, int, int]
+        (是否全部一致, 一致项数, 不一致项数, 跳过项数)。
+    """
+    if not os.path.isfile(DOC_NUMBERS_PATH):
+        print(f"  [FAIL] 文档数字登记表不存在：{os.path.relpath(DOC_NUMBERS_PATH, PROJECT_ROOT)}")
+        return False, 0, 1, 0
+    with open(DOC_NUMBERS_PATH, "r", encoding="utf-8") as fh:
+        spec = json.load(fh)
+    metrics: Dict[str, Any] = {}
+    if os.path.isfile(DAG_METRICS_PATH):
+        with open(DAG_METRICS_PATH, "r", encoding="utf-8") as fh:
+            metrics = (json.load(fh) or {}).get("metrics", {}) or {}
+
+    ok_n = bad_n = skip_n = 0
+    for section, kind in (
+        ("artifact_checks", "artifact"),
+        ("metric_checks", "metric"),
+        ("text_checks", "text"),
+    ):
+        for ent in spec.get(section, []):
+            key = ent.get("key", "(未命名)")
+            got: Any = None
+            reason = ""
+            if kind == "artifact":
+                import torch
+
+                rel = ent["artifact"]
+                p = os.path.join(PROJECT_ROOT, rel)
+                if not os.path.isfile(p):
+                    if ent.get("required", False):
+                        bad_n += 1
+                        print(f"  [FAIL] {key}: 必需产物不存在 {rel}")
+                    else:
+                        skip_n += 1
+                        print(f"  [SKIP] {key}: 产物不存在 {rel}（需先运行对应冒烟/矩阵脚本）")
+                    continue
+                try:
+                    ckpt = torch.load(p, map_location="cpu", weights_only=False)
+                    got = _dotted(ckpt, ent["field"])
+                except Exception as exc:
+                    bad_n += 1
+                    print(f"  [FAIL] {key}: 产物读取/取字段失败 {exc!r}")
+                    continue
+            elif kind == "metric":
+                name = ent["metric"]
+                if name not in metrics:
+                    bad_n += 1
+                    print(f"  [FAIL] {key}: 现跑指标缺失 {name}")
+                    continue
+                got = metrics[name]
+            else:
+                src = ent.get("command")
+                if src is not None:
+                    if src not in outputs:
+                        bad_n += 1
+                        print(f"  [FAIL] {key}: 未找到命令 {src!r} 的输出")
+                        continue
+                    text = outputs[src]
+                else:
+                    p = os.path.join(PROJECT_ROOT, ent["file"])
+                    if not os.path.isfile(p):
+                        skip_n += 1
+                        print(f"  [SKIP] {key}: 文本文件不存在 {ent['file']}")
+                        continue
+                    raw = open(p, "rb").read()
+                    text = raw.decode(ent.get("encoding", "utf-8"), "replace")
+                m = re.search(ent["regex"], text)
+                if ent.get("count_matches"):
+                    # 计数类判据：正则只作为"模式"，取值 = 命中次数（如判据 [PASS] 条数）
+                    got = len(re.findall(ent["regex"], text))
+                elif not m:
+                    bad_n += 1
+                    print(f"  [FAIL] {key}: 正则未命中 {ent['regex']!r}")
+                    continue
+                else:
+                    got = m.group(1) if m.groups() else m.group(0)
+                if ent.get("as_float"):
+                    got = float(got)
+                if ent.get("as_int"):
+                    got = int(got)
+            if _match(got, ent):
+                ok_n += 1
+            else:
+                bad_n += 1
+                reason = f"实测={got!r} 登记={ent['value']!r}"
+                print(f"  [FAIL] {key}: 文档数字与现跑不一致 —— {reason}")
+    print(
+        f"  doc_numbers: 一致 {ok_n} 项 / 不一致 {bad_n} 项 / 跳过 {skip_n} 项"
+        f"（登记表 {os.path.relpath(DOC_NUMBERS_PATH, PROJECT_ROOT)}）"
+    )
+    return bad_n == 0, ok_n, bad_n, skip_n
+
+
+def main() -> int:
+    """执行全部验收命令与文档数字比对，返回退出码（0 = 全绿）。"""
+    print("=" * 78)
+    print("[verify_all] 依次执行验收命令")
+    print("=" * 78)
+    all_ok, outputs = run_commands()
+    print("=" * 78)
+    print("[verify_all] 文档数字防线（doc_numbers.json 现跑比对）")
+    print("=" * 78)
+    doc_ok, ok_n, bad_n, skip_n = check_doc_numbers(outputs)
+    print("=" * 78)
+    print(
+        f"总体结论："
+        f"{'全部命令退出码 0 且无 FAIL' if all_ok else '存在命令失败'}"
+        f"；文档数字 {'全部一致' if doc_ok else '存在不一致'}"
+        f"（一致 {ok_n} / 不一致 {bad_n} / 跳过 {skip_n}）"
+    )
+    return 0 if (all_ok and doc_ok) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
