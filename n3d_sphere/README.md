@@ -495,6 +495,16 @@ python n3d_proto/train.py --smoke-test   -> 9/9 PASS、退出码 0、loss = 2.41
 
 * 正式产物目录：`checkpoints/n3d_sphere/`；验证类运行（`--smoke-test` / `--max-batches > 0`）
   一律写入 `checkpoints/n3d_sphere/_verify/`，**绝不覆盖正式产物**；
+* **历史口径存档 `checkpoints/n3d_sphere/_verify/legacy/`**：仅存放**改造前 `D > H` 口径**的
+  产物（`D <= H` 硬校验已拒绝该组合），供历史对照与追溯，**不参与当前验收、不被任何验收
+  命令读取或重写**。J1 清理时把 11 个 `*_D0.25_*` 冒烟产物从 `_verify/` 根目录**移动**
+  （非删除）到此处，逐文件 SHA256 前后一致、计数与字节均守恒（证据
+  `_verify/legacy_archive_manifest.json`：含每个文件的 size / `sha256_before` /
+  `sha256_after` / `bytes_identical`，以及 `legacy/` 与根目录两侧的总数与总字节守恒断言）。
+  **判定口径**：以"文件名中的 `_D<D>_` 字段 + 产物内嵌 `config` 的 `H`/`D` + mtime"三重
+  证据一致为准 —— 实测 11 个文件的 `config` 均为 `H=0.15 / D=0.25`（`D > H`），与名称口径
+  1:1 吻合，**无边界模糊项**；唯一不带 `D` 标识的 `.pt` 是 `smoke.pt`，其内嵌 `config` 为
+  `H=0.15 / D=0.15`（`D = H`），故判定为**当前口径**并保留在根目录；
 * 冒烟产物命名：**完全默认组合**（neuron3d + SMALL_CONFIG 的 N/y/H/D/seed/batch_size +
   `flow_axis=z` + 两个 `any_isolated` + `space_radius=0`）退化为 `smoke.pt`；
   其它任何组合为 `smoke[_ar{arch}]_{指纹}.pt`，指纹为
@@ -573,7 +583,9 @@ python n3d_proto/train.py --smoke-test   -> 9/9 PASS、退出码 0、loss = 2.41
 | `_verify/verify_device_regression.py` | **D1-D7 设备契约（F16 回归取证）**：层拓扑量的类型/注册状态、`vars(model)` 通用扫描（不得存在搬不动的张量容器）、层切分等价性、`.to('meta')` 搬运实验 + 普通 Python list 搬不动的机制复现、两条守卫负例（必须抛 RuntimeError）、CUDA 实测（无 GPU 时自动 skip 并标注"静态取证"）、`state_dict` 往返逐位一致 |
 | `_verify/run_smoke_matrix.py` | 以当前代码重跑 **11 种冒烟配置组合**，从日志解析**实际落盘路径**并与独立预测的产物名比对、回读 config 与期望逐字段比对、断言 `smoke.pt` 未被非默认组合污染且**同一路径多次写入逐位一致**；刷新 `smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt`，并由四条 scope 记录重建 `smoke_scope_matrix.json` |
 | `_verify/verify_all.py` | 一键依次执行上面全部命令（含一期回归）与**文档数字防线**（`doc_numbers.json` 现跑比对），汇总退出码 |
-| `_verify/doc_numbers.json` | **文档数字登记表**：README / spec 中出现的实测值（本轮 **174 项** = 49 产物字段 + 111 全精度指标 + 14 文本计数），由 `verify_all.py` 现跑比对 |
+| `_verify/doc_numbers.json` | **文档数字登记表**：README / spec 中出现的实测值（本轮 **188 项** = 49 产物字段 + 111 全精度指标 + **14 跨 seed 快照聚合** + 14 文本计数），由 `verify_all.py` 现跑比对 |
+| `_verify/legacy_archive_manifest.json` | **J1 归档取证清单**：11 个改造前 `D > H` 产物的逐个 `size` / `sha256_before` / `sha256_after` / `bytes_identical` 与配置字段，以及 `legacy/` 与 `_verify/` 根目录**两侧的总数、总字节守恒**与 `smoke.pt` 未被扰动的断言 |
+| `_verify/legacy/` | **历史口径存档目录**：改造前 `D > H` 的 11 个冒烟产物（共 10,017,363 字节），仅作历史对照，**不参与当前验收** |
 | `_verify/legacy_dh_baseline.json` | **`D = H` 改造前的历史基线**（`D > H`，现已不可由 `Config` 构造）：登记改造前 `default_any_any_z` / `small_any_any_z` 的 E / 层数 / `S_in` / `S_out` / params，以及来源产物与快照的路径与 SHA256 |
 | `_verify/sphere_dag_metrics.json` | `verify_sphere_dag.py` 每次运行落盘的**全精度**指标（R1-R7b，111 条），供 `doc_numbers.json` 现跑比对取用 |
 | `_verify/smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` | 11 种冒烟组合的取证记录（产物名 / 退出码 / PASS / FAIL / loss / 梯度范数 / config 核对 / SHA256 一致性字段）与完整日志 |
@@ -696,6 +708,20 @@ python n3d_proto/train.py --smoke-test                                          
 > 而 `update_spec(mode="add")` 会**无脑追加**而不是替换，容易制造重复 heading。
 > 可执行结论：**结构性改动后必须跑一次"载体一致性扫描"**（本项目已把它固化为
 > C6（禁用词）、`doc_numbers.json`（现跑数字）、以及"标题唯一性"三项检查）。
+
+### 10.5 清理（J1~J3：归档改造前旧产物 + 补登记跨 seed 区间）
+
+| 编号 | 事项 | 处置 |
+|---|---|---|
+| **J1** | `_verify/` 根目录**残留改造前 `D > H` 口径**的冒烟产物（11 个 `*_D0.25_*`），与当前 `H0.15_D0.15` 产物同目录且命名高度相似 —— 离朱 R14 报告记录其**首轮测试脚本曾据此误选产物** | 以"文件名 `_D<D>_` 字段 + 产物内嵌 `config` 的 `H`/`D` + mtime"三重口径枚举：实测 11 个文件 `config` 全为 `H=0.15/D=0.25`（`D > H`），与名称口径 1:1 吻合、**无边界模糊项**（唯一无 `D` 标识的 `smoke.pt` 内嵌 `H=0.15/D=0.15` → 当前口径，保留）。11 个文件**移动**（非删除）到 `_verify/legacy/`，逐文件 **SHA256 前后完全一致**、计数 11→11 与字节 10,017,363→10,017,363 双双守恒、根目录 9 个当前产物 SHA256 全部未变、`smoke.pt` 仍为 `4E11F12F…6A71`；证据 `_verify/legacy_archive_manifest.json`。同步更新 `legacy_dh_baseline.json` 的 3 条 artifact 路径为 `legacy/…`（并给 any/any 那条补 `artifact_note` 说明其原写入的 `smoke.pt` 已被覆盖、未单独存档）、README §8 与 §9、`current_spec.md` |
+| **J2** | `doc_numbers.json` 未登记跨 seed 参数量区间 | 新增 `snapshot_checks` 类别（`verify_all.py` 现场按测点聚合 `min`/`max`/`range`/`count`，并支持按 `seed` 取单点），登记 DEFAULT 测点跨 **10 seed** 的 `params` 区间 **146237 ~ 164263**、`E` 区间 **727 ~ 750**、`\｜S_in\｜` **182 ~ 205**、`\｜S_out\｜` **185 ~ 203**、双副本 **167 ~ 192**、层数 **9 ~ 9**、seed 数 **10**；SMALL 测点同时登记 **seed=42 单点**（`E=106`、`params=43930`、`S_in=55`、`S_out=53`、层数 7）与其**跨 10 seed 区间**（`E 96 ~ 115`、`params 39235 ~ 44710`）。数据源 `_verify/topology_snapshot.json`（由本轮的 `snapshot` 命令重写，**同轮同源、无滞后**）。登记项总数 174 → **188**（其中首轮我把 SMALL 的 seed=42 单点值误登记为"区间"，**被本防线当场抓出**（实测 `[96,115]` / `[39235,44710]` vs 登记 `[106,106]` / `[43930,43930]`），遂把单点与区间拆成两类断言） |
+| **J3** | 复跑验收 | `verify_all.py` 退出码 0：10 条命令全部退出码 0、无 FAIL；`doc_numbers` 一致项数由 174 增至 **188**、不一致 0、跳过 0；`smoke.pt` SHA 仍为 `4E11F12F…6A71`；一期回归通过（证据 `_verify/log_verify_all_j3.txt`） |
+
+> **第七类教训（来自 J1）**：**"语义已废弃的产物必须离开活跃目录"**。`D > H` 被硬校验拒绝
+> 之后，那些旧产物在**命名上与当前产物只差一个字段**，留在同一目录里就会继续被
+> 人工或脚本误选（离朱确已误选过一次）。可执行结论：口径变更时**同步归档旧口径产物**，
+> 并保留**逐文件 SHA256 的搬运证据**（既证明无字节丢失，也让"哪些是历史、哪些是当前"
+> 成为可机器复核的事实，而不是靠命名约定。
 
 > **本轮教训（第四类）**：**"几何约束必须在构造期闭环，而不是靠下游发现"**。
 > `D > H` 此前在三个预设里长期存在却无人校验；更隐蔽的是"`D` 合法但过小"——

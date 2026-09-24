@@ -1,0 +1,17 @@
+{
+  "plan_id": "plan_f31a672e-b3ba-4f9d-b6ee-6ee5d01dad6e",
+  "module_name": "n3d_sphere",
+  "development_plan": "# 模块 n3d_sphere 清理计划（J1~J4）：归档改造前旧产物 + 补登记跨 seed 参数区间\n\n## 背景\n用户要求在收尾时一并清理\"多余数据\"。离朱 R14 独立测试报告（`test_reports/lizhu_n3d_sphere_dh_constraint_r14_report.md` §11）提出了 3 条 info 观察项，用户选择处理其中的第 1、2 条：\n1. `checkpoints/n3d_sphere/_verify/` 下仍残留**改造前 `D > H` 口径**的冒烟产物（`H0.15_D0.25` 等，离朱实测为 11 个 `*_D0.25_*` 文件），与当前 `H0.15_D0.15` 产物**同目录且命名高度相似**，**已经实际误导过一次测试脚本**（离朱首轮误选）。\n2. `doc_numbers.json` 未登记跨 seed 参数量区间 `146237 ~ 164263`。\n第 3 条（派生产物会被验收命令重写、SHA 不变）仅为并发提示，本轮**不处理**。\n\n一期 n3d_proto 仍零改动。\n\n## 任务\n\n### J1 归档改造前旧产物到 `legacy/`\n- 枚举 `checkpoints/n3d_sphere/_verify/` 下所有属于**改造前 `D > H` 口径**的产物（以文件名 / 配置指纹 / mtime 判定，离朱实测为 11 个 `*_D0.25_*` 文件；请勿硬编码数量，实际枚举并以证据为准），**移动**到 `checkpoints/n3d_sphere/_verify/legacy/` 子目录。\n- **逐文件 SHA256 取证**：给出移动前后每个文件的 SHA256 对比，证明是**搬运而非删除**、无任何字节丢失；同时报告移动前后文件总数与总字节数守恒。\n- 判定口径须写清：哪些文件属旧口径、依据是什么；若发现边界模糊项（例如不带 `D` 标识的文件），先列出并给出判定理由，不要静默处理。\n- 同步更新：\n  - `n3d_sphere/README.md` 的产物清单与产物命名章节，明确 `_verify/legacy/` 的用途（历史口径存档，**不参与当前验收**）\n  - `.module_agent/n3d_sphere/current_spec.md`\n  - `checkpoints/n3d_sphere/_verify/legacy_dh_baseline.json` 中记录的产物路径（若其中写有旧路径则同步）\n  - 任何验证脚本 / `doc_numbers.json` / 冒烟矩阵中引用旧路径或旧产物名的地方（若有）\n- 归档后须确认：当前口径产物（`smoke.pt` 等）**未被扰动**、`checkpoints/n3d_sphere/model.pt` 仍不存在。\n\n### J2 `doc_numbers.json` 补登记跨 seed 参数量区间\n- 把 `DEFAULT any/any/z` 测点跨 10 seed 的**参数量区间 `146237 ~ 164263`** 纳入 `doc_numbers.json`（并视结构补充必要的 `E` 区间 `727 ~ 750`、`|S_in|` 区间 `182 ~ 205`），数据源取 `checkpoints/n3d_sphere/_verify/topology_snapshot.json`。\n- 使 `verify_all.py` 的现跑比对能够覆盖这些值；登记项须可在 `verify_all` 输出中看到。\n- 不得引入「登记表 ↔ 现跑」的滞后问题（参考上一轮对 `log_verify_all_h3.txt` 的处置经验：由验收脚本自身产出的内容不得在同一轮内登记）。\n\n### J3 复跑验收\n- `python checkpoints/n3d_sphere/_verify/verify_all.py` → **10 条命令全部退出码 0、无 FAIL**。\n- `doc_numbers.json` 现跑比对：**一致项数增加（原 174）、不一致 0、跳过 0**。\n- 当前冒烟产物 `smoke.pt` 的 SHA256 必须仍为 `4E11F12FEFABE9C8F978348792C8775336E9D121D544BCA0D76350AA440E6A71`（未被扰动）；`sphere_dag_metrics.json` / `topology_snapshot.json` 若被重写，SHA 应保持不变（确定性）。\n- 留取证日志（如 `checkpoints/n3d_sphere/_verify/log_verify_all_j3.txt`）并登记进 `module_definition.json`（注意 C6 禁用词）。\n- **E5 一期回归**：`python n3d_proto/train.py --smoke-test` 9/9 PASS、退出码 0、`loss=2.419689`；`git status --porcelain -- n3d_proto` 输出为空；一期三件产物 SHA256 未变。\n\n### J4 收尾\n- 调用 `module_agent_plan(action=\"plan_complete\", files=[...], test_passed=true)` 标记计划完成，并写入执行总结。\n- **不要**自行关闭任何会话，**不要**启动离朱：风后会在本计划完成后统一执行「关闭会话 + 清理失效数据」。\n\n## 硬约束\n- **禁止修改 `n3d_proto/` 下任何文件**（含 `.module_agent/n3d_proto/current_spec.md`）。\n- 归档必须**逐文件 SHA256 取证**，不得丢失任何字节；不得删除（只移动）。\n- 报告中不得出现无工件支撑的实测数字；所有实测值须标注 seed、配置与路径。\n- 任何元数据/文档更新之后必须以一次完整的 `verify_all`（含 C6 零残留）收尾，不得复用更新前的结论。\n- 本工作区为 exFAT 卷，`write` 工具不可用（EISDIR）；沿用 pwsh + .NET File.WriteAllText(UTF-8 无 BOM) 落盘、`edit` 做定点修改。",
+  "session_id": "b2fa162e-c0bf-4e74-bb6e-6a942dbe3a56",
+  "modified_files": [
+    "checkpoints/n3d_sphere/_verify/legacy/",
+    "checkpoints/n3d_sphere/_verify/legacy_archive_manifest.json",
+    "checkpoints/n3d_sphere/_verify/legacy_dh_baseline.json",
+    "checkpoints/n3d_sphere/_verify/doc_numbers.json",
+    "checkpoints/n3d_sphere/_verify/verify_all.py",
+    "checkpoints/n3d_sphere/_verify/log_verify_all_j3.txt",
+    "n3d_sphere/README.md",
+    ".module_agent/n3d_sphere/current_spec.md",
+    ".module_agent/n3d_sphere/module_definition.json"
+  ]
+}

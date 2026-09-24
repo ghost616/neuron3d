@@ -23,10 +23,10 @@
 | `n3d_sphere/__init__.py` | 包声明与模块定位：纯球形分层 DAG、自包含、一期不变、快速入口 |
 | `n3d_sphere/utils.py` | 通用工具层（可复现性 `set_seed`、设备 `get_device`、日志、参数/梯度统计），自包含实现；四步闭环算子为历史遗留、当前架构不调用 |
 | `n3d_sphere/data.py` | MNIST 数据层（IDX 惰性解析 + 归一化 + DataLoader，num_workers>0 时按 (seed, worker_id) 播种） |
-| `n3d_sphere/config.py` | 超参配置层：球半径窗口公式、FCC 晶格常数派生量、判据开关、三预设（SMALL/DEFAULT/HIGHACC，**均为 `D = H`**）；`__post_init__` 实施 **`D <= H` 硬校验（G1）** |
+| `n3d_sphere/config.py` | 超参配置层：球半径窗口公式、FCC 晶格常数派生量、判据开关、三预设（SMALL/DEFAULT/HIGHACC，**均为 `D = H`**）；`__post_init__` 实施 **`D <= H` 硬校验（G1）**；模块 docstring 的参考值与"关键不变量"清单已与合法口径同步（H1） |
 | `n3d_sphere/model.py` | 球形分层 DAG 模型：FCC 规则堆积、半球突触采样、神经元级连接（同对去重取最近突触对）、Kahn 拓扑序与 CSR 分组、**整层向量化的两阶段双副本前向**、**设备契约守卫 `_assert_index_device`**、**连通性下限校验 `check_connectivity_floor`（G3）**、统计与自检接口；另含 `MLPBaseline` 对照基线 |
 | `n3d_sphere/train.py` | 训练入口：CLI（flow-axis/space-radius/**d**/input-scope/readout-scope/placement，`--d` 的 help 注明 `D <= H`）、产物指纹与隔离、15 条冒烟判据、checkpoint 元数据 |
-| `n3d_sphere/README.md` | 模块文档：几何与尺度、**`D <= H` 硬约束与连通性下限（含改造前后对照表）**、连接规则、两阶段双副本前向、判据开关、CLI、冒烟判据、实测拓扑统计（标注 seed）、产物纪律与字节确定性、验证脚本、已知边界与各轮修复记录 |
+| `n3d_sphere/README.md` | 模块文档：几何与尺度、**`D <= H` 硬约束与连通性下限（含改造前后对照表）**、连接规则、两阶段双副本前向、判据开关、CLI、冒烟判据、实测拓扑统计（标注 seed）、**产物纪律（含 `_verify/legacy/` 历史口径存档的用途与判定口径）**、字节确定性与 SHA256 语义、验证脚本、已知边界与各轮修复记录 |
 | `checkpoints/n3d_sphere/_verify/verify_sphere_dag.py` | 几何 / FCC / DAG / 去重 / 双副本 / 逐边数值 / 感受野 / 判据 / 产物 验证脚本（R1-R7b，4 组配置）；每次运行把 111 条全精度指标落盘 `sphere_dag_metrics.json` |
 | `checkpoints/n3d_sphere/_verify/verify_dh_constraint.py` | **H1-H4**：`D <= H` 硬校验（含负例消息取证）、三预设 `D = H` 一致性、连通性下限校验（含 D 过小负例）、退化实测 |
 | `checkpoints/n3d_sphere/_verify/verify_device_regression.py` | **设备契约回归取证（D1-D7）**：类型/注册状态、`vars(model)` 通用扫描、层切分等价性、`meta` 搬运实验与对照、两条守卫负例、CUDA 实测或静态取证、`state_dict` 往返逐位一致 |
@@ -34,21 +34,29 @@
 | `checkpoints/n3d_sphere/_verify/verify_config_contracts.py` | 半径公式 / 窗口校验 / 字段清理 / 零残留验证脚本（C1-C6） |
 | `checkpoints/n3d_sphere/_verify/verify_topology_snapshot.py` | 固定实验点（6 个，均 `D = H`）× 10 seed 拓扑量快照脚本（落盘 `topology_snapshot.json`） |
 | `checkpoints/n3d_sphere/_verify/run_smoke_matrix.py` | 以当前代码重跑 11 种冒烟组合：解析实际落盘路径并与独立预测的产物名比对、回读 config 与期望逐字段比对、断言同路径多次写入逐位一致；刷新 `smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` 并重建 `smoke_scope_matrix.json` |
-| `checkpoints/n3d_sphere/_verify/verify_all.py` | 一键验证入口：依次执行 **10 条**验收命令、汇总退出码，并执行**文档数字防线**（`doc_numbers.json` 现跑比对） |
-| `checkpoints/n3d_sphere/_verify/doc_numbers.json` | **文档数字登记表**（**174 项** = 49 产物字段 + 111 全精度指标 + 14 文本计数），由 `verify_all.py` 现跑比对，不一致即判失败 |
-| `checkpoints/n3d_sphere/_verify/legacy_dh_baseline.json` | **`D = H` 改造前的历史基线**（`D > H`，现已不可由 `Config` 构造）：改造前两测点的 E / 层数 / `S_in` / `S_out` / params 及其来源产物与快照的 SHA256 |
+| `checkpoints/n3d_sphere/_verify/verify_all.py` | 一键验证入口：依次执行 **10 条**验收命令、汇总退出码，并执行**文档数字防线**（`doc_numbers.json` 现跑比对；四类数据源：产物字段 / R1-R7b 指标 / **跨 seed 快照聚合（含按 seed 取单点）** / 命令输出文本；输出含分类明细行） |
+| `checkpoints/n3d_sphere/_verify/doc_numbers.json` | **文档数字登记表**（**188 项** = 49 产物字段 + 111 全精度指标 + **14 跨 seed 快照聚合** + 14 文本计数），由 `verify_all.py` 现跑比对，不一致即判失败 |
+| `checkpoints/n3d_sphere/_verify/legacy_archive_manifest.json` | **J1 归档取证清单**：11 个改造前 `D > H` 产物的逐个 `size` / `sha256_before` / `sha256_after` / `bytes_identical` 与配置字段，两侧总数与总字节守恒断言，以及 `smoke.pt` 未被扰动的记录 |
+| `checkpoints/n3d_sphere/_verify/legacy/` | **历史口径存档目录**（不属于当前验收）：改造前 `D > H` 的 11 个冒烟产物（共 10,017,363 字节），仅供历史对照；不被任何验收命令读取或重写 |
+| `checkpoints/n3d_sphere/_verify/legacy_dh_baseline.json` | **`D = H` 改造前的历史基线**（`D > H`，现已不可由 `Config` 构造）：改造前两测点的 E / 层数 / `S_in` / `S_out` / params 及其来源产物与快照的 SHA256；J1 后其 records 中的 artifact 路径已指向 `legacy/` |
 | `checkpoints/n3d_sphere/_verify/sphere_dag_metrics.json` | `verify_sphere_dag.py` 落盘的全精度实测指标（R1-R7b，111 条） |
+| `checkpoints/n3d_sphere/_verify/topology_snapshot.json` | 6 测点 × 10 seed 的拓扑量快照；doc_numbers 的 `snapshot_checks` 现场从此文件聚合跨 seed 区间与按 seed 单点 |
 | `checkpoints/n3d_sphere/_verify/smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` | 11 种冒烟组合的取证记录（产物名 / 退出码 / PASS / FAIL / loss / 梯度范数 / config 核对 / SHA 一致性字段）与完整日志 |
-| `checkpoints/n3d_sphere/_verify/log_verify_all_f21.txt` | 一键验证的完整输出（10 条命令退出码与判据计数、文档数字比对结果） |
+| `checkpoints/n3d_sphere/_verify/log_verify_all_f21.txt` / `log_verify_all_g5.txt` / `log_verify_all_h3.txt` / `log_verify_all_j3.txt` | 四轮（F21 / G5 / H3 / J3）`verify_all.py` 的完整验收输出：10 条命令退出码与判据计数、文档数字防线（分类明细 + 总计）与总结句 |
 | `checkpoints/n3d_sphere/_verify/topology_snapshot.json` / `smoke_scope_matrix.json` | 拓扑量快照与四种 scope 组合的冒烟汇总记录 |
 ## 验收标准
 
 ### 实测验收结果（唯一记录处；全部命令退出码 0）
 
-所有实测数字均**登记在 `checkpoints/n3d_sphere/_verify/doc_numbers.json`**（**174 项** =
-49 产物字段 + 111 全精度指标 + 14 文本计数）并由 `verify_all.py` 在**同一轮现跑**中逐项
-比对；下表中的数字若与登记表或现跑不一致即判失败。本轮（`D <= H` 约束 + 预设 `D = H` +
-连通性下限校验）已把全部受影响数字整体刷新。
+所有实测数字均**登记在 `checkpoints/n3d_sphere/_verify/doc_numbers.json`**（**188 项** =
+49 产物字段 + 111 全精度指标 + **14 跨 seed 快照聚合** + 14 文本计数）并由 `verify_all.py`
+在**同一轮现跑**中逐项比对；下表中的数字若与登记表或现跑不一致即判失败。本轮（`D <= H`
+约束 + 预设 `D = H` + 连通性下限校验 + J1 归档清理 + J2 跨 seed 区间登记）已把全部受影响
+数字整体刷新。
+
+> **历史口径归档**：改造前 `D > H` 口径的 11 个冒烟产物已由 J1 移到
+> `checkpoints/n3d_sphere/_verify/legacy/`（逐文件 SHA256 前后一致、计数与字节守恒，
+> 证据 `legacy_archive_manifest.json`），**不参与当前验收**；根目录只保留 9 个当前口径产物。
 
 | 判据 | 实测证据 |
 | --- | --- |
@@ -58,10 +66,10 @@
 | R1-R7b 几何/FCC/DAG/去重/双副本/逐边数值/感受野/判据/产物 | `verify_sphere_dag.py all` 退出码 0（10 项判据标签全 PASS），**在 4 组配置上执行**（SMALL / DEFAULT / DEFAULT+`flow_axis=x` / DEFAULT+`space_radius=0.9`，均为 `D = H`），111 条全精度指标落盘 `_verify/sphere_dag_metrics.json`。**R5**：max\|Δa_up\| = 1.047723 / 2.259184 / 1.702276 / 2.259184，受影响下游非 `S_in` 神经元 = 9 / 59 / 61 / 59，`d(sum a_up)/d(a_in)` 非零 = 132/192、653/768、643/768、653/768；**R5b**：最大偏差 = 5.960e-08 / 2.384e-07 / 5.960e-08 / 2.384e-07（阈值 1e-5），M1 形态反例错配 = 106/106、727/736、716/730、727/736 且结果差异 = 8.437e-01 / 1.655e+00 / 1.703e+00 / 1.655e+00；**R5c**：最深层祖先覆盖 7/7、9/9、10/10、9/9 层，第一层扰动传到最深层最大变化 = 7.924e-05 / 2.500e-04 / 2.625e-04 / 2.500e-04；**R7b**：`readout_scope` 两取值 \|S_out\| any=187 / all=14，同一输入下 logits 最大差异 = 0.858180 |
 | **H1-H4 `D <= H` 与连通性下限（G1/G3）** | `verify_dh_constraint.py` 退出码 0：H1 负例 `H=0.10/D=0.15`、`H=0.15/D=0.25`、`H=0.10/D=0.1000001` 全部抛 `ValueError`（消息含 H/D/D/H 与约束说明），边界 `D == H`、`D < H` 正常构造；H2 三预设均 `D = H` 且 `describe()` / `to_dict()` 往返一致；H3 三预设通过下限并报出指标（SMALL E=106/K=7/S_in=55/S_out=53/params=43930；DEFAULT E=736/K=9/S_in=193/S_out=187/params=154864；HIGHACC 同 DEFAULT 但 params=154874，因启用 `readout_bias`）；H4 退化实测 D=0.05/0.03/0.02 → E=146/17/1（`E/N` = 0.5703/0.0664/0.0039）全部被下限校验拦下 |
 | **D1-D7 设备契约（F16）** | `verify_device_regression.py` 退出码 0（D1-D5 与 D7 共 6 项 PASS，D6 无 GPU 时 SKIP）：D1 `level_edge_reach` / `level_node_reach` 均为已注册 int64 `[K,2]` 张量（SMALL `(7,2)`、`flow_axis=x` `(10,2)`）；D2 `vars(model)` 通用扫描无未注册张量与含张量容器；D3 层切分与独立分层逐位一致、层边区间无缝覆盖 `[0,E)`；D4 `.to('meta')` 后索引张量全部搬到 meta，而对照的普通 Python list 中张量仍停留在 cpu；D5 两条守卫负例均抛 RuntimeError；D6 本机无 GPU → 标注"CUDA 路径为静态取证"并 skip；D7 `state_dict` 往返后前向逐位一致 |
-| **文档数字防线（F20）** | `verify_all.py` 现跑比对 `doc_numbers.json`：**一致 174 项 / 不一致 0 项 / 跳过 0 项** |
+| **文档数字防线（F20/J2）** | `verify_all.py` 现跑比对 `doc_numbers.json`：**一致 188 项 / 不一致 0 项 / 跳过 0 项**；分类明细 artifact 49 / metric 111 / **snapshot 14** / text 14（各类均"不一致 0、跳过 0"）。snapshot 类登记 DEFAULT 测点跨 10 seed 的 `params 146237~164263`、`E 727~750`、`S_in 182~205`、`S_out 185~203`、双副本 167~192、层数 9~9、seed 数 10，以及 SMALL 测点的 seed=42 单点值与其跨 10 seed 区间（`E 96~115`、`params 39235~44710`） |
 | S1-S5 判据语义与产物指纹 | `verify_scope_and_fingerprint.py` 退出码 0；`all/any` 下 `d(sum a_up)/d(a_in)` 非零 479/512、`any/any` 下 439/512；`input_scope=all_isolated` 的两种组合双副本神经元数均为 0；指纹变体已全部改用合法 `D`（`D=0.05`、`H=0.12/D=0.12`） |
-| C1-C6 半径公式/窗口/字段/零残留 | `verify_config_contracts.py` 退出码 0（C1/C3 用例已改为 `D <= H` 的合法组合；残留扫描覆盖 n3d_sphere 全部源文件 + README + 本功能说明 + 文件定义，真实命中 0 行、上下文豁免 4 行） |
-| 拓扑快照 | `verify_topology_snapshot.py` 退出码 0（60 条记录落盘 `topology_snapshot.json`，6 个测点均为 `D = H`，自检 `：PASS`） |
+| C1-C6 半径公式/窗口/字段/零残留 | `verify_config_contracts.py` 退出码 0（C1/C3 用例已改为 `D <= H` 的合法组合；残留扫描覆盖 n3d_sphere 全部源文件 + README + 本功能说明 + 文件定义，真实命中 0 行、上下文豁免 5 行） |
+| 拓扑快照 | `verify_topology_snapshot.py` 退出码 0（60 条记录落盘 `topology_snapshot.json`，6 个测点均为 `D = H`，自检 `：PASS`）；DEFAULT 测点跨 10 seed：E 727~750、params 146237~164263、`S_in` 182~205、`S_out` 185~203、双副本 167~192、层数恒 9；SMALL 测点跨 10 seed：E 96~115、params 39235~44710（seed=42 为 E=106 / params=43930） |
 | **E5 一期未被触碰** | `python n3d_proto/train.py --smoke-test` **9/9 PASS、退出码 0、loss=2.419689**；`git status --porcelain -- n3d_proto` 输出为空；一期三件产物 SHA256 与本轮开工前完全一致 |
 
 ### 阶段 A 冒烟判据（15 条，新架构口径）
@@ -89,18 +97,16 @@
 > **写入顺序不变量（G6，离朱第 13 轮捕获）**：C6 零残留扫描的**目标**包含
 > `.module_agent/n3d_sphere/module_definition.json`，而 `update_definition` 会改写该文件 ——
 > 因此**任何元数据 / 文档更新都必须排在最终 `verify_all` 之前**，不得复用更新前的验收结论。
-> 曾因"先跑验收、后改元数据"而在 `module_definition.json` 中留下一行真实命中
-> （描述里逐字列举了旧架构字段名），已改为"以脚本内 `REMOVED_FIELDS` 清单为准"的表述。
 
 - `verify_sphere_dag.py`：R1 几何、R2 FCC、R3 DAG、R4 去重、R5 双副本、**R5b 逐边数值正确性**、**R5c 感受野覆盖**、R6 判据（含 readout 严格口径）、**R7b readout_scope 生效性**、R7 产物；R1-R7b 均在 4 组配置上执行；运行时落盘 `sphere_dag_metrics.json`（111 条全精度指标）。
-- `verify_dh_constraint.py`：**H1-H4** `D <= H` 硬校验（含两条负例）、三预设 `D = H` 一致性、连通性下限（含 D 过小负例）、退化实测（用"临时停用下限校验"取出被拒配置的真实拓扑量）。
+- `verify_dh_constraint.py`：**H1-H4** `D <= H` 硬校验（含两条负例）、三预设 `D = H` 一致性、连通性下限（含 D 过小负例）、退化实测。
 - `verify_device_regression.py`：**D1-D7 设备契约回归取证**。
 - `verify_scope_and_fingerprint.py`：S1-S3 判据语义与双副本随 scope 的行为、S4-S5 产物指纹维度与冒烟命名规则。
 - `verify_config_contracts.py`：C1 半径公式、C2-C3 窗口校验与 FCC 容纳性、C4-C5 旧字段清理与取值域、C6 零残留断言（扫描词表与上下文豁免词均在脚本内定义，豁免逐行打印并计数）。
-- `verify_topology_snapshot.py`：固定实验点 × 10 seed 拓扑量快照（落盘 JSON）。
+- `verify_topology_snapshot.py`：固定实验点 × 10 seed 拓扑量快照（落盘 JSON；doc_numbers 的 `snapshot_checks` 从此文件的当轮内容现场聚合，**同轮同源、无滞后**）。
 - `run_smoke_matrix.py`：11 种冒烟组合重跑与取证刷新（产物名预测比对 + config 校验 + 默认产物未被污染 + 同一路径多次写入逐位一致），并重建 `smoke_scope_matrix.json`。
-- `verify_all.py`：一键依次执行 **10 条命令**（含 `--arch mlp` 冒烟、H1-H4、D1-D7 与一期回归）并汇总退出码，随后执行**文档数字防线**（artifact 类按扩展名分派 `.pt`→`torch.load` / `.json`→`json.load`，字段下钻支持含点键名与 list 整数下标）。
-- 取证文件：`doc_numbers.json`（174 项）、`legacy_dh_baseline.json`（`D = H` 改造前基线）、`sphere_dag_metrics.json`（111 条）、`log_smoke_matrix_f9.txt` / `smoke_matrix_f9.json`、`log_verify_all_f21.txt`（F21 验收）、`log_verify_all_g5.txt`（G5 验收）、`log_verify_all_h3.txt`（H3 验收）。
+- `verify_all.py`：一键依次执行 **10 条命令**（含 `--arch mlp` 冒烟、H1-H4、D1-D7 与一期回归）并汇总退出码，随后执行**文档数字防线**（四类数据源；artifact 按扩展名分派 `.pt`→`torch.load` / `.json`→`json.load`，字段下钻支持含点键名与 list 整数下标；`snapshot_checks` 按测点聚合 min/max/range/count 并支持按 `seed` 取单点；输出含分类明细行）。
+- 取证文件：`doc_numbers.json`（188 项）、`legacy_dh_baseline.json`（`D = H` 改造前基线）、`legacy_archive_manifest.json`（J1 归档逐文件 SHA256 与守恒证明）、`legacy/`（历史口径存档，不参与验收）、`sphere_dag_metrics.json`（111 条）、`topology_snapshot.json`、`log_smoke_matrix_f9.txt` / `smoke_matrix_f9.json`、`log_verify_all_f21.txt` / `log_verify_all_g5.txt` / `log_verify_all_h3.txt` / `log_verify_all_j3.txt`（四轮验收）。
 ## 纯球形分层有向无环架构
 
 ### 球体几何与尺度

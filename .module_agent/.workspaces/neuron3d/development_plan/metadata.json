@@ -1,17 +1,9 @@
 [
   {
-    "plan_id": "plan_d49675e8-b7af-4b2a-a2ea-a78bcc2c9587",
-    "plan_summary": "新增 D ≤ H 硬校验、三个预设改为 D=H（DEFAULT/HIGHACC 0.10、SMALL 0.15）、增加连通性下限校验（E≥N、层数≥2、S_in/S_out 非空）防图退化；并连带全量重跑刷新冒烟矩阵、R1-R7b、拓扑快照、doc_numbers.json 与 README/spec/module_definition 中所有受影响数字（|S_in| 50→193、DEFAULT 参数 42,919→154,864）；最后重跑 verify_all 与一期 E5 回归。",
+    "plan_id": "plan_f31a672e-b3ba-4f9d-b6ee-6ee5d01dad6e",
+    "plan_summary": "清理多余数据：把 _verify 下改造前 D>H 口径的旧冒烟产物（离朱实测 11 个 *_D0.25_* 文件）逐文件 SHA256 取证后归档到 _verify/legacy/，并同步 README/spec/legacy_dh_baseline 的路径与说明；把跨 10 seed 参数量区间 146237~164263 纳入 doc_numbers.json 由 verify_all 现跑比对；最后重跑 verify_all（含 C6）与一期 E5 回归并调用 plan_complete 收尾。",
     "starter_session_id": "session-abe38eb5-a63b-4ab1-8a50-4a5711fcb0c3",
-    "code_reviewed": true,
-    "plan_completed": true,
-    "test_passed": true
-  },
-  {
-    "plan_id": "plan_88510012-7256-4cc9-a000-4eb3c783f960",
-    "plan_summary": "修复皋陶第 4 轮审查遗留的 2 个小项：config.py 模块 docstring 的非法参考值（D=0.15 → D=0.10，R_max 1.754601 → 1.403681）并补齐\"关键不变量\"中的 D ≤ H；module_definition.json 补登记 G5 取证日志；随后重跑 verify_all（含 C6 零残留与 doc_numbers 174/0/0）与一期 E5 回归，并调用 plan_complete 收尾。",
-    "starter_session_id": "session-abe38eb5-a63b-4ab1-8a50-4a5711fcb0c3",
-    "code_reviewed": true,
+    "code_reviewed": false,
     "plan_completed": true,
     "test_passed": true
   }
