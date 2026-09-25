@@ -144,6 +144,42 @@
           "description": "README 说明用法（GUI 与 CLI）、零依赖与自包含声明、产物命名规则、断言口径，以及所有实测数字的来源与 seed 标注"
         }
       ]
+    },
+    {
+      "name": "n3d_shape",
+      "description": "N3D 三期形状变体：把神经元空间形状从球体泛化为立方体与圆柱体，自包含实现，上游零改动",
+      "responsibilities": [
+        "提供形状感知的神经元放置（生长度量：‖p‖₂ / ‖p‖∞ / max(‖p_xy‖₂,|z|/λ)）",
+        "提供形状专属尺寸窗口公式与构造期校验",
+        "提供形状感知的冒烟判据与独立验证脚本",
+        "提供形状维度的产物指纹以防同名互覆",
+        "提供形状对照的训练入口与实测报告"
+      ],
+      "dependencies": [
+        "framework"
+      ],
+      "functions": [
+        {
+          "name": "形状配置层",
+          "description": "shape / cyl_aspect 字段、取值域校验、形状专属尺寸上下界与窗口校验、to_dict/describe/预设同步"
+        },
+        {
+          "name": "形状生长度量与放置",
+          "description": "三种生长度量实现、形状专属 extents 与放置半径、容纳性与 2H 断言；sphere 分支与二期张量逐位一致"
+        },
+        {
+          "name": "形状感知冒烟判据",
+          "description": "把二期 15 条冒烟判据同构为形状感知版本，退出码语义保持 0/1/2，三形状全绿"
+        },
+        {
+          "name": "独立验证脚本",
+          "description": "verify_shape.py 逐条硬断言：三形状连通性下限 / 2H / DAG 无环·严格上行·拓扑序覆盖 / K>=2 / scope 非零 / 指纹含形状维度且可区分 / sphere 与二期张量逐位一致"
+        },
+        {
+          "name": "形状对照训练验收",
+          "description": "seed=42、DEFAULT、10 epoch 下五组对照（sphere 重跑 / cube / cylinder λ=1 / λ=0.5 / λ=2），独立日志与产物，如实报告不下因果结论"
+        }
+      ]
     }
   ]
 }

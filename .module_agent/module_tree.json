@@ -15,6 +15,10 @@
     {
       "name": "n3d_viz",
       "description": "N3D 神经元拓扑三维可视化工具模块：零新依赖（仅 torch/numpy + 标准库 tkinter），把已训练 checkpoint 中的神经元位置与连接导出为自包含交互式 HTML、点云 PLY 与线框 OBJ，并提供 GUI 与 CLI 双入口"
+    },
+    {
+      "name": "n3d_shape",
+      "description": "N3D 三期形状变体模块：把神经元空间形状从球体泛化为立方体与圆柱体（生长度量替换：‖p‖₂ / ‖p‖∞ / max(‖p_xy‖₂,|z|/λ)），自包含实现，一期与二期零改动"
     }
   ]
 }

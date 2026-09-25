@@ -38,5 +38,37 @@
     "code_reviewed": true,
     "plan_completed": true,
     "test_passed": true
+  },
+  {
+    "plan_id": "plan_02c4326a-5e41-40c9-9b08-61f4731d1224",
+    "plan_summary": "新建独立自包含模块 n3d_shape：把神经元空间形状从球体泛化为立方体与圆柱体（生长度量替换），完成配置层、形状放置、冒烟判据、独立验证脚本、五组训练对照与文档，上游模块零改动",
+    "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_ab80197e-2f35-4798-8290-5f689cd67716",
+    "plan_summary": "n3d_shape 神经元空间形状变体：配置层、形状生长度量与放置、形状感知冒烟判据、独立验证脚本、五组训练对照与文档，上游零改动（新模块，9 个文件）",
+    "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": false
+  },
+  {
+    "plan_id": "plan_0838da22-5ab3-4d7f-a86b-24c5e36063ca",
+    "plan_summary": "n3d_shape 修复轮：修复皋陶审查的 1 error（cylinder R_min 误拒合法配置）+ 2 warning（S3b 同源、删除二期 R_max 断言理由不实）+ 4 info（死诊断字段、README 数字与披露、头部清单、返回注解），并复跑全部判据与上游回归",
+    "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_7fb93d7a-c653-4685-bd58-3cb5477b02fa",
+    "plan_summary": "n3d_shape 修复轮复审：验证皋陶上轮 1 error（cylinder R_min 误拒合法配置）+ 2 warning（S3b 同源、删除二期 R_max 断言理由不实）+ 4 info 的逐条修复，以及离朱第 3 轮 F1/F2 收尾",
+    "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": false
   }
 ]
