@@ -1,0 +1,16 @@
+## 专长
+
+- Python 3.12 + PyTorch 张量数据处理；把 `state_dict` 中的几何 buffer 安全抽出为纯 Python / numpy 结构。
+- 零依赖数据可视化：手写三维投影（视图矩阵 + 透视投影 + 深度排序）与 Canvas/WebGL 渲染器，生成**单文件自包含 HTML**。
+- 零依赖几何导出：手写 PLY（点云）与 OBJ（`v` / `l`）写出器。
+- 桌面 GUI：Python 标准库 `tkinter` / `ttk` / `filedialog`，含后台线程 + 队列的消息传递，保证长任务不阻塞界面。
+- CLI 设计：`argparse`，与 GUI 共享同一套核心逻辑。
+
+## 其他约定
+
+- **零新依赖是硬约束**：不得在 `requirements.txt` 增加任何条目，不得 import 除 `torch` / `numpy` / Python 标准库之外的第三方包（`tkinter` 属标准库，可用）。
+- **不得 import 业务模块**：`n3d_viz` 不 import `n3d_sphere` / `n3d_proto`，只读 checkpoint 文件。
+- **不臆造数据**：所有断言与文档中的数字必须来自真实执行产物，并标注来源 checkpoint 与 `seed`；不得写入未经运行的期望值。
+- **产物纪律**：产物名由 checkpoint 名派生，禁止固定同名覆盖；写入前若同名文件已存在须明确提示。
+- **不改动他人模块**：`n3d_sphere` / `n3d_proto` 的源码与产物一律不得修改。
+- 函数签名带类型注解，类与重要函数写 docstring，关键算法（三维投影、深度排序、坐标写出）写中文注释解释原理。

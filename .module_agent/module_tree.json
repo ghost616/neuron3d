@@ -11,6 +11,10 @@
     {
       "name": "n3d_sphere",
       "description": "N3D 二期架构变体：球形有向拓扑（球体神经元分布 + 半球切分突触 + 全局流向）的自包含实现"
+    },
+    {
+      "name": "n3d_viz",
+      "description": "N3D 神经元拓扑三维可视化工具模块：零新依赖（仅 torch/numpy + 标准库 tkinter），把已训练 checkpoint 中的神经元位置与连接导出为自包含交互式 HTML、点云 PLY 与线框 OBJ，并提供 GUI 与 CLI 双入口"
     }
   ]
 }

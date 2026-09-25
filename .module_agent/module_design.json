@@ -82,6 +82,68 @@
           "description": "新增 --topology / --flow-axis / --space-radius CLI（未提供哨兵语义），产物指纹含 topology / flow_axis 维度，CHECKPOINT_DIR 隔离到 checkpoints/n3d_sphere/，支持冒烟测试与全量训练"
         }
       ]
+    },
+    {
+      "name": "n3d_viz",
+      "description": "N3D 神经元拓扑三维可视化工具：零新依赖，把已训练 checkpoint 的神经元位置与连接导出为自包含交互式 HTML、点云 PLY 与线框 OBJ，提供 GUI 与 CLI 双入口",
+      "responsibilities": [
+        "加载并校验二期训练产物 (.pt)，缺键时明确报错并退出非 0",
+        "从 state_dict 抽取三维拓扑：神经元坐标、连接边与权重、S_in/S_out 掩码、分层表与度分布",
+        "生成自包含交互式三维 HTML（内联数据与渲染器，零外部 URL，不嵌入 syn_dist）",
+        "写出点云 PLY 与线框 OBJ，坐标与 checkpoint 逐位一致",
+        "提供 tkinter GUI（文件/文件夹选择、开始、状态、日志、一键打开产物）与 CLI 双入口",
+        "提供零依赖验证脚本，逐条硬断言产物正确性与异常行为"
+      ],
+      "functions": [
+        {
+          "name": "产物加载与校验",
+          "description": "读取 checkpoint，校验 model_state_dict 是否含二期拓扑必需键；对一期产物/损坏文件/路径不存在给出可读错误并以非 0 退出码结束"
+        },
+        {
+          "name": "拓扑抽取",
+          "description": "把 neuron_pos、edge_src/edge_dst、edge_weight、edge_dist、in/out_scope_mask、topo_index、level_node_reach/level_edge_reach、in/out_degree 等张量转为纯 Python/numpy 结构，计算分层着色分组与阈值过滤统计"
+        },
+        {
+          "name": "产物命名派生",
+          "description": "由 checkpoint 文件名派生出互不撞名的 html/ply/obj 产物路径，默认输出目录 checkpoints/n3d_viz/，同名已存在时明确提示"
+        },
+        {
+          "name": "自包含交互式 HTML 生成",
+          "description": "把拓扑数据以 JSON 内联、渲染器以 JS 内联到单个 HTML 文件，保证无任何外部 URL 引用且体积小于 2MB"
+        },
+        {
+          "name": "三维交互渲染",
+          "description": "手写视图/投影矩阵与深度排序，实现旋转、缩放、平移、按层着色、按 |edge_weight| 映射边粗细与颜色、S_in/S_out 高亮、分层参考平面"
+        },
+        {
+          "name": "交互控件",
+          "description": "图层开关（神经元/连接/层平面）、边权重阈值过滤、悬停显示神经元 id/层/入度/出度/scope、图例"
+        },
+        {
+          "name": "点云 PLY 导出",
+          "description": "手写 PLY 写出器，输出 N 个神经元顶点坐标，点数量与坐标与 checkpoint 逐位一致"
+        },
+        {
+          "name": "线框 OBJ 导出",
+          "description": "手写 OBJ 写出器，输出顶点与 E 条 l 线框连接，行数与端点索引正确"
+        },
+        {
+          "name": "tkinter 图形界面",
+          "description": "窗口含 .pt 浏览选择、输出文件夹浏览选择、开始按钮、状态提示、日志区、一键打开产物或文件夹；长任务在后台线程执行并通过队列回传日志，界面不卡死"
+        },
+        {
+          "name": "命令行入口",
+          "description": "argparse 解析 --checkpoint/--out-dir/--out/--threshold 等参数执行同一套核心逻辑；不带参数时启动 GUI 窗口"
+        },
+        {
+          "name": "零依赖验证脚本",
+          "description": "逐条硬断言 PLY 顶点数、OBJ 行数、坐标逐位一致、层分组与 S_in/S_out 计数、阈值过滤边数、HTML 体积与零外部 URL、不含 syn_dist，以及一期产物的非 0 退出与缺失键名报错"
+        },
+        {
+          "name": "模块文档",
+          "description": "README 说明用法（GUI 与 CLI）、零依赖与自包含声明、产物命名规则、断言口径，以及所有实测数字的来源与 seed 标注"
+        }
+      ]
     }
   ]
 }

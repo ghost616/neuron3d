@@ -1,0 +1,49 @@
+{
+  "module_name": "n3d_viz",
+  "files": [
+    {
+      "path": "n3d_viz/__init__.py",
+      "description": "包声明与模块定位：写明「零新依赖」（仅 torch / numpy / 标准库）与「自包含」（不 import n3d_sphere / n3d_proto）两条硬约束，导出 core / export_geometry / render_html / gui 子模块，并提供脚本直跑兼容说明。"
+    },
+    {
+      "path": "n3d_viz/core.py",
+      "description": "数据层与契约中心：checkpoint 加载（torch.load map_location=cpu）、二期必需键校验（区分路径不存在 / 文件损坏 / 非二期产物三类错误）、索引取值域校验（topo_index / edge_src / edge_dst 必须落在 [0,N)，违规抛 CheckpointSchemaError 并附越界值与下标）、把张量抽取为纯 Python 结构的 TopologyData、分层着色分组与度统计与阈值过滤统计（|edge_weight| median 统一为排序后上中位）、产物命名派生（viz_<ckpt名>.*）与输出路径解析、HTML 内联 JSON 负载构造（pos_digits / weight_digits 的 None 表示取默认位宽 DEFAULT_POS_DIGITS=6 / DEFAULT_WEIGHT_DIGITS=8）、三件套写出编排 write_outputs（支持 ply_binary / with_ply_edges / include_planes，同名产物提示不静默覆盖）。"
+    },
+    {
+      "path": "n3d_viz/export_geometry.py",
+      "description": "零依赖几何导出：手写 PLY 点云写出器（binary_little_endian float32 或 ascii，含按层着色 RGB）与 OBJ 线框写出器（N 个 v 行 + E 个 l 行，索引从 1 开始），以及独立的 PLY / OBJ 回读解析器（parse_ply_vertices / parse_obj / parse_ply_edge_count）供验证脚本使用；含脚本直跑 CLI（只导出 PLY / OBJ）。"
+    },
+    {
+      "path": "n3d_viz/render_html.py",
+      "description": "单文件 HTML 生成层：读取 assets/viewer.html 模板与 assets/viewer.js 渲染器，把 JSON 负载与渲染器源码内联成自包含 HTML；提供 assert_self_contained 静态断言（无 http/https 与协议相对引用、不含 syn_dist、体积 < 2MB）；含脚本直跑 CLI（只生成 HTML 并做自包含校验）。"
+    },
+    {
+      "path": "n3d_viz/gui.py",
+      "description": "tkinter 图形界面薄封装：.pt 文件与输出文件夹输入框 + 浏览按钮（filedialog）、阈值滑块与层平面开关、开始生成按钮、状态栏与可滚动日志区、一键打开 HTML（默认浏览器）与打开输出文件夹；长任务在后台线程执行并通过 queue + root.after() 回传日志，界面不卡死；同名产物覆盖信息同时写入日志与状态栏（双通道提示）；build_smoke_window 供 GUI 冒烟断言使用；不实现拖拽（与零依赖冲突）。"
+    },
+    {
+      "path": "n3d_viz/__main__.py",
+      "description": "命令行入口：argparse 解析 --checkpoint / --out-dir / --out / --threshold / --no-plan-planes / --ply-ascii / --with-ply-edges / --quiet；给出 --checkpoint 时复用 core 逻辑生成三件套并按约定返回退出码（0 成功 / 2 参数或 GUI 失败 / 3 checkpoint 错误）；不带参数时启动 tkinter GUI。"
+    },
+    {
+      "path": "n3d_viz/verify_viz.py",
+      "description": "零依赖硬断言验证脚本：逐条断言 PLY/OBJ 顶点与线段数、产物坐标与 neuron_pos 逐位一致（容差 1e-6）、层着色组数与各层规模、S_in/S_out 高亮数、阈值保留边数、HTML 体积与外部引用与 syn_dist、内联数据规模自洽、开关类参数的产物可观测差异、一期产物异常路径退出码与缺失键名、越界索引负例（退出码 3 / 报错含越界值与下标 / 无 traceback / 无产物）、源码静态扫描（不 import 业务模块、无第三方依赖）、GUI 冒烟与渲染器逻辑冒烟；末尾汇总并通过退出码表达结果，可落 Markdown 报告（报告含渲染器冒烟小节；默认产物写入 checkpoints/n3d_viz/_verify）。"
+    },
+    {
+      "path": "n3d_viz/assets/viewer.html",
+      "description": "HTML 视图模板：页面结构、控件面板（图层开关 / 阈值滑块 / 重置按钮）、统计面板、图例与悬停标签、画布样式；含 /*__N3D_DATA_JSON__*/ 与 /*__N3D_VIEWER_JS__*/ 两个占位标记，构建时被替换为数据负载与渲染器源码。"
+    },
+    {
+      "path": "n3d_viz/assets/viewer.js",
+      "description": "三维交互渲染器（Canvas 2D，零依赖）：手写轨道相机视图矩阵、透视投影与按深度排序的画家算法；鼠标拖拽旋转、滚轮缩放、右键平移、悬停神经元详情；按 z 分层着色（S_in/S_out 以同心小圆叠加高亮）、按 |edge_weight| 映射边粗细与颜色、绘制 K 层参考平面；图层开关与阈值滑块实时刷新保留边数；关键算法含中文原理注释。"
+    },
+    {
+      "path": "n3d_viz/assets/viewer_smoke.js",
+      "description": "渲染器逻辑冒烟脚本（Node + 最小 DOM/Canvas 桩，零第三方依赖）：真实执行 HTML 中内联的 viewer.js，断言圆形总数 == N + S_in + S_out、S_in/S_out 高亮圈数 == 193/187、绘制线段数 ≥ 阈值内边数、投影 bbox 有限且落在画布附近、投影质心接近画布中心、阈值滑块联动、悬停命中并填充详情、图例色块数 == K+3；由 verify_viz.py 调用。"
+    },
+    {
+      "path": "n3d_viz/README.md",
+      "description": "模块文档：GUI 与 CLI 两种用法、零依赖与自包含声明、三件套产物说明与命名规则、HTML 交互能力与渲染原理、模块结构、验收标准与断言口径清单、异常路径说明、全部实测数字及其来源 checkpoint 与 seed 标注，以及「边集与突触位置随 seed 变化、神经元 FCC 位置与 seed 无关」的引用纪律。"
+    }
+  ]
+}
