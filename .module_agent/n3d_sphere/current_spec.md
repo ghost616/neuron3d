@@ -25,8 +25,8 @@
 | `n3d_sphere/data.py` | MNIST 数据层（IDX 惰性解析 + 归一化 + DataLoader，num_workers>0 时按 (seed, worker_id) 播种） |
 | `n3d_sphere/config.py` | 超参配置层：球半径窗口公式、FCC 晶格常数派生量、判据开关、三预设（SMALL/DEFAULT/HIGHACC，**均为 `D = H`**）；`__post_init__` 实施 **`D <= H` 硬校验（G1）**；模块 docstring 的参考值与"关键不变量"清单已与合法口径同步（H1） |
 | `n3d_sphere/model.py` | 球形分层 DAG 模型：FCC 规则堆积、半球突触采样、神经元级连接（同对去重取最近突触对）、Kahn 拓扑序与 CSR 分组、**整层向量化的两阶段双副本前向**、**设备契约守卫 `_assert_index_device`**、**连通性下限校验 `check_connectivity_floor`（G3）**、统计与自检接口；另含 `MLPBaseline` 对照基线 |
-| `n3d_sphere/train.py` | 训练入口：CLI（flow-axis/space-radius/**d**/input-scope/readout-scope/placement，`--d` 的 help 注明 `D <= H`）、产物指纹与隔离、15 条冒烟判据、checkpoint 元数据 |
-| `n3d_sphere/README.md` | 模块文档：几何与尺度、**`D <= H` 硬约束与连通性下限（含改造前后对照表）**、连接规则、两阶段双副本前向、判据开关、CLI、冒烟判据、实测拓扑统计（标注 seed）、**产物纪律（含 `_verify/legacy/` 历史口径存档的用途与判定口径）**、字节确定性与 SHA256 语义、验证脚本、已知边界与各轮修复记录 |
+| `n3d_sphere/train.py` | 训练入口：CLI（flow-axis/space-radius/**d**/input-scope/readout-scope/placement，`--d` 的 help 注明 `D <= H`）、产物指纹与隔离、15 条冒烟判据、checkpoint 元数据；覆盖已有产物前按 `--backup`（默认开）生成 `<产物名>.pt.bak` —— 这是"同名覆盖仍可追溯"的关键机制（K1 修复轮 error①） |
+| `n3d_sphere/README.md` | 模块文档：几何与尺度、**`D <= H` 硬约束与连通性下限（含改造前后对照表）**、连接规则、两阶段双副本前向、判据开关、CLI、冒烟判据、实测拓扑统计（标注 seed）、**产物纪律（含 `_verify/legacy/` 历史口径存档的用途与判定口径）**、字节确定性与 SHA256 语义、**第 7.2 节二期首次正式全量训练（5 轮对照表 / 达标结论 / 正式产物来源 / 筛参轮 / 迭代顺序与未探索维度）**、**第 10.6 节 K1 修复轮（皋陶 2 error + 4 warning + 3 info 的逐条修复与两类教训）**、验证脚本、已知边界与各轮修复记录 |
 | `checkpoints/n3d_sphere/_verify/verify_sphere_dag.py` | 几何 / FCC / DAG / 去重 / 双副本 / 逐边数值 / 感受野 / 判据 / 产物 验证脚本（R1-R7b，4 组配置）；每次运行把 111 条全精度指标落盘 `sphere_dag_metrics.json` |
 | `checkpoints/n3d_sphere/_verify/verify_dh_constraint.py` | **H1-H4**：`D <= H` 硬校验（含负例消息取证）、三预设 `D = H` 一致性、连通性下限校验（含 D 过小负例）、退化实测 |
 | `checkpoints/n3d_sphere/_verify/verify_device_regression.py` | **设备契约回归取证（D1-D7）**：类型/注册状态、`vars(model)` 通用扫描、层切分等价性、`meta` 搬运实验与对照、两条守卫负例、CUDA 实测或静态取证、`state_dict` 往返逐位一致 |
@@ -34,25 +34,36 @@
 | `checkpoints/n3d_sphere/_verify/verify_config_contracts.py` | 半径公式 / 窗口校验 / 字段清理 / 零残留验证脚本（C1-C6） |
 | `checkpoints/n3d_sphere/_verify/verify_topology_snapshot.py` | 固定实验点（6 个，均 `D = H`）× 10 seed 拓扑量快照脚本（落盘 `topology_snapshot.json`） |
 | `checkpoints/n3d_sphere/_verify/run_smoke_matrix.py` | 以当前代码重跑 11 种冒烟组合：解析实际落盘路径并与独立预测的产物名比对、回读 config 与期望逐字段比对、断言同路径多次写入逐位一致；刷新 `smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` 并重建 `smoke_scope_matrix.json` |
-| `checkpoints/n3d_sphere/_verify/verify_all.py` | 一键验证入口：依次执行 **10 条**验收命令、汇总退出码，并执行**文档数字防线**（`doc_numbers.json` 现跑比对；四类数据源：产物字段 / R1-R7b 指标 / **跨 seed 快照聚合（含按 seed 取单点）** / 命令输出文本；输出含分类明细行） |
-| `checkpoints/n3d_sphere/_verify/doc_numbers.json` | **文档数字登记表**（**188 项** = 49 产物字段 + 111 全精度指标 + **14 跨 seed 快照聚合** + 14 文本计数），由 `verify_all.py` 现跑比对，不一致即判失败 |
+| `checkpoints/n3d_sphere/_verify/run_round.py` | **正式全量训练取证 runner**（K1）：Python 侧写盘把子进程 stdout+stderr **流式**写成 UTF-8 日志（规避 Windows PowerShell 重定向写 UTF-16LE 使日志不可解析），末尾追加真实 `EXITCODE=<n>` |
+| `checkpoints/n3d_sphere/_verify/verify_full_runs.py` | **F-L1~F-R1 正式全量训练取证判据**（K1；K1 修复轮加固）：F-L1 台账结构自检；F-L2/F-L3 逐轮三方一致（台账 vs 真实终端日志 vs **该轮冻结快照**，含逐 epoch 轨迹、参数量按重建模型 `count_parameters()` 口径、**快照路径存在性 + SHA256 + 字节数强制比对**、退出码、达标判定）；F-L4 正式产物 `model.pt` 与台账来源轮一致；F-R1 逐位可复现重放（限批写 `_verify/`）。日志按 BOM 自动识别 UTF-8/UTF-16LE。`ledger` 秒级（已纳入 `verify_all`）/ `bounded` 分钟级 |
+| `checkpoints/n3d_sphere/_verify/build_full_runs_ledger.py` | 轮次台账构建脚本（K1，**不是判据**）：按每轮显式声明的 `snapshot_source`（`artifact` / `backup`）冻结产物快照到 `artifacts/<轮次>.pt`，冻结时强制校验『来源→快照 SHA256 一致』与『快照 config/test_acc 与本轮终端日志一致』（不一致即中止），执行限批重放取 CE 和，写出 `full_runs.json` |
+| `checkpoints/n3d_sphere/_verify/register_full_runs_doc_numbers.py` | 把各轮登记项写入 `doc_numbers.json` 的 `full_run_checks` 类（K1，**不是判据**；产物字段以**冻结快照**为读回对象），并写入两次限批筛参的 `text_checks`；全部现场取数、可重复运行 |
+| `checkpoints/n3d_sphere/_verify/verify_snapshots_k1fix.py` | **K1 修复轮的 5 轮快照 × 配置复核脚本**（只读）：打印快照路径/字节数/SHA256/`snapshot_source`/现算 `artifact_available`，并用 `torch.load` 复核 `(epochs, batch_size, lr, readout_bias, lr_schedule, grad_clip, test_acc, E)` 与轮次期望逐项一致；输出落 `log_snapshots_k1fix.txt` |
+| `checkpoints/n3d_sphere/_verify/full_runs.json` | **正式全量训练轮次台账**（K1）：5 轮的配置、命令行、日志路径、`exit_code`（含 `exit_code_note` 取证方式与时点）、达标判定、`artifact_available` / `artifact_retention` / `artifact_backup` / `artifact_backup_sha256` / `snapshot_source` / `artifact_snapshot_sha256` / `artifact_snapshot_bytes`、逐 epoch 轨迹、限批重放登记值，以及正式产物 `model.pt` 的来源轮次与内嵌 config |
+| `checkpoints/n3d_sphere/_verify/artifacts/` | **轮次产物冻结快照（5 轮各一份，K1）**：`A_baseline_default.pt`（`82C92A4E…`）/ `B_preset_highacc.pt`（`DE1A13E5…`，来源=`.bak`）/ `C_lr2e3_bs64.pt`（`D460F8F2…`）/ `D_capacity_N384.pt`（`63AEC14D…`，来源=`.bak`）/ `E_N384_epochs40.pt`（`995CECD5…`）；同名覆盖时被覆盖轮的产物由 `train.py` 存为 `<产物名>.pt.bak`，快照即从此冻结 |
+| `checkpoints/n3d_sphere/_verify/log_full_roundA_baseline.txt` / `log_full_roundB_highacc.txt` / `log_full_roundC_lr2e3_bs64.txt` / `log_full_roundD_N384.txt` / `log_full_roundE_N384_epochs40.txt` | 5 轮正式全量训练的真实终端输出（A/B/C 为 UTF-16LE 且无 `EXITCODE`；D/E 为 UTF-8 且末尾含 `EXITCODE=0`） |
+| `checkpoints/n3d_sphere/_verify/screen_y16_b400.txt` / `screen_N384_b400.txt` | 两次**限批筛参**（`--max-batches 400`，**非正式对照**）的真实终端输出与 `EXITCODE=0`：`y=16×16`（末轮 loss 0.0584、E=805、params=135333）被否、`N=384`（0.0457、E=1145、params=233513）入选 |
+| `checkpoints/n3d_sphere/_verify/exit_code_roundA.txt` / `log_exitcode_roundB.txt` / `log_exitcode_roundC.txt` | A/B/C 三轮的退出码取证（A 为独立登记文件，其 `$LASTEXITCODE` 时点歧义已在 README §7.2 注明；B/C 为同配置同 seed 的限批重放日志） |
+| `checkpoints/n3d_sphere/_verify/log_snapshots_k1fix.txt` / `log_verify_all_k1.txt` / `log_proto_smoke_k1.txt` | K1 轮的取证输出：5 轮快照复核、`verify_all.py` 完整验收（11 条命令 + 文档数字防线 252 项）、一期回归原始输出（9/9 PASS、`loss=2.419689`） |
+| `checkpoints/n3d_sphere/_verify/verify_all.py` | 一键验证入口：依次执行 **11 条**验收命令、汇总退出码，并执行**文档数字防线**（`doc_numbers.json` 现跑比对；**五类**数据源：产物字段 / **全量轮次（优先读冻结快照，纯日志字段不依赖产物存在性）** / R1-R7b 指标 / **跨 seed 快照聚合（含按 seed 取单点）** / 命令输出文本；输出含分类明细行） |
+| `checkpoints/n3d_sphere/_verify/doc_numbers.json` | **文档数字登记表**（**252 项** = 49 产物字段 + 111 全精度指标 + **14 跨 seed 快照聚合** + **44 文本计数** + **34 全量轮次登记项**），由 `verify_all.py` 现跑比对，不一致即判失败 |
 | `checkpoints/n3d_sphere/_verify/legacy_archive_manifest.json` | **J1 归档取证清单**：11 个改造前 `D > H` 产物的逐个 `size` / `sha256_before` / `sha256_after` / `bytes_identical` 与配置字段，两侧总数与总字节守恒断言，以及 `smoke.pt` 未被扰动的记录 |
 | `checkpoints/n3d_sphere/_verify/legacy/` | **历史口径存档目录**（不属于当前验收）：改造前 `D > H` 的 11 个冒烟产物（共 10,017,363 字节），仅供历史对照；不被任何验收命令读取或重写 |
 | `checkpoints/n3d_sphere/_verify/legacy_dh_baseline.json` | **`D = H` 改造前的历史基线**（`D > H`，现已不可由 `Config` 构造）：改造前两测点的 E / 层数 / `S_in` / `S_out` / params 及其来源产物与快照的 SHA256；J1 后其 records 中的 artifact 路径已指向 `legacy/` |
 | `checkpoints/n3d_sphere/_verify/sphere_dag_metrics.json` | `verify_sphere_dag.py` 落盘的全精度实测指标（R1-R7b，111 条） |
 | `checkpoints/n3d_sphere/_verify/topology_snapshot.json` | 6 测点 × 10 seed 的拓扑量快照；doc_numbers 的 `snapshot_checks` 现场从此文件聚合跨 seed 区间与按 seed 单点 |
 | `checkpoints/n3d_sphere/_verify/smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` | 11 种冒烟组合的取证记录（产物名 / 退出码 / PASS / FAIL / loss / 梯度范数 / config 核对 / SHA 一致性字段）与完整日志 |
-| `checkpoints/n3d_sphere/_verify/log_verify_all_f21.txt` / `log_verify_all_g5.txt` / `log_verify_all_h3.txt` / `log_verify_all_j3.txt` | 四轮（F21 / G5 / H3 / J3）`verify_all.py` 的完整验收输出：10 条命令退出码与判据计数、文档数字防线（分类明细 + 总计）与总结句 |
+| `checkpoints/n3d_sphere/_verify/log_verify_all_f21.txt` / `log_verify_all_g5.txt` / `log_verify_all_h3.txt` / `log_verify_all_j3.txt` / `log_verify_all_k1.txt` | 五轮（F21 / G5 / H3 / J3 / K1）`verify_all.py` 的完整验收输出：命令退出码与判据计数、文档数字防线（分类明细 + 总计）与总结句 |
 | `checkpoints/n3d_sphere/_verify/topology_snapshot.json` / `smoke_scope_matrix.json` | 拓扑量快照与四种 scope 组合的冒烟汇总记录 |
 ## 验收标准
 
 ### 实测验收结果（唯一记录处；全部命令退出码 0）
 
-所有实测数字均**登记在 `checkpoints/n3d_sphere/_verify/doc_numbers.json`**（**188 项** =
-49 产物字段 + 111 全精度指标 + **14 跨 seed 快照聚合** + 14 文本计数）并由 `verify_all.py`
-在**同一轮现跑**中逐项比对；下表中的数字若与登记表或现跑不一致即判失败。本轮（`D <= H`
-约束 + 预设 `D = H` + 连通性下限校验 + J1 归档清理 + J2 跨 seed 区间登记）已把全部受影响
-数字整体刷新。
+所有实测数字均**登记在 `checkpoints/n3d_sphere/_verify/doc_numbers.json`**（**252 项** =
+49 产物字段 + 111 全精度指标 + **14 跨 seed 快照聚合** + **44 文本计数** + **34 全量轮次登记项**）
+并由 `verify_all.py` 在**同一轮现跑**中逐项比对；下表中的数字若与登记表或现跑不一致即判失败。
+本轮（`D <= H` 约束 + 预设 `D = H` + 连通性下限校验 + J1 归档清理 + J2 跨 seed 区间登记 +
+**K1 二期首次正式全量训练取证（5 轮，全部未达标）**）已把全部受影响数字整体刷新。
 
 > **历史口径归档**：改造前 `D > H` 口径的 11 个冒烟产物已由 J1 移到
 > `checkpoints/n3d_sphere/_verify/legacy/`（逐文件 SHA256 前后一致、计数与字节守恒，
@@ -66,7 +77,8 @@
 | R1-R7b 几何/FCC/DAG/去重/双副本/逐边数值/感受野/判据/产物 | `verify_sphere_dag.py all` 退出码 0（10 项判据标签全 PASS），**在 4 组配置上执行**（SMALL / DEFAULT / DEFAULT+`flow_axis=x` / DEFAULT+`space_radius=0.9`，均为 `D = H`），111 条全精度指标落盘 `_verify/sphere_dag_metrics.json`。**R5**：max\|Δa_up\| = 1.047723 / 2.259184 / 1.702276 / 2.259184，受影响下游非 `S_in` 神经元 = 9 / 59 / 61 / 59，`d(sum a_up)/d(a_in)` 非零 = 132/192、653/768、643/768、653/768；**R5b**：最大偏差 = 5.960e-08 / 2.384e-07 / 5.960e-08 / 2.384e-07（阈值 1e-5），M1 形态反例错配 = 106/106、727/736、716/730、727/736 且结果差异 = 8.437e-01 / 1.655e+00 / 1.703e+00 / 1.655e+00；**R5c**：最深层祖先覆盖 7/7、9/9、10/10、9/9 层，第一层扰动传到最深层最大变化 = 7.924e-05 / 2.500e-04 / 2.625e-04 / 2.500e-04；**R7b**：`readout_scope` 两取值 \|S_out\| any=187 / all=14，同一输入下 logits 最大差异 = 0.858180 |
 | **H1-H4 `D <= H` 与连通性下限（G1/G3）** | `verify_dh_constraint.py` 退出码 0：H1 负例 `H=0.10/D=0.15`、`H=0.15/D=0.25`、`H=0.10/D=0.1000001` 全部抛 `ValueError`（消息含 H/D/D/H 与约束说明），边界 `D == H`、`D < H` 正常构造；H2 三预设均 `D = H` 且 `describe()` / `to_dict()` 往返一致；H3 三预设通过下限并报出指标（SMALL E=106/K=7/S_in=55/S_out=53/params=43930；DEFAULT E=736/K=9/S_in=193/S_out=187/params=154864；HIGHACC 同 DEFAULT 但 params=154874，因启用 `readout_bias`）；H4 退化实测 D=0.05/0.03/0.02 → E=146/17/1（`E/N` = 0.5703/0.0664/0.0039）全部被下限校验拦下 |
 | **D1-D7 设备契约（F16）** | `verify_device_regression.py` 退出码 0（D1-D5 与 D7 共 6 项 PASS，D6 无 GPU 时 SKIP）：D1 `level_edge_reach` / `level_node_reach` 均为已注册 int64 `[K,2]` 张量（SMALL `(7,2)`、`flow_axis=x` `(10,2)`）；D2 `vars(model)` 通用扫描无未注册张量与含张量容器；D3 层切分与独立分层逐位一致、层边区间无缝覆盖 `[0,E)`；D4 `.to('meta')` 后索引张量全部搬到 meta，而对照的普通 Python list 中张量仍停留在 cpu；D5 两条守卫负例均抛 RuntimeError；D6 本机无 GPU → 标注"CUDA 路径为静态取证"并 skip；D7 `state_dict` 往返后前向逐位一致 |
-| **文档数字防线（F20/J2）** | `verify_all.py` 现跑比对 `doc_numbers.json`：**一致 188 项 / 不一致 0 项 / 跳过 0 项**；分类明细 artifact 49 / metric 111 / **snapshot 14** / text 14（各类均"不一致 0、跳过 0"）。snapshot 类登记 DEFAULT 测点跨 10 seed 的 `params 146237~164263`、`E 727~750`、`S_in 182~205`、`S_out 185~203`、双副本 167~192、层数 9~9、seed 数 10，以及 SMALL 测点的 seed=42 单点值与其跨 10 seed 区间（`E 96~115`、`params 39235~44710`） |
+| **文档数字防线（F20/J2/K1）** | `verify_all.py` 现跑比对 `doc_numbers.json`：**一致 252 项 / 不一致 0 项 / 跳过 0 项**；分类明细 artifact 49 / metric 111 / **snapshot 14** / text 44 / **full_run 34**（各类均"不一致 0、跳过 0"）。snapshot 类登记 DEFAULT 测点跨 10 seed 的 `params 146237~164263`、`E 727~750`、`S_in 182~205`、`S_out 185~203`、双副本 167~192、层数 9~9、seed 数 10，以及 SMALL 测点的 seed=42 单点值与其跨 10 seed 区间（`E 96~115`、`params 39235~44710`） |
+| **K1 二期首次正式全量训练（5 轮，共享 seed=42 单点运行，全部未达标；K1 修复轮已更正）** | 逐轮命令与结论：**A** `python n3d_sphere/train.py --seed 42`（DEFAULT，退出码 0）→ `test_acc=0.9759`、loss=0.0195、E=736、params=154864、层数 9、137.5s；**B** `--preset highacc --seed 42`（退出码 0）→ **0.9823**、loss=0.0005、params=154874、258.1s；**C** `--preset highacc --seed 42 --epochs 20 --batch-size 64 --lr 2e-3`（退出码 0）→ 0.9816、loss=0.0001、params=154874、495.7s；**D** `--preset highacc --seed 42 --n 384`（退出码 0）→ **0.9828（5 轮最好）**、loss=0.0002、E=1145、params=233523、层数 11、371.7s；**E** `--preset highacc --seed 42 --n 384 --epochs 40`（退出码 0）→ 0.9826、loss=0.0000、E=1145、params=233523、710.1s。达标线 **0.9864**（MLP 对照基线），5 轮**全部未达标**，最好轮 D 距线 **0.36pp**；5 轮均无 NaN/Inf、无崩溃、无下限报错、无 OOM；上限 5 轮用尽后停止并如实汇总。**迭代顺序与未探索维度**：实际为 A 基线 → B 优化 → C 优化 → D 容量 → E 容量+优化（**先做优化组**；该偏离**没有同期依据** —— 轮 B 日志 `01:22:08` 早于 `01:27` 的筛参；`01:27` 两次 `--max-batches 400` 筛参解释的是此后容量维度选 `N=384` 与剩余额度分配，见 README §7.2.3），**几何组（H/D/flow_axis）与判据组（两 scope 四种组合）从未探索**，归因结论不得外推。**产物**：5 轮各有一份可 `torch.load` 复核的冻结快照 `_verify/artifacts/<轮次>.pt`（A `82C92A4E…` / B `DE1A13E5…` / C `D460F8F2…` / D `63AEC14D…` / E `995CECD5…`），来源由每轮 `snapshot_source` 声明（B/D 为 `backup` —— 其产物在同名覆盖时被 `train.py` 的 `--backup` 存为 `<产物名>.pt.bak`，故**未丢失**；`artifact_available=false` 只表示该文件名当前已被同指纹后轮占用）。**正式产物** `checkpoints/n3d_sphere/model.pt` 来源 = **轮 A（DEFAULT_CONFIG 原样）**，内嵌 `config` 为 `N=256/y=8x8/H=D=0.10/bs=64/lr=1e-3/epochs=10/seed=42/Adam`、`test_acc=0.9759`、`epochs=10`、`E=736`、`params=154864`；因**无达标轮**故"达标轮落 model.pt"未触发，`model.pt` **不等于**最好配置（D 的 0.9828）；**轮 A 覆盖了一份既有的同配置产物并生成 `model.pt.bak`**（与轮 A 产物逐位相同 `82C92A4E…`），此后未再被覆盖，**该既有产物的来源不可追溯**（CreationTime `01:13:25` 早于轮 A 的 `torch.save`，但无任何全量训练日志与之对应，全盘亦无第二份 `model.pt*`）。**筛参轮（限批，非正式对照）**：`01:27` 两次 `--max-batches 400`（两侧同为 `preset=default` + `seed=42` + `bs=64`，彼此同预算可比）—— `y=16×16` 的 **epoch 1 平均训练 loss×100 = 41.17**（loss 0.4117）/ **前 100 batch CE 和 = 78.92**（batch100 running_loss 0.7892）、末轮 loss 0.0584、`E=805`、`params=135333` → 被否；`N=384` 的 **36.85** / **68.01**、末轮 0.0457、`E=1145`、`params=233513` → 入选。正式 5 轮同口径参照（**口径一 / 口径二**）：A 27.60 / 75.05、B 26.84 / 52.89、C 23.89 / 59.68、D 24.88 / 48.84、E 24.88 / 48.84；**筛参与 D/E 非同一配置**（筛参 `preset=default`（Adam、lr=1e-3、bs=64、bias 关、无调度/裁剪）vs D/E `preset=highacc`（AdamW+wd=1e-4、cosine、lr=2e-3、bs=128、clip 1.0、bias 开）），**无逐位可比性**。**退出码口径**：仅 D/E 的日志末尾自带 `EXITCODE=0`；A 由 `exit_code_roundA.txt`（mtime `01:21:00`，晚于限批重放的 `01:20:42`，时点歧义如实标注）、B/C 由同配置同 seed 的限批重放日志取证，三份文件均**未改写原始日志**。**复核**：`verify_full_runs.py ledger` 退出码 0（F-L1 结构自检、F-L2/F-L3 逐轮三方一致含**快照路径存在性 + SHA256 + 字节数强制比对**、F-L4 正式产物与来源轮一致）、`verify_full_runs.py bounded` 退出码 0（F-R1 逐位可复现重放：前 200 batch CE 和 A 108.4 / B 78.4 / C 90.44 / D 72.78 / E 72.78）、`verify_snapshots_k1fix.py` 退出码 0（5 轮快照 × `(epochs,bs,lr,bias,sched,clip,acc,E)` 逐项一致）；F-L2 的参数量断言经修复后 **5 轮全部实际执行**（快照重建 `count_parameters()` == 日志 params：154864/154874/154874/233523/233523）。取证：`_verify/full_runs.json`、`_verify/log_full_round*.txt`、`_verify/artifacts/`、`_verify/screen_*.txt`。 |
 | S1-S5 判据语义与产物指纹 | `verify_scope_and_fingerprint.py` 退出码 0；`all/any` 下 `d(sum a_up)/d(a_in)` 非零 479/512、`any/any` 下 439/512；`input_scope=all_isolated` 的两种组合双副本神经元数均为 0；指纹变体已全部改用合法 `D`（`D=0.05`、`H=0.12/D=0.12`） |
 | C1-C6 半径公式/窗口/字段/零残留 | `verify_config_contracts.py` 退出码 0（C1/C3 用例已改为 `D <= H` 的合法组合；残留扫描覆盖 n3d_sphere 全部源文件 + README + 本功能说明 + 文件定义，真实命中 0 行、上下文豁免 5 行） |
 | 拓扑快照 | `verify_topology_snapshot.py` 退出码 0（60 条记录落盘 `topology_snapshot.json`，6 个测点均为 `D = H`，自检 `：PASS`）；DEFAULT 测点跨 10 seed：E 727~750、params 146237~164263、`S_in` 182~205、`S_out` 185~203、双副本 167~192、层数恒 9；SMALL 测点跨 10 seed：E 96~115、params 39235~44710（seed=42 为 E=106 / params=43930） |
@@ -105,8 +117,11 @@
 - `verify_config_contracts.py`：C1 半径公式、C2-C3 窗口校验与 FCC 容纳性、C4-C5 旧字段清理与取值域、C6 零残留断言（扫描词表与上下文豁免词均在脚本内定义，豁免逐行打印并计数）。
 - `verify_topology_snapshot.py`：固定实验点 × 10 seed 拓扑量快照（落盘 JSON；doc_numbers 的 `snapshot_checks` 从此文件的当轮内容现场聚合，**同轮同源、无滞后**）。
 - `run_smoke_matrix.py`：11 种冒烟组合重跑与取证刷新（产物名预测比对 + config 校验 + 默认产物未被污染 + 同一路径多次写入逐位一致），并重建 `smoke_scope_matrix.json`。
-- `verify_all.py`：一键依次执行 **10 条命令**（含 `--arch mlp` 冒烟、H1-H4、D1-D7 与一期回归）并汇总退出码，随后执行**文档数字防线**（四类数据源；artifact 按扩展名分派 `.pt`→`torch.load` / `.json`→`json.load`，字段下钻支持含点键名与 list 整数下标；`snapshot_checks` 按测点聚合 min/max/range/count 并支持按 `seed` 取单点；输出含分类明细行）。
-- 取证文件：`doc_numbers.json`（188 项）、`legacy_dh_baseline.json`（`D = H` 改造前基线）、`legacy_archive_manifest.json`（J1 归档逐文件 SHA256 与守恒证明）、`legacy/`（历史口径存档，不参与验收）、`sphere_dag_metrics.json`（111 条）、`topology_snapshot.json`、`log_smoke_matrix_f9.txt` / `smoke_matrix_f9.json`、`log_verify_all_f21.txt` / `log_verify_all_g5.txt` / `log_verify_all_h3.txt` / `log_verify_all_j3.txt`（四轮验收）。
+- `run_round.py`（**K1**）：正式全量训练取证 runner —— Python 侧写盘把子进程 stdout+stderr **流式**写成 **UTF-8** 日志并在末尾追加真实 `EXITCODE=<n>`（规避 Windows PowerShell 重定向写 UTF-16LE 导致日志不可解析）。
+- `verify_full_runs.py`（**K1**）：**F-L1~F-R1 正式全量训练取证判据** —— F-L1 台账结构自检；F-L2/F-L3 逐轮三方一致（台账 vs 真实终端日志 vs 可 `torch.load` 的产物，含逐 epoch 轨迹、参数量按"重建模型 `count_parameters()`"口径、退出码、达标判定）；F-L4 正式产物 `model.pt` 与台账来源轮次一致；F-R1 逐位可复现重放（`--max-batches` 限批，产物写入 `_verify/`）。`ledger` 模式秒级并已纳入 `verify_all`；`bounded` 模式分钟级，需单独执行。
+- `build_full_runs_ledger.py` / `register_full_runs_doc_numbers.py`（**K1**，**均不是判据**）：前者从真实日志与产物构建轮次台账并冻结产物快照，后者把登记项写入 `doc_numbers.json` 的 `full_run_checks` 类；两者的值全部现场取数、不手填。
+- `verify_all.py`：一键依次执行 **11 条命令**（含 `--arch mlp` 冒烟、H1-H4、D1-D7、**F-L1~F-L4 全量轮次复核**与一期回归）并汇总退出码，随后执行**文档数字防线**（**五类数据源**；artifact 按扩展名分派加载器、`full_run_checks` 按轮次/正式产物现场取数且**优先读该轮冻结快照**（`logged.*` 纯日志字段不依赖产物存在性）、`snapshot_checks` 按测点聚合 min/max/range/count 并支持按 `seed` 取单点、`text_checks` 对指定文件/命令输出做正则提取或命中计数；输出含分类明细行）。
+- 取证文件：`doc_numbers.json`（252 项）、`full_runs.json`（**5 轮全量训练台账**）、`artifacts/`（**5 轮产物冻结快照**：`A_baseline_default.pt` / `B_preset_highacc.pt` / `C_lr2e3_bs64.pt` / `D_capacity_N384.pt` / `E_N384_epochs40.pt`）、`verify_snapshots_k1fix.py` 与 `log_snapshots_k1fix.txt`、`screen_y16_b400.txt` / `screen_N384_b400.txt`（限批筛参）、`log_full_roundA_baseline.txt` / `log_full_roundB_highacc.txt` / `log_full_roundC_lr2e3_bs64.txt` / `log_full_roundD_N384.txt` / `log_full_roundE_N384_epochs40.txt`（5 轮真实终端输出）、`exit_code_roundA.txt` / `log_exitcode_roundB.txt` / `log_exitcode_roundC.txt`（A/B/C 退出码取证）、`legacy_dh_baseline.json`（`D = H` 改造前基线）、`legacy_archive_manifest.json`（J1 归档逐文件 SHA256 与守恒证明）、`legacy/`（历史口径存档，不参与验收）、`sphere_dag_metrics.json`（111 条）、`topology_snapshot.json`、`log_smoke_matrix_f9.txt` / `smoke_matrix_f9.json`、`log_verify_all_f21.txt` / `log_verify_all_g5.txt` / `log_verify_all_h3.txt` / `log_verify_all_j3.txt`（四轮验收）。
 ## 纯球形分层有向无环架构
 
 ### 球体几何与尺度
@@ -230,6 +245,86 @@ DEFAULT 测点（N=256 / y=8×8 / **H=0.10 / D=0.10** / flow_axis=z / 两个 any
 - 改造前对照：同测点在 `D=0.15` 时为 E=900~924、S_in=40~52、params=35094~44489（已由 `legacy_dh_baseline.json` 固化）
 
 SMALL 测点（N=64 / y=4×4 / **H=0.15 / D=0.15** / seed=42）：E=106、平均出度 1.65625、最大出度 4、层数 7、S_in=55、S_out=53、双副本 44、可学习参数 43930。
+### 正式全量训练轮次台账与档案（K1；K1 修复轮已更正）
+
+二期首次正式全量训练（K1）的全部轮次都登记在 `checkpoints/n3d_sphere/_verify/full_runs.json`，
+每轮只改**一组**参数，判定规则（`test_acc >= 0.9864`）在开工前固定、每轮结束立即判定：
+
+| 轮次 | 参数组 | 关键改动 | `test_acc` | 最终 train loss | E | params | 层数 | 耗时 s | 退出码取值方式 | 产物留存形式 / 冻结快照（SHA256 前 16 位） |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A `A_baseline_default` | A 容量（默认值未改动） | 无（DEFAULT_CONFIG 原样） | **0.9759** | 0.0195 | 736 | 154,864 | 9 | 137.5 | 独立文件 `exit_code_roundA.txt`（时点歧义见下） | 直接写正式路径 `model.pt`；快照 `artifacts/A_baseline_default.pt`（`82C92A4E…`，来源=artifact） |
+| B `B_preset_highacc` | C 优化（预设整体携带） | AdamW + cosine + `grad_clip` + `readout_bias` + bs128 + lr2e-3 + 20 epoch | **0.9823** | 0.0005 | 736 | 154,874 | 9 | 258.1 | 同配置同 seed 限批重放 `log_exitcode_roundB.txt` | 同名被 C 覆盖 → 留存于 `<产物名>.pt.bak`（`DE1A13E5…`）；快照 `artifacts/B_preset_highacc.pt`（`DE1A13E5…`，来源=backup） |
+| C `C_lr2e3_bs64` | C 优化（`batch_size` 单点） | 在 B 之上 bs 128→64 | 0.9816 | 0.0001 | 736 | 154,874 | 9 | 495.7 | 同配置同 seed 限批重放 `log_exitcode_roundC.txt` | 当前 `<产物名>.pt` 即 C 产物（`D460F8F2…`）；快照同 SHA |
+| D `D_capacity_N384` | A 容量（`N` 单点） | 在 highacc 之上 N 256→384 | **0.9828** | 0.0002 | 1,145 | 233,523 | 11 | 371.7 | `run_round.py` 日志自带 `EXITCODE=0` | 同名被 E 覆盖 → 留存于 `<产物名>.pt.bak`（`63AEC14D…`）；快照 `artifacts/D_capacity_N384.pt`（`63AEC14D…`，来源=backup） |
+| E `E_N384_epochs40` | A 容量 + C 优化（`epochs` 单点） | 在 D 之上 epochs 20→40 | 0.9826 | 0.0000 | 1,145 | 233,523 | 11 | 710.1 | `run_round.py` 日志自带 `EXITCODE=0` | 当前 `<产物名>.pt` 即 E 产物（`995CECD5…`）；快照同 SHA |
+
+- **共享 seed=42 前提**：5 轮均为固定 `seed=42` 的单点运行；`seed` 影响突触采样（边集/边数）、
+  参数初始化与数据打乱，故全部对照**只在同一 seed 内成立**，不得表述为与 seed 无关；
+  与之无关的只有神经元 FCC 放置。本轮**不做**多 seed 方差扫描。
+- **迭代顺序与未探索维度（如实标注；K1 修复轮 2 修正时间线）**：实际顺序为
+  **A 基线 → B 优化（`--preset highacc`）→ C 优化（bs/lr/epochs）→ D 容量（`--n 384`）
+  → E 容量+优化（`epochs=40`）**，**先做了优化组**，偏离"A 容量 → B 几何 → C 优化 → E 判据"
+  的优先序。**该偏离没有同期依据**（如实标注，不做事后合理化）：轮 B 的日志于 `01:22:08` 结束，
+  早于 `01:27` 的两次限批筛参，故筛参无法解释"为何先做优化"；`01:27` 的筛参实际解释的是**此后**的
+  两件事 —— ① 容量维度选 `N=384`（而非 `y=16×16`，见 README §7.2.3）；② 剩余额度的分配
+  （额度用于已显现增益的容量与优化两维，几何与判据两组因此再未获得额度）。
+  **几何组（`H`/`D`/`flow_axis`）与判据组（两 scope 四种组合）从未探索**，
+  故"5 轮用尽"仅指已探索两维内的用尽，归因结论（优化增益最大、容量增益小）**不得外推**。
+- **结论**：达标线 = 一期 MLP 对照基线 **0.9864**，5 轮**全部未达标**，最好轮 **D = 0.9828**
+  （距线 **0.36pp**）；5 轮均无 NaN/Inf、无崩溃、无连通性下限报错、无 OOM（无跳过轮、无重试掩盖）；
+  上限 5 轮用尽后停止并如实汇总，**不伪造达标**。
+- **产物纪律（K1 修复轮更正）**：全量产物的文件名指纹为
+  `full_N{N}_y{..}_H{..}_D{..}_pl{..}_ax{..}_is{..}_rs{..}_s{seed}[_tag].pt`，
+  **不含 `lr` / `batch_size` / `epochs`**，因此 B↔C、D↔E 各自共用同一个文件名、后跑者覆盖先跑者；
+  `train.py` 在覆盖前按 `--backup`（默认开）把被覆盖者复制为 `<产物名>.pt.bak`，故**被覆盖轮的
+  产物并未丢失**（B 的 `.bak` 实测 `test_acc=0.9823`、D 的 `.bak` 实测 `0.9828`）。
+  台账为**每一轮**冻结快照 `_verify/artifacts/<轮次>.pt`（5 轮齐备），来源由每轮
+  `snapshot_source` 显式声明（`artifact` / `backup`），并逐轮登记
+  `artifact_snapshot_sha256` 与 `artifact_snapshot_bytes`。**`artifact_available` 是现算字段**：
+  表示"该轮声明的产物文件名当前是否等于本轮产物"（B/D 为 `false`，**只说明该文件名已被同指纹
+  后轮占用，不代表本轮无产物支撑**）。
+- **正式产物来源（以产物内嵌 `config` 为准）**：`checkpoints/n3d_sphere/model.pt` 来源 = **轮 A**
+  （`DEFAULT_CONFIG` 原样：`N=256`、`y=8×8`、`H=D=0.10`、`bs=64`、`lr=1e-3`、`epochs=10`、
+  `seed=42`、Adam、`lr_schedule=none`、`weight_decay=0.0`、`readout_bias=False`、`grad_clip=0.0`），
+  内嵌字段 `test_acc=0.9759` / `epochs=10` / `E=736`。因**无达标轮**，"达标轮落 `model.pt`"这一支
+  **未触发**，故 `model.pt` **不等于**本轮最好配置（D 的 0.9828）。
+  **`.bak` 如实陈述（K1 修复轮更正，替换早期"从未被覆盖、没有产生 `.bak`"的说法）**：
+  轮 A **覆盖了一份既有的同配置产物**并生成 `model.pt.bak`（`18072331` 字节、SHA256 与轮 A 产物
+  逐位相同 `82C92A4E8396021C…`），此后 `model.pt` 未再被覆盖；该既有产物的
+  **来源不可追溯**——其 CreationTime `01:13:25` 早于轮 A 的 `torch.save`（`01:17:06`），
+  但 `.module_agent` 时间窗与本轮 `_verify/` 日志中**没有任何全量训练记录**与之对应，
+  全盘亦无第二份 `model.pt*`，故只登记"存在过、被备份、与轮 A 逐位相同"三项可核查事实，
+  **不给出推测性结论**（该不确定性不影响任何实测数字）。
+- **退出码取证口径（K1 修复轮更正）**：**只有 D/E** 的日志末尾自带 `EXITCODE=0`（由 `run_round.py`
+  写盘）；**A** 的退出码来自事后登记的 `exit_code_roundA.txt`（mtime `01:21:00`，晚于
+  `log_repro_A_bounded200.txt` 的 `01:20:42`，故其 `$LASTEXITCODE` **可能取自随后那次限批重放**
+  —— 歧义如实标注）；**B/C** 的退出码取自同配置同 seed 的限批重放日志
+  `log_exitcode_roundB.txt` / `log_exitcode_roundC.txt`。三份取证文件均**未改写原始日志**。
+  台账的 `exit_code_note` 字段逐轮记录上述方式与时点。
+- **取证与判据**：每轮真实终端输出落在 `_verify/log_full_round*.txt`；判据为
+  `verify_full_runs.py ledger`（F-L1 结构自检、F-L2/F-L3 逐轮三方一致**含快照路径存在性 +
+  SHA256 + 字节数强制比对**、F-L4 正式产物与来源轮一致）与 `verify_full_runs.py bounded`
+  （F-R1 逐位可复现重放：5 轮"前 200 batch CE 和"实测 A 108.4 / B 78.4 / C 90.44 / D 72.78 /
+  E 72.78，限批产物写入 `_verify/`）；另有只读复核脚本 `verify_snapshots_k1fix.py`
+  逐轮打印 `(epochs, batch_size, lr, readout_bias, lr_schedule, grad_clip, test_acc, E)` 比对结果。
+  各轮数字同时登记进 `doc_numbers.json` 的 `full_run_checks`（**34** 项）与两个命名口径的
+  `text_checks`（**44** 项 = 两次筛参的末轮 loss / `E` / params 6 项 + 筛参与 5 个正式轮的
+  「epoch 1 平均 loss×100」与「前 100 batch CE 和」共 23 项 + `full_run.param_assertion_rounds`
+  1 项 + 其余 14 项），由 `verify_all.py` 现跑比对。
+
+- **筛参轮（限批，非正式对照；K1 修复轮 2 更正口径）**：`01:27` 两次 `--max-batches 400` 筛参
+  （两侧同为 `preset=default` + `--max-batches 400` + `seed=42` + `batch_size=64`，**彼此同预算可比**）：
+  `y=16×16` 的 **epoch 1 平均训练 loss×100 = 41.17**（loss 0.4117）、**前 100 batch CE 和 = 78.92**
+  （batch100 running_loss 0.7892），末轮 loss 0.0584、`E=805`、`params=135,333` → **被否**；
+  `N=384` 的 **36.85**（0.3685）、**68.01**（0.6801），末轮 loss 0.0457、`E=1145`、`params=233,513`
+  → **入选**（成为轮 D 的 `N` 取值）。两个口径的**定义与取值来源**：**「epoch 1 平均训练 loss×100」**
+  取自 `[epoch 1/N] loss=` 结局行；**「前 100 batch CE 和」** 取自 `epoch 1 | batch 100 | running_loss=`
+  行 × 100（该 `running_loss` 本身即前 100 个 batch 的 loss 均值）。正式 5 轮的同口径参照为
+  A 27.60 / 75.05、B 26.84 / 52.89、C 23.89 / 59.68、D 24.88 / 48.84、E 24.88 / 48.84；
+  **筛参与 D/E 非同一配置**（筛参 `preset=default`：Adam、lr=1e-3、bs=64、bias 关、无调度/裁剪；
+  D/E `preset=highacc`：AdamW+wd=1e-4、cosine、lr=2e-3、**bs=128**、clip 1.0、bias 开），
+  **二者无逐位可比性**（历史错误更正：早期曾把 B/D 的 epoch1 平均 loss×100 当作筛参的
+  "前 100 batch CE 和"，且曾误称"D/E 与 N=384 筛参首 100 batch 完全一致"）。
 ## 命令行与配置入口
 
 ### 几何与判据 CLI

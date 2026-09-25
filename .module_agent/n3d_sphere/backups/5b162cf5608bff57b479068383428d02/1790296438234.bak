@@ -808,45 +808,25 @@ python n3d_proto/train.py --smoke-test   -> 9/9 PASS、退出码 0、loss = 2.41
 | `_verify/screen_y16_b400.txt` / `screen_N384_b400.txt` | **两次限批筛参**的真实终端输出（K1，`run_round.py` 写盘、UTF-8、末尾含 `EXITCODE=0`）：`y=16×16`（末轮 loss 0.0584、E=805、params=135333）被否，`N=384`（0.0457、E=1145、params=233513）入选；**非正式对照**，仅作筛参取证（见 §7.2.3） |
 | `_verify/log_snapshots_k1fix.txt` | K1 修复轮 5 轮快照复核的完整输出（`verify_snapshots_k1fix.py` 逐轮 PASS） |
 | `_verify/log_full_runs_bounded_k1fix2.txt` | K1 修复轮 2 的 F-R1 逐位可复现重放输出（5 轮 `--max-batches 200`，CE 和与 `E` 与台账登记值一致；限批产物写入 `_verify/`） |
-| `_verify/log_verify_all_k1fix2.txt` | K1 修复轮 2 的 `verify_all.py` 完整验收输出（11 条命令退出码与判据计数、文档数字防线 **一致 252 项 / 不一致 0 / 跳过 0** 分类明细与总计、**计数自检 PASS**） |
-| `_verify/log_verify_all_counts.txt` | **K1 计数修正轮**的 `verify_all.py` 完整验收输出（11 条命令、文档数字防线 **一致 252 项 / 不一致 0 / 跳过 0**、**计数自检 PASS** —— 现场统计 252 = 49 + 111 + 14 + 44 + 34，并逐份解码 7 份验收日志核对 README 所写计数） |
+| `_verify/log_verify_all_k1fix2.txt` | K1 修复轮 2 的 `verify_all.py` 完整验收输出（11 条命令退出码与判据计数、文档数字防线 **251** 项分类明细与总计） |
 | `_verify/log_proto_smoke_k1fix2.txt` | K1 修复轮 2 的一期回归原始输出（`python n3d_proto/train.py --smoke-test`，9/9 PASS、`loss=2.419689`） |
 | `_verify/log_full_runs_bounded_k1fix.txt` | K1 修复轮 F-R1 逐位可复现重放的完整输出（5 轮各 `--max-batches 200`，CE 和与 `E` 与台账登记值一致） |
-| `_verify/log_verify_all_k1fix.txt` | K1 修复轮（未重跑）的 `verify_all.py` 完整验收输出（11 条命令退出码与判据计数、文档数字防线 **一致 228 项** 分类明细与总计） |
+| `_verify/log_verify_all_k1fix.txt` | K1 修复轮 `verify_all.py` 的完整验收输出（11 条命令退出码与判据计数、文档数字防线 252 项分类明细与总计） |
 | `_verify/log_proto_smoke_k1fix.txt` | K1 修复轮一期回归取证的原始输出（`python n3d_proto/train.py --smoke-test`，9/9 PASS、`loss=2.419689`） |
-| `_verify/log_verify_all_k1.txt` | K1 轮的 `verify_all.py` 完整验收输出（11 条命令退出码与判据计数、文档数字防线 **一致 208 项** 分类明细与总计，K1 轮当时口径） |
+| `_verify/log_verify_all_k1.txt` | K1 轮 `verify_all.py` 的完整验收输出（11 条命令退出码与判据计数、文档数字防线分类明细与总计） |
 | `_verify/log_proto_smoke_k1.txt` | K1 轮一期回归取证的原始输出（`python n3d_proto/train.py --smoke-test`，9/9 PASS、`loss=2.419689`） |
 | `_verify/exit_code_roundA.txt` / `log_exitcode_roundB.txt` / `log_exitcode_roundC.txt` | A/B/C 三轮的**退出码取证**（A 为早期独立登记文件；B/C 为同配置同 seed 的 `--max-batches 200` 重放，含 `EXITCODE=0`），原始终端日志保持原样不动 |
 | `_verify/verify_*_repro*.pt` / `_verify/screen_*.pt` / `_verify/verify_400_*.pt` / `verify_200_*.pt` 及同名 `.bak` | **统一登记口径（K1 修复轮 2）**：限批产物**不逐条登记**进模块文件定义，其**证据为本目录的日志**（`log_exitcode_roundB/C.txt`、`log_repro_A_bounded200.txt`、`screen_*.txt`、`log_full_runs_bounded_k1fix.txt`）——即"**限批产物以日志为证据**"。理由：`--max-batches > 0` 会按 `<bpe>_<指纹>_<tag>` 生成大量中间文件（含同名覆盖产生的 `.bak`），逐条登记既不稳定也不表达证据链；**正式产物与 5 轮冻结快照才是逐条登记的**（它们参与 F-L2/F-L4 判据）。该口径在 `module_definition.json` 中一致执行。 |
 | `checkpoints/n3d_sphere/model.pt.bak` / `full_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt.bak` / `full_N384_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt.bak` | **同名覆盖的原始证据本体**（K1，逐条登记）：`model.pt.bak` 与轮 A 产物**逐位相同**（`82C92A4E…`），是"轮 A 覆盖了一份既有同配置产物"的直接证据；另两份分别是 **B 轮**（`DE1A13E5…`，实测 `test_acc=0.9823`）与 **D 轮**（`63AEC14D…`，实测 `test_acc=0.9828`）产物在同名覆盖前的留存形式，也是 `artifacts/B_preset_highacc.pt` / `D_capacity_N384.pt` 两份冻结快照的**来源** |
-| `_verify/log_verify_all_k1.txt` / `log_proto_smoke_k1.txt` / `log_repro_A_bounded200.txt` | K1 轮的三份原始证据（逐条登记）：`verify_all.py` 完整验收输出（**一致 208 项**，见上一行）、一期回归输出（9/9 PASS、`loss=2.419689`）、轮 A 的限批可复现重放输出（前 200 batch CE 和 108.4） |
-| `_verify/verify_all.py` | 一键依次执行上面全部命令（含一期回归）与**文档数字防线**（`doc_numbers.json` 现跑比对，五类数据源；`full_run` 类**优先读该轮冻结快照**、`logged.*` 类纯日志登记项**不依赖产物存在性**），汇总退出码；防线末尾执行**计数自检**（见下） |
-
-> **`full_run.param_assertion_rounds` 这条登记项是什么**（K1 修复轮 2 新增，全文唯一说明处）：
-> 它是一条 **`text_checks` 计数类登记项** —— 正则 `参数量核对已执行` 在
-> `_verify/log_full_runs_ledger_k1fix2.txt` 中的**命中次数**必须等于 **5**。
-> 含义：F-L2 分支的"参数量核对"（用该轮**冻结快照**内嵌 `config` 重建模型取
-> `count_parameters()`，与终端日志打印的 `params` 比对）**在 5 轮上全部实际执行过** ——
-> 这正是 K1 修复轮 2 warning① 的回归判据（修前该分支以 `artifact_available` 为门槛，
-> B/D 两轮被整体跳过，`count_matches` 只有 3）。把"断言有没有真的跑"也变成现跑判据，
-> 是为了防止它未来又被某个条件静默跳过。
-
-> **计数自检（K1 计数修正轮新增，`verify_all.py` 文档数字防线末尾执行）**：
-> ① 现场 `len()` 统计 `doc_numbers.json` 的五类分类计数与总项数（**期望值不手填**，
-> 全部由登记表现场重建）；② 现场统计本次现跑的一致/不一致/跳过数；
-> ③ 把 README、`current_spec.md` 以及**被引用验收日志的文本**中出现的计数字符串
-> 与现场统计逐项比对，不一致即打印"**文档写 X、现场为 Y**"并判 FAIL。
-> 该机制用于根治"计数靠人工同步"的同类风险（本题的 4 处计数不实即由此类脱节造成）。
-| `_verify/doc_numbers.json` | **文档数字登记表**：README / spec 中出现的实测值（**252 项** = 49 产物字段 + 111 全精度指标 + **14 跨 seed 快照聚合** + **44 文本计数** + **34 全量轮次登记项**；`docs` 键为 2 条文档路径，**不计入判据项数**），由 `verify_all.py` 现跑比对（含**计数自检**：五类分类计数与总项数必须与 README / spec / 被引用验收日志中的计数同源一致）。K1 阶段累计扩充：`full_run_checks` 20→34（K1 修复轮：5 轮各补 `config.batch_size` / `config.epochs`）；`text_checks` 14→20（K1 修复轮：两次筛参的末轮 loss / `E` / params）→ **44**（K1 修复轮 2 新增 **24** 项 = 两次筛参 **8** 项 + 5 个正式轮 **15** 项 + `full_run.param_assertion_rounds` **1** 项；前 23 项按 README §7.2.3 的两个命名口径分别登记，末 1 项断言"F-L2 参数量核对在 5 轮上都实际执行"，见 §9 末尾说明） |
+| `_verify/log_verify_all_k1.txt` / `log_proto_smoke_k1.txt` / `log_repro_A_bounded200.txt` | K1 轮的三份原始证据（逐条登记）：`verify_all.py` 完整验收输出、一期回归输出（9/9 PASS、`loss=2.419689`）、轮 A 的限批可复现重放输出（前 200 batch CE 和 108.4） |
+| `_verify/verify_all.py` | 一键依次执行上面全部命令（含一期回归）与**文档数字防线**（`doc_numbers.json` 现跑比对，五类数据源；`full_run` 类**优先读该轮冻结快照**、`logged.*` 类纯日志登记项**不依赖产物存在性**），汇总退出码 |
+| `_verify/doc_numbers.json` | **文档数字登记表**：README / spec 中出现的实测值（本轮 **252 项** = 49 产物字段 + 111 全精度指标 + **14 跨 seed 快照聚合** + **44 文本计数** + **34 全量轮次登记项**），由 `verify_all.py` 现跑比对。K1 修复轮累计扩充：`full_run_checks` 20→34（5 轮各补 `config.batch_size` / `config.epochs`）；`text_checks` 14→20（两次筛参的末轮 loss / `E` / params）→ **43**（K1 修复轮 2 新增 23 项：两次筛参与 5 个正式轮的 `epoch 1 平均 loss` / `×100` / `batch100 running_loss` / `前 100 batch CE 和`，按 README §7.2.3 的两个命名口径分别登记） |
 | `_verify/legacy_archive_manifest.json` | **J1 归档取证清单**：11 个改造前 `D > H` 产物的逐个 `size` / `sha256_before` / `sha256_after` / `bytes_identical` 与配置字段，以及 `legacy/` 与 `_verify/` 根目录**两侧的总数、总字节守恒**与 `smoke.pt` 未被扰动的断言 |
 | `_verify/legacy/` | **历史口径存档目录**：改造前 `D > H` 的 11 个冒烟产物（共 10,017,363 字节），仅作历史对照，**不参与当前验收** |
 | `_verify/legacy_dh_baseline.json` | **`D = H` 改造前的历史基线**（`D > H`，现已不可由 `Config` 构造）：登记改造前 `default_any_any_z` / `small_any_any_z` 的 E / 层数 / `S_in` / `S_out` / params，以及来源产物与快照的路径与 SHA256 |
 | `_verify/sphere_dag_metrics.json` | `verify_sphere_dag.py` 每次运行落盘的**全精度**指标（R1-R7b，111 条），供 `doc_numbers.json` 现跑比对取用 |
 | `_verify/smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt` | 11 种冒烟组合的取证记录（产物名 / 退出码 / PASS / FAIL / loss / 梯度范数 / config 核对 / SHA256 一致性字段）与完整日志 |
-| `_verify/log_verify_all_f21.txt` | F21 轮的 `verify_all.py` 完整验收输出（当时 9 条命令、文档数字防线 **一致 93 项 / 不一致 0 / 跳过 0**） |
-| `_verify/log_verify_all_g5.txt` | G5 轮的 `verify_all.py` 完整验收输出（当时 10 条命令、文档数字防线 **一致 174 项 / 不一致 0 / 跳过 0**） |
-| `_verify/log_verify_all_h3.txt` | H3 轮的 `verify_all.py` 完整验收输出（当时 10 条命令、文档数字防线 **一致 174 项 / 不一致 0 / 跳过 0**） |
-| `_verify/log_verify_all_j3.txt` | J3 轮的 `verify_all.py` 完整验收输出（10 条命令、文档数字防线 **一致 188 项 / 不一致 0 / 跳过 0**、C6 明细附件） |
+| `_verify/log_verify_all_f21.txt` / `log_verify_all_g5.txt` / `log_verify_all_h3.txt` | 三轮（F21 / G5 / H3）`verify_all.py` 的完整验收输出：10 条命令的退出码与判据计数、文档数字防线结果与总结句 |
 
 一键复现（也可直接 `verify_all.py` 一次跑完）：
 
@@ -1026,43 +1006,11 @@ python n3d_proto/train.py --smoke-test                                          
 |---|---|---|
 | **error** | README §7.2.3 筛参表**口径张冠李戴**：把正式轮 B/D 的"epoch 1 平均训练 loss×100"（0.2684×100=26.84、0.2488×100=24.88）当成筛参轮的"前 100 batch CE 和"；且含一条**假断言**（"D/E 与 N=384 筛参首 100 batch 完全一致"） | ① 先定**两个已命名口径并全文统一**：**「epoch 1 平均训练 loss×100」**（源 `[epoch 1/N] loss=` 结局行）与**「前 100 batch CE 和」**（源 `epoch 1 | batch 100 | running_loss=` × 100；该 `running_loss` 即前 100 batch 的 loss 均值），并写明二者严禁混用，附"历史错误更正"说明；② 按日志真实值重填筛参两行：`y=16×16` → epoch1 loss **0.4117**（×100=41.17）、batch100 running_loss **0.7892**（×100=78.92）；`N=384` → **0.3685**（36.85）、**0.6801**（68.01）；③ 参照行改为独立表格并标注每轮预设/批大小/lr/epochs，A 27.60/75.05、B 26.84/52.89、C 23.89/59.68、D 24.88/48.84、E 24.88/48.84（前值为 epoch1 loss×100，后值为前 100 batch CE 和）；④ **删除假断言**，改写为"筛参走 `--preset default`（Adam、lr=1e-3、bs=64、bias 关、无调度/裁剪），D/E 走 `--preset highacc`（AdamW+wd=1e-4、cosine、lr=2e-3、**bs=128**、clip 1.0、bias 开）→ **非同一配置、批大小亦不同，无逐位可比性**"；筛参仅用于 y 维度 vs N 维度的**同预算一阶比较**（两侧同为 `preset=default` + `--max-batches 400` + `seed=42`）；D 与 E 四项数字两两相同则给出真实解释（仅 `epochs` 不同，epoch 1 轨迹与批大小相同 → 必然一致，另由 F-R1 前 200 batch CE 和 72.78 独立佐证）；⑤ 上述数字**全部**登记进 `doc_numbers.json` 的 `text_checks`（新增 23 项：筛参两轮 × 4 个量 + 正式 5 轮 × 3 个量，全部现跑正则提取），使同类错误今后被现跑防线当场拦截（`text_checks` 20→**43**，总项 228→**251**）。取证：`screen_y16_b400.txt` / `screen_N384_b400.txt`（`preset=default`、batch100 running_loss 0.7892/0.6801）与 5 份 `log_full_round*.txt` |
 | **warning①** | `verify_full_runs.py` F-L2 的 (a1) 参数量分支仍以 `artifact_available` 为门槛 → **B/D 两轮被整体跳过**，与同函数 (b) 分支"优先冻结快照"的读回口径不一致，也与 README §9 / spec 的描述不符 | (a1) 的读回对象改为"**有冻结快照就读快照**"（与 (b) 统一），使 **5 轮一致执行**参数量核对；PASS 行新增 `参数量核对已执行：<快照名> 重建得 X == 日志 X` 便于核验。实测（`ledger` 模式）：A `A_baseline_default.pt` 154864==154864、B `B_preset_highacc.pt` 154874==154874、C `C_lr2e3_bs64.pt` 154874==154874、D `D_capacity_N384.pt` 233523==233523、E `E_N384_epochs40.pt` 233523==233523 —— **5/5 实际执行且通过** |
-| **warning②** | `current_spec.md` 验收表**结构损坏**：K1 行与 S1-S5 行被合并进同一物理行（长 2415 字符）；`verify_all.py` bullet 被追加成两句、同一事实重复 | ① 按"先定位 S1-S5 行首标记再切分"的方式**拆回两行**（K1 行 2203 字符独立成行、S1-S5 行 212 字符独立成行），表格结构恢复；② 该 bullet **重写为一句**（mode 等价于定点替换），保留"五类数据源 / `full_run_checks` 按轮次与正式产物现场取数且优先读冻结快照 / `logged.*` 纯日志字段不依赖产物存在性 / snapshot 聚合 / text 正则"的完整语义；③ 复核全文最长行 2203 字符且无超长表格行，另同步修正全文 228→**252** 项与 text 20→**44** 的计数口径（该处初值 251/43 经 K1 计数修正轮更正） |
+| **warning②** | `current_spec.md` 验收表**结构损坏**：K1 行与 S1-S5 行被合并进同一物理行（长 2415 字符）；`verify_all.py` bullet 被追加成两句、同一事实重复 | ① 按"先定位 S1-S5 行首标记再切分"的方式**拆回两行**（K1 行 2203 字符独立成行、S1-S5 行 212 字符独立成行），表格结构恢复；② 该 bullet **重写为一句**（mode 等价于定点替换），保留"五类数据源 / `full_run_checks` 按轮次与正式产物现场取数且优先读冻结快照 / `logged.*` 纯日志字段不依赖产物存在性 / snapshot 聚合 / text 正则"的完整语义；③ 复核全文最长行 2203 字符且无超长表格行，另同步修正全文 228→**251** 项与 text 20→**43** 的计数口径 |
 | **warning③** | `module_definition.json` 缺**证据本体**登记；且限批产物登记口径不一致（一处逐条、一处不登记） | ① 补登记 6 项：`model.pt.bak`、`full_N256_…_s42.pt.bak`、`full_N384_…_s42.pt.bak`（error①/error② 的**证据本体**）、`_verify/log_verify_all_k1.txt`、`log_proto_smoke_k1.txt`、`log_repro_A_bounded200.txt`；② **统一限批产物口径为"以日志为证据、不逐条登记"**，并在 `module_definition.json` 与 README §9 **两侧写成同一条明文**（把原先"属限批取证链的一部分"的含糊行改为统一口径行）；③ 复跑 C6 零残留扫描：**真实命中 0 行**、上下文豁免 5 行、`[C6] PASS`（新描述未引入被禁词） |
 | **warning④** | "偏离依据是 01:27 的两次筛参，于是把容量放在优化之后" —— **时间线不成立**（轮 B 日志 `01:22:08` 结束早于筛参；筛参发生在 B 之后、轮 C 运行期间） | README §7.2.1 与 spec K1 段改为如实陈述：**"先做优化组"这一偏离没有同期依据**（如实标注，不做事后合理化）；`01:27` 的两次筛参实际解释的是**此后**的两件事 —— ① 容量维度选 `N=384`（而非 `y=16×16`，见 §7.2.3）；② 剩余额度的分配（额度用于已显现增益的容量与优化两维，几何与判据两组因此再未获得额度）。"**几何组与判据组从未探索、归因不得外推**"的表述保持不变 |
 | **info①** | `.bak` 的 mtime 机制解释**说反了**（原文称"`shutil.copyfile` 不更新 mtime 所致"） | §7.2.2 改述为：`shutil.copyfile` **不复制元数据**，故 `.bak` 的 CreationTime/LastWriteTime **都是"复制发生的那一刻"**；实测 `model.pt.bak` CreationTime=`01:17:04`、两份文件 LastWriteTime 均为 `01:17:06` —— 这只是"**备份紧随写入**"（copyfile 先建目标、torch.save 随后原地写入）的结果；`model.pt` 的 CreationTime=`01:13:25` 是**既有产物最初的创建时刻**（`torch.save` 对已存在文件是原地截断重写，不改变 CreationTime） |
-| **info②** | 本轮新写的数字/断言须全部登记，拦断"修一处、冒一处" | 见 error ⑤：`doc_numbers.json` 的 `text_checks` 新增 **24** 项（筛参 2×4 = 8 项 + 正式 5×3 = 15 项 + `full_run.param_assertion_rounds` 1 项），全部由 `verify_all.py` 现跑正则提取比对；总登记项 228→**252**（artifact 49 / metric 111 / snapshot 14 / text **44** / full_run 34），文档与 spec 的计数同步刷新 |
-
-> **第十一类教训（来自本轮的计数不实，K1 计数修正轮）**：**"计数是派生量，必须由现场统计生成、
-> 由判据核对"**。`text_checks 43 / 总项 251 / 新增 23` 这三处错值都不是"算错"，
-> 而是"上一轮改完登记表后**用手工同步了文档**"——手写与 `len()` 之间的缝隙就是错误的来源
-> （同一格里"252 = 49+111+14+44+34"与行尾"251"还会**自相矛盾**）。
-> 可执行结论：**把"计数"也变成现跑判据**（`verify_all.py` 的计数自检：期望值由登记表现场
-> `len()` 重建，再与 README / spec / 被引用验收日志文本比对），并**禁止把某一轮的计数写到
-> 另一轮日志行上**（被引用证据文件的内容必须逐份真实解码核对）。
-
-### 10.8 K1 计数修正轮（针对皋陶第三次审查——**已通过 approved=true**——遗留的 1 warning + 1 info）
-
-| 编号 | 问题 | 修复（改前 → 改后，全部以现场统计为准） |
-|---|---|---|
-| **warning①** | README 的 `doc_numbers.json` 说明行计数不实且**同格自相矛盾**（开头写"252 项 = 49+111+14+**44**+34"，行尾却写"→ **43**"与"总项 228→**251**"、"新增 23 项"） | ① 该行：`text_checks … → 43` **→ 44**；`228→251` **→ 252**；`新增 23 项` **→ 24 项**（并明确拆为：两次筛参 **8** 项 + 5 个正式轮 **15** 项 + `full_run.param_assertion_rounds` **1** 项，见 §9 该条说明）；开头"252 = 49+111+14+44+34"与行尾结论现已一致 |
-| | README `log_verify_all_k1fix2.txt` 行写"**251** 项" | → **一致 252 项 / 不一致 0 / 跳过 0**（该文件现场解码即为 252） |
-| | README `log_verify_all_k1fix.txt` 行写"**252** 项"（把本轮数字写到上一轮日志行上） | → **一致 228 项**（K1 修复轮日志的真实内容；未重跑即无 252） |
-| | README `log_verify_all_k1.txt` 行未写计数 | → 补"**一致 208 项**"（K1 轮当时口径） |
-| | `log_verify_all_f21/g5/h3` 合行未写计数、`j3` 行重复一次 | → 拆为 4 行并各写真实计数：f21 **93**、g5 **174**、h3 **174**、j3 **188**；删除重复行 |
-| | §10.7 的 info② 行写"新增 **23** 项 / 228→**251** / text **43**" | → **24 项 / 228→252 / text 44** |
-| | `full_run.param_assertion_rounds` 登记项**全文未提及** | → §9 新增该条登记项的**唯一说明处**（正则 `参数量核对已执行` 在 `log_full_runs_ledger_k1fix2.txt` 中命中次数必须为 **5**，即 F-L2 参数量核对在 5 轮上全部实际执行过） |
-| | `current_spec.md` 的登记表说明句被上轮追加成**重复两句** | → 合并为一句并保留完整口径（`full_run_checks` **34** 项 + 两个命名口径的 `text_checks` **44** 项及其构成），消除重复表述 |
-| **info②** | "登记项总数/分类计数"这一派生量**未纳入现跑判据**（同类风险可复发） | → `verify_all.py` 在文档数字防线**末尾新增「计数自检」**并在总体结论行打印结果（`计数自检 PASS/FAIL`）。口径：① 现场 `len()` 重建 `doc_numbers.json` 五类分类计数与总项（**期望值不手填**）；② 与 README 说明行逐项比对**且校验分类相加 == 总项**（消除同格自相矛盾）、并与 `current_spec.md` 的说明行/现跑结果句比对；③ **逐份真实解码**所有 `log_verify_all*.txt` 并比 README 对它们的引用行所写计数（按完整文件名精确定位，避免 `k1` 与 `k1fix` 前缀混淆——本判据自身首版曾因此误报）；④ 校验"本轮现跑计数在 README 中真的有据"。实测输出：现场 `artifact 49 / metric 111 / snapshot 14 / text 44 / full_run 34 → 总项 252`，7 份历史日志计数 93/174/174/188/208/228/252 全部与 README 所写一致，**计数自检 PASS** |
-
-> **第十二类教训（来自 info②）**：**"凡是手抄过的数字，都要有一条机器判据盯着它"**。
-> 本轮的 4 处错值全部是"手抄计数"的产物，且**同一格里能同时出现正确与错误的两个数**
-> —— 说明人眼校对在长文档上不可靠。可执行结论：**派生量（计数、区间、比率）一经登记，
-> 就必须有"从现场重建期望值 → 与文档比对"的现跑判据**；本轮已把"计数"这一类补齐
-> （此前的区间/比率类已分别由 `snapshot_checks` 与 `metric_checks` 覆盖）。
->
-> **计数自检的容忍口径（如实说明）**：为不破坏既有 11 条命令与既有登记项语义，
-> 计数自检**不新增 `doc_numbers.json` 登记项**，因此 `doc_numbers` 总数保持 **252 项**不变；
-> 它是防线的**结构性自检**而非"现跑取数项"，故不计入 252。
+| **info②** | 本轮新写的数字/断言须全部登记，拦断"修一处、冒一处" | 见 error ⑤：`doc_numbers.json` 的 `text_checks` 新增 **23** 项（筛参 2×4 + 正式 5×3），全部由 `verify_all.py` 现跑正则提取比对；总登记项 228→**251**（artifact 49 / metric 111 / snapshot 14 / text **43** / full_run 34），文档与 spec 的计数同步刷新 |
 
 > **第十类教训（来自 error）**：**"派生量必须随身带着口径名与取值来源"**。
 > 26.84 / 24.88 这两个数本身没错（它们确实是正式轮 B/D 的 epoch1 平均 loss×100），

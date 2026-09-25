@@ -6,5 +6,37 @@
     "code_reviewed": false,
     "plan_completed": true,
     "test_passed": true
+  },
+  {
+    "plan_id": "plan_dd02171a-6ab4-4a69-9309-eaa0eb3c5f3c",
+    "plan_summary": "二期纯球形分层 DAG 首次正式全量训练（DEFAULT_CONFIG, seed=42, 10 epoch），未达 98.64% 则按 A→B→C→E 自动调参重训（上限 5 轮），并完成文档数字登记与 verify_all 验收闭环；一期 n3d_proto 零改动。",
+    "starter_session_id": "session-3f6ed93c-ad76-40b1-879b-ecfe9fe787a8",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_f90ca671-f4d5-40c3-a96c-0753c63c4672",
+    "plan_summary": "审查修复轮（皋陶 K1 审查 2 error + 4 warning + 3 info 全修）：补冻 B/D 的 .bak 快照并修正台账错登记、改写\"无 .bak\"不实陈述并追溯既有产物来源、如实标注迭代顺序偏离与几何/判据两组未探索、修正 EXITCODE 口径、补登记筛参轮与取证文件、加固 verify_full_runs 快照存在性断言；训练代码零改动、不重跑全量训练，完成后重跑 verify_all 并送复审。",
+    "starter_session_id": "session-3f6ed93c-ad76-40b1-879b-ecfe9fe787a8",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_7aba0462-c523-4e8c-8d6c-f666b1624b13",
+    "plan_summary": "K1 修复轮 2（皋陶第二次审查 1 error + 4 warning + 2 info）：修正 README §7.2.3 筛参表错列与\"同配置同 seed\"假断言并按日志真实值改写、新写数字全部登记进 doc_numbers.json、统一 verify_full_runs F-L2 参数量断言口径（B/D 不得被跳过）、修 current_spec.md 表格错行与重复句、补登记 .pt.bak 等证据本体并统一限批产物登记口径、修正\"偏离依据\"时间线、改正 .bak mtime 机制解释；训练代码零改动、不重跑全量训练，完成后跑 verify_all 并送第三次审查。",
+    "starter_session_id": "session-3f6ed93c-ad76-40b1-879b-ecfe9fe787a8",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_9ec5a1a4-90ec-4811-8be0-a3415cb4be08",
+    "plan_summary": "计数修正轮（皋陶第三次审查已通过后遗留 1 warning + 1 info）：修正 README 中 4 处登记项计数不实（43→44、251→252、被引用日志行改回 228、23→24）含一处错述被引用日志内容，补 full_run.param_assertion_rounds 说明，并把\"登记表自身计数\"纳入 verify_all.py 现跑判据以根治人工同步计数；训练代码零改动、不重跑训练，完成后重跑 verify_all 收尾。",
+    "starter_session_id": "session-3f6ed93c-ad76-40b1-879b-ecfe9fe787a8",
+    "code_reviewed": false,
+    "plan_completed": true,
+    "test_passed": true
   }
 ]
