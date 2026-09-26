@@ -1,0 +1,19 @@
+{
+  "plan_id": "plan_35b2a757-a80f-4991-af24-2e0865f5a93f",
+  "module_name": "",
+  "development_plan": "复审 n3d_viz 收尾轮（针对你上轮提出的维护性 info #1：`[2d][重渲]` 手写复刻 CLI 默认参数集）。本轮只改 4 个文件：`core.py` / `__main__.py` / `verify_viz.py` / `README.md`。请独立核验，不得以文档自述或与实现同源的判据为准：\n\n【① 共享渲染入口的重构是否真的\"行为保持\"】\n(1) 核验 `core.DEFAULT_WRITE_OPTIONS` 是否为「CLI 默认形式」的唯一事实来源，且 `core.render_default()` 自身**不手写任何参数**、只展开该常量；`__main__.py` 的 `write_options_from_args()` 是否以该常量为起点做覆盖（即默认值只在 core 定义一次）。\n(2) **关键：请独立做重构零回归验证** —— 用重构后的 CLI（相对路径 `checkpoints/n3d_sphere/model.pt`）与 5 套异构产物重新渲染，与交付件做**字节级**比对（应为 6 ckpt × 3 件套 = 18 个文件逐字节相同）。请特别检查 `__main__.py` 是否真的在\"默认路径\"下走 `render_default`、非默认路径仍走 `write_outputs`，两条路径的产物是否一致（例如 `--threshold 0.30` 显式传入时应与默认路径产物相同）。\n(3) 核验 `render_default` 的 `data=` 参数（跳过重复 `load_topology`）是否**不影响输出**；以及 `run_cli` 传入已解析的 `data` 与未传入时的产物是否逐字节相同。\n(4) 检查重构是否引入**行为差异**：如默认 `out`/`log` 处理、`DEFAULT_OUT_DIR`、异常类型（`CheckpointNotFoundError` / `CheckpointSchemaError`）、退出码（0/2/3）是否与重构前一致。\n\n【② [2e] 参数集一致性断言是否承重】\n(5) `[2e]` 现有 3 项：argparse 默认值映射 == `DEFAULT_WRITE_OPTIONS`；`render_default` **实际使用的参数集** == `DEFAULT_WRITE_OPTIONS`（据称用白盒桩替换 `write_outputs` 记录实参、`finally` 恢复）；CLI 选项表面 == 冻结清单。请核验三项**都不是同源空转** —— 特别是第 2 项：若桩实现与 `render_default` 同源，则它可能只是\"把同一常量抄两遍\"。请独立注入验证。\n(6) **请独立重做拒绝证明**（据称已有三种注入）：(a) 改 `--no-plan-planes` 的 argparse 默认值为 True；(b) 改 `--threshold` 默认值为 0.50；(c) 新增一个 CLI 开关 `--dummy-new-flag`。三种注入下 `[2e]` 对应条目必须 FAIL 且 `verify_viz.py` 退出码非 0；恢复后源文件 SHA256 逐字节相同、全绿（据称 173/0/0）。请核验在注入态下 `[2a]` 与 `[2d]` 是否仍全 PASS（即该类脱耦确实只能由 `[2e]` 拦住）。\n(7) 检查 `[2e]` 是否覆盖了「新增布尔开关」这一风险场景（用户/审查关注点），以及白盒桩在**断言失败提前返回**时是否仍会 `finally` 恢复（不得污染后续断言）。\n\n【③ 硬约束与零回归（务必独立复跑）】\n(8) **未触碰任何产物**：`checkpoints/n3d_viz/viz_model.{html,ply,obj}` 磁盘 SHA256/字节数是否仍为 `15A80EBB…/88,521`、`9A097D16…/4,120`、`1F594ECF…/15,695` 逐位一致；5 套异构交付件 15 件 SHA256 是否逐位不变。\n(9) **不得引入任何\"形状类型\"字段或分支**（用户核心约束）：运行时代码与 HTML 负载 meta 中不得出现 shape / geom / cyl_aspect 之类字段或分支判断。\n(10) `verify_viz.py` 项数（据称 170 → 173，构成 77+81+12+3，分组 `[2a]5 / [2b]42 / [2c]32 / [2d]14 / [2e]3`）是否与 README 声明一致且可被真实报告复现；`compileall` 与两个 `node --check` 是否退码 0；`assets/viewer_smoke.js` 是否全绿。\n(11) CLI 退出码契约与开关是否未被破坏：二期 0；一期产物 3（报错含所需 6/6 缺失键、无 traceback、零产物）；非法参数 2；路径不存在 3；`--no-plan-planes` / `--ply-ascii` / `--with-ply-edges` / `--threshold` 是否仍逐项生效（产物可观测差异）。\n(12) `n3d_sphere` / `n3d_proto` / `n3d_shape` git status 是否干净、既有产物 SHA256 是否逐位不变；`requirements.txt` 是否零新增依赖；`n3d_viz` 是否仍不 import 上游模块。",
+  "session_id": "",
+  "modified_files": [
+    "n3d_viz/__init__.py",
+    "n3d_viz/core.py",
+    "n3d_viz/export_geometry.py",
+    "n3d_viz/render_html.py",
+    "n3d_viz/gui.py",
+    "n3d_viz/__main__.py",
+    "n3d_viz/verify_viz.py",
+    "n3d_viz/assets/viewer.html",
+    "n3d_viz/assets/viewer.js",
+    "n3d_viz/assets/viewer_smoke.js",
+    "n3d_viz/README.md"
+  ]
+}

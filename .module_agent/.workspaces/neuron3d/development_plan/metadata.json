@@ -16,56 +16,80 @@
     "test_passed": true
   },
   {
-    "plan_id": "plan_2c6c2fae-7e1a-4239-99ce-00d2527c294e",
-    "plan_summary": "新建 n3d_viz 模块：零依赖二期拓扑三维可视化工具（GUI+CLI 双入口），产出自包含交互式 HTML、点云 PLY、线框 OBJ，含硬断言验证脚本",
-    "starter_session_id": "session-45d19084-0f10-444b-83c2-27df794fb010",
-    "code_reviewed": true,
-    "plan_completed": true,
-    "test_passed": true
-  },
-  {
-    "plan_id": "plan_297a60f5-6da1-40e3-b12a-a3945932a564",
-    "plan_summary": "n3d_viz 小修轮：修复皋陶 3 个 warning（参数语义/docstring 矛盾、缺失取值域校验导致静默错层与 traceback、GUI 覆盖提示未进状态栏）+ 统一 |edge_weight| median 口径 + 修复 verify_viz 的 render_smoke 未消费与未判 returncode，新增取值域负例断言并全量回归",
-    "starter_session_id": "session-45d19084-0f10-444b-83c2-27df794fb010",
-    "code_reviewed": true,
-    "plan_completed": true,
-    "test_passed": true
-  },
-  {
-    "plan_id": "plan_56ea3dba-051b-47dd-92ed-09af7063aa84",
-    "plan_summary": "n3d_viz 收尾轮（纯文案+清理，不改实现逻辑）：修 core.py:628 docstring 首段自相矛盾、修 README §6 表格 3 单元格错位与指引方向、改 _assert_in_range 越界计数措辞、清理 _bad_index 约 69MB 负例临时产物并如实更正上轮总结中“info 一律未动”的不实表述，重跑 verify_viz.py 回归",
-    "starter_session_id": "session-45d19084-0f10-444b-83c2-27df794fb010",
-    "code_reviewed": true,
-    "plan_completed": true,
-    "test_passed": true
-  },
-  {
-    "plan_id": "plan_02c4326a-5e41-40c9-9b08-61f4731d1224",
-    "plan_summary": "新建独立自包含模块 n3d_shape：把神经元空间形状从球体泛化为立方体与圆柱体（生长度量替换），完成配置层、形状放置、冒烟判据、独立验证脚本、五组训练对照与文档，上游模块零改动",
+    "plan_id": "plan_5f8b05cf-aabb-4fee-b7f5-1bc43ce6da73",
+    "plan_summary": "n3d_viz 几何无关化：层配色随 K 可扩展（K≤9 逐字节不变、K>9 均匀色相去重）、verify_viz 参数化并新增非规整几何合成组与真实异构几何组、文档定位改为\"对几何零假设\"、重新渲染 5 个 n3d_shape 产物",
     "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
     "code_reviewed": true,
     "plan_completed": true,
     "test_passed": true
   },
   {
-    "plan_id": "plan_ab80197e-2f35-4798-8290-5f689cd67716",
-    "plan_summary": "n3d_shape 神经元空间形状变体：配置层、形状生长度量与放置、形状感知冒烟判据、独立验证脚本、五组训练对照与文档，上游零改动（新模块，9 个文件）",
+    "plan_id": "plan_b5031d26-0885-46f6-9573-13d42798cb5c",
+    "plan_summary": "n3d_viz 几何无关化审查：验证层配色随 K 可扩展（K≤9 逐字节不变、K>9 逐位去重）、回归防线几何无关化（[2a]契约 + [2b]非规整几何合成组 + [2c]真实异构几何组 + [2d]零回归锚点）、文档定位改为\"对几何零假设\"、以及\"不得引入形状字段/分支\"的硬约束",
     "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
     "code_reviewed": true,
     "plan_completed": true,
     "test_passed": false
   },
   {
-    "plan_id": "plan_0838da22-5ab3-4d7f-a86b-24c5e36063ca",
-    "plan_summary": "n3d_shape 修复轮：修复皋陶审查的 1 error（cylinder R_min 误拒合法配置）+ 2 warning（S3b 同源、删除二期 R_max 断言理由不实）+ 4 info（死诊断字段、README 数字与披露、头部清单、返回注解），并复跑全部判据与上游回归",
+    "plan_id": "plan_2f62dc78-712c-4b22-84c7-036c771ee57c",
+    "plan_summary": "n3d_viz 修复轮：把 [2d] 零回归锚点改为\"磁盘锚点校验 + 当前代码重渲字节级比对\"两层承重断言并做拒绝证明；为 _hue_palette_rgb 撞色搜索分支补必然撞色断言或显式声明覆盖边界；README 点明\"字节级复现须用相对路径\"的口径",
     "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
     "code_reviewed": true,
     "plan_completed": true,
     "test_passed": true
   },
   {
-    "plan_id": "plan_7fb93d7a-c653-4685-bd58-3cb5477b02fa",
-    "plan_summary": "n3d_shape 修复轮复审：验证皋陶上轮 1 error（cylinder R_min 误拒合法配置）+ 2 warning（S3b 同源、删除二期 R_max 断言理由不实）+ 4 info 的逐条修复，以及离朱第 3 轮 F1/F2 收尾",
+    "plan_id": "plan_9f75ca9d-416e-4202-b25d-9f1b4c1343c0",
+    "plan_summary": "n3d_viz 修复轮复审：验证 [2d] 零回归锚点已改为承重断言（重渲 + 字节级比对 + 拒绝证明）、_hue_palette_rgb 撞色回退分支已获覆盖（K=1536 必撞色构造 + 承重证明）、README 复现口径已点明；并确认未触碰任何产物",
+    "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": false
+  },
+  {
+    "plan_id": "plan_18d8fe3c-25d2-4757-b645-4d71a2c03c76",
+    "plan_summary": "n3d_viz 收尾轮：抽出共享渲染入口 core.render_default 供 __main__ 与 [2d][重渲] 共用，并新增\"argparse 默认值 == render_default 参数集\"的承重一致性断言（含拒绝证明）；要求 CLI 渲染输出与全部产物逐字节不变",
+    "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_35b2a757-a80f-4991-af24-2e0865f5a93f",
+    "plan_summary": "n3d_viz 收尾轮复审：验证 core.render_default 共享渲染入口的重构确为\"行为保持\"（18 个产物逐字节不变）、[2e] 参数集一致性断言确实承重（三种注入均被拦住）、以及未引入形状字段/分支且未触碰任何产物",
+    "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": false
+  },
+  {
+    "plan_id": "plan_8b3f73a7-a01a-40b3-bf72-aab36500af74",
+    "plan_summary": "n3d_shape 两阶段：① 修 2H 契约断言的浮点容差缺陷（改在 float64 格点上校验 + float32 尺度感知二次防线，含拒绝证明），使 cylinder λ=2 @ N=1024 可构造；② 按固定口径（N=1024、固定超参、逐形状只搜 D、对齐各自 ANY/ANY 的 params ≤0.5%）跑 5 组 ALL/ALL 训练对照，扩展账本与文档并做纯探索式报告",
+    "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_e743c539-8583-4480-a1ad-b66e941b41eb",
+    "plan_summary": "n3d_shape 审查：① 2H 契约容差缺陷修复（float64 精确契约 + float32 尺度感知二次防线，含拒绝证明与边界收紧）；② ALL/ALL 参数对齐形状对照（固定 N=1024、逐形状搜 D 对齐各自 ANY/ANY params ≤0.5%，2×5 对照表与 10 组账本）；③ 新增 S15/S16 常驻防线是否承重",
+    "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": false
+  },
+  {
+    "plan_id": "plan_5913b38f-0e08-4fd0-9061-f2922f5e4761",
+    "plan_summary": "n3d_shape 修复轮：把既有 5 组 any/any 产物 SHA256 与两组 params 跨度改为承重断言（含拒绝证明）；修正 README §16.2 可达区间 4 个不可达下端与 §16.1 自相矛盾的下界依据；补\"两道防线后置可检下限约 4-7e-6\"与账本\"零改动\"口径的显式披露",
+    "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
+    "code_reviewed": true,
+    "plan_completed": true,
+    "test_passed": true
+  },
+  {
+    "plan_id": "plan_de1a4007-1f7e-4445-a7a0-54c2b86d8018",
+    "plan_summary": "n3d_shape 复核：验证你上轮 5 项 info 的修复是否到位 —— #1 两条\"断言\"是否已变为承重断言（FROZEN_ANYANY 双向断言 + FROZEN_SPAN 跨度断言，含拒绝证明与落盘守卫）；#2 README §16.2 可达区间是否已按显式口径修正且端点真实可达；#3 §16.1 下界依据是否已自洽；#4 后置可检下限披露；#5 账本口径",
     "starter_session_id": "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4",
     "code_reviewed": true,
     "plan_completed": true,

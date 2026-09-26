@@ -1,0 +1,19 @@
+{
+  "plan_id": "plan_b5031d26-0885-46f6-9573-13d42798cb5c",
+  "module_name": "",
+  "development_plan": "审查 n3d_viz 几何无关化改动（6 个文件：core.py / export_geometry.py / verify_viz.py / __main__.py / gui.py / README.md）。请独立核验，不得以文档自述或与实现同源的判据为准：\n\n【核心修复（层配色随 K 可扩展）】\n(1) 请独立确认改动前的真实缺陷：原 `core.py` 与 `export_geometry.py` 各有一份 9 色表并用 `k % len(...)` 循环，导致 K>9 时层色重复。重点核验 `cylinder λ=2`（K=15）产物：层色去重数必须 == 15（修复前为 9），且 PLY 顶点色去重数同步为 15；HTML 第 i 层色必须 == `layer_palette_hex(15)[i]` 逐项一致。\n(2) 确认色板已**同源**：HTML 层色与 PLY 层色必须来自同一函数，`LAYER_COLORS == core.layer_palette_rgb(9)`；`layer_palette_rgb(K) == [hex_to_rgb(h) for h in layer_palette_hex(K)]`。\n(3) 确认 **K ≤ 9 时输出逐字节不变**（这是零回归锚点的前提）。\n(4) 确认 `K > 9` 的扩展色**两两不同**（去重数恒等于 K），且 `K=1..64` 全部分量落在 0..255；请特别检查实现是否用了\"确定性撞色搜索\"而非侥幸不撞。\n(5) 确认**未引入任何第三方依赖**（不得引入 matplotlib/plotly 等；`colorsys` 属标准库可用），`requirements.txt` 零新增。\n\n【零回归锚点（关键）】\n(6) 请独立重算 `checkpoints/n3d_viz/viz_model.{html,ply,obj}` 的 SHA256 与字节数，并与 git HEAD 的旧实现重渲染结果做**字节级**比对，确认 K=9 路径完全未被改动。\n\n【回归防线几何无关化】\n(7) 确认原有二期基准组（写死的 `EXPECTED_N=256` / `EXPECTED_E=736` / `EXPECTED_LAYER_COUNTS`）**仍作为原验收保留**，新增各组必须是\"从 checkpoint 读实际 N/E/K/层规模\"而非写死。请特别检查新增断言是否真的参数化（有无隐藏的写死值）。\n(8) 核验 `[2b]` 非规整几何合成组：5 类样本（随机点云 / 螺旋线 / 每层 1 个神经元 / K=1 / K=33）是否真的**几何上不规整**（而非伪装成 FCC 的规整点云），且逐项断言（顶点数==N、`l` 行数==E、层数==实际 K、层色去重数==K、坐标与 `neuron_pos` 逐位一致、payload 长度自洽、产物名派生）确实生效；临时产物是否已清理（无残留、残留体积 0 字节）。\n(9) 核验 `[2c]` 真实异构几何组是否**只断言泛化不变量、未断言任何形状标签**（不得出现 shape/cube/cylinder 之类的类型判断）；产物缺失时是否为\"明确 SKIP 并计入报告\"而非静默跳过。\n(10) **反桩检验**：请对新增的关键断言做承重性验证 —— 例如把色板函数或 `hex_to_rgb` 的守卫改回旧的宽松语义，确认相应断言会 FAIL；若断言在注入缺陷后仍全绿，即为空转断言，须报出。\n\n【硬约束复验】\n(11) `n3d_viz` **不得引入任何\"形状类型\"字段或分支**：请检查 meta / payload / viewer.js / GUI / README 中是否出现了 `shape` / `cyl_aspect` / `cube` / `cylinder` 之类的一等形状概念（作为**输入数据的来源标注**可以，作为**分支判断依据**则违规）。这是用户明确要求\"不要固定形状、只按神经元位置展示\"的核心约束。\n(12) `n3d_viz` 不得 import `n3d_sphere` / `n3d_proto` / `n3d_shape`（AST / 正则扫描）；顶层 import 仅 torch / numpy / 标准库。\n(13) `n3d_sphere` / `n3d_proto` / `n3d_shape` 源码与产物零改动（git 干净 + 既有产物 SHA256 逐位不变）。\n(14) 报告中不得出现无产物支撑的实测数字；`verify_viz.py` 的断言项数与 README 声明的条数构成必须一致。\n\n【务必独立复跑】`python -m compileall -q n3d_viz`、两个 `node --check`、`python n3d_viz/verify_viz.py`（期望 158/0/0 退码 0）、CLI 退出码契约（0/2/3，含一期产物退码 3 且列出 6 个缺失键）。若环境具备 Playwright，可参考离朱的 E2E 证据但不强制重跑。",
+  "session_id": "",
+  "modified_files": [
+    "n3d_viz/__init__.py",
+    "n3d_viz/core.py",
+    "n3d_viz/export_geometry.py",
+    "n3d_viz/render_html.py",
+    "n3d_viz/gui.py",
+    "n3d_viz/__main__.py",
+    "n3d_viz/verify_viz.py",
+    "n3d_viz/assets/viewer.html",
+    "n3d_viz/assets/viewer.js",
+    "n3d_viz/assets/viewer_smoke.js",
+    "n3d_viz/README.md"
+  ]
+}

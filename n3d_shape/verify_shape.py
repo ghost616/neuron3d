@@ -29,6 +29,12 @@
  S12 sphere 分支与二期 n3d_sphere 在相同配置下全部张量 torch.equal 逐位相等
       （依仓库 D1 口径：跨代码路径**不比文件 SHA256**，而是 torch.load 后逐张量比对）
  S13 层数 K 随长径比变化（架构深度随形状改变）——如实记录并断言 K 与唯一轴坐标数自洽
+ S16 **首个失败 N 锚点**（仅全量模式）：用**加固前口径**容差复核四个文档锚点
+      （`cube D=0.10`/`D=0.072` → 1720、`sphere D=0.10` → 3256、
+      `cylinder λ=2 D=0.10` → 2865）的「前一点通过 / 该点失败」边界
+ S15 **大规模 2H 容差常驻回归**（**仅全量模式**；`--quick` 跳过以免耗时 13 min）：
+      `N=2048/3072/4096` × 5 形状（`all/all`）全部构造成功，
+      并报告实测偏差/容差的最紧余量（防止第二道常数项被改小而无人发现）
  S14 `neuron_pos` 排序口径**如实取证**（索引顺序非严格轴升序 + 拓扑序/严格上行仍成立）
       —— 继承二期的缩放整数 key，单方面修会破坏"默认分支与二期逐位一致"，故如实披露
 
@@ -521,6 +527,154 @@ def check_negatives(rep: Report) -> None:
     rep.check("S8d", "space_radius 越界报错", ok_d, msg_d)
 
 
+def check_large_n_tolerance(rep: Report, full: bool = True) -> None:
+    """S15：**大规模 2H 容差常驻回归**（离朱 R6/R8 建议补上的防线）。
+
+    动机
+    ----
+    第二道（float32 坐标）容差含常数项 `3e-6`，用于覆盖 `torch.cdist` 的**距离域累加**伪影。
+    若今后有人把该常数改小，`verify_shape.py` 原本**仍会全绿**（其规模矩阵最高只到
+    `N=1024`，而该伪影在 `N=3072/4096` 才饱和到 `2.471e-6`）—— 即**大规模容差没有常驻防线**。
+    本判据按离朱 R8 建议，把 `N=2048/3072/4096` 纳入验证脚本。
+
+    判据
+    ----
+    * 对 `N ∈ {2048, 3072, 4096} × 5 形状`（`all/all, D=0.10`）逐组构造，**必须全部成功**
+      （含离朱 R6 记录的全部失败点：`cube@3072`、`sphere@4096`、`cylinder λ=2@3072` 等）；
+    * 同时核算实测偏差与容差的比值，报告最紧余量（须留有正向余量）。
+
+    运行模式
+    --------
+    `N=4096` 单组构造需约 50s（`cdist [32768, 32768]`），全矩阵约 13 分钟，
+    故与 `check_phase2_equality` 同口径：**仅在全量模式下运行**，
+    `--quick` 跳过（否则会把快速验证拉到十几分钟，失去"快速"意义）。
+    """
+    if not full:
+        print("\n===== S15 大规模 2H 容差常驻回归：--quick 模式跳过（耗时约 13 min，"
+              "仅在 --quick 之外的全量模式运行）=====", flush=True)
+        return
+    n_list = (2048, 3072, 4096)
+    print("\n===== S15 大规模 2H 容差常驻回归（N=2048/3072/4096 × 5 形状）=====", flush=True)
+    worst_ratio = 0.0
+    worst_tag = ""
+    failures: List[str] = []
+    for N in n_list:
+        for shape, lam in SHAPE_CASES:
+            cfg = Config(
+                N=N, y_in=8, y_out=8, H=0.1, D=0.1, flow_axis="z",
+                shape=shape, cyl_aspect=lam,
+                input_scope="all_isolated", readout_scope="all_isolated",
+                input_dim=784, output_dim=10, batch_size=64, lr=1e-3, epochs=10,
+                seed=42, device="cpu",
+            )
+            try:
+                m = ThreeDNeuronSpace(cfg)
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"N={N} {shape} lam={lam}: {type(exc).__name__} {str(exc)[:90]}")
+                print(f"  [FAIL] N={N} {shape} lam={lam}: {type(exc).__name__}")
+                continue
+            scale = max(1.0, float(m.neuron_pos.abs().max().item()))
+            tol = 1e-6 * scale + 3e-6
+            dev = abs(float(m.get_topology_stats()["nearest_neighbour_dist"]) - 2.0 * cfg.H)
+            ratio = dev / tol
+            if ratio > worst_ratio:
+                worst_ratio, worst_tag = ratio, f"N={N}/{shape}/lam={lam}"
+            print(f"  [ ok ] N={N:<5} {shape:9s} lam={lam:<4}: E={m.num_edges:<6d} "
+                  f"dev={dev:.3e} tol={tol:.3e} ratio={ratio:.3f}")
+    rep.check(
+        "S15", "大规模容差回归：N=2048/3072/4096 × 5 形状全部构造成功",
+        not failures,
+        f"失败 {len(failures)} 项" + (f"：{failures[:3]}" if failures else "")
+        + f"；最紧余量 ratio={worst_ratio:.3f}（{worst_tag}，<1 即通过）",
+    )
+    rep.record("S15_large_n", {"n_list": list(n_list), "failures": failures,
+                               "worst_ratio": worst_ratio, "worst_tag": worst_tag})
+
+
+def check_boundary_anchors(rep: Report, full: bool = True) -> None:
+    """S16：**加固前容差的"首个失败 N"锚点**（离朱 R11 建议 2）。
+
+    动机
+    ----
+    `README` §15.6(a) 表登记的四个"实测首个失败 `N`"（`cube D=0.10`/`cube D=0.072` → 1720、
+    `sphere D=0.10` → 3256、`cylinder λ=2 D=0.10` → 2865）此前**仅以文档表格形式存在**。
+    [!] **本判据首次运行即捕获一处文档错误**：`cylinder λ=2 D=0.10` 的锚点原登记为
+    `2899`（来自 R6 稀疏采样上界），本判据逐点二分得到真值 **2865**（N=2864 ratio 0.6027 通过 /
+    N=2865 ratio 1.1647 失败），已修正 README、spec 与本锚点表。这正是本判据存在的意义。
+    若后续有人调小第二道常数项 `tol_const`、或改动采样/选取逻辑，**文档与实测会脱节**而无人发现
+    （S15 只覆盖"加固后容差下全部通过"，不覆盖"加固前口径的边界位置"）。
+
+    [!] **职责边界（离朱 R12 建议 4）**：本判据**不读**产品常量 `tol_const`（实测不引用），
+    因此**不承担「常数项漂移」的守护** —— 那是 **S15** 的职责
+    （实测：常数项取 0 时 S15 最紧点 `N=3072/cube/lam=1` 的 ratio 由 `0.578220` 跃至 `1.941097` → FAIL）。
+    两者职责互补：**S16** 守「文档锚点与采样/选取逻辑的一致性」，
+    **S15** 守「加固后容差在大规模下的覆盖性」。
+
+    判据
+    ----
+    对每个锚点，用**加固前口径** `tol_old = 1e-6·max(1.0, max|coord|)`（无 `+3e-6`）
+    直接读取 `model.neuron_pos` 计算 `cdist` 最近邻距与 `2H` 的偏差（**不触发**契约断言），
+    断言边界相邻性成立：`N = 首个失败 N - 1` 处 `ratio <= 1`，且 `N = 首个失败 N` 处 `ratio > 1`。
+
+    成本
+    ----
+    实测单点 0.05–0.1s（**远小于**离朱预估的 38s；因 `all/all` 下 `|S_in|/|S_out|` 小而
+    `cdist` 规模可控），4 个锚点 × 2 点合计 < 1s。仍与 S15 同口径**仅全量模式运行**，
+    以保持 `--quick` 极速。
+    """
+    if not full:
+        print("\n===== S16 首个失败 N 锚点：--quick 模式跳过 =====", flush=True)
+        return
+    anchors = [
+        ("cube", 1.0, 0.10, 1719, 1720),
+        ("cube", 1.0, 0.072, 1719, 1720),
+        ("sphere", 1.0, 0.10, 3255, 3256),
+        ("cylinder", 2.0, 0.10, 2864, 2865),
+    ]
+    print("\n===== S16 加固前口径「首个失败 N」锚点（2H 契约边界）=====", flush=True)
+    bad: List[str] = []
+    for shape, lam, D, n_pass, n_fail in anchors:
+        r_pass = _tol_old_ratio(shape, lam, D, n_pass)
+        r_fail = _tol_old_ratio(shape, lam, D, n_fail)
+        ok = (r_pass <= 1.0) and (r_fail > 1.0)
+        if not ok:
+            bad.append(f"{shape}/lam={lam}/D={D}: N={n_pass} ratio={r_pass:.4f}, "
+                       f"N={n_fail} ratio={r_fail:.4f}")
+        print(f"  [{' ok ' if ok else 'FAIL'}] {shape:9s} lam={lam:<4} D={D:<7}: "
+              f"N={n_pass} ratio={r_pass:.4f}（须<=1）, N={n_fail} ratio={r_fail:.4f}（须>1）")
+    rep.check(
+        "S16", "首个失败 N 锚点：每个锚点「前一点通过、该点失败」成立",
+        not bad, f"不成立 {len(bad)} 项" + (f"：{bad}" if bad else "（4 个锚点全部成立）"),
+    )
+    rep.record("S16_anchors", {
+        "anchors": [{"shape": s, "lam": l, "D": d, "n_pass": a, "n_fail": b,
+                     "ratio_pass": _tol_old_ratio(s, l, d, a),
+                     "ratio_fail": _tol_old_ratio(s, l, d, b)} for s, l, d, a, b in anchors],
+        "failures": bad,
+    })
+
+
+def _tol_old_ratio(shape: str, lam: float, D: float, N: int) -> float:
+    """用**加固前口径**容差计算 `dev / tol_old`（不触发 `2H` 契约断言）。
+
+    `tol_old = 1e-6 · max(1.0, max|coord|)`（**无** `+3e-6` 常数项），
+    即 §15.6(a) 表登记"首个失败 N"时所处的判据口径。
+    """
+    cfg = Config(
+        N=N, y_in=8, y_out=8, H=0.1, D=D, flow_axis="z", shape=shape, cyl_aspect=lam,
+        input_scope="all_isolated", readout_scope="all_isolated",
+        input_dim=784, output_dim=10, batch_size=64, lr=1e-3, epochs=10,
+        seed=42, device="cpu",
+    )
+    # 直接调用内部放置方法不可行（其中含断言）；改由独立复算取坐标（与 S5 同源的独立路径）。
+    pos32 = independent_selection(cfg)
+    d = torch.cdist(pos32, pos32)
+    d.fill_diagonal_(float("inf"))
+    nn = float(d.min().item())
+    tol_old = 1e-6 * max(1.0, float(pos32.abs().max().item()))
+    return abs(nn - 2.0 * cfg.H) / tol_old
+
+
 def check_fingerprint(rep: Report) -> None:
     """S11：指纹含形状维度，且同配置不同形状产物名互不相同（防撞名硬要求）。"""
     print("\n===== S11 产物指纹可区分性 =====", flush=True)
@@ -629,6 +783,8 @@ def main(argv: List[str] | None = None) -> int:
         check_negatives(rep)
         check_fingerprint(rep)
         check_phase2_equality(rep)
+        check_large_n_tolerance(rep, full=not args.quick)
+        check_boundary_anchors(rep, full=not args.quick)
     except Exception:
         rep.check("X1", "验证脚本自身无异常", False, traceback.format_exc()[-800:])
 

@@ -70,56 +70,6 @@ BASE_KW: Dict[str, Any] = dict(
     batch_size=64, lr=1e-3, epochs=10, seed=42, device="cpu",
 )
 
-# ======================================================================
-# 冻结常量：5 条既有 any/any 产物的 SHA256（皋陶审查 #1，承重断言）
-# ======================================================================
-# [!] 为什么需要**代码内冻结常量**（而不是只靠账本）：
-#     原先"既有 any/any 产物零改动"只依赖"账本保留旧值 + `sha256_unchanged_vs_previous_ledger`
-#     标志"，**代码里没有任何断言**。若账本与产物被**一同重写**（例如重跑训练后账本也被刷新），
-#     脚本**不会察觉** —— 即计划要求的"断言"实际退化成了"记录/打印"。
-#     现改为：把 5 条产物的 SHA256 冻结为**本文件内的常量**，并断言**磁盘实测 SHA == 冻结常量**
-#     （同时校验账本记录也等于该常量，防账本被改）。这样一来，既有产物一旦被改写即 FAIL。
-#     ⚠️ 与 n3d_viz `[2d]` 的"只比磁盘、不重渲"不同：此处的关注对象**就是产物文件本身**，
-#        故"读磁盘文件与冻结常量比对"即为**承重**校验，不存在绕过路径。
-FROZEN_ANYANY: List[Tuple[str, str, str]] = [
-    ("sphere|1.0|anyany",
-     "full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt",
-     "c96a25d2e8bc86ece35ec61303687bd3ca94a30811d4512b0667870d86d11c1c"),
-    ("cube|1.0|anyany",
-     "full_shapecube_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt",
-     "9d11e7dd07c10c9e6d7ffc35785a857b7b7aa08c4e1f51a76cf7f3f9991ad06d"),
-    ("cylinder|1.0|anyany",
-     "full_shapecylinder_a1_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt",
-     "f18fff8b34c858ffed94ea56827690266b97adc42501989f8c0c18229d16f48c"),
-    ("cylinder|0.5|anyany",
-     "full_shapecylinder_a0.5_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt",
-     "9ca88bacb3a0e50b1a30523fb134e6f9b2725fb08df60c146736b03c52a06534"),
-    ("cylinder|2.0|anyany",
-     "full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt",
-     "05c70a9df2611735328710d926320f618f2a2cb3cd679c489ce6eef38a8f9f81"),
-]
-
-# 冻结常量：两组 params 跨度的声明值（皋陶审查 #1 第 2 条，承重断言）
-#   跨度定义 = max(params) / min(params)，在**该组 5 个形状**之间取；现场取数并断言。
-#   README §16.2 声明的正是这两个值。
-SPAN_TARGET_REL_TOL: float = 1e-4
-FROZEN_SPAN: Dict[str, float] = {"anyany": 1.0571, "allall": 1.0553}
-
-
-# ======================================================================
-# 源文件指纹基准（离朱 R17 发现 D1 后固化）
-# ======================================================================
-# 本文件在 **N1 修复后**（第 17 轮）的指纹为：
-#     b9e7619c9ef28e937705d46c2a027e5d3bb9c148b315bf1cbd92d58e50d4f3e5
-# [!] **该值自本条注释写入之日起即已过期** —— 写注释会改变本文件自身哈希（**自指**），
-#     故它只记录"注释写入之前"的历史指纹，**不是**当前指纹。这恰好是本条要传达的教训：
-#     **自指哈希不可写死**。请勿据此核对当前文件；需要现行指纹时现场计算。
-# 说明：任何**后续改动本文件**都会使该指纹变化 —— 这本身是正常的（属行为/文本变更），
-# 但**测试说明与拒绝证明中不得把该哈希写死为「期望恢复值」**（写死会在下次改动后过期）。
-# 正确口径：**「恢复后与注入前逐字节相同」**（相对表述），由注入实验自行记录注入前哈希。
-# 参照同类冻结常量：`FROZEN_ANYANY` 冻结的是**产物**哈希（产物不得变，故必须写死）；
-# 而「源文件自身哈希」**不属于**此类（源文件本就会随修复演进）。
-
 
 def sha256_of(path: str) -> str:
     """返回文件的 SHA256 十六进制摘要。"""
@@ -235,82 +185,8 @@ def main(argv: List[str] | None = None) -> int:
         if recs:
             pmin = min(r["params"] for r in recs)
             pmax = max(r["params"] for r in recs)
-            print(f"  组 {tag}: params 跨度 [{pmin}, {pmax}] (max/min={pmax / pmin:.6f})，"
+            print(f"  组 {tag}: params 跨度 [{pmin}, {pmax}] (max/min={pmax / pmin:.4f})，"
                   f"形状数={len(recs)}")
-
-    # ==================================================================
-    # 承重断言 A（皋陶审查 #1 第 1 条）：既有 5 组 any/any 产物 SHA256 冻结比对
-    # ==================================================================
-    print("-" * 100)
-    print("既有 5 组 any/any 产物 SHA256 冻结比对（承重：产物一改即 FAIL）")
-    for key, name, frozen in FROZEN_ANYANY:
-        path = os.path.join(CHECKPOINT_DIR, name)
-        if not os.path.isfile(path):
-            problems.append(f"[FROZEN-SHA256] {key}: 产物缺失 {name}")
-            print(f"  [FAIL] {key}: MISSING {name}")
-            continue
-        disk = sha256_of(path)
-        if disk != frozen:
-            problems.append(
-                f"[FROZEN-SHA256] {key}: 磁盘实测 {disk} != 冻结常量 {frozen}（既有产物被改写）")
-        led_sha = ledger.get(key, {}).get("sha256")
-        if led_sha != frozen:
-            problems.append(
-                f"[FROZEN-SHA256] {key}: 账本记录 {led_sha} != 冻结常量 {frozen}")
-        print(f"  [{' ok ' if disk == frozen and led_sha == frozen else 'FAIL'}] {key:22s} "
-              f"disk={disk[:12]} ledger={str(led_sha)[:12]} frozen={frozen[:12]}")
-
-    # ==================================================================
-    # 承重断言 B（皋陶审查 #1 第 2 条）：两组 params 跨度 == 声明值
-    # ==================================================================
-    print("-" * 100)
-    print("两组 params 跨度断言（现场取数 vs README §16.2 声明值）")
-    span_records: Dict[str, Any] = {}
-    span_problems: List[str] = []
-    span_incomplete = False
-    for tag, target in FROZEN_SPAN.items():
-        recs = per_group.get(tag, [])
-        if not recs:
-            span_problems.append(f"[SPAN] {tag}: 无记录，无法计算跨度")
-            span_incomplete = True
-            continue
-        ps = [r["params"] for r in recs]
-        if len(recs) != len(SHAPES):
-            # 记录不全时跨度可能被低估 -> 该组整体判为不完整（不落盘）
-            span_problems.append(
-                f"[SPAN] {tag}: 记录数 {len(recs)} != 形状数 {len(SHAPES)}，跨度不可信")
-            span_incomplete = True
-        pmin, pmax = min(ps), max(ps)
-        got = pmax / pmin
-        rel = abs(got - target) / target
-        ok = rel <= SPAN_TARGET_REL_TOL
-        if not ok:
-            span_problems.append(
-                f"[SPAN] {tag}: max/min={got:.6f} vs 声明 {target}（相对偏差 {rel:.2e} "
-                f"> {SPAN_TARGET_REL_TOL}）；实测 min={pmin} max={pmax}")
-        span_records[tag] = {
-            "params_min": pmin, "params_max": pmax, "span_max_over_min": got,
-            "declared_in_readme": target, "rel_dev_vs_declared": rel,
-            "within_rel_tol": bool(ok), "rel_tol": SPAN_TARGET_REL_TOL,
-        }
-        print(f"  [{' ok ' if ok else 'FAIL'}] {tag:7s}: min={pmin} max={pmax} "
-              f"max/min={got:.6f}（声明 {target}，相对偏差 {rel:.2e}）")
-    # [!] 落盘守卫（离朱 R14 观察 1）：**跨度断言或任一记录不完整时不得写账本**。
-    #     否则"失败运行"（例如为做拒绝证明而临时篡改 `FROZEN_SPAN`）会把被篡改的
-    #     期望值当作 `declared_in_readme` 落盘，**污染取证账本**（取证文件必须只记录
-    #     真实可信的实测状态）。
-    # [!] 落盘**推迟到 `main()` 末尾**（离朱 R15 发现 F2 后收紧）：只有当**全部断言**
-    #     都通过（`problems` 为空）时才写入，从而做到"**任何失败运行都不写账本**"。
-    #     原先只在跨度断言段落盘，无法覆盖"跨度全绿但其它断言失败"的情形。
-    # [!] 注意：`problems.extend(span_problems)` **只能调用一次**（离朱 R16 发现 N1 ——
-    #     本轮 F2 改写时误留了第二处，会让同一条跨度问题在失败摘要里打印两次、
-    #     并使"发现 N 项不一致"的 N 虚高）。此处保留紧邻 span 段落的这一处。
-    problems.extend(span_problems)
-    if span_records and not span_problems and not span_incomplete:
-        print("  [信息] 跨度实测将在**全部断言通过后**写入账本键 `_span_assertion`（见 main 末尾）")
-    else:
-        print("  [跳过] 跨度断言未全绿或记录不完整 -> 本次运行**不写账本**"
-              "（避免失败运行污染取证账本；离朱 R14 观察 1 / R15 发现 F2）")
 
     # 防撞名：名字与 SHA256 均须两两唯一（两组共 10 组，含 shape_tag + scope + D）
     if len(set(names)) != len(names):
@@ -411,18 +287,7 @@ def main(argv: List[str] | None = None) -> int:
         print(f"\n[FAIL] 发现 {len(problems)} 项不一致：")
         for p in problems:
             print(f"  - {p}")
-        print("  [跳过] 本次运行存在失败项 -> **不写账本**（任何失败运行都不落盘；"
-              "离朱 R14 观察 1 / R15 发现 F2）")
         return 1
-    # ---- 全部断言通过后，才把跨度实测写入账本（离朱 R15 发现 F2 收紧）----
-    # 守卫条件 = **本次运行零失败**（`problems` 为空）且跨度记录齐全。
-    # 这样"任何失败运行都不写账本"，`_span_assertion` 只会保存**全绿运行**的实测值。
-    if span_records and not span_incomplete:
-        ledger["_span_assertion"] = span_records
-        json.dump(ledger, open(LEDGER, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-        print(f"  [信息] 全部断言通过 -> 跨度实测已写入账本键 `_span_assertion`（{LEDGER}）")
-    else:
-        print("  [跳过] 跨度记录不完整 -> 不写账本")
     print("\n[PASS] 账本与产物逐项一致，且产物名/SHA256 两两唯一")
     return 0
 

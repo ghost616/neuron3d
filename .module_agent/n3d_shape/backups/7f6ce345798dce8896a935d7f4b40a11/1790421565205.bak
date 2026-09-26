@@ -106,21 +106,6 @@ SPAN_TARGET_REL_TOL: float = 1e-4
 FROZEN_SPAN: Dict[str, float] = {"anyany": 1.0571, "allall": 1.0553}
 
 
-# ======================================================================
-# 源文件指纹基准（离朱 R17 发现 D1 后固化）
-# ======================================================================
-# 本文件在 **N1 修复后**（第 17 轮）的指纹为：
-#     b9e7619c9ef28e937705d46c2a027e5d3bb9c148b315bf1cbd92d58e50d4f3e5
-# [!] **该值自本条注释写入之日起即已过期** —— 写注释会改变本文件自身哈希（**自指**），
-#     故它只记录"注释写入之前"的历史指纹，**不是**当前指纹。这恰好是本条要传达的教训：
-#     **自指哈希不可写死**。请勿据此核对当前文件；需要现行指纹时现场计算。
-# 说明：任何**后续改动本文件**都会使该指纹变化 —— 这本身是正常的（属行为/文本变更），
-# 但**测试说明与拒绝证明中不得把该哈希写死为「期望恢复值」**（写死会在下次改动后过期）。
-# 正确口径：**「恢复后与注入前逐字节相同」**（相对表述），由注入实验自行记录注入前哈希。
-# 参照同类冻结常量：`FROZEN_ANYANY` 冻结的是**产物**哈希（产物不得变，故必须写死）；
-# 而「源文件自身哈希」**不属于**此类（源文件本就会随修复演进）。
-
-
 def sha256_of(path: str) -> str:
     """返回文件的 SHA256 十六进制摘要。"""
     return hashlib.sha256(open(path, "rb").read()).hexdigest()
@@ -266,26 +251,18 @@ def main(argv: List[str] | None = None) -> int:
     print("-" * 100)
     print("两组 params 跨度断言（现场取数 vs README §16.2 声明值）")
     span_records: Dict[str, Any] = {}
-    span_problems: List[str] = []
-    span_incomplete = False
     for tag, target in FROZEN_SPAN.items():
         recs = per_group.get(tag, [])
         if not recs:
-            span_problems.append(f"[SPAN] {tag}: 无记录，无法计算跨度")
-            span_incomplete = True
+            problems.append(f"[SPAN] {tag}: 无记录，无法计算跨度")
             continue
         ps = [r["params"] for r in recs]
-        if len(recs) != len(SHAPES):
-            # 记录不全时跨度可能被低估 -> 该组整体判为不完整（不落盘）
-            span_problems.append(
-                f"[SPAN] {tag}: 记录数 {len(recs)} != 形状数 {len(SHAPES)}，跨度不可信")
-            span_incomplete = True
         pmin, pmax = min(ps), max(ps)
         got = pmax / pmin
         rel = abs(got - target) / target
         ok = rel <= SPAN_TARGET_REL_TOL
         if not ok:
-            span_problems.append(
+            problems.append(
                 f"[SPAN] {tag}: max/min={got:.6f} vs 声明 {target}（相对偏差 {rel:.2e} "
                 f"> {SPAN_TARGET_REL_TOL}）；实测 min={pmin} max={pmax}")
         span_records[tag] = {
@@ -295,22 +272,10 @@ def main(argv: List[str] | None = None) -> int:
         }
         print(f"  [{' ok ' if ok else 'FAIL'}] {tag:7s}: min={pmin} max={pmax} "
               f"max/min={got:.6f}（声明 {target}，相对偏差 {rel:.2e}）")
-    # [!] 落盘守卫（离朱 R14 观察 1）：**跨度断言或任一记录不完整时不得写账本**。
-    #     否则"失败运行"（例如为做拒绝证明而临时篡改 `FROZEN_SPAN`）会把被篡改的
-    #     期望值当作 `declared_in_readme` 落盘，**污染取证账本**（取证文件必须只记录
-    #     真实可信的实测状态）。
-    # [!] 落盘**推迟到 `main()` 末尾**（离朱 R15 发现 F2 后收紧）：只有当**全部断言**
-    #     都通过（`problems` 为空）时才写入，从而做到"**任何失败运行都不写账本**"。
-    #     原先只在跨度断言段落盘，无法覆盖"跨度全绿但其它断言失败"的情形。
-    # [!] 注意：`problems.extend(span_problems)` **只能调用一次**（离朱 R16 发现 N1 ——
-    #     本轮 F2 改写时误留了第二处，会让同一条跨度问题在失败摘要里打印两次、
-    #     并使"发现 N 项不一致"的 N 虚高）。此处保留紧邻 span 段落的这一处。
-    problems.extend(span_problems)
-    if span_records and not span_problems and not span_incomplete:
-        print("  [信息] 跨度实测将在**全部断言通过后**写入账本键 `_span_assertion`（见 main 末尾）")
-    else:
-        print("  [跳过] 跨度断言未全绿或记录不完整 -> 本次运行**不写账本**"
-              "（避免失败运行污染取证账本；离朱 R14 观察 1 / R15 发现 F2）")
+    if span_records:
+        ledger["_span_assertion"] = span_records
+        json.dump(ledger, open(LEDGER, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        print(f"  [信息] 跨度实测已写入账本键 `_span_assertion`（{LEDGER}）")
 
     # 防撞名：名字与 SHA256 均须两两唯一（两组共 10 组，含 shape_tag + scope + D）
     if len(set(names)) != len(names):
@@ -411,18 +376,7 @@ def main(argv: List[str] | None = None) -> int:
         print(f"\n[FAIL] 发现 {len(problems)} 项不一致：")
         for p in problems:
             print(f"  - {p}")
-        print("  [跳过] 本次运行存在失败项 -> **不写账本**（任何失败运行都不落盘；"
-              "离朱 R14 观察 1 / R15 发现 F2）")
         return 1
-    # ---- 全部断言通过后，才把跨度实测写入账本（离朱 R15 发现 F2 收紧）----
-    # 守卫条件 = **本次运行零失败**（`problems` 为空）且跨度记录齐全。
-    # 这样"任何失败运行都不写账本"，`_span_assertion` 只会保存**全绿运行**的实测值。
-    if span_records and not span_incomplete:
-        ledger["_span_assertion"] = span_records
-        json.dump(ledger, open(LEDGER, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-        print(f"  [信息] 全部断言通过 -> 跨度实测已写入账本键 `_span_assertion`（{LEDGER}）")
-    else:
-        print("  [跳过] 跨度记录不完整 -> 不写账本")
     print("\n[PASS] 账本与产物逐项一致，且产物名/SHA256 两两唯一")
     return 0
 

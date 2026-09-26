@@ -1,0 +1,211 @@
+# n3d_shape 第 9 轮测试报告（R8 残留修正 + S15 常驻防线）
+
+- 测试智能体：离朱
+- 测试对象：`n3d_shape/verify_shape.py`（新增 S15）、`n3d_shape/README.md`、`.module_agent/n3d_shape/current_spec.md`
+- 被测文件 SHA256（测试时快照）：
+  - `n3d_shape/verify_shape.py` = `66cb8669dea9e0a592aec43bb39725068b5ba403616cc446be0ed0a8fbf82f52`
+  - `n3d_shape/README.md` = `67f786da8ce59c26e61148cf6e06fd7dde5fd7e577b46d8773c4b2c2b4a29e5c`
+  - `n3d_shape/model.py` = `4035dae6b1b24410182021ed658eb05b3f2614b68bc60098f549c09165c64ccb`
+  - `.module_agent/n3d_shape/current_spec.md` = `23a04807d693356729a25e82daa79f088880a617de2334ceb7dc50e385ac8cda`
+- 测试脚本与原始日志：`lizhu_r9_scripts/`（`t1`–`t10`），临时包副本：`.lizhu_env/s15neg/n3d_shape_neg/`（gitignore 内，未污染工作区）
+
+## 一、结论摘要
+
+**spec 第 1–16 条全部通过，零回归成立，"拒绝证明"实测成立。** 无 error / warning 级缺陷。
+新发现 4 项**信息项（info）**：3 项为 R8 修正未覆盖的**同类表述/口径残留**（均在代码注释与文档表格内部，不影响代码行为与断言结论），1 项为**离朱侧复用脚本的字符串解析缺陷**（已改按标记计数复核）。
+
+## 二、测试概览
+
+| 测试类型 | 是否适用 | 用例数 | 通过 | 失败 | 结论 |
+| --- | --- | --- | --- | --- | --- |
+| 单元/功能探针（纯逻辑，无 DOM） | 适用 | 44 | 43 | 1（我自设预期写错，非交付缺陷，见 §5.1） | 通过 |
+| 接口测试（HTTP method/参数/鉴权/响应） | **不适用** | — | — | — | 本模块无 HTTP 接口，纯本地 Python 库 |
+| 编译测试 `python -m compileall -q n3d_shape` | 适用 | 1 | 1 | 0 | 退码 0 |
+| 脚本级 E2E：`verify_shape.py` 全量 | 适用 | 144 | 144 | 0 | 退码 0，706s |
+| 脚本级 E2E：`verify_shape.py --quick` | 适用 | 78 | 78 | 0 | 退码 0，12s |
+| 脚本级 E2E：`verify_full_runs.py` | 适用 | 10 组 | 10 | 0 | 退码 0 |
+| 脚本级 E2E：五形状冒烟 + 负例 + 一期/二期冒烟 | 适用 | 9 次运行 | 9 | 0 | 退码 0/0/0/0/0，负例退码 2 |
+| 完整性回归（SHA256 / git / 依赖 / import） | 适用 | 26 | 26 | 0 | 全通过 |
+| 浏览器 E2E（Playwright） | **不适用** | — | — | — | 本模块为无 GUI 的算法库，无页面交互 |
+| **合计（有效用例）** | | **312** | **311** | **1**（测试脚本自身预期错误） | 交付判定：**通过** |
+
+## 三、逐条判定（spec 第 1–16 条）
+
+### 一、S15 常驻防线
+
+| # | 判据 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 1 | `check_large_n_tolerance` 存在且真实生效：`N∈{2048,3072,4096}` × 5 形状逐组构造、断言全部成功、报告最紧余量 | ✅ | 全量报告 `records.S15_large_n` = `{n_list:[2048,3072,4096], failures:[], worst_ratio:0.5782196743197042, worst_tag:"N=3072/cube/lam=1.0"}`；核验 `tol=1e-6×1.272792+3e-6=4.2728e-6`、`dev=2.4706e-6` → `0.5782`，与 README §15.6/§8.3 声明的 `ratio = 0.578`、`N=3072/cube` **逐位一致** |
+| 2 | 仅全量模式运行；`--quick` 跳过并打印说明 | ✅ | `--quick` 日志打印 `===== S15 …：--quick 模式跳过（耗时约 13 min，仅在 --quick 之外的全量模式运行）=====`；quick 报告 `checks` 中 **无** `S15` 条目。`--quick` 实测 **12.0s**（声明约 15s），全量实测 **705.9s**（声明约 740s） |
+| 3 | 条数：全量 144/144、`--quick` 78/78，以 `checks` 长度为准 | ✅ | `verify_shape_report.json` → `checks=144`，`all_ok=true`，失败 0；`verify_shape_report_quick.json` → `checks=78`，`all_ok=true`，失败 0 |
+| 4 | **拒绝证明**：临时副本内去掉第二道容差的 `+ 3e-6` 后 S15 必须 FAIL | ✅ **实测完成** | 见 §4.1（8/15 组合构造失败，S15 `ok=false`；工作区源码未改） |
+| 5 | 头部判据清单含 S15，且与 README §8.3 表、代码实际断言集三者一致 | ✅ | 头部清单第 32–34 行含 S15；README §8.3 表含 S15 行；`rep.check` 静态 id 集 = `{S1,S2,S3,S3b,S3c,S3e,S4,S5,S6a-c,S7,S8a-d,S9,S10,S11a-c,S12a,S12b,S13,S14,S15}`（+异常兜底 X1），与实际报告 id 集**逐项一致**；条数构成 `(2×5)×13 + 3+4+3+1+2+1 = 144`、`(1×5)×13 + 13 = 78` 亦一致 |
+
+### 二、P1：float64 量化下限不是单一常数
+
+| # | 判据 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 6 | README §15.6(b) 与 `current_spec.md` 不得再写"误差恒为 `5.4e-8`"，须为离散下限描述 | ✅（文档侧） | README 第 921–925 行、spec 第 83–85 行均为"离散量化下限 `[3.29e-8, 5.40e-8]`（35 组中 33 组 `5.40e-8`，仅 `N=512` 的 `sphere` 与 `cylinder λ=2` 为 `3.29e-8`；`N>=768` 全部 `5.40e-8`），与 `max\|coord\|` 无关"。**但代码侧同类表述仍在**（见 §5 信息项 I2） |
+| 7 | 独立复算该区间：7 档 N × 5 形状，float64 计算同批 float32 坐标的最近邻距，偏差只有两个离散值 | ✅ | 见 §4.2：35/35 组落在 `{3.2926e-8, 5.3999e-8}`；33 组 = `5.399907e-08`；仅 `N=512/sphere` 与 `N=512/cylinder λ=2` = `3.292565e-08`；`N>=768` 共 30 组全部 `5.399907e-08` |
+
+### 三、P2：首个失败 N 为实测精确值
+
+| # | 判据 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 8 | README §15.6(a) 与 spec 表头须为"实测首个失败 N"，数值为 `cube D=0.10 → 1720`、`sphere D=0.10 → <=3399`、`cylinder λ=2 D=0.10 → 2899`、`cube D=0.072 → <=2000`，并注明 R6/R8 口径 | ✅ | README 第 909 行表头"**实测首个失败 `N`**（R6 初测为抽样上界，R8 已定点复核精确化）"；spec 第 78 行同口径；四个数值齐全且与实测一致（§4.3）。**信息项**：同表 `dev/tol/ratio` 三元组有两行仍属 R6 抽样 N 口径（见 I1） |
+| 9 | 抽查复核 ≥2 个精确值（`cube D=0.10` 1719 通过/1720 失败；`cylinder λ=2 D=0.10` 2800 通过/2899 失败），口径为加固前容差 | ✅ | 见 §4.3：`1719 → ratio 0.603 PASS / 1720 → ratio 1.130 FAIL`；`2800 → ratio 0.603 PASS / 2899 → ratio 1.165 FAIL`；两处口径均为 `tol_old = 1e-6·max(1,max\|coord\|)`（无 `+3e-6`） |
+
+### 四、零回归（硬约束）
+
+| # | 判据 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 10 | `python -m compileall -q n3d_shape` 退码 0 | ✅ | 退码 **0** |
+| 11 | 全量 144/144 退码 0；`--quick` 78/78 退码 0；两者独立报告文件互不覆盖 | ✅ | 全量退码 0（144/144）、quick 退码 0（78/78）；`verify_shape_report.{md,json}`（43374 B，11:10:10）与 `verify_shape_report_quick.{md,json}`（25000 B，10:59:22）并存、内容与条数不同 |
+| 12 | `verify_full_runs.py` 覆盖 10 组、退码 0 | ✅ | 退码 **0**；日志：`10 组产物名互不相同=True`、`10 组 SHA256 互不相同=True`、any/any 与 all/all 各 5 组、末行 `[PASS]` |
+| 13 | 五形状冒烟各 16/16 退码 0；负例退码 2；一期/二期冒烟退码 0 | ✅ | 见 §4.4：五形状各 `[PASS] [1..16]`、FAIL 0、退码 0；`cube --cyl-aspect 1.5` 与 `cylinder --cyl-aspect 5.0` 均退码 **2** 且报文含预期关键字；`n3d_proto`、`n3d_sphere` 冒烟退码 0 |
+| 14 | 既有 5 组 any/any 产物 SHA256 逐位不变；`n3d_sphere`/`n3d_proto` git 干净；既有 62 个产物 SHA256 不变；`requirements.txt` 零新增依赖；生产代码零上游 import | ✅ | 见 §4.5：5 组 any/any 与基线 `C:\n3d_shape_run\anyany_sha_before.json` **逐位一致**；62 个基线产物重算 SHA256 **0 处不一致**；git status 中 `n3d_sphere`/`n3d_proto` 条目 **0**；`requirements.txt` 未被修改且不含上游模块；生产 6 个 `.py` 零上游 import（仅 `verify_shape.py` 含 `n3d_sphere`，属验证侧依赖并已披露） |
+| 15 | 阶段 1 门槛仍为 `E=3202 / K=23 / \|S_in\|=44 / \|S_out\|=43 / params=48962` | ✅ | 实测 `{E:3202, K:23, S_in:44, S_out:43, params:48962}`，与登记 **完全相等**（构造探测、未训练） |
+| 16 | 阶段 2 的 2×5 表数值不变；`E`/`K` 在两种 scope 下相同 | ✅ | 2×5 表逐格复算一致（sphere `97.59/97.56`、cube `97.57/97.09`、cyl1 `97.86/97.32`、cyl0.5 `97.40/97.42`、cyl2 `97.70/97.22`；`E/K/params/D` 全部与 README §16.2 相同）；scope 不变性 **10/10** 通过（同形状同 `D` 下 any/any 与 all/all 的 `E`/`K` 逐形状相同，两种 `D` 各一组） |
+
+## 四、详细证据
+
+### 4.1 S15 拒绝证明（spec 第 4 条，实测完成）
+
+方法：把 `n3d_shape/` 复制到 `.lizhu_env/s15neg/n3d_shape_neg/`，在**副本**内删除第二道容差的常数项
+（`model.py`: `tol_f32 = 1e-6 * scale + 3e-6` → `tol_f32 = 1e-6 * scale`；`verify_shape.py` 的 S15 记账式同样处理），
+然后**直接调用副本内的 `check_large_n_tolerance(rep, full=True)`**（不跑 `main()`，避免污染真实报告目录）。
+
+| 检查 | 结果 |
+| --- | --- |
+| 副本已无 `+ 3e-6`（model.py / verify_shape.py） | ✅ |
+| **工作区源码未被改动**（两文件仍含 `+ 3e-6`） | ✅ |
+| 点探 `N=3072/cube` | ✅ **AssertionError**：`[契约失败] (float32 坐标) … 实测 0.19999752938747406`，报文内实际容差 `1.272792e-06`（= 去掉常数项后的值） |
+| **S15 本体结果** | ✅ **FAIL**（`ok=false`）：15 组合中 **8 组构造失败**，S15 记录 `failures=8` |
+| 失败组合 | `N=2048/cube`；`N=3072`：cube、cylinder λ=0.5、cylinder λ=2；`N=4096`：sphere、cube、cylinder λ=0.5、cylinder λ=2 |
+| 覆盖 spec 要求（"至少一个 `N=3072/4096` 组合失败"） | ✅ 实测 **7 个** `N=3072/4096` 失败点 |
+| 反证未被"过度覆盖" | ✅ 仍有 7 组通过，最紧余量 `ratio=0.904`（`N=2048/cylinder λ=0.5`），说明不是"一律失败"的空转判据 |
+| 副本 S15 耗时 | 92.3s（失败组提前 abort，故远低于全量 706s） |
+
+结论：**S15 是一道真实、灵敏、可失败的防线**；此前"常数项被改小而无人发现"的缺口确已闭合。
+
+### 4.2 float64 量化下限独立复算（spec 第 7 条）
+
+口径：`D=0.10`、`H=0.1`、`y_in=y_out=8`、`all/all`；取**同一批 float32 坐标**（`model.neuron_pos` 原样），
+用 **float64 分块 `cdist`**（排除自身）复算最近邻距，`dev64 = |nn64 − 2H|`。
+
+* 实测离散值集合（12 位小数）= **`[3.2926e-08, 5.3999e-08]`**，35 组无一例外。
+* 33/35 组 = `5.399907e-08`；**恰为 2 组** = `3.292565e-08`：`N=512/sphere` 与 `N=512/cylinder λ=2`（与文档点名一致）。
+* `N>=768` 共 30 组**全部** `5.399907e-08`。
+* 与 `max|coord|` 无关：同 `N` 下 `max|coord|` 从 0.707107 变到 2.404163（跨 7 档 N 共 35 组），`dev64` 仍只有两个离散取值。
+* 同批坐标的 float32 距离偏差 `dev32` 则随 N 增长并饱和于 `2.470613e-06`（如 `N=4096` 的 cube/cyl λ=0.5/cyl λ=2 均为 `2.470613e-06`），**比 float64 下限大 46～75 倍**，印证"误差全是 float32 距离域累加伪影"。
+* 耗时 346.8s；7/7 检查通过。
+
+### 4.3 P2 精确值抽查（spec 第 9 条）
+
+口径：`tol_old = 1e-6 · max(1.0, max|coord|)`（**加固前**，无 `+3e-6`）；模型用当前代码构造（加固后容差，不会抛错），再独立复算 `dev` 与 `tol_old` 比较。
+
+| 配置 | N | `dev` | `tol_old` | `dev/tol_old` | 旧口径 | 文档声明 | 一致 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `cube D=0.10` | 1717 | 6.824732e-07 | 1.131371e-06 | 0.603 | PASS | （未声明，附加） | — |
+| `cube D=0.10` | 1718 | 6.824732e-07 | 1.131371e-06 | 0.603 | PASS | （未声明，附加） | — |
+| `cube D=0.10` | **1719** | 6.824732e-07 | 1.131371e-06 | 0.603 | **PASS** | N=1719 通过 | ✅ |
+| `cube D=0.10` | **1720** | 1.278520e-06 | 1.131371e-06 | **1.130** | **FAIL** | 首个失败 N=1720 | ✅ |
+| `cylinder λ=2 D=0.10` | 2799 | 1.278520e-06 | 2.121320e-06 | 0.603 | PASS | （未声明，附加） | — |
+| `cylinder λ=2 D=0.10` | **2800** | 1.278520e-06 | 2.121320e-06 | 0.603 | **PASS** | N=2800 通过 | ✅ |
+| `cylinder λ=2 D=0.10` | **2899** | 2.470613e-06 | 2.121320e-06 | **1.165** | **FAIL** | 首个失败 N=2899 | ✅ |
+| `sphere D=0.10` | 3000 | 1.278520e-06 | 1.555635e-06 | 0.822 | PASS | 3000 通过 | ✅ |
+| `sphere D=0.10` | 3398 / **3399** | 1.874566e-06 | 1.555635e-06 | **1.205** | **FAIL** | 首个失败 N<=3399 | ✅ |
+| `cube D=0.072` | **2000** | 1.278520e-06 | 1.131371e-06 | **1.130** | **FAIL** | 首个失败 N<=2000 | ✅ |
+
+* 同批 12 组在**加固后**容差下**全部通过**（`tol_new = tol_old + 3e-6`），即加固只吸收 float32 伪影、不放宽真实契约。
+* `cube D=0.10` 的 `dev`/`tol`/`ratio` 三元组与 README 表格逐位一致（`1.2785e-6 / 1.1314e-6 / 1.130`）。
+
+### 4.4 冒烟与负例（spec 第 13 条）
+
+| 运行 | 编号判据 | 退码 |
+| --- | --- | --- |
+| `--smoke-test --shape sphere` | `[PASS] [1..16]`，FAIL 0 | 0 |
+| `--smoke-test --shape cube` | `[PASS] [1..16]`，FAIL 0 | 0 |
+| `--smoke-test --shape cylinder --cyl-aspect 1.0` | `[PASS] [1..16]`，FAIL 0 | 0 |
+| `--smoke-test --shape cylinder --cyl-aspect 0.5` | `[PASS] [1..16]`，FAIL 0 | 0 |
+| `--smoke-test --shape cylinder --cyl-aspect 2.0` | `[PASS] [1..16]`，FAIL 0 | 0 |
+| `cube --cyl-aspect 1.5`（负例） | 报文含 `cyl-aspect` | **2** |
+| `cylinder --cyl-aspect 5.0`（负例） | 报文含 `R_max` | **2** |
+| `n3d_proto/train.py --smoke-test` | — | 0 |
+| `n3d_sphere/train.py --smoke-test` | `[PASS] [1..15]`，FAIL 0 | 0 |
+
+### 4.5 完整性与零回归（spec 第 14 条，26/26 通过）
+
+| 检查 | 实测 |
+| --- | --- |
+| 5 组 any/any 产物 SHA256 vs 基线 `anyany_sha_before.json` | 5/5 **逐位不变**（`c96a25d2e8…`/`9d11e7dd07…`/`f18fff8b34…`/`9ca88bacb3…`/`05c70a9df2…`） |
+| 10 组（any/any + all/all）产物存在且 SHA256 == 账本 | 10/10 |
+| `full_runs_shape_sha256.json` 与主账本交叉一致 | ✅ |
+| 既有 62 个一期/二期产物 SHA256 | 62/62 重算，**0 处不一致/缺失** |
+| `git status` 中 `n3d_sphere` / `n3d_proto` | **0 条**（干净） |
+| `checkpoints/` 是否被 git 跟踪/污染 | 0 条 |
+| `requirements.txt` | 未修改、无 `n3d_sphere`/`n3d_proto`、零新增依赖 |
+| 生产代码（`config/model/train/data/utils/__init__`）上游 import | **零违规** |
+| `verify_shape.py` 上游 import | 仅 `n3d_sphere`（验证侧依赖，文档已披露） |
+
+> 备注：本轮新增的 `lizhu_r9_scripts/`（未跟踪）与 `.lizhu_env/`（gitignore）均为**测试侧**产物，未触碰交付源码；
+> 交付侧仅 `n3d_shape/*` 与 `.module_agent/n3d_shape/*` 有改动（由力牧在此之前完成）。
+
+## 五、失败用例分析与新发现项
+
+### 5.1 唯一"失败"：我自设的探查预期写错（测试脚本问题，非交付缺陷）
+
+`cube D=0.072 / N=1999` 被我写成"预期 pass"（无文档依据，属我自行加码的邻近点）。实测 `dev=1.278520e-06 > tol_old=1.131371e-06` → **旧口径 FAIL**。
+这不与任何文档声明冲突：README/spec 对 `cube D=0.072` 声明的是"首个失败 `N <= 2000`"，`N=1999` 失败**仍满足** `<=2000`（实际更紧）。
+判为**测试脚本预期错误**，非交付缺陷。
+
+### 5.2 复用脚本造成的 5 条"假失败"（测试侧解析缺陷，已复核为全绿）
+
+`lizhu_r8_scripts/t8_smoke.py` 复用后，5 个形状的 `smoke_16_16` 判定为 FAIL（`16/16 marker found 0 times`）。
+原因：`train.py --smoke-test` 只打印带编号的 `[PASS] [n]` 逐条判据，**从不打印"16/16"字面量**，脚本的正则解析失败即判 FAIL。
+本轮改按 `[PASS] [n]` 标记计数复核：**五形状均 16 条 `[PASS]`、0 条 `[FAIL]`、编号 [1..16] 无缺号、退码 0**（见 §4.4）。
+（该项在 R8 脚本中同样存在，属**离朱侧工具缺陷**，非交付问题。）
+
+### 5.3 信息项（info，不构成失败）
+
+| 编号 | 位置 | 问题 | 证据 | 建议 |
+| --- | --- | --- | --- | --- |
+| **I1** | README §15.6(a) 表 / `current_spec.md` 对应段 | 表内 `dev / tol / ratio` 三元组仍沿用 **R6 抽样 N** 的 `max\|coord\|`，与同行已精确化的"首个失败 N"口径不一致 | 实测 `cylinder λ=2`：`N=2899 → max\|coord\|=2.121320、ratio=1.165`，而表中写 `2.2627e-6 / 1.092`；后者实测对应 `N=3072`（`max\|coord\|=2.262742、ratio=1.092`）。`cube D=0.072`：`N=2000 → 1.131371 / ratio=1.130`，表中写 `1.2728e-6 / 1.941`；后者实测对应 `N=3072`（`1.272792 / ratio=1.941`） | 给该列补注"N 归属"（或把三元组换成对应首个失败 N 的值：cyl λ=2 → `2.4706e-6/2.1213e-6 (1.165)`；cube 0.072 保持 `<=2000` 则取 `1.2785e-6/1.1314e-6 (1.130)`）。首列"首个失败 N"本身已复核正确 |
+| **I2** | `n3d_shape/model.py` 第 461 行、第 540 行注释 | 仍写"改用 float64 算距离则**恒为** `5.4e-8`"/"误差**恒为** `5.4e-8`（= 纯坐标量化，与 N、量级无关）" —— P1 已把 README/spec 精确化为"离散下限 `[3.29e-8, 5.40e-8]`，2/35 组为 `3.29e-8`"，代码侧同类表述未同步 | 实测 2/35 组为 `3.2926e-8`（`N=512` 的 sphere 与 cyl λ=2），故"恒为 5.4e-8"在代码注释里同样不精确 | 把两处改为与 README §15.6(b) 同口径的"离散下限 `[3.29e-8, 5.40e-8]`（多数 `5.40e-8`，`N=512` 的 sphere/cyl λ=2 为 `3.29e-8`）" |
+| **I3** | `n3d_shape/model.py` 第 552–555 行断言报文 | 报文文本把 `+ 3e-6` **硬编码**（不是由变量拼出），容差一旦改动，报文会与实际值脱节，误导定位 | 本轮负例（副本内删除常数项）实测：报文写"`… + 3e-6`"，而其打印的实际容差已是 `1.272792e-06` | 报文改为按变量拼装（如 `f"1e-6*max(1,{scale:.6f}) + {const:.0e}"`） |
+| **I4** | `lizhu_r8_scripts/t8_smoke.py`（离朱侧，非交付） | 以"16/16"字面量判定冒烟条数导致 5 条假失败 | 见 §5.2 | 改为按 `\[PASS\]\s*\[\d+\]` 计数；交付侧无需改动 |
+
+## 六、环境问题说明
+
+| 事项 | 现象 | 处置 | 是否影响结论 |
+| --- | --- | --- | --- |
+| `E:` 卷间歇性写入失败 | `write` 工具原子落盘报 `EISDIR: illegal operation on a directory, link '…\.tmpdir\….tmp' -> '…py'`（spec 已预告） | 改用 .NET `[System.IO.File]::WriteAllText(..., UTF8Encoding($false))` 落盘（剥 BOM），未误判为代码缺陷 | 否，仅影响我的脚本落盘方式 |
+| 日志编码 | Windows PowerShell 5.1 下 `*>` 重定向把 Python 输出写成 UTF-16LE 且中文二次编码错乱 | 后续统一改为 `$env:PYTHONIOENCODING=utf-8` + `Out-File -Encoding utf8`；机读结果由 Python 直接写 UTF-8 JSON | 否，判定一律以退出码 + 机读 JSON 为准 |
+| 资源竞争 | 为防 `N=4096`（float32 `cdist` 峰值内存数 GB）并发 OOM，三个重负载任务（全量验证、float64 复算、负例证明）**串行**执行 | 全部一次成功，无 OOM/崩溃 | 否，仅延长总时长（合计约 30 分钟） |
+| 未执行项 | 接口测试（无 HTTP 接口）、浏览器 E2E（无 UI/无 Playwright 场景） | 明确判为**不适用**，未以单测替代 UI 验证（本模块亦无 DOM 逻辑） | 否 |
+
+## 七、修复建议（按优先级）
+
+1. **[建议，非阻塞] I1**：给 README §15.6(a) 表的"偏差/容差（比值）"列补注 N 归属，或替换为与"首个失败 N"同 N 的数值；`current_spec.md` 同步。当前写法会让读者把 `1.092`/`1.941` 误当成首个失败 N 处的比值（实测应为 `1.165`/`1.130`）。
+2. **[建议，非阻塞] I2**：把 `model.py` 第 461/540 行的"恒为 5.4e-8"同步为离散下限口径，使 P1 在**代码侧**也无残留。
+3. **[建议，非阻塞] I3**：`model.py` 断言报文不要硬编码 `+ 3e-6`。
+4. **[离朱侧自修，非交付项] I4**：冒烟条数判定改按 `[PASS] [n]` 计数。
+5. **无需修复**：S15 判据设计、条数、运行模式、拒绝证明能力、零回归与阶段 1/2 门槛**全部达标**，本轮可判定交付通过。
+
+## 八、附：命令与产物清单
+
+| 命令 | 退码 | 日志/产物 |
+| --- | --- | --- |
+| `python n3d_shape/verify_shape.py` | 0 | `lizhu_r9_scripts/t1_full_shape.log`；`checkpoints/n3d_shape/_verify/verify_shape_report.{md,json}` |
+| `python n3d_shape/verify_shape.py --quick` | 0 | `t2_quick_shape.log`；`verify_shape_report_quick.{md,json}` |
+| `python n3d_shape/verify_full_runs.py` | 0 | `t4_full_runs.log` |
+| `python -m compileall -q n3d_shape` | 0 | `t11_compileall.log` |
+| `python lizhu_r9_scripts/t3_boundary.py` | 1（仅我自设预期错 1 条） | `t3_boundary.log`、`t3_results.json` |
+| `python lizhu_r9_scripts/t5_integrity.py` | 0 | `t5_stdout.log`、`t5_results.json` |
+| `python lizhu_r9_scripts/t6_quantization.py` | 0 | `t6.log`、`t6_results.json` |
+| `python lizhu_r9_scripts/t7_negative_proof.py` | 0 | `t7.log`、`t7_results.json` |
+| `python lizhu_r9_scripts/t8_smoke.py` | 1（5 条假失败，见 §5.2） | `t8_stdout.log`、`t8_smoke_*.log` |
+| `python lizhu_r9_scripts/t9_doc_ratio.py` | 0 | `t9.log`、`t9_results.json` |
+| `python lizhu_r9_scripts/t10_gate.py` | 0 | `t10.log`、`t10_results.json` |
+
+**总体判定：通过（spec 第 1–16 条全部达标，零回归成立，拒绝证明实测成立；4 项 info 级残留，均不影响代码行为、断言结论与交付验收）。**
