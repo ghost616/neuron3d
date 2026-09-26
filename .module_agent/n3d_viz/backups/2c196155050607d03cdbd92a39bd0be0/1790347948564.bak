@@ -133,31 +133,8 @@ K=15（cylinder λ=2，seed=42）修复后实测层色 15 个两两不同：
 #5cd4f2 #5c98f2 #5c5cf2 #985cf2 #d45cf2 #f25cd4 #f25c98
 ```
 
-`verify_viz.py` 对此有三组断言：`[2a]` 对 `K ∈ [1, 64]` 逐个检查（去重数 == K，且
-`K <= 9` 与既有 9 色逐字节相同），`[2a]` 另用 `K = 1536` 覆盖**撞色回退分支**（见下），
-`[2c]` 在真实异构产物上检查（K=15 产物去重数 == 15）。
-
-#### 撞色回退分支的覆盖口径（K ≤ 64 区间不可达）
-
-`core._hue_palette_rgb` 里除了纯色相扩展，还有一段**确定性撞色回退**：候选色若已被占用，
-就沿「色相微移 (`_PALETTE_HUE_STEP`) + 明度微降」的固定序列取下一个候选，上限
-`_PALETTE_SEARCH_LIMIT = 4096` 次，超出则抛 `ValueError`。
-
-实测：在断言覆盖的 `K ∈ [10, 64]` 区间内，纯色相扩展的**撞色数为 0** —— 即
-`candidate not in used` 恒为真、`step` 永远停在 0，**该分支不可达**。这属于「防了但没人守」
-的盲区，故新增断言
-`[2a] _hue_palette_rgb 撞色回退分支（必撞色构造）`：用 `K = 1536`（色相间隔 1/1536，
-小于 8 位量化步长）**主动构造必然撞色**，三重把守 + 实测值：
-
-| 把守点 | 实测（K=1536） |
-|---|---|
-| 前提成立：纯色相扩展撞色数 > 0 | 撞色 **636** 个 |
-| 回退真的被执行：`_hsv_to_rgb_bytes` 调用次数 > K | 候选调用 **2,172** 次（回退 **636** 次，无回退时应恰好 == 1536） |
-| 回退结果正确：最终去重数 == K（含公开入口 `layer_palette_hex(K)`） | **1536 == 1536** |
-
-**承重证明**：第二项用调用计数直接证明分支被进入（若撞色消失则断言立即失败，杜绝「空转绿灯」）；
-第一项若前提不成立也直接报错；第三项在回退写错（例如误用 `candidate in used` 分支、或跳过
-未占用检查）时必然产出重复色而失败。
+`verify_viz.py` 对此有两组断言：`[2a]` 对 `K ∈ [1, 64]` 逐个检查（去重数 == K，且
+`K <= 9` 与既有 9 色逐字节相同），`[2c]` 在真实异构产物上检查（K=15 产物去重数 == 15）。
 
 ### 非规整几何实测（几何零假设的证据）
 
@@ -201,84 +178,16 @@ K=15（cylinder λ=2，seed=42）修复后实测层色 15 个两两不同：
 Node + DOM 桩真实执行一次，**通过 12 / 失败 0**（图例色块数 == K+3 == **18**）——
 与二期产物的 12/12（K+3 == 12）一致。
 
-### 零回归锚点（两层：产物完整性 + 代码回归）
+### 零回归锚点
 
-`[2d]` 组按**两层**断言二期默认产物 `viz_model.{html,ply,obj}` 与几何无关化**改动前逐位相同**
-（K=9 走既有色表，输出逐字节不变）：
-
-| 层 | 断言 | 守什么 |
-|---|---|---|
-| 层 1：产物完整性 | 磁盘 `checkpoints/n3d_viz/` 下的三件套存在、SHA256 与字节数 == 锚点常量（6 项） | 交付件未被改动 |
-| 层 2：代码回归（**承重**） | 用**共享渲染入口** `core.render_default(ANCHOR_RERENDER_CKPT, …)` 重渲到 `_verify/_anchor_rerender/`，三件套的 SHA256 与字节数同样 == **同一组锚点常量**（6 项），比对后清理并断言无残留（2 项） | `K <= 9` 路径的**代码**行为未被改变 |
-
-锚点常量（HTML / PLY / OBJ 的 SHA256 与字节数）：
+`[2d]` 组断言二期默认产物 `checkpoints/n3d_viz/viz_model.{html,ply,obj}` 的 SHA256
+与本次几何无关化**改动前逐位相同**（K=9 走既有色表，输出逐字节不变）：
 
 ```
-viz_model.html 15A80EBBF2FD586BFB3C4C41E25F79F0E3E8F0C19D3B60AE22BE3F296EDA518C  88,521 字节
-viz_model.ply  9A097D16306160F95C9E15826CB11ABED57C6809F2904660B700573889398801   4,120 字节
-viz_model.obj  1F594ECF466E28F751C174A85A8A4E5459A304973F6266B3E11C567C25A09FED  15,695 字节
+viz_model.html 15A80EBBF2FD586BFB3C4C41E25F79F0E3E8F0C19D3B60AE22BE3F296EDA518C
+viz_model.ply  9A097D16306160F95C9E15826CB11ABED57C6809F2904660B700573889398801
+viz_model.obj  1F594ECF466E28F751C174A85A8A4E5459A304973F6266B3E11C567C25A09FED
 ```
-
-**为什么必须有层 2（反桩拒绝证明，实测留档）**：层 1 只比对磁盘上已有的文件，对代码侧回归
-完全无感。把 `core.LEVEL_PALETTE_BASE` 前两项对调（`core.py` 一行改动）后实测：
-
-| 断言组 | 注入缺陷后 | 说明 |
-|---|---|---|
-| `[2a]` 全部（含 `K <= 9 == 既有 9 色前 K 个`） | **5/5 PASS** | 该条是与同一个常量自比，对「常量本身被改」不敏感 |
-| `[2d][磁盘]`（层 1） | **6/6 PASS** | 磁盘产物没动 |
-| `[2d][重渲] html`（层 2） | **FAIL**（期望 `15A80EBB…`，实测 `4E147DA5…`） | 承重 |
-| `[2d][重渲] ply`（层 2） | **FAIL**（期望 `9A097D16…`，实测 `B7449AB4…`） | 承重 |
-| `[2d][重渲] obj`（层 2） | PASS | OBJ 不含颜色，不受影响 |
-| `verify_viz.py` 退出码 | **1** | 非 0 |
-| `core.py` SHA256 | 注入前 `2770BFCA…` → 注入后 `21B5CCBC…` → 恢复后 `2770BFCA…`（**逐字节相同**） | 恢复无损，恢复后全绿 |
-
-> 结论：硬约束「`K <= 9` 逐字节不变」**有承重断言把守**——去掉该守卫（或改动 K≤9 路径的
-> 任何可见行为），`[2d][重渲]` 会直接判失败并使退出码非 0。
-
-### 参数集一致性：锚点语义永不脱耦
-
-锚点的语义是「**CLI 默认形式**的产物」，因此「CLI 默认值」与「锚点重渲参数」必须是同一份定义。
-现在二者都收敛到 `core.DEFAULT_WRITE_OPTIONS`（唯一事实来源），并经同一个入口
-`core.render_default` 使用：
-
-| 使用方 | 说明 |
-|---|---|
-| `python -m n3d_viz` **默认路径** | 参数集等于 `DEFAULT_WRITE_OPTIONS` 时，`__main__` 调用 `core.render_default(..., data=data)` |
-| `verify_viz.py` `[2d][重渲]` | 同样调用 `core.render_default(ANCHOR_RERENDER_CKPT, out_dir=…)`，**不再手写参数集** |
-| `verify_viz.py` `[2e]` | 三条**承重**断言把守三者一致：argparse 默认值映射 == `DEFAULT_WRITE_OPTIONS` == `render_default` 实际实参；CLI 选项表面 == 冻结清单 |
-
-**为什么必须把耦合显式化**：若两边各自手写一份，日后任一默认值变化会导致两种坏结局之一 ——
-锚点断言**无故 FAIL**（被误判为回归），或为了让断言变绿而两边一起改、**锚点悄悄漂移成
-「另一套默认形式」的产物**。
-
-**拒绝证明（三种注入，实测留档）**：`__main__.py` 源文件 SHA256 在三次注入前均为
-`2E015E4EEDB72CF34ABF4732A6B1D3EB80563D904F2DFBF513484CAA8EEB569C`（7,352 字节），
-每次恢复后**逐字节相同**，全量自检回到 173/0/0：
-
-| 注入 | 命中条目 | 结果 |
-|---|---|---|
-| `--no-plan-planes` 的 argparse `default` 改为 `True` | `[2e]` 序号 138 | **FAIL**：`{…,'include_planes': False} != {…,'include_planes': True}`；`verify_viz.py` 退出码 **1**；此时 `[2a]` 5/5、`[2d]` 14/14 仍全 PASS（正说明该类改动只能由 `[2e]` 拦住） |
-| `--threshold` 的默认值改为 `0.50` | `[2e]` 序号 138 | **FAIL**：`{'threshold': 0.5, …} != {'threshold': 0.3, …}`；退出码 **1**；`[2d]` 14/14 仍全 PASS |
-| 新增一个 CLI 开关 `--dummy-new-flag` | `[2e]` 序号 140 | **FAIL**：选项表面 16 != 15；退出码 **1**（覆盖「新增布尔开关」这一风险场景） |
-
-### 字节级复现口径：必须用**相对路径** `--checkpoint`
-
-HTML 内嵌的 `meta.checkpoint` 记录的是**调用时给出的路径字符串**，因此字节级复核只在
-「同一调用形式」下成立。交付件与锚点都是用**相对路径**产出的（如
-`checkpoints\n3d_shape\...`）；改用绝对路径重渲会让 HTML **仅因该字段多 14 个字节**
-（PLY / OBJ 无路径字段，仍逐字节相同）。实测对照：
-
-| checkpoint | 相对路径 HTML | 绝对路径 HTML | 差 | PLY / OBJ |
-|---|---|---|---|---|
-| `checkpoints/n3d_sphere/model.pt` | 88,521 | 88,535 | +14 | 逐字节相同 |
-| `full_shapesphere_..._s42.pt` | 88,634 | 88,648 | +14 | 逐字节相同 |
-| `full_shapecube_..._s42.pt` | 87,755 | 87,769 | +14 | 逐字节相同 |
-| `full_shapecylinder_a0.5_..._s42.pt` | 85,507 | 85,521 | +14 | 逐字节相同 |
-| `full_shapecylinder_a1_..._s42.pt` | 87,173 | 87,187 | +14 | 逐字节相同 |
-| `full_shapecylinder_a2_..._s42.pt` | 88,429 | 88,443 | +14 | 逐字节相同 |
-
-因此 `[2d]` 的层 2 重渲固定使用相对路径常量 `ANCHOR_RERENDER_CKPT`
-（见 `verify_viz.py`），不使用命令行传入的 `--checkpoint`。
 
 ---
 
@@ -355,17 +264,15 @@ n3d_viz/
 
 ```bash
 python n3d_viz/verify_viz.py --report checkpoints/n3d_viz/_verify/verify_report.md
-# 实测：通过 173 / 失败 0 / 跳过 0，退出码 0
+# 实测：通过 158 / 失败 0 / 跳过 0，退出码 0
 ```
 
 断言项数构成：几何无关化前的 **77 项**（其中二期基准组含写死的 `EXPECTED_N=256` /
 `EXPECTED_E=736` / `EXPECTED_LAYER_COUNTS=[13,24,37,35,39,34,37,24,13]`，作为原验收口径不变）
-\+ 几何无关化轮 **81 项** + 修复轮 **12 项** + 收尾轮 **3 项** = **173 项**。新增项全部
-**从 checkpoint 读实际 N / E / K / 层规模，不写死任何值**；构成：`[2a]` 5 项（层配色可扩展性
-+ 撞色回退分支）+ `[2b]` 42 项（5 类非规整几何合成样本 × 8 项 + 2 项临时产物清理）+
-`[2c]` 32 项（5 个真实异构产物 × 6 项 + 产物名两两不同 + K=15 去重数）+ `[2d]` 14 项
-（磁盘完整性 6 项 + 用共享入口重渲 6 项 + 重渲临时产物清理 2 项）+ `[2e]` 3 项
-（CLI 默认形式 / `render_default` 实际参数 / CLI 选项表面 三者的一致性）。
+\+ 本轮新增 **81 项** = **158 项**。新增项全部**从 checkpoint 读实际 N / E / K / 层规模，
+不写死任何值**：`[2a]` 4 项（层配色可扩展性 + `hex_to_rgb` 输入契约）+ `[2b]` 42 项（5 类非规整几何
+合成样本 × 8 项 + 2 项临时产物清理）+ `[2c]` 32 项（5 个真实异构产物 × 6 项 + 产物名两两不同 +
+K=15 去重数）+ `[2d]` 3 项（零回归锚点 SHA256）。
 
 | 断言 | 口径 | 实测 |
 |---|---|---|
@@ -390,42 +297,15 @@ python n3d_viz/verify_viz.py --report checkpoints/n3d_viz/_verify/verify_report.
 | 无第三方依赖 | 扫描全部顶层 import 与 `requirements.txt` | 仅 `torch` / `numpy` / 标准库 |
 | GUI 冒烟 | `gui` 可导入，`withdraw()` 状态下构造并销毁 Tk 窗口（不进 mainloop） | 构造成功，顶层子控件 7 个 |
 | 开关类参数产物差异 | 每个布尔开关开/关两态产物必须不同 | `include_planes` True/False 产物不同；`--no-plan-planes` 产物 `showPlanes == false`；`--with-ply-edges` 产物 PLY 含 736 条 `element edge` |
-| 渲染器逻辑 | Node + DOM 桩执行内联 `viewer.js` | 通过 12 / 失败 0（断言清单序号 141） |
+| 渲染器逻辑 | Node + DOM 桩执行内联 `viewer.js` | 通过 12 / 失败 0（断言清单序号 126） |
 | 负例临时产物清理 | 负例跑完 `_bad_index/` 无文件残留、残留体积 == 0 字节 | 残留 0 个文件 / 0 字节（清理前曾残留 4 个共 ~69MB 的 `bad_*.pt`） |
 | `[2a]` 层色去重数 | `K ∈ [1,64]` 逐个检查去重数 == K | 64 个 K 全部通过 |
 | `[2a]` K ≤ 9 色板 | == 既有 9 色前 K 个（逐字节不变） | `K=0..9` 全部通过 |
 | `[2a]` HTML/PLY 层色同源 | hex→RGB 与 RGB 色板逐一相等 | `K ∈ {1,9,10,15,33,64}` 全部通过 |
 | `[2a]` `hex_to_rgb` 输入契约 | 非法文本抛 `ValueError`、分量恒 ∈ [0,255] | 正向 6 项、反向 15 项（含 `#-12345` / `#4e8c f` / `##4e8cff`）、`K=1..64` 分量全部通过 |
-| `[2a]` 撞色回退分支 | `K=1536` 主动构造必然撞色：前提成立 + 回退真的执行 + 去重数 == K | 撞色 636 个；候选调用 2,172 次（回退 636 次）；去重数 1536 == 1536 |
 | `[2b]` 非规整几何合成组 | 5 类样本 × 8 项（顶点数 / `l` 行数 / 层数 / HTML 层色去重数 / PLY 层色去重数 / 坐标逐位一致 / payload 长度自洽 / 产物名派生） | 40 项全部通过 + 2 项临时产物清理 |
 | `[2c]` 真实异构几何组 | 5 个产物 × 6 项泛化不变量（**不断言形状标签**） | 30 项全部通过 + 产物名两两不同 + K=15 去重数 == 15 |
-| `[2d]` 零回归锚点（两层） | 层 1 磁盘产物完整性 6 项；层 2 **用共享入口 `core.render_default` 重渲**并与同一组锚点常量比对 6 项 + 清理 2 项 | 14 项全部通过；注入 `LEVEL_PALETTE_BASE` 对调缺陷后层 2 的 html/ply 两条 FAIL、退出码 1（见 §2「零回归锚点」） |
-| `[2e]` 参数集一致性 | CLI 默认形式 == `core.DEFAULT_WRITE_OPTIONS` == `render_default` 实际参数；CLI 选项表面 == 冻结清单 | 3 项全部通过（`{'threshold':0.3,'ply_binary':True,'with_ply_edges':False,'include_planes':True}`；15 个 option string）；三种注入（`--no-plan-planes` 默认改 True / `--threshold` 默认改 0.5 / 新增一个 CLI 开关）均使对应条目 FAIL、退出码 1，恢复后源文件 SHA256 逐字节相同（见 §2「参数集一致性」） |
-
-### 一键复现（口径要点）
-
-```bash
-# 1) 全量硬断言（含 [2d] 用当前代码重渲并与锚点常量比对）
-python -m compileall -q n3d_viz
-python n3d_viz/verify_viz.py --report checkpoints/n3d_viz/_verify/verify_report.md   # 期望 173/0/0，退出码 0
-
-# 2) JS 语法 + 渲染器逻辑冒烟
-node --check n3d_viz/assets/viewer.js
-node --check n3d_viz/assets/viewer_smoke.js
-
-# 3) 重新生成某产物（字节级复核时 --checkpoint 必须是**相对仓库根**的路径，理由见 §2）
-python -m n3d_viz -c checkpoints/n3d_sphere/model.pt --out-dir checkpoints/n3d_viz/_verify/_repro
-```
-
-三条口径要点：
-
-1. **必须用相对路径** `--checkpoint`：HTML 内嵌 `meta.checkpoint` 记录调用时的路径字符串，
-   绝对路径会让 HTML 多 14 字节（PLY / OBJ 不受影响）——实测对照表见 §2「字节级复现口径」。
-2. **`verify_viz.py` 的验证产出一律写入 `--out-dir`（默认 `checkpoints/n3d_viz/_verify/`）**，
-   不覆盖 `checkpoints/n3d_viz/` 下的正式交付件；`[2b]`/`[2d]` 的临时 checkpoint 与产物比对完即删
-   （各有「无文件残留 / 残留体积 0 字节」两条断言把守）。
-3. `[2d]` 的层 2 重渲固定使用常量 `ANCHOR_RERENDER_CKPT`（相对路径），
-   **不跟随**命令行传入的 `--checkpoint`，因此换个 ckpt 跑验证也仍会守护 K ≤ 9 路径。
+| `[2d]` 零回归锚点 | `viz_model.{html,ply,obj}` SHA256 与改动前逐位相同 | 3 项全部一致 |
 
 ### 数值口径（唯一化，避免同一指标出现多个无法判断口径的数字）
 
@@ -513,7 +393,7 @@ broadcast_neuron_to_in / neuron_of_output_syn / neuron_of_input_syn / ln_s_in.we
 | `syn_dist` 体积 | 16,777,216 字节（未进入内存、未嵌入 HTML） |
 | HTML / PLY / OBJ 大小 | 88,521 / 4,120 / 15,695 字节 |
 | 产物 SHA256 | HTML `15A80EBBF2FD586B…` / PLY `9A097D16306160F9…` / OBJ `1F594ECF466E28F7…`（几何无关化前后**逐位相同**） |
-| 验证汇总 | 通过 **173** / 失败 0 / 跳过 0（退出码 0）。按 `verify_report.md` 的**断言清单序号**定位（序号由断言插入顺序决定，新增断言会使后续序号顺移，故**以断言名称为准**）：序号 **14** = `[2a]` 撞色回退分支；序号 **90/91** = `[2b]` 合成组临时产物清理；序号 **136/137** = `[2d]` 重渲临时产物清理；序号 **138/139/140** = `[2e]` 参数集一致性三项；序号 **141** = 渲染器逻辑冒烟（内含 12 条子断言，均通过）；序号 **167/168** = 负例临时产物清理（`_bad_index/` 无文件残留 / 残留体积 0 字节） |
+| 验证汇总 | 通过 **158** / 失败 0 / 跳过 0（退出码 0）。按 `verify_report.md` 的**断言清单序号**定位（序号由断言插入顺序决定，新增断言会使后续序号顺移，故**以断言名称为准**）：序号 **126** = 渲染器逻辑冒烟（内含 12 条子断言，均通过）；序号 **89/90** = `[2b]` 合成组临时产物清理（无文件残留 / 残留体积 0 字节）；序号 **152/153** = 负例临时产物清理（`_bad_index/` 无文件残留 / 残留体积 0 字节） |
 
 **6.2 非规整 / 异构几何产物（`checkpoints/n3d_shape/`，seed=42）**
 
@@ -548,7 +428,6 @@ broadcast_neuron_to_in / neuron_of_output_syn / neuron_of_input_syn / ln_s_in.we
 - **张量必须含 N3D 拓扑键**：`REQUIRED_KEYS` 定义在 `n3d_viz/core.py`，缺任一键即抛 `CheckpointSchemaError` 并携带全部缺失键名。「几何零假设」不代表放弃 schema 校验——键名与形状契约仍然强制，不符合即退出码 3、不产生任何产物。
 - **不读 `syn_dist`**：`core._syn_dist_bytes` 只记录其字节数，从不把该张量转成 Python 对象。
 - **层色随 K 自动扩展**：`K <= 9` 走既有 9 色（输出逐字节不变），`K > 9` 按均匀色相扩展（去重数 == K）。层色的唯一实现是 `core.layer_palette_hex` / `core.layer_palette_rgb`，HTML 与 PLY 同源；**不得在 `viewer.js` 或 `export_geometry.py` 里再写第二份色表**。
-- **渲染默认形式的唯一事实来源是 `core.DEFAULT_WRITE_OPTIONS`**：CLI 默认路径与 `[2d]` 锚点重渲都经 `core.render_default` 使用它；改动 CLI 默认值或新增 CLI 开关时，`[2e]` 会立即 FAIL，请同步确认锚点语义（**不得**在 `verify_viz.py` 里重新手写一份参数集）。
 - **产物覆盖**：同名产物存在时 CLI 打印提示、GUI 在日志与状态栏提示，verify 脚本打印 `existed` 标记；不做静默覆盖。
 - **`verify_viz.py` 默认把产物写到 `checkpoints/n3d_viz/_verify/`**（含 `verify_report.md` 报告）**，避免与正式产物互相污染（对齐"验证类命令一律写入 `_verify/`"的产物纪律）。`[2b]` 合成组的临时 checkpoint 与产物跑完立即删除，`_synthetic/` 不残留文件（有 2 条断言把守）。
 - **零回归锚点**：`checkpoints/n3d_viz/viz_model.{html,ply,obj}` 的 SHA256 记录在 `verify_viz.py` 的 `PHASE2_ANCHOR_SHA256`；任何使 `K <= 9` 路径输出变化的改动都会被 `[2d]` 组直接判失败。

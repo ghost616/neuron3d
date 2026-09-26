@@ -5,9 +5,8 @@
 足以支撑「产物坐标与 checkpoint 的 ``neuron_pos`` 逐位一致（容差 1e-6）」
 这一硬断言。
 
-颜色来源：神经元按所在的拓扑层着色（``TopologyData.layer_groups``），层色由
-:func:`n3d_viz.core.layer_palette_rgb` 给出——与 HTML 渲染器的层色**同源**
-（K <= 9 取既有 9 色前 K 个；K > 9 按均匀色相扩展，K 个层色两两不同）。
+颜色来源：神经元按所在的拓扑层着色（``TopologyData.layer_groups``），
+层色由 :data:`LAYER_COLORS` 循环取用，与 HTML 渲染器保持一致。
 """
 
 from __future__ import annotations
@@ -28,11 +27,17 @@ else:
     from .core import TopologyData
     from . import core as _core
 
-#: 层配色基础表（9 色 RGB），与 :data:`n3d_viz.core.LEVEL_PALETTE_BASE` **同源**：
-#: 由后者经 ``core.hex_to_rgb`` 转换而来，因此 PLY 层色与 HTML 层色逐位一致。
-#: K <= 9 时按前 K 个取用；K > 9 时由 ``core.layer_palette_rgb`` 按均匀色相扩展。
-LAYER_COLORS: tuple[tuple[int, int, int], ...] = tuple(
-    _core.hex_to_rgb(c) for c in _core.LEVEL_PALETTE_BASE
+#: 层配色（与 assets/viewer.js 中的层色一致）。
+LAYER_COLORS: tuple[tuple[int, int, int], ...] = (
+    (78, 140, 255),
+    (0, 183, 194),
+    (46, 204, 113),
+    (163, 217, 119),
+    (247, 209, 84),
+    (243, 156, 18),
+    (232, 115, 74),
+    (217, 79, 112),
+    (155, 89, 182),
 )
 
 #: OBJ 坐标小数位。float32 的有效十进制位约 9 位，故 9 位可无损回读。
@@ -44,24 +49,11 @@ def _clamp_byte(value: float) -> int:
     return max(0, min(255, int(round(value * 255.0))))
 
 
-def layer_colors_rgb(data: TopologyData) -> list[tuple[int, int, int]]:
-    """返回该产物的 K 个层色（RGB），K 可大于 9（按均匀色相扩展）。
-
-    Args:
-        data: 拓扑数据。
-
-    Returns:
-        长度为 ``data.n_layers`` 的颜色列表，两两不同。
-    """
-    return _core.layer_palette_rgb(data.n_layers)
-
-
 def neuron_colors(data: TopologyData) -> list[tuple[int, int, int]]:
-    """按层返回每个神经元的 RGB 颜色（层色与 HTML 渲染器同源）。"""
+    """按层返回每个神经元的 RGB 颜色。"""
     colors: list[tuple[int, int, int]] = [(200, 200, 200)] * data.n_neurons
-    palette = layer_colors_rgb(data)
     for k, group in enumerate(data.layer_groups):
-        rgb = palette[k]
+        rgb = LAYER_COLORS[k % len(LAYER_COLORS)]
         for idx in group:
             if 0 <= idx < data.n_neurons:
                 colors[idx] = rgb

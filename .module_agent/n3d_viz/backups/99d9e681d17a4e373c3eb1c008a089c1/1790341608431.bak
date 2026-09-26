@@ -9,20 +9,12 @@
 3. 计算分层着色分组、度统计、阈值过滤统计；
 4. 派生产物名并写出三件套。
 
-几何口径（**对几何零假设**）：图形完全由 ``neuron_pos`` 决定，本模块不假设
-球 / 立方体 / 圆柱，也不假设晶格（FCC）或分层规整性；任意 N3D 拓扑产物
-（随机点云、任意曲面、非晶格、非均匀分层）都按同一套逻辑渲染。
-「层」= ``level_node_reach`` 给出的**同时计算的神经元分组**（不是几何切片假设）；
-层参考平面取该组神经元沿流向轴位置的**均值**，必然包含这一组神经元。
-
-引用纪律：基准产物 ``checkpoints/n3d_sphere/model.pt`` 的 ``neuron_pos`` 与分层
-结构由排布参数决定、与 seed 无关；而边集（E）、边权重、突触位置随 seed 变化，
-故一切边级数字必须标注 seed。
+引用纪律：``neuron_pos`` 与分层结构由 FCC 排布决定，与 seed 无关；
+边集（E）、边权重、突触位置随 seed 变化，故一切边级数字必须标注 seed。
 """
 
 from __future__ import annotations
 
-import colorsys
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -63,64 +55,11 @@ DEFAULT_OUT_DIR: str = "checkpoints/n3d_viz"
 DEFAULT_POS_DIGITS: int = 6
 DEFAULT_WEIGHT_DIGITS: int = 8
 
-#: **CLI 默认形式**（也即零回归锚点）所用的写出参数集 —— 全模块**唯一事实来源**。
-#:
-#: 为什么必须集中定义：零回归锚点 ``checkpoints/n3d_viz/viz_model.*`` 的语义是
-#: 「**CLI 默认形式**的产物」。若 ``__main__`` 的默认值与锚点的重渲参数各自手写一份，
-#: 日后任一默认值变化都会导致两种坏结局之一：锚点断言**无故 FAIL**（被误判为回归），
-#: 或为了让断言变绿而两边一起改、**锚点悄悄漂移成「另一套默认形式」的产物**。
-#: 因此 ``__main__`` 的默认路径与 ``verify_viz`` 的 ``[2d][重渲]`` 都经
-#: :func:`render_default` 使用本集合；``verify_viz`` 另有 ``[2e]`` 组承重断言，
-#: 比对 argparse 默认值与本集合（任一默认值被改动即 FAIL）。
-DEFAULT_WRITE_OPTIONS: dict[str, Any] = {
-    "threshold": DEFAULT_THRESHOLD,
-    "ply_binary": True,
-    "with_ply_edges": False,
-    "include_planes": True,
-}
-
 #: 渲染器源码位置（构建时读入并内联，保证 HTML 单文件自包含）。
 ASSETS_DIR: Path = Path(__file__).resolve().parent / "assets"
 
 _TPL_MARKER: str = "/*__N3D_VIEWER_JS__*/"
 _DATA_MARKER: str = "/*__N3D_DATA_JSON__*/"
-
-
-# ---------------------------------------------------------------------------
-# 层配色（HTML 与 PLY 的唯一同源实现）
-#
-# 本模块对几何零假设：图形完全由 ``neuron_pos`` 决定，不假设球 / 立方体 /
-# 圆柱，也不假设晶格或分层规整性；层数 K 由 ``level_node_reach`` 决定，可以
-# 任意大（例如非均匀分层的 cylinder λ=2 实测 K=15）。因此配色不能再用
-# 「9 色 + ``k % 9`` 循环」——那会让第 9 层与第 0 层同色，分层着色失去可分辨性。
-#
-# 口径：
-# * ``K <= 9``：取 :data:`LEVEL_PALETTE_BASE` 的**前 K 个**，逐字节不变，
-#   既有产物（含二期 ``checkpoints/n3d_viz/viz_model.*``）零回归；
-# * ``K > 9``：按**均匀色相**生成 K 个两两不同的颜色（标准库 ``colorsys``
-#   做 HSV->RGB，零第三方依赖），颜色去重数恒等于 K（K ∈ [1, 64] 已断言）。
-# ---------------------------------------------------------------------------
-
-#: 层配色基础表（9 色 hex）；K <= 9 时按前 K 个取用，保证既有产物逐字节不变。
-LEVEL_PALETTE_BASE: tuple[str, ...] = (
-    "#4e8cff",
-    "#00b7c2",
-    "#2ecc71",
-    "#a3d977",
-    "#f7d154",
-    "#f39c12",
-    "#e8734a",
-    "#d94f70",
-    "#9b59b6",
-)
-
-#: 色相扩展调色板的参数（K > 9 时生效）。
-_PALETTE_HUE_STEP: float = 0.0137     # 撞色时色相微移量（占整圈的比例）
-_PALETTE_SAT: float = 0.62            # 饱和度固定
-_PALETTE_VALUE: float = 0.95          # 明度基准
-_PALETTE_VALUE_STEP: float = 0.02     # 撞色时明度微降量
-_PALETTE_VALUE_LEVELS: int = 20       # 明度微降的循环档数
-_PALETTE_SEARCH_LIMIT: int = 4096     # 单色最多尝试次数（保证必然终止）
 
 
 class CheckpointError(RuntimeError):
@@ -164,7 +103,7 @@ class TopologyData:
         level_node_reach: K 个 ``(start, end)`` 半开区间，按 topo_index 分段。
         level_edge_reach: K 个 ``(start, end)`` 半开区间，表示第 k 层的入边。
         in_degree / out_degree: N 个整数的入度 / 出度。
-        layer_z: K 个层参考平面的流向轴（z）坐标，取该层神经元位置的均值。
+        layer_z: K 个层参考平面的 z 坐标（沿 flow_axis 的分层取值）。
         layer_counts: K 个层的神经元数。
         layer_groups: K 个组的神经元 id 列表（分层着色分组）。
         layer_edge_counts: K 个层的入边数（第 1 层实测为 0）。
@@ -540,9 +479,7 @@ def extract_topology(
         ids = topo_index[start:end]
         layer_groups.append([int(i) for i in ids])
         layer_counts.append(len(ids))
-        # 层参考平面取该层神经元沿流向轴（z）位置的**均值**：层本身就是这一组
-        # 「同时计算的神经元」的定义，故该平面必然包含这一组神经元，与几何是否
-        # 规整（晶格 / 任意曲面 / 非均匀分层）无关。不改成最小二乘拟合平面。
+        # 层参考平面取该层神经元 z 坐标的均值；二期分层沿 flow_axis=z 且同层 z 相同。
         zs = [pos[i][2] for i in ids]
         layer_z.append(float(sum(zs) / len(zs)) if zs else 0.0)
 
@@ -666,119 +603,6 @@ def resolve_output_paths(
 
 
 # ---------------------------------------------------------------------------
-# 层配色函数（HTML 负载与 PLY 顶点色共用，保证两处层色同源）
-# ---------------------------------------------------------------------------
-#: 合法十六进制字符集（用于 `hex_to_rgb` 的严格校验）。
-_HEX_DIGITS: frozenset[str] = frozenset("0123456789abcdefABCDEF")
-
-
-def hex_to_rgb(color: str) -> tuple[int, int, int]:
-    """把 ``#rrggbb`` 形式的颜色转成 ``(r, g, b)`` 字节三元组。
-
-    Args:
-        color: 形如 ``"#4e8cff"`` 的颜色文本（前导 ``#`` 可有可无、至多一个；两侧空白被忽略）。
-
-    Returns:
-        ``(r, g, b)``，各分量取值 0..255。
-
-    Raises:
-        ValueError: 文本不是恰好 6 位十六进制（含多余前导 ``#``、前导正负号、内部空白等）。
-    """
-    text = color.strip()
-    # 只剥离**一个**前导 '#'：str.lstrip('#') 是字符集合语义，会把 "##4e8cff"
-    # 这类多余井号一并吞掉，使非法文本被静默接受。
-    if text.startswith("#"):
-        text = text[1:]
-    # 必须逐字符校验：`int(seg, 16)` 会接受前导正负号，"#-12345" 这类输入
-    # 会静默产生负分量，与「各分量 0..255」的返回值契约相悖。
-    if len(text) != 6 or any(ch not in _HEX_DIGITS for ch in text):
-        raise ValueError(f"颜色文本必须是 6 位十六进制：{color!r}")
-    return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
-
-
-def _hsv_to_rgb_bytes(hue: float, sat: float, val: float) -> tuple[int, int, int]:
-    """HSV -> RGB 字节三元组（用标准库 :mod:`colorsys`，零第三方依赖）。"""
-    r, g, b = colorsys.hsv_to_rgb(hue % 1.0, sat, val)
-    return (
-        max(0, min(255, int(round(r * 255.0)))),
-        max(0, min(255, int(round(g * 255.0)))),
-        max(0, min(255, int(round(b * 255.0)))),
-    )
-
-
-def _hue_palette_rgb(n_layers: int) -> list[tuple[int, int, int]]:
-    """按均匀色相生成 ``n_layers`` 个两两不同的 RGB 颜色（K > 9 时使用）。
-
-    原理：第 i 个颜色的色相取 ``i / n_layers``（均匀铺满整圈色相环），
-    饱和度与明度固定在可读区间。由于 HSV 量化到 8 位后理论上存在撞色可能，
-    这里再做一步**确定性搜索**：若候选色已被占用，就沿「色相微移 + 明度微降」
-    的固定序列取下一个候选，直到得到未用颜色。搜索上限
-    :data:`_PALETTE_SEARCH_LIMIT` 保证必然终止（超出则抛 ``ValueError``）。
-
-    **撞色回退分支的覆盖口径（重要）**：在断言覆盖的 ``K <= 64`` 范围内，
-    纯色相扩展**实测撞色数为 0**，即 `candidate not in used` 恒为真、
-    ``step`` 永远停在 0 —— 该分支在这一区间内**不可达**。为使它不落入
-    「改了也没人发现」的盲区，`verify_viz.py` 的
-    ``[2a] _hue_palette_rgb 撞色回退分支（必撞色构造）`` 断言用
-    ``K = 1536``（色相间隔 1/1536，量化到 8 位后必然撞色）**主动进入**该分支，
-    并以调用计数证明回退确实发生、且最终去重数仍 == K。
-
-    Args:
-        n_layers: 需要的颜色数（> 0）。
-
-    Returns:
-        长度为 ``n_layers`` 的 RGB 列表，**两两不同**（去重数 == n_layers）。
-
-    Raises:
-        ValueError: 当 ``_PALETTE_SEARCH_LIMIT`` 次候选尝试都被占用时
-            （``K <= 1536`` 实测不会发生）。
-    """
-    used: set[tuple[int, int, int]] = set()
-    palette: list[tuple[int, int, int]] = []
-    for i in range(n_layers):
-        base_hue = (i / float(n_layers)) % 1.0
-        picked: tuple[int, int, int] | None = None
-        for step in range(_PALETTE_SEARCH_LIMIT):
-            hue = (base_hue + step * _PALETTE_HUE_STEP) % 1.0
-            val = _PALETTE_VALUE - _PALETTE_VALUE_STEP * (step % _PALETTE_VALUE_LEVELS)
-            candidate = _hsv_to_rgb_bytes(hue, _PALETTE_SAT, val)
-            if candidate not in used:
-                picked = candidate
-                break
-        if picked is None:  # pragma: no cover - K <= 1536 实测不触发（见 docstring 覆盖口径）
-            raise ValueError(f"无法为第 {i} 个层生成未占用的颜色（K={n_layers}）。")
-        used.add(picked)
-        palette.append(picked)
-    return palette
-
-
-def layer_palette_hex(n_layers: int) -> list[str]:
-    """返回 ``n_layers`` 个层色（``#rrggbb``），供 HTML 负载使用。
-
-    Args:
-        n_layers: 层数 K（0 返回空列表）。
-
-    Returns:
-        K 个 hex 颜色；``K <= 9`` 时为 :data:`LEVEL_PALETTE_BASE` 的前 K 个
-        （逐字节不变），``K > 9`` 时为均匀色相扩展色板，去重数 == K。
-    """
-    if n_layers <= 0:
-        return []
-    if n_layers <= len(LEVEL_PALETTE_BASE):
-        return list(LEVEL_PALETTE_BASE[:n_layers])
-    return ["#%02x%02x%02x" % rgb for rgb in _hue_palette_rgb(n_layers)]
-
-
-def layer_palette_rgb(n_layers: int) -> list[tuple[int, int, int]]:
-    """返回 ``n_layers`` 个层色的 RGB 字节三元组，供 PLY 顶点色使用。
-
-    与 :func:`layer_palette_hex` **同源**（同一张基础色表 / 同一套色相扩展），
-    因此 HTML 渲染器的层色与 PLY 顶点色逐位一致。
-    """
-    return [hex_to_rgb(c) for c in layer_palette_hex(n_layers)]
-
-
-# ---------------------------------------------------------------------------
 # HTML 内联数据负载
 # ---------------------------------------------------------------------------
 def _round_floats(values: Iterable[float], digits: int | None) -> list[float]:
@@ -829,9 +653,8 @@ def build_html_payload(
     # None 统一解析为默认位宽，避免同一个 None 在不同函数里表示不同含义
     pos_digits_eff = DEFAULT_POS_DIGITS if pos_digits is None else int(pos_digits)
     weight_digits_eff = DEFAULT_WEIGHT_DIGITS if weight_digits is None else int(weight_digits)
-    # 层色由共用色板函数给出：K <= 9 取既有 9 色前 K 个（逐字节不变），
-    # K > 9 按均匀色相扩展，保证 K 个层色两两不同（否则分层着色失去可分辨性）。
-    layer_colors = layer_palette_hex(data.n_layers)
+    layer_colors = ["#4e8cff", "#00b7c2", "#2ecc71", "#a3d977",
+                    "#f7d154", "#f39c12", "#e8734a", "#d94f70", "#9b59b6"]
     layers = []
     for k, (start, end) in enumerate(data.level_node_reach):
         layers.append(
@@ -842,7 +665,7 @@ def build_html_payload(
                 "count": int(data.layer_counts[k]),
                 "z": float(data.layer_z[k]),
                 "in_edges": int(data.layer_edge_counts[k]),
-                "color": layer_colors[k],
+                "color": layer_colors[k % len(layer_colors)],
             }
         )
 
@@ -1027,38 +850,3 @@ def write_outputs(
     emit(f"[HTML] {target}（{size} 字节，单文件自包含）")
 
     return reports
-
-
-def render_default(
-    ckpt_path: str | Path = "",
-    out_dir: str | Path = DEFAULT_OUT_DIR,
-    out: str | Path | None = None,
-    log: Callable[[str], None] | None = None,
-    *,
-    data: TopologyData | None = None,
-) -> dict[str, dict[str, Any]]:
-    """以 **CLI 默认形式**（:data:`DEFAULT_WRITE_OPTIONS`）渲染三件套。
-
-    本函数是「CLI 默认路径」与「零回归锚点的代码回归层」共用的**唯一渲染入口**：
-    两者必须走同一条路径，否则 ``__main__`` 的默认值一变，锚点就会静默漂移成
-    「另一套默认形式」的产物，或让锚点断言无故失败（见 :data:`DEFAULT_WRITE_OPTIONS`）。
-
-    它是 :func:`write_outputs` 的一层薄封装，自身**不再手写任何参数**，
-    因此与 :data:`DEFAULT_WRITE_OPTIONS` 天然不会脱耦。
-
-    Args:
-        ckpt_path: checkpoint 路径；仅在 ``data`` 为 None 时用于加载。
-        out_dir: 输出目录（不存在则创建）。
-        out: 显式 HTML 路径；给出时 PLY / OBJ 与它同目录同名。
-        log: 进度回调（CLI / GUI 共用；None 时静默）。
-        data: 已加载的拓扑数据。CLI 为了打印 ``[数据]`` 摘要已解析过一次，
-            传入可避免重复加载十几 MB 的产物。
-
-    Returns:
-        与 :func:`write_outputs` 相同的报告字典。
-
-    Raises:
-        CheckpointError: ``data`` 为 None 时由 :func:`load_topology` 抛出。
-    """
-    topology = load_topology(ckpt_path) if data is None else data
-    return write_outputs(topology, out_dir=out_dir, out=out, log=log, **DEFAULT_WRITE_OPTIONS)

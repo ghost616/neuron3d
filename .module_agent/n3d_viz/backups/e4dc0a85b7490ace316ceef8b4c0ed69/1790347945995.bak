@@ -80,37 +80,12 @@ SHAPE_DIR = "checkpoints/n3d_shape"
 #: 零回归锚点：改动前二期正式产物的 SHA256（[2d] 组逐位比对）。
 #: 记录时间 = 本次几何无关化改动之前（checkpoints/n3d_viz/viz_model.* 当时字节
 #: 88,521 / 4,120 / 15,695）。
-#:
-#: **复现口径（必须遵守，见 [I2]）**：HTML 内嵌的 ``meta.checkpoint`` 记录的是
-#: **调用时给出的路径字符串**，因此字节级比对只在「同一调用形式」下成立。锚点是
-#: 用**相对路径** ``checkpoints/n3d_sphere/model.pt`` 产出的；改用绝对路径重渲会让
-#: HTML 仅因该字段多出若干字节而比对失败（PLY / OBJ 无色无路径字段，仍逐字节相同）。
-#: 故 [2d] 的重渲断言一律使用下面的 :data:`ANCHOR_RERENDER_CKPT` 相对路径常量，
-#: 不使用命令行传入的 ``--checkpoint``。
 PHASE2_ANCHOR_DIR = "checkpoints/n3d_viz"
 PHASE2_ANCHOR_SHA256: dict[str, str] = {
     "viz_model.html": "15A80EBBF2FD586BFB3C4C41E25F79F0E3E8F0C19D3B60AE22BE3F296EDA518C",
     "viz_model.ply": "9A097D16306160F95C9E15826CB11ABED57C6809F2904660B700573889398801",
     "viz_model.obj": "1F594ECF466E28F751C174A85A8A4E5459A304973F6266B3E11C567C25A09FED",
 }
-
-#: 零回归锚点对应的字节数（与 :data:`PHASE2_ANCHOR_SHA256` 同源、一并比对）。
-PHASE2_ANCHOR_BYTES: dict[str, int] = {
-    "viz_model.html": 88521,
-    "viz_model.ply": 4120,
-    "viz_model.obj": 15695,
-}
-
-#: [2d] **代码回归层**重渲用的 checkpoint —— 必须是**相对仓库根**的路径字符串，
-#: 以与锚点产物内嵌的 ``meta.checkpoint`` 形式一致（原因见上方口径说明）。
-ANCHOR_RERENDER_CKPT = "checkpoints/n3d_sphere/model.pt"
-
-#: [2d] 代码回归层的临时输出目录名（位于 ``--out-dir`` 之下，比对完即清理）。
-ANCHOR_RERENDER_DIRNAME = "_anchor_rerender"
-
-#: [I1] 撞色回退分支的**必撞色**探针规模：色相间隔 1/1536，量化到 8 位后必然撞色。
-#: 该分支在 ``K <= 64`` 区间内不可达（实测撞色数 0），故此断言是该分支的唯一覆盖。
-COLLISION_PROBE_K = 1536
 
 #: [2b] 合成几何样本的随机种子（边集与坐标随 seed 变化，报告中必须标注）。
 SYNTH_SEED = 20250925
@@ -249,64 +224,6 @@ def _check_palette_same_source() -> str:
         hexes = core.layer_palette_hex(k)
         assert [core.hex_to_rgb(h) for h in hexes] == core.layer_palette_rgb(k), f"K={k} 不同源"
     return "K ∈ {1,9,10,15,33,64}：hex 转换后 == RGB 色板；出口表 == core 基础表"
-
-
-def _check_palette_collision_fallback() -> str:
-    """[I1] `core._hue_palette_rgb` 的**撞色回退分支**覆盖（该分支在 K <= 64 时不可达）。
-
-    背景：在断言覆盖的 ``K ∈ [10, 64]`` 范围内，纯色相扩展的撞色数实测为 0，
-    即 ``candidate not in used`` 恒为真、``step`` 永远停在 0，回退分支（色相微移 +
-    明度微降 + `_PALETTE_SEARCH_LIMIT`）从未被真正执行 —— 属「不可达但未断言」的
-    防御代码，一旦有缺陷则 158 条断言一条都拓不到。
-
-    本断言用 ``K = COLLISION_PROBE_K``（1536，色相间隔 1/1536 < 8 位量化步长）
-    **主动构造必然撞色**，三重把守：
-
-    1. 前提成立：纯色相扩展在该 K 下撞色数 > 0（否则本断言无意义，直接报错）；
-    2. 回退真的发生了：统计 ``_hsv_to_rgb_bytes`` 的调用次数，必须 > K
-       （无回退时恰好 == K）；这排除了「撞色消失、断言空转」的假绿灯；
-    3. 回退结果正确：最终去重数 == K，且公开入口 ``layer_palette_hex(K)`` 同样成立。
-
-    ``_hsv_to_rgb_bytes`` 的替换在 ``finally`` 中恢复，不影响后续断言。
-
-    Returns:
-        实测摘要（撞色个数、候选调用次数、回退次数、最终去重数）。
-    """
-    k = COLLISION_PROBE_K
-    # 1) 前提：纯色相扩展（无回退）在该 K 下必然撞色
-    naive = [
-        core._hsv_to_rgb_bytes((i / float(k)) % 1.0, core._PALETTE_SAT, core._PALETTE_VALUE)
-        for i in range(k)
-    ]
-    collisions = k - len(set(naive))
-    assert collisions > 0, (
-        f"K={k} 的纯色相扩展未出现撞色（撞色数 {collisions}），无法覆盖回退分支；"
-        "请调整 COLLISION_PROBE_K"
-    )
-    # 2) 回退确实被执行：候选调用次数必须 > K
-    calls = {"n": 0}
-    original = core._hsv_to_rgb_bytes
-
-    def _counting(hue: float, sat: float, val: float) -> tuple[int, int, int]:
-        calls["n"] += 1
-        return original(hue, sat, val)
-
-    core._hsv_to_rgb_bytes = _counting  # type: ignore[assignment]  # 白盒计数钩子
-    try:
-        palette = core._hue_palette_rgb(k)
-    finally:
-        core._hsv_to_rgb_bytes = original  # type: ignore[assignment]
-    retries = calls["n"] - k
-    assert retries > 0, (
-        f"候选调用 {calls['n']} 次 == K={k}，说明撞色回退分支实际未被触发（断言将空转）"
-    )
-    # 3) 回退结果正确
-    assert len(set(palette)) == k, f"回退后去重数 {len(set(palette))} != K={k}"
-    assert len(set(core.layer_palette_hex(k))) == k, f"公开入口 layer_palette_hex({k}) 去重数 != K"
-    return (
-        f"K={k}：纯色相扩展撞色 {collisions} 个（前提成立）；候选调用 {calls['n']} 次、"
-        f"回退 {retries} 次；最终去重数 == {k}"
-    )
 
 
 def _check_hex_contract() -> str:
@@ -508,94 +425,6 @@ def _make_synthetic_checkpoint(
     return path
 
 
-#: [2e] 冻结的 CLI 选项表面（`build_parser()` 暴露的全部 option string）。
-#: 新增/删除 CLI 选项都必须显式更新本清单，并确认该选项是否影响「渲染默认形式」：
-#: 若影响，必须同步 :data:`n3d_viz.core.DEFAULT_WRITE_OPTIONS` 与 ``[2d]`` 的锚点语义。
-CLI_OPTION_STRINGS: tuple[str, ...] = (
-    "--checkpoint", "-c",
-    "--out-dir", "-d",
-    "--out", "-o",
-    "--threshold", "-t",
-    "--no-plan-planes",
-    "--ply-ascii",
-    "--with-ply-edges",
-    "--quiet", "-q",
-    "--help", "-h",
-)
-
-
-def _check_cli_default_options() -> str:
-    """[2e] CLI 默认形式的写出参数集必须逐项等于 :data:`core.DEFAULT_WRITE_OPTIONS`。
-
-    这是「锚点 = CLI 默认形式的产物」这一语义的**承重**把守：改动 ``__main__`` 的任一
-    相关默认值（阈值、``--ply-ascii`` / ``--with- ply-edges`` / ``--no-plan-planes``
-    的默认语义）都会让本条立即 FAIL，而不是让 ``[2d]`` 的锚点静默漂移。
-    """
-    from n3d_viz import __main__ as cli
-
-    got = cli.write_options_from_args(cli.build_parser().parse_args([]))
-    want = dict(core.DEFAULT_WRITE_OPTIONS)
-    assert got == want, (
-        f"CLI 默认形式的写出参数集与 core.DEFAULT_WRITE_OPTIONS 不一致：{got} != {want}；"
-        "改动 CLI 默认值时必须同步确认 [2d] 的零回归锚点是否仍代表同一套「默认形式」"
-    )
-    return f"argparse([]) 映射 == {got}"
-
-
-def _check_render_default_options() -> str:
-    """[2e] ``core.render_default`` 实际使用的参数集必须等于 ``DEFAULT_WRITE_OPTIONS``。
-
-    白盒做法：临时把 :func:`core.write_outputs` 换成记录实参的桩（因此**不落盘**），
-    调用 ``render_default`` 后逐一比对记录到的关键字实参；替换在 ``finally`` 中恢复。
-    这样即使日后有人在 ``render_default`` 内部重新手写参数（而非展开
-    ``DEFAULT_WRITE_OPTIONS``），本条也会立刻 FAIL。
-    """
-    captured: dict[str, Any] = {}
-    original = core.write_outputs
-
-    def _capture(data: Any, out_dir: Any = None, out: Any = None,
-                 log: Any = None, **kwargs: Any) -> dict[str, Any]:
-        captured.update(kwargs)
-        captured["_out_dir"] = out_dir
-        captured["_out"] = out
-        return {"captured": True}
-
-    core.write_outputs = _capture  # type: ignore[assignment]  # 白盒捕获钩子
-    try:
-        # data 直接给哨兵对象：render_default 不会再加载 checkpoint
-        result = core.render_default("__not_used__.pt", out_dir="__nowhere__", data=object())
-    finally:
-        core.write_outputs = original  # type: ignore[assignment]
-    assert result == {"captured": True}, "render_default 未走 core.write_outputs"
-    focused = {k: v for k, v in captured.items() if not k.startswith("_")}
-    want = dict(core.DEFAULT_WRITE_OPTIONS)
-    assert focused == want, (
-        f"render_default 实际传给 write_outputs 的参数集 {focused} != {want}；"
-        "该函数必须展开 core.DEFAULT_WRITE_OPTIONS，不得自己手写参数"
-    )
-    return f"render_default -> write_outputs(**{focused})"
-
-
-def _check_cli_option_surface() -> str:
-    """[2e] CLI 选项表面必须与 :data:`CLI_OPTION_STRINGS` 冻结清单一致。
-
-    动机：风险场景里包含「新增/变更布尔开关」。若只比对既有开关的默认值，一个**新增**
-    且默认影响渲染的开关会绕过 [2e]；冻结选项表面即可让「新增开关」这件事必须被显式
-    处理（更新清单 + 判断是否影响默认形式），而不是悄悄改变锚点语义。
-    """
-    from n3d_viz import __main__ as cli
-
-    parser = cli.build_parser()
-    got = sorted({s for action in parser._actions for s in action.option_strings})
-    want = sorted(set(CLI_OPTION_STRINGS))
-    assert got == want, (
-        f"CLI 选项表面发生变化：{got} != {want}；请更新 CLI_OPTION_STRINGS，"
-        "并确认新增/删除的选项是否影响「CLI 默认形式」的渲染结果"
-        "（若影响，必须同步 core.DEFAULT_WRITE_OPTIONS 与 [2d] 的锚点语义）"
-    )
-    return f"{len(want)} 个 option string 与冻结清单一致"
-
-
 def _read_ply_colors(path: Path) -> list[tuple[int, int, int]]:
     """回读 PLY 顶点颜色（属性顺序由头部声明决定，这里取 red/green/blue 列）。"""
     import struct
@@ -702,8 +531,6 @@ def verify(
               "同一张基础色表 + 同一套色相扩展")
     chk.check("[2a] hex_to_rgb 输入契约（非法抛 ValueError、分量 0..255）", _check_hex_contract,
               "拒绝前导正负号 / 内部空白 / 多余前导 # / 非十六进制字符")
-    chk.check("[2a] _hue_palette_rgb 撞色回退分支（必撞色构造）", _check_palette_collision_fallback,
-              f"K <= 64 实测撞色数 0（该分支不可达），故用 K={COLLISION_PROBE_K} 主动进入")
 
     # ------------------------------------------------------------ 产物生成
     print("\n[2] 生成三件套产物")
@@ -1058,81 +885,16 @@ def verify(
                   lambda: _assert_all_eq(k15, 15),
                   "非均匀分层 cylinder λ=2 实测 K=15；修复前仅 9 色循环 → 去重数为 9")
 
-    # ---------------------------------------------- [2d] 零回归锚点（两层）
-    # 教训：旧版 [2d] 只把**磁盘上已有**的产物与常量比对、不重渲，因此对「代码侧的
-    # K <= 9 回归」完全无感（把 LEVEL_PALETTE_BASE 前两项对调后 [2a] 四项与磁盘比对
-    # 全部 PASS，而重渲出来的 HTML / PLY 已与锚点不同）。现在拆成两层：
-    #   层 1 产物完整性：磁盘锚点存在且 SHA256 / 字节数 == 常量（守护交付件未被改动）
-    #   层 2 代码回归（承重）：用**当前代码**重渲到临时目录，与**同一组锚点常量**比对
-    # 层 2 必须用相对路径 checkpoint（见 ANCHOR_RERENDER_CKPT 的口径说明）。
-    print("\n[2d] 零回归锚点：磁盘产物完整性 + 用当前代码重渲的逐字节回归")
+    # ---------------------------------------------- [2d] 零回归锚点
+    print("\n[2d] 零回归锚点：二期正式产物 SHA256 与改动前逐位相同")
     for fname, want in PHASE2_ANCHOR_SHA256.items():
         fpath = _ROOT / PHASE2_ANCHOR_DIR / fname
         if not fpath.exists():
-            chk.skip(f"[2d][磁盘] {fname} SHA256 == 锚点", f"{fpath} 不存在")
+            chk.skip(f"[2d] {fname} SHA256 不变", f"{fpath} 不存在")
             continue
-        chk.check(f"[2d][磁盘] {fname} SHA256 == 锚点",
+        chk.check(f"[2d] {fname} SHA256 == 改动前",
                   _guarded(None, lambda p=fpath, w=want: _assert_eq(_sha256(p), w)),
-                  f"{PHASE2_ANCHOR_DIR}/{fname}")
-        chk.check(f"[2d][磁盘] {fname} 字节数 == 锚点",
-                  _guarded(None, lambda p=fpath, w=PHASE2_ANCHOR_BYTES[fname]:
-                           _assert_eq(p.stat().st_size, w)),
-                  f"{PHASE2_ANCHOR_DIR}/{fname}")
-
-    anchor_dir = out_path / ANCHOR_RERENDER_DIRNAME
-    anchor_ckpt = _ROOT / ANCHOR_RERENDER_CKPT
-    a_err: str | None = None
-    a_files: dict[str, tuple[Path, str, int]] = {}
-    if not anchor_ckpt.exists():
-        chk.skip("[2d][重渲] 用当前代码重渲并比对锚点", f"{anchor_ckpt} 不存在")
-    else:
-        try:
-            # 走**共享渲染入口** core.render_default（不再手写参数集）：
-            # 锚点的语义是「CLI 默认形式的产物」，因此重渲必须与 CLI 默认路径同路。
-            # 相对路径加载：meta.checkpoint 记录的就是这个字符串，必须与锚点同形式。
-            a_reports = core.render_default(ANCHOR_RERENDER_CKPT, out_dir=anchor_dir)
-            for fname, key in (("viz_model.html", "html"), ("viz_model.ply", "ply"),
-                               ("viz_model.obj", "obj")):
-                p = Path(a_reports[key]["path"])
-                a_files[fname] = (p, _sha256(p), p.stat().st_size)
-        except Exception as exc:  # noqa: BLE001 - 把失败原因带到每条断言上
-            a_err = f"{type(exc).__name__}: {exc}"
-
-        for fname, want in PHASE2_ANCHOR_SHA256.items():
-            entry = a_files.get(fname)
-            chk.check(f"[2d][重渲] {fname} SHA256 == 锚点（K<=9 路径承重）",
-                      _guarded(a_err, lambda e=entry, w=want: _assert_eq(e[1], w) if e else
-                               _assert_true(False)),
-                      f"core.render_default @ {ANCHOR_RERENDER_CKPT}")
-            chk.check(f"[2d][重渲] {fname} 字节数 == 锚点",
-                      _guarded(a_err, lambda e=entry, w=PHASE2_ANCHOR_BYTES[fname]:
-                               _assert_eq(e[2], w) if e else _assert_true(False)),
-                      f"core.render_default @ {ANCHOR_RERENDER_CKPT}")
-
-        # 比对完成后清理临时产物（与负例/合成组同一套产物纪律）
-        for p, _sha, _size in a_files.values():
-            p.unlink(missing_ok=True)
-        leftover_anchor = [p for p in anchor_dir.rglob("*") if p.is_file()]
-        chk.check("[2d] 重渲临时产物已清理（无文件残留）",
-                  lambda: _assert_eq(len(leftover_anchor), 0),
-                  f"清理前 {len(a_files)} 个文件")
-        chk.check("[2d] 重渲临时残留体积 == 0 字节",
-                  lambda: _assert_eq(sum(p.stat().st_size for p in leftover_anchor), 0),
-                  "不污染 _verify 目录")
-
-    # ---------------------------------------------- [2e] 参数集一致性（承重）
-    # 动机：[2d] 的锚点语义是「CLI 默认形式的产物」。若 __main__ 的 argparse 默认值
-    # 与 core.DEFAULT_WRITE_OPTIONS 各自演进，会出现两种坏结局之一 —— 锚点断言无故
-    # FAIL（被误判为回归），或为了让断言变绿而两边一起改、锚点悄悄漂移成「另一套
-    # 默认形式」的产物。故把该耦合**显式化并承重**。
-    print("\n[2e] 参数集一致性：CLI 默认形式 == core.DEFAULT_WRITE_OPTIONS == render_default 实际参数")
-    chk.check("[2e] argparse 默认值映射 == core.DEFAULT_WRITE_OPTIONS", _check_cli_default_options,
-              "改任一 CLI 默认值都会让本条直接 FAIL")
-    chk.check("[2e] render_default 实际使用的参数集 == core.DEFAULT_WRITE_OPTIONS",
-              _check_render_default_options,
-              "白盒捕获 render_default 传给 write_outputs 的实参（不落盘）")
-    chk.check("[2e] CLI 选项表面与冻结清单一致", _check_cli_option_surface,
-              "新增/删除 CLI 选项必须显式更新清单并确认是否影响「渲染默认形式」")
+                  f"{fpath.stat().st_size} 字节")
 
     # ------------------------------------------------- 渲染器逻辑冒烟（Node + DOM 桩）
     print("\n[5b] 渲染器逻辑冒烟（真实执行内联 viewer.js）")

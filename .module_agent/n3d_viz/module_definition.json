@@ -7,11 +7,11 @@
     },
     {
       "path": "n3d_viz/core.py",
-      "description": "数据层与契约中心：checkpoint 加载（torch.load map_location=cpu）、二期必需键校验（区分路径不存在 / 文件损坏 / 非二期产物三类错误）、索引取值域校验（topo_index / edge_src / edge_dst 必须落在 [0,N)，违规抛 CheckpointSchemaError 并附越界值与下标）、把张量抽取为纯 Python 结构的 TopologyData、分层着色分组与度统计与阈值过滤统计（|edge_weight| median 统一为排序后上中位）、产物命名派生（viz_<ckpt名>.*）与输出路径解析、HTML 内联 JSON 负载构造（pos_digits / weight_digits 的 None 表示取默认位宽 DEFAULT_POS_DIGITS=6 / DEFAULT_WEIGHT_DIGITS=8）、三件套写出编排 write_outputs（支持 ply_binary / with_ply_edges / include_planes，同名产物提示不静默覆盖）。"
+      "description": "数据层与契约中心，对几何零假设（图形完全由 neuron_pos 决定，不假设球/立方体/圆柱、不假设晶格或分层规整性）：checkpoint 加载（torch.load map_location=cpu）、二期必需键校验（区分路径不存在 / 文件损坏 / 非二期产物三类错误）、索引取值域校验（topo_index / edge_src / edge_dst 必须落在 [0,N)，违规抛 CheckpointSchemaError 并附越界值与下标）、把张量抽取为纯 Python 结构的 TopologyData、分层着色分组与度统计与阈值过滤统计（|edge_weight| median 统一为排序后上中位；层参考平面取该层神经元位置的均值，层=同时计算的神经元分组）、层配色的唯一同源实现（LEVEL_PALETTE_BASE 基础 9 色 + hex_to_rgb + layer_palette_hex / layer_palette_rgb：K<=9 取前 K 个逐字节不变、K>9 用标准库 colorsys 按均匀色相扩展且去重数恒等于 K，其中撞色回退分支在 K<=64 区间实测不可达、已在 docstring 写明覆盖口径并由 verify_viz 用 K=1536 主动构造必撞色来把守；hex_to_rgb 严格校验：只剥离至多一个前导 #、逐字符校验 6 位十六进制，拒绝前导正负号/内部空白/多余 #/非十六进制字符并抛 ValueError，分量恒 0..255）、产物命名派生（viz_<ckpt名>.*）与输出路径解析、HTML 内联 JSON 负载构造（pos_digits / weight_digits 的 None 表示取默认位宽 DEFAULT_POS_DIGITS=6 / DEFAULT_WEIGHT_DIGITS=8）、**CLI 默认形式的写出参数集唯一事实来源 DEFAULT_WRITE_OPTIONS 与共享渲染入口 render_default（__main__ 默认路径与 verify_viz [2d] 锚点重渲都走它，不得各处手写参数集）**、三件套写出编排 write_outputs（支持 ply_binary / with_ply_edges / include_planes，同名产物提示不静默覆盖）。"
     },
     {
       "path": "n3d_viz/export_geometry.py",
-      "description": "零依赖几何导出：手写 PLY 点云写出器（binary_little_endian float32 或 ascii，含按层着色 RGB）与 OBJ 线框写出器（N 个 v 行 + E 个 l 行，索引从 1 开始），以及独立的 PLY / OBJ 回读解析器（parse_ply_vertices / parse_obj / parse_ply_edge_count）供验证脚本使用；含脚本直跑 CLI（只导出 PLY / OBJ）。"
+      "description": "零依赖几何导出：手写 PLY 点云写出器（binary_little_endian float32 或 ascii，含按层着色 RGB）与 OBJ 线框写出器（N 个 v 行 + E 个 l 行，索引从 1 开始），以及独立的 PLY / OBJ 回读解析器（parse_ply_vertices / parse_obj / parse_ply_edge_count）供验证脚本使用；层色不再持有独立色表，而是通过 layer_colors_rgb / neuron_colors 调用 core.layer_palette_rgb（LAYER_COLORS 由 core.LEVEL_PALETTE_BASE 派生），保证 HTML 层色与 PLY 层色同源、K>9 时自动扩展；含脚本直跑 CLI（只导出 PLY / OBJ）。"
     },
     {
       "path": "n3d_viz/render_html.py",
@@ -19,15 +19,15 @@
     },
     {
       "path": "n3d_viz/gui.py",
-      "description": "tkinter 图形界面薄封装：.pt 文件与输出文件夹输入框 + 浏览按钮（filedialog）、阈值滑块与层平面开关、开始生成按钮、状态栏与可滚动日志区、一键打开 HTML（默认浏览器）与打开输出文件夹；长任务在后台线程执行并通过 queue + root.after() 回传日志，界面不卡死；同名产物覆盖信息同时写入日志与状态栏（双通道提示）；build_smoke_window 供 GUI 冒烟断言使用；不实现拖拽（与零依赖冲突）。"
+      "description": "tkinter 图形界面薄封装：.pt 文件与输出文件夹输入框 + 浏览按钮（filedialog）、阈值滑块与层平面开关、开始生成按钮、状态栏与可滚动日志区、一键打开 HTML（默认浏览器）与打开输出文件夹；checkpoint 输入框默认值由 default_checkpoint_text() 给出，遵循「二期默认产物存在则用它、否则留空」且不绑定任何具体模块产物；长任务在后台线程执行并通过 queue + root.after() 回传日志，界面不卡死；同名产物覆盖信息同时写入日志与状态栏（双通道提示）；build_smoke_window 供 GUI 冒烟断言使用；不实现拖拽（与零依赖冲突）。"
     },
     {
       "path": "n3d_viz/__main__.py",
-      "description": "命令行入口：argparse 解析 --checkpoint / --out-dir / --out / --threshold / --no-plan-planes / --ply-ascii / --with-ply-edges / --quiet；给出 --checkpoint 时复用 core 逻辑生成三件套并按约定返回退出码（0 成功 / 2 参数或 GUI 失败 / 3 checkpoint 错误）；不带参数时启动 tkinter GUI。"
+      "description": "命令行入口：argparse 解析 --checkpoint / --out-dir / --out / --threshold / --no-plan-planes / --ply-ascii / --with-ply-edges / --quiet；提供 write_options_from_args（以 core.DEFAULT_WRITE_OPTIONS 为起点按开关覆盖，使 CLI 默认值只在一处定义）与参数集一致性把守对象；默认路径（参数集等于 core.DEFAULT_WRITE_OPTIONS 时）改调共享渲染入口 core.render_default，非默认路径走 core.write_outputs；给出 --checkpoint 时复用 core 逻辑生成三件套并按约定返回退出码（0 成功 / 2 参数或 GUI 失败 / 3 checkpoint 错误）；用法示例含「非二期默认产物」的异构几何（K=15）调用与几何零假设口径说明；不带参数时启动 tkinter GUI。"
     },
     {
       "path": "n3d_viz/verify_viz.py",
-      "description": "零依赖硬断言验证脚本：逐条断言 PLY/OBJ 顶点与线段数、产物坐标与 neuron_pos 逐位一致（容差 1e-6）、层着色组数与各层规模、S_in/S_out 高亮数、阈值保留边数、HTML 体积与外部引用与 syn_dist、内联数据规模自洽、开关类参数的产物可观测差异、一期产物异常路径退出码与缺失键名、越界索引负例（退出码 3 / 报错含越界值与下标 / 无 traceback / 无产物）、源码静态扫描（不 import 业务模块、无第三方依赖）、GUI 冒烟与渲染器逻辑冒烟；末尾汇总并通过退出码表达结果，可落 Markdown 报告（报告含渲染器冒烟小节；默认产物写入 checkpoints/n3d_viz/_verify）。"
+      "description": "零依赖硬断言验证脚本：二期基准组保留写死的 EXPECTED_N=256 / EXPECTED_E=736 / EXPECTED_LAYER_COUNTS 作原验收不变，其余各组一律从 checkpoint 读实际 N/E/K/层规模；逐条断言 PLY/OBJ 顶点与线段数、产物坐标与 neuron_pos 逐位一致（容差 1e-6）、层着色组数与各层规模、S_in/S_out 高亮数、阈值保留边数、HTML 体积与外部引用与 syn_dist、内联数据规模自洽、开关类参数的产物可观测差异、一期产物异常路径退出码与缺失键名、越界索引负例（退出码 3 / 报错含越界值与下标 / 无 traceback / 无产物）；几何无关化防线含 [2a] 5 项（K∈[1,64] 去重数==K、K<=9 逐字节不变、HTML 与 PLY 同源、hex_to_rgb 输入契约、用 K=1536 主动构造必然撞色以覆盖 _hue_palette_rgb 的撞色回退分支并以调用计数证明回退真的执行）、[2b] 非规整几何合成组（就地构造 5 类几何完全不规整的合法 state_dict：随机点云/螺旋线/每层 1 个神经元/K=1 单层/K=33，逐类 8 项断言 + 2 项临时产物清理）、[2c] 真实异构几何组（checkpoints/n3d_shape/*.pt 5 个产物，缺失时明确 SKIP，只断言泛化不变量不断言形状标签）、[2d] 零回归锚点的**两层**断言：层 1 磁盘产物完整性（SHA256 + 字节数共 6 项），层 2 用**共享入口 core.render_default**（相对路径 ANCHOR_RERENDER_CKPT，不跟随命令行 --checkpoint）重渲到 _verify/_anchor_rerender/ 并与同一组锚点常量比对（SHA256 + 字节数共 6 项）+ 重渲临时产物清理 2 项、[2e] 参数集一致性 3 项（argparse 默认值映射 == core.DEFAULT_WRITE_OPTIONS；白盒捕获 render_default 传给 write_outputs 的实参 == 该常量；CLI 选项表面 == 冻结清单 CLI_OPTION_STRINGS）——[2d]+[2e] 共同保证「锚点 = CLI 默认形式的产物」永不脱耦（均留有注入—恢复拒绝证明）；另含源码静态扫描（不 import n3d_sphere/n3d_proto/n3d_shape、无第三方依赖）、GUI 冒烟与渲染器逻辑冒烟；末尾汇总（现行 173 项）并通过退出码表达结果，可落 Markdown 报告（默认产物写入 checkpoints/n3d_viz/_verify，不覆盖正式交付件）。"
     },
     {
       "path": "n3d_viz/assets/viewer.html",
@@ -43,7 +43,7 @@
     },
     {
       "path": "n3d_viz/README.md",
-      "description": "模块文档：GUI 与 CLI 两种用法、零依赖与自包含声明、三件套产物说明与命名规则、HTML 交互能力与渲染原理、模块结构、验收标准与断言口径清单、异常路径说明、全部实测数字及其来源 checkpoint 与 seed 标注，以及「边集与突触位置随 seed 变化、神经元 FCC 位置与 seed 无关」的引用纪律。"
+      "description": "模块文档：定位为「任意 N3D 拓扑产物的可视化工具，对几何零假设」（图形完全由 neuron_pos 决定，不假设球/立方体/圆柱、不假设晶格或分层规整性，但边界仍需符合 N3D 拓扑 schema、一期产物仍退码 3）；澄清「层 = 同时计算的神经元分组」与层平面取位置均值的口径；GUI 与 CLI 两种用法（含异构几何产物调用示例）、零依赖与自包含声明、三件套产物说明与命名规则、层配色随 K 自动扩展的口径（K<=9 走既有色表逐字节不变、K>9 按均匀色相扩展去重数==K，含 K=15 实测色值）与撞色回退分支的覆盖口径（K<=64 不可达、以 K=1536 必撞色构造把守）、非规整几何实测表（5 类合成样本 + 5 个真实异构产物）、零回归锚点的两层设计与反桩拒绝证明留档、**参数集一致性（core.DEFAULT_WRITE_OPTIONS 为唯一事实来源，CLI 默认路径与 [2d] 重渲共用 core.render_default，[2e] 三条承重断言 + 三种注入拒绝证明）**、字节级复现必须用相对路径 --checkpoint 的口径与 6 个产物 +14 字节实测对照表、一键复现命令、HTML 交互能力与渲染原理、模块结构、验收标准与断言口径清单（77 → 173 项构成，序号引用统一为「断言清单序号」并声明以名称为准）、异常路径说明、全部实测数字及其来源 checkpoint 与 seed 标注，以及引用纪律。"
     }
   ]
 }

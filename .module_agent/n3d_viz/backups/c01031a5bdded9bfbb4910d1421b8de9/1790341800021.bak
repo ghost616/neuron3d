@@ -5,14 +5,7 @@
 #   python -m n3d_viz --checkpoint checkpoints/n3d_sphere/model.pt
 #   python -m n3d_viz --checkpoint checkpoints/n3d_sphere/model.pt --threshold 0.30 --no-plan-planes
 #   python -m n3d_viz --checkpoint checkpoints/n3d_sphere/model.pt --out-dir checkpoints/n3d_viz
-#   # 非「二期默认产物」的用法：任意符合 N3D 拓扑 schema 的产物都按同一套逻辑渲染
-#   # （下例是 K=15 的异构几何产物，走「K > 9 按均匀色相扩展」的层色板）
-#   python -m n3d_viz -c checkpoints/n3d_shape/full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt
 #   python -m n3d_viz                       # 不带参数 -> 启动 tkinter GUI
-#
-# 几何口径：本模块对几何零假设——图形完全由 neuron_pos 决定，不假设球 / 立方体 /
-# 圆柱，也不假设晶格或分层规整性；但仍需符合 N3D 拓扑 schema（键名与形状契约），
-# 一期（n3d_proto）产物仍以退出码 3 报错。
 #
 # 全部生成逻辑复用 core / export_geometry / render_html，本文件不含第二份绘图实现。
 
@@ -21,7 +14,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Sequence
 
 from . import core
 
@@ -73,30 +66,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def write_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
-    """把 argparse 结果映射为 :func:`core.write_outputs` 的写出参数集。
-
-    起点是 :data:`n3d_viz.core.DEFAULT_WRITE_OPTIONS`（**CLI 默认形式的唯一事实来源**），
-    再按各布尔开关覆盖 —— 因此「默认值」在整个模块里只定义一次，不会与
-    ``verify_viz`` 的 ``[2d]`` 锚点重渲参数脱耦。
-
-    Args:
-        args: :func:`build_parser` 解析结果。
-
-    Returns:
-        可直接 ``**`` 展开给 :func:`n3d_viz.core.write_outputs` 的参数字典。
-    """
-    options = dict(core.DEFAULT_WRITE_OPTIONS)
-    options["threshold"] = float(args.threshold)
-    if args.ply_ascii:
-        options["ply_binary"] = False
-    if args.with_ply_edges:
-        options["with_ply_edges"] = True
-    if args.no_plan_planes:
-        options["include_planes"] = False
-    return options
-
-
 def run_cli(argv: Sequence[str] | None = None) -> int:
     # 命令行主流程：解析参数 -> 加载拓扑 -> 写出三件套 -> 打印摘要。
     parser = build_parser()
@@ -140,17 +109,16 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     emit(f"[数据] 阈值过滤统计 = {data.edge_threshold_stats((0.05, 0.10, 0.20, 0.30, 0.50))}")
     emit(f"[数据] syn_dist 体积 = {data.syn_dist_bytes} 字节（不嵌入 HTML）")
 
-    options = write_options_from_args(args)
-    if options == core.DEFAULT_WRITE_OPTIONS:
-        # 默认形式：走与零回归锚点 [2d][重渲] 完全相同的共享入口，
-        # 保证「锚点 = CLI 默认形式的产物」这一语义永不脱耦。
-        reports = core.render_default(
-            args.checkpoint, out_dir=args.out_dir, out=args.out, log=emit, data=data,
-        )
-    else:
-        reports = core.write_outputs(
-            data, out_dir=args.out_dir, out=args.out, log=emit, **options,
-        )
+    reports = core.write_outputs(
+        data,
+        out_dir=args.out_dir,
+        out=args.out,
+        threshold=args.threshold,
+        ply_binary=not args.ply_ascii,
+        with_ply_edges=args.with_ply_edges,
+        include_planes=not args.no_plan_planes,
+        log=emit,
+    )
 
     if reports["html"]["existed"] or reports["ply"]["existed"] or reports["obj"]["existed"]:
         print(

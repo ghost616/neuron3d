@@ -32,22 +32,7 @@ else:
     from . import core
 
 _WINDOW_TITLE = "N3D 二期拓扑三维可视化"
-#: 二期默认产物（仅作界面预填建议值，不是唯一合法输入）。
-#: 本模块对几何零假设、也不绑定任何具体模块产物，因此默认值遵循
-#: 「二期默认产物存在则用它，否则留空」：留空时由用户用「浏览…」自行选择任意
-#: 符合 N3D 拓扑 schema 的 .pt 产物（例如 checkpoints/n3d_shape/ 下的异构几何产物）。
-_DEFAULT_CKPT_REL = "checkpoints/n3d_sphere/model.pt"
-
-
-def default_checkpoint_text() -> str:
-    """返回 checkpoint 输入框的预填文本：默认产物存在则用它，否则留空。
-
-    Returns:
-        相对仓库根的默认产物路径；该文件不存在时返回空串（不臆造路径）。
-    """
-    root = Path(__file__).resolve().parent.parent
-    candidate = root / _DEFAULT_CKPT_REL
-    return _DEFAULT_CKPT_REL if candidate.is_file() else ""
+_DEFAULT_CKPT = "checkpoints/n3d_sphere/model.pt"
 
 
 def open_in_file_manager(path: str | Path) -> None:
@@ -89,7 +74,7 @@ class VizApp:
         self.last_html: Path | None = None
         self.last_out_dir: Path | None = None
 
-        self.ckpt_var = tk.StringVar(value=default_checkpoint_text())
+        self.ckpt_var = tk.StringVar(value=_DEFAULT_CKPT)
         self.outdir_var = tk.StringVar(value=core.DEFAULT_OUT_DIR)
         self.status_var = tk.StringVar(value="就绪：选择 .pt 产物与输出文件夹后点击「开始生成」。")
         self.threshold_var = tk.DoubleVar(value=core.DEFAULT_THRESHOLD)
