@@ -397,6 +397,15 @@ class Config:
         输出类别数（MNIST 为 10）。默认 10。
     hidden_dim : int
         仅 `--arch mlp` 对照基线使用（主模型不使用该字段）。默认 2048。
+    fc_dim : int
+        **两端全连接包裹开关**（本模块第三轮新增的单一配置）。取值语义：
+        `0` = **关闭**（默认，走现状路径：`W_in` / `W_out` 直连，参数集与数值**逐位不变**）；
+        `-1` = **跟随 N**（两端有效宽度 `H = N`）；
+        `> 0` = 显式宽度 `H = fc_dim`。
+        启用后的结构：`x → Linear(784→H)+b+ReLU → 投影 P(|S_in|,H) → N3D 核心（不变）`
+        `→ h = a_up[S_out] → Linear(|S_out|→H)+b+ReLU → Linear(H→10)+b → logits`。
+        **启用时不再创建 `W_in` / `W_out` / `W_out_bias`**（它们被上面两组全连接层取代），
+        输入侧偏置复用 `neuron_bias[in_scope_mask]`。`< -1` 在构造期报错。默认 0。
     batch_size : int
         批大小。默认 64。
     lr : float
@@ -459,6 +468,8 @@ class Config:
     input_dim: int = 784
     output_dim: int = 10
     hidden_dim: int = 2048  # 仅 `--arch mlp` 对照基线使用（主模型不使用该字段）
+    # 两端全连接包裹开关：0 = 关闭（默认，逐位不变）/ -1 = 跟随 N / > 0 = 显式宽度
+    fc_dim: int = 0
 
     # ---- 训练 ----
     batch_size: int = 64
@@ -521,6 +532,14 @@ class Config:
         if self.hidden_dim <= 0:
             raise ValueError(
                 f"Config.hidden_dim 必须为正整数，当前 hidden_dim={self.hidden_dim}"
+            )
+        # ---- fc_dim 校验（本模块第三轮新增）----
+        # [!] 只允许 -1（跟随 N）或 >= 0（0 = 关闭）：`< -1` 是**无意义哨兵**，
+        #    必须在构造期拒绝，而不是等到下游按"宽度 = -2"去建张量。
+        if int(self.fc_dim) < -1:
+            raise ValueError(
+                f"Config.fc_dim 只允许 -1（跟随 N）或 >= 0（0 表示关闭），"
+                f"当前 fc_dim={self.fc_dim}"
             )
 
         # ---- 几何字段校验 ----
@@ -625,11 +644,32 @@ class Config:
             "effective_space_radius": effective,
             "circum_coef": float(spec.circum_coef),
             "shape_circum_radius": float(circum_radius),
+            # fc_dim 的**有效宽度**：0 -> 0（关闭）；-1 -> N；> 0 -> 该值。
+            "fc_width": self._resolve_fc_width(),
         }
 
     # ------------------------------------------------------------------
     # 便捷属性
     # ------------------------------------------------------------------
+    @property
+    def fc_enabled(self) -> bool:
+        """两端全连接包裹是否启用（`fc_dim != 0`）。"""
+        return int(self.fc_dim) != 0
+
+    @property
+    def fc_width(self) -> int:
+        """两端全连接的**有效宽度** `H`：`0`=关闭 -> 0；`-1`=跟随 N -> N；`>0` -> 该值。"""
+        return int(self._derived["fc_width"])
+
+    def _resolve_fc_width(self) -> int:
+        """把 `fc_dim` 的三种取值语义解析成有效宽度（构造期唯一解析点）。"""
+        fd = int(self.fc_dim)
+        if fd == 0:
+            return 0
+        if fd == -1:
+            return int(self.N)
+        return fd
+
     @property
     def n_input_syn(self) -> int:
         """输入突触总数 N * y_in。"""
@@ -708,6 +748,7 @@ class Config:
             "input_dim": self.input_dim,
             "output_dim": self.output_dim,
             "hidden_dim": self.hidden_dim,
+            "fc_dim": self.fc_dim,
             "batch_size": self.batch_size,
             "lr": self.lr,
             "epochs": self.epochs,
@@ -755,6 +796,7 @@ class Config:
             f"seed={self.seed}",
             f"device={self.device}",
             f"weight_decay={self.weight_decay}",
+            f"fc_dim={self.fc_dim}",
             f"readout_bias={self.readout_bias}",
             f"lr_schedule={self.lr_schedule}",
             f"grad_clip={self.grad_clip}",

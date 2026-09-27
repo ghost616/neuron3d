@@ -373,4 +373,104 @@ MLP 9-seed mean 98.6289% / min 98.54% / max 98.73% / σ 0.0595%。
 
 **验证链**：`compileall` 退码 0；`verify_ladder.py` 退码 0；既有 `verify_shape.py` 全量 **145/145**、
 `verify_full_runs.py` 退码 0（零回归）。
+## 两端全连接包裹（fc_dim）
+
+
+### 两端全连接包裹（单一配置 `fc_dim`）
+
+**职责**：在 N3D 主模型上新增**单一配置 `fc_dim`**，实现"**两端全连接包裹 N3D 核心**"的结构，
+用于把主模型的**参数量**对齐到同预算 MLP 基线后做同参对照。
+
+**启用（`fc_dim != 0`）时的结构与形状契约（六段）**：
+
+```
+x [B,784]
+ ├─ (1) Linear(784 -> H) + bias(H) + ReLU                  [fc_in_weight (H,784) / fc_in_bias (H)]
+ ├─ (2) 投影 P (|S_in|, H) -> a_scope [B, |S_in|]           [proj_weight (|S_in|,H)]
+ │       偏置复用 neuron_bias[in_scope_mask]；a_in[in_scope_mask] = a_scope.T
+ ├─ (3) 核心：K 层稀疏递推（E 条边）+ 双副本，共享 edge_weight  ← 与关闭路径完全同一套核心
+ ├─ (4) h_sel = a_up[S_out] -> [B, |S_out|]                ← **索引收集**（非掩码）
+ ├─ (5) Linear(|S_out| -> H) + bias(H) + ReLU              [fc_out_weight (H,|S_out|) / fc_out_bias (H)]
+ └─ (6) Linear(H -> 10) + bias(10) -> logits（线性无激活）   [head_weight (10,H) / head_bias (10)]
+```
+
+**配置语义与 CLI**：
+
+* `Config.fc_dim: int = 0`：`0` = **关闭**（默认；走现状路径，参数集 / buffer 集 / 前向数值
+  **逐位不变**）；`-1` = **跟随 N**（`H = N`）；`> 0` = 显式宽度。
+  `Config.__post_init__` 只允许 `-1` 或 `>= 0`（`< -1` 报错）；`to_dict()` / `describe()` 必须含该字段
+  （否则 `train.apply_overrides` 经 `Config(**base.to_dict())` 往返会**静默丢字段**）；
+  派生量 `fc_enabled` / `fc_width`。
+* CLI：`--fc-dim`（`default=None` —— `None` 与 `0` 必须区分）；`validate_override_args` 的
+  "负数一律报错"规则**为 `--fc-dim` 单独放宽到 `>= -1`**；`--arch mlp` 搭配非 0 `--fc-dim`
+  在 CLI 层拒绝（拒绝静默无效参数）。`build_smoke_config` 的 `explicit` 判定与 `is_default_smoke`
+  均纳入 `fc_dim`（防静默丢弃 / 防静默覆盖 `smoke.pt`）。
+* 产物指纹：`full_checkpoint_name` / `config_fingerprint` / `smoke_fingerprint` 在 `fc_dim != 0` 时
+  插入 `_fc{n}` 段；**`fc_dim == 0` 不加段**，故既有产物名（10 个三期 + 22 个 N 阶梯 + `_control/` 一期 MLP）
+  **逐字不变**。产物载荷新增顶层 `fc_dim` / `fc_width` 取证字段。
+
+**关键实现约束（三条，均已在代码与 README §18 写明）**：
+
+1. **关闭时一个 FC 参数 / buffer 都不创建**（仿 `readout_bias` 先例），且既有参数的
+   **创建顺序与名称逐字保持** —— 这是"关闭路径逐位不变"的结构前提（S12 按名字逐个 `torch.equal`）；
+2. **启用时不再创建 `W_in` / `W_out` / `W_out_bias`**（被 (1)(2) 与 (5)(6) 取代），
+   故参数量 = `H·input_dim + H + |S_in|·H + E + N + H·|S_out| + H + output_dim·H + output_dim`；
+3. **(4) 用索引收集而非掩码**（非 `S_out` 神经元根本不进计算图）；为不破坏既有契约，
+   `readout_activations()` 的 `[B, N]` 掩码语义**保持不变**，fc 路径由新增的
+   `fc_readout_logits()`（(4)(5)(6)）承担、由 `forward()` 分派；`fc_enabled` 时
+   `_assert_index_device` 把 `out_scope_index` 一并纳入设备契约。
+
+**诊断**：`get_topology_stats()` 新增 `fc_dim` / `fc_width`；`count_dense_weight_tensors()` 的形状判据
+无需豁免（FC 矩阵活在特征空间，因 `|S_in| <= N < N·y_out` 不可能等于 `[N·y_out, N·y_in]`），
+实测仍恒为 0。**输入侧结构性零梯度**：`S_in` 内出度为 0 的神经元对应的投影行为结构性零梯度
+（其 `a_in` 不参与下游聚合、也不进 readout），实测 **15~22 行 / 576~600 行（合计 163/5,365 ≈ 3.04%）**。
+
+**关闭路径零回归的取证口径**：用**改动前源码现场生成的快照**
+（`_verify/fc_pre_change_snapshot.json`，含当时 `config.py`/`model.py`/`train.py` 的 SHA256、
+29 个参数/buffer 的逐张量 SHA256、4 个中间量的前向 SHA256）做逐位证明 ——
+`fc_dim=0` 时 29 张量 + 5 前向张量**全部相等**、参数量 `43940` 相同、无 FC 参数/buffer、
+产物名不含 `_fc` 段。另：`verify_shape.py` 的 S12 过滤元组必须登记每个三期专属字段
+（第 3 轮把 `fc_dim` 加入 `("shape", "cyl_aspect", "fc_dim")`；否则 `Phase2Config(**phase2_kw)`
+会抛 `TypeError` 使 S12 整段异常 —— 该回归由本轮 `verify_shape.py` 首次运行捕获并修复）。
+
+### fc_dim 同参对齐对照（`run_fc_alignment.py` / `verify_fc_alignment.py`）
+
+**职责**：逐 seed 搜索 `N` 使 `fc_dim=-1` 的总参数最接近 MLP 基线，再在同预算下做配对对照。
+
+**固定口径（事先固定）**：`preset=highacc`、`shape=sphere`、`flow_axis=z`、`H=D=0.10`、
+不传 `--space-radius`、`y_in=y_out=8`、`num_workers=0`、两个 scope 均 `any_isolated`；
+**`fc_dim = -1`**；同参目标 `1,628,170`（MLP `hidden_dim=2048`，`torch.load` 复核）；
+逐 seed 在 `N ∈ [815, 831]`（步长 1）**逐 N 实测**总参数取 `argmin |params − target|`
+（**不可解析求解**：`params(N)` 局部非单调）；断言 `|偏差| ≤ 0.5%`；
+`seed ∈ {1, 2, 3, 7, 42, 43, 99, 123, 2024}`，每个 seed 另跑一次同预算同 seed 的 MLP 基线。
+
+**接口**：
+
+* `run_fc_alignment.py --stage {search,train,all} [--force] [--dry-run] [--extract <ckpt>]`：
+  `search` 档为**构造探测**（只构造不训练，逐 N 实测 `params`）；`train` 档按解出的 `N`
+  跑 9 组 N3D+FC 与 9 组 MLP；每轮**独立子进程** + 逐轮 UTF-8 日志（末尾真实退出码）+
+  台账 `_verify/fc_alignment_runs.json`（`N`/`seed`/`arch`/`fc_dim`/`params`/偏差/`E`/`K`/
+  `|S_in|`/`|S_out|`/`test_acc`/产物名/`SHA256`/退出码/耗时 + 逐 seed 的 17 行搜索表，
+  **全部现场取数**）+ **断点续跑** + 失败轮如实记录不静默重试 + 运行前后 **33 个既有产物**
+  SHA256 零回归快照断言；退出码 `0`/`1`/`2`。
+* `verify_fc_alignment.py`：现跑复核。A 段 `fc_dim` 语义与关闭路径逐位零回归（对改动前快照）；
+  B 段台账逐条（SHA/命名/字段/产物 `config` 口径/现场重建复算/**同参偏差 ≤ 0.5% 断言**）；
+  C 段搜索块（`chosen_N` 必须等于 17 行实测表的 `argmin`，且现场重建该 `N` 的 `params` 一致）；
+  D 段 **33 个既有产物 SHA256 冻结常量**承重断言；退出码 `0`/`1`。
+
+**实测结论（真实执行，18 轮全部退出码 0、33 个既有产物零回归）**：
+选中 `N ∈ [822, 828]`（跨度 1.1%，逐 seed 不同），偏差 `-0.3166% ~ +0.0209%`（**9/9 ≤ 0.5%**）；
+N3D+FC 9-seed `test_acc` mean **98.6344%** / min 98.52% / max 98.75% / σ 0.0875%，
+MLP 9-seed mean 98.6289% / min 98.54% / max 98.73% / σ 0.0595%；
+**配对差**（同 seed 逐对）mean **+0.0056 pp**、stdev 0.1374 pp、min −0.21 pp、max +0.21 pp
+（9 对中 5 正 4 负）。消耗：搜索 106.9 s + 训练 7,796.7 s ≈ 2.17 h。
+
+**两条限制**：① 同参对齐只是"参数量接近"（±0.5%），`E`(2,566–2,611) / `K`(恒 15) /
+`|S_in|`(576–600) / `|S_out|`(566–597) 与逐 seed 的 `N` 仍各不相同，且 MLP 是 dense 全连接、
+N3D+FC 是"全连接 + 稀疏 DAG + 全连接"的混合结构，两者**完全不同源**，差异**不可单独归因于**
+包裹结构；② 搜索解**不唯一**（`params(N)` 非单调）+ `Δ` 量级与 seed 噪声带同量级，
+**不下**因果结论；一期 `98.64%`（12 epoch + dropout=0.1）本轮**未**做同源比较，只能作参考线。
+
+**验证链**：`compileall` 退码 0；`verify_fc_alignment.py` 退码 0；`verify_shape.py` 全量 **145/145**、
+`verify_full_runs.py` 退码 0；`fc_dim=-1` 冒烟 **16/16** 退码 0。
 

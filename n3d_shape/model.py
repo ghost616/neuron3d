@@ -58,10 +58,34 @@
   —— 只有 `S_out` 中的神经元向输出层贡献信号，非 `S_out` 神经元被整体屏蔽
   （其 `W_out` 列不参与计算图、梯度恒为 0，这是该口径的直接推论）。
 
+**两端全连接包裹（`fc_dim`，第 3 轮新增，默认关闭）**
+------------------------------------------------------
+`fc_dim == 0` 时**完全走上面这套现状路径**（参数集 / buffer 集 / 前向数值**逐位不变**）。
+`fc_dim != 0` 时（`-1` = 宽度跟随 N；`> 0` = 显式宽度 `H`）把 N3D 核心**夹在两个全连接层之间**：
+
+    x [B,784]
+     (1) Linear(784 -> H) + bias(H) + ReLU                      [fc_in_weight/fc_in_bias]
+     (2) a_scope = ReLU( fc_hidden @ P + neuron_bias[S_in] )    [proj_weight, P: |S_in| x H]
+     (3) 核心：K 层稀疏递推 + 双副本，共享 edge_weight           ← 与关闭路径完全同一套核心
+     (4) h_sel = a_up[S_out]（**索引收集**，[B, |S_out|]）        [out_scope_index]
+     (5) z = ReLU( h_sel @ W_fc_out^T + b_fc_out )              [fc_out_weight: H x |S_out|]
+     (6) logits = z @ W_head^T + b_head（线性，无激活）           [head_weight: output_dim x H]
+
+* **启用时不再创建 `W_in` / `W_out` / `W_out_bias`** —— 它们分别被 (1)(2) 与 (5)(6) 取代，
+  故参数量公式为 `H·784 + H + |S_in|·H + E + N + H·|S_out| + H + output_dim·H + output_dim`；
+* **(4) 用索引收集而非掩码**：非 `S_out` 神经元根本不进入计算图（"输出侧死列归零"的
+  结构化实现，不先算 `[B, N]` 再置零）；
+* `readout_activations()` 的 `[B, N]` 掩码契约**保持不变**（两条路径共用，供冒烟判据 [13] 与
+  既有调用方使用）；fc 路径的 (4)(5)(6) 由 `fc_readout_logits()` 承担、由 `forward()` 分派。
+
 参数集合
 --------
 `W_in [input_dim, |S_in|]`、`edge_weight [E_neuron]`（每条神经元级连接一个）、
-`neuron_bias [N]`、`W_out [output_dim, N]`（可选 `W_out_bias [output_dim]`）。
+`neuron_bias [N]`、`W_out [output_dim, N]`（可选 `W_out_bias [output_dim]`）—— 以上为
+`fc_dim == 0`（关闭）路径。`fc_dim != 0` 时改为：
+`fc_in_weight [H, input_dim]`、`fc_in_bias [H]`、`proj_weight [|S_in|, H]`、
+`edge_weight [E_neuron]`、`neuron_bias [N]`、`fc_out_weight [H, |S_out|]`、`fc_out_bias [H]`、
+`head_weight [output_dim, H]`、`head_bias [output_dim]`。
 不存在 `W_conn_sparse` 按边级、`tau_raw`、`neuron_threshold`、`ln_s_in`、`alpha` 残差等旧结构。
 [!] **参数量必然随形状变化**（表面/体积比不同 → 边界神经元占比不同 → `E` / `|S_in|` /
 `|S_out|` 不同），故"其他不变"只能保证**规则不变**，**不得**沿用球体的连通性与参数量数字。
@@ -83,6 +107,14 @@
 | W_in                      | [input_dim, |S_in|]   | Parameter      |
 | W_out                     | [output_dim, N]       | Parameter      |
 | W_out_bias（可选）         | [output_dim]          | Parameter      |
+| fc_in_weight              | [H, input_dim]        | Parameter（仅 fc_dim!=0） |
+| fc_in_bias                | [H]                   | Parameter（仅 fc_dim!=0） |
+| proj_weight               | [|S_in|, H]           | Parameter（仅 fc_dim!=0） |
+| fc_out_weight             | [H, |S_out|]          | Parameter（仅 fc_dim!=0） |
+| fc_out_bias               | [H]                   | Parameter（仅 fc_dim!=0） |
+| head_weight               | [output_dim, H]       | Parameter（仅 fc_dim!=0） |
+| head_bias                 | [output_dim]          | Parameter（仅 fc_dim!=0） |
+| out_scope_index           | [|S_out|]             | buffer (int64)（仅 fc_dim!=0） |
 
 稀疏实现约束
 ------------
@@ -339,17 +371,56 @@ class ThreeDNeuronSpace(nn.Module):
         # ---------------- 可学习参数（按连接构建，禁止 dense 权重矩阵） ----------------
         self.num_in_scope: int = int(in_scope_mask.sum().item())
         self.num_out_scope: int = int(out_scope_mask.sum().item())
-        # W_in 只作用于 S_in 神经元：形状 [input_dim, |S_in|]（空集时给 1 列占位并在 forward 报错）
-        self.W_in = nn.Parameter(
-            torch.empty(int(config.input_dim), max(self.num_in_scope, 1))
-        )
+        # ---- fc_dim（第 3 轮新增）：两端全连接包裹开关 ----
+        # [!] 关闭（fc_dim == 0）时**一个 FC 参数 / buffer 都不创建**，且下方参数的
+        #     **创建顺序与名称与改动前完全一致** —— 这是"关闭路径逐位不变"的结构前提
+        #     （`verify_shape.py` 的 S12 按参数名逐个与二期 `torch.equal` 比对，集合/顺序一变即失败）。
+        self.fc_dim: int = int(config.fc_dim)
+        self.fc_width: int = int(config.fc_width)
+        self.fc_enabled: bool = bool(config.fc_enabled)
+        if self.fc_enabled and (self.num_in_scope <= 0 or self.num_out_scope <= 0):
+            raise ValueError(
+                f"fc_dim != 0 时要求 S_in 与 S_out 均非空：当前 |S_in|={self.num_in_scope}、"
+                f"|S_out|={self.num_out_scope}（input_scope={self.input_scope!r}，"
+                f"readout_scope={self.readout_scope!r}）。请改用 any_isolated 或增大 D。"
+            )
+        if not self.fc_enabled:
+            # W_in 只作用于 S_in 神经元：形状 [input_dim, |S_in|]（空集时给 1 列占位并在 forward 报错）
+            self.W_in = nn.Parameter(
+                torch.empty(int(config.input_dim), max(self.num_in_scope, 1))
+            )
         # 每条神经元级连接一个独立权重
         self.edge_weight = nn.Parameter(torch.empty(self.num_edges))
         self.neuron_bias = nn.Parameter(torch.empty(self.N))
-        self.W_out = nn.Parameter(torch.empty(int(config.output_dim), self.N))
-        self.readout_bias_enabled: bool = bool(config.readout_bias)
-        if self.readout_bias_enabled:
-            self.W_out_bias = nn.Parameter(torch.zeros(int(config.output_dim)))
+        if not self.fc_enabled:
+            self.W_out = nn.Parameter(torch.empty(int(config.output_dim), self.N))
+            self.readout_bias_enabled: bool = bool(config.readout_bias)
+            if self.readout_bias_enabled:
+                self.W_out_bias = nn.Parameter(torch.zeros(int(config.output_dim)))
+        else:
+            # ---- (1)(2)：全连接输入层 + 投影（取代 W_in；偏置复用 neuron_bias[S_in]）----
+            self.fc_in_weight = nn.Parameter(
+                torch.empty(self.fc_width, int(config.input_dim))
+            )
+            self.fc_in_bias = nn.Parameter(torch.zeros(self.fc_width))
+            self.proj_weight = nn.Parameter(
+                torch.empty(self.num_in_scope, self.fc_width)
+            )
+            # ---- (4)：S_out 的**索引收集**下标（仅在启用时注册：关闭路径 buffer 集不变）----
+            self.register_buffer(
+                "out_scope_index",
+                out_scope_mask.nonzero(as_tuple=False).flatten().to(torch.long),
+                persistent=True,
+            )
+            # ---- (5)(6)：全连接输出层 + 线性输出（取代 W_out / W_out_bias）----
+            self.fc_out_weight = nn.Parameter(
+                torch.empty(self.fc_width, self.num_out_scope)
+            )
+            self.fc_out_bias = nn.Parameter(torch.zeros(self.fc_width))
+            self.head_weight = nn.Parameter(
+                torch.empty(int(config.output_dim), self.fc_width)
+            )
+            self.head_bias = nn.Parameter(torch.zeros(int(config.output_dim)))
         self._init_parameters()
 
     # ==================================================================
@@ -1132,17 +1203,35 @@ class ThreeDNeuronSpace(nn.Module):
         gen = torch.Generator(device="cpu").manual_seed(int(c.seed) + 1)
         with torch.no_grad():
             std = 1.0 / math.sqrt(float(c.input_dim))
-            self.W_in.normal_(0.0, std, generator=gen)
+            if not self.fc_enabled:
+                self.W_in.normal_(0.0, std, generator=gen)
             fan_in = max(int(self.in_degree.max().item()), 1)
             bound = 1.0 / math.sqrt(float(fan_in))
             self.edge_weight.uniform_(-bound, bound, generator=gen)
             self.neuron_bias.fill_(NEURON_BIAS_INIT)
-            fan_out = float(self.N)
-            bound_out = math.sqrt(6.0 / (float(c.output_dim) + fan_out))
-            self.W_out.uniform_(-bound_out, bound_out, generator=gen)
-            if self.readout_bias_enabled:
-                # 输出层偏置零初始化：初始前向与无 bias 时完全一致
-                self.W_out_bias.zero_()
+            if not self.fc_enabled:
+                fan_out = float(self.N)
+                bound_out = math.sqrt(6.0 / (float(c.output_dim) + fan_out))
+                self.W_out.uniform_(-bound_out, bound_out, generator=gen)
+                if self.readout_bias_enabled:
+                    # 输出层偏置零初始化：初始前向与无 bias 时完全一致
+                    self.W_out_bias.zero_()
+            else:
+                # ---- fc_dim 启用路径的参数初始化 ----
+                # [!] **必须放在既有抽样之后**：否则会改变关闭路径的随机数消耗顺序，
+                #     破坏"关闭路径逐位不变"这条硬约束。
+                self.fc_in_weight.normal_(0.0, std, generator=gen)
+                self.fc_in_bias.zero_()
+                bound_proj = 1.0 / math.sqrt(float(self.fc_width))
+                self.proj_weight.uniform_(-bound_proj, bound_proj, generator=gen)
+                bound_fcout = 1.0 / math.sqrt(float(max(self.num_out_scope, 1)))
+                self.fc_out_weight.uniform_(-bound_fcout, bound_fcout, generator=gen)
+                self.fc_out_bias.zero_()
+                bound_head = math.sqrt(
+                    6.0 / (float(c.output_dim) + float(self.fc_width))
+                )
+                self.head_weight.uniform_(-bound_head, bound_head, generator=gen)
+                self.head_bias.zero_()
 
     @property
     def has_readout_bias(self) -> bool:
@@ -1182,9 +1271,19 @@ class ThreeDNeuronSpace(nn.Module):
                 "请改用 'any_isolated' 或增大 D / 减小 H 使更多输入突触孤立。"
             )
         # [B, |S_in|] -> 散射到 [N, B]（index_copy 语义，S_in 之外为 0）
-        a_scope = F.relu(
-            x @ self.W_in + self.neuron_bias[self.in_scope_mask]
-        )                                                    # [B, |S_in|]
+        if self.fc_enabled:
+            # (1)(2)：x -> Linear(input_dim->H)+b+ReLU -> 投影 P(|S_in|,H) + neuron_bias[S_in]
+            fc_hidden = F.relu(
+                x @ self.fc_in_weight.transpose(0, 1) + self.fc_in_bias
+            )                                                # [B, H]
+            a_scope = F.relu(
+                fc_hidden @ self.proj_weight.transpose(0, 1)
+                + self.neuron_bias[self.in_scope_mask]
+            )                                                # [B, |S_in|]
+        else:
+            a_scope = F.relu(
+                x @ self.W_in + self.neuron_bias[self.in_scope_mask]
+            )                                                # [B, |S_in|]
         a_in = torch.zeros(
             (self.N, x.shape[0]), dtype=a_scope.dtype, device=a_scope.device
         )
@@ -1339,6 +1438,9 @@ class ThreeDNeuronSpace(nn.Module):
         ]
         if self.has_readout_bias:
             required.append("W_out_bias")
+        # fc_dim 路径的 (4) 索引收集下标：同为 buffer，必须随 .to(device) 一起搬运
+        if self.fc_enabled:
+            required.append("out_scope_index")
         for name in required:
             if name not in movable:
                 raise RuntimeError(
@@ -1393,6 +1495,51 @@ class ThreeDNeuronSpace(nn.Module):
         h = a_up * self.out_scope_mask.unsqueeze(1).to(a_up.dtype)
         return h.transpose(0, 1)
 
+    def fc_readout_logits(self, a_up: torch.Tensor) -> torch.Tensor:
+        """`fc_dim != 0` 路径的读出（(4)(5)(6)）：索引收集 S_out -> 全连接输出层 -> 线性输出。
+
+        数学形式
+        --------
+        * (4) `h_sel = a_up[S_out]`：**索引收集**（形状 `[B, |S_out|]`）。非 `S_out` 神经元
+          **根本不进入计算图** —— 即"输出侧死列归零"的结构化实现，而不是先算 `[B, N]`
+          再把非 `S_out` 列置零；
+        * (5) `z = ReLU( h_sel · W_fc_out^T + b_fc_out )`，`W_fc_out ∈ R^{H × |S_out|}`；
+        * (6) `logits = z · W_head^T + b_head`，`W_head ∈ R^{output_dim × H}`（**无激活**；
+          softmax 在 loss 内）。
+
+        `readout_activations()` 的 `[B, N]` 掩码契约保持不变（供冒烟判据 [13] 与既有调用方），
+        本方法是 fc 路径专用的索引收集版本。
+
+        参数
+        ----
+        a_up : torch.Tensor
+            形状 [N, B] 的上游版本激活。
+
+        返回
+        ----
+        torch.Tensor
+            形状 [B, output_dim] 的分类 logits。
+
+        异常
+        ------
+        RuntimeError
+            `fc_dim == 0`（未启用该路径）时抛出，避免被误用。
+        """
+        if not self.fc_enabled:
+            raise RuntimeError(
+                "fc_readout_logits 仅在 fc_dim != 0 时可用；当前 fc_dim=0，"
+                "请走 readout_activations + W_out 路径。"
+            )
+        if a_up.dim() != 2 or a_up.shape[0] != self.N:
+            raise ValueError(
+                f"a_up 必须为 2D [N={self.N}, B]，当前 shape={tuple(a_up.shape)}"
+            )
+        h_sel = a_up.index_select(0, self.out_scope_index).transpose(0, 1)  # [B, |S_out|]
+        z = F.relu(
+            h_sel @ self.fc_out_weight.transpose(0, 1) + self.fc_out_bias
+        )                                                                   # [B, H]
+        return z @ self.head_weight.transpose(0, 1) + self.head_bias        # [B, output_dim]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """前向传播：阶段 1（输入层驱动） -> 阶段 2（按拓扑序单遍逐层递推） -> readout。
 
@@ -1422,9 +1569,10 @@ class ThreeDNeuronSpace(nn.Module):
             raise ValueError(
                 f"输入第二维必须为 input_dim={self.config.input_dim}，当前 {x.shape[1]}"
             )
-        if x.device != self.W_in.device:
+        device_anchor = self.fc_in_weight if self.fc_enabled else self.W_in
+        if x.device != device_anchor.device:
             raise ValueError(
-                f"设备不一致：x 在 {x.device}，模型参数在 {self.W_in.device}，"
+                f"设备不一致：x 在 {x.device}，模型参数在 {device_anchor.device}，"
                 f"请先 model.to(device) 或 x.to(device)"
             )
         # ---- 1. 阶段 1：输入层驱动（S_in 神经元） ----
@@ -1432,6 +1580,9 @@ class ThreeDNeuronSpace(nn.Module):
         # ---- 2. 阶段 2：按拓扑序单遍逐层递推（双副本展开：a_up[A] + a_in[A]） ----
         a_up = self.stage2_recurrence(a_in)
         # ---- 3. readout：仅 S_out 神经元向输出层贡献信号 ----
+        if self.fc_enabled:
+            # fc_dim 路径：(4) 索引收集 S_out -> (5) 全连接输出层 -> (6) 线性输出
+            return self.fc_readout_logits(a_up)
         h = self.readout_activations(a_up)
         logits = h @ self.W_out.transpose(0, 1)
         if self.has_readout_bias:
@@ -1451,6 +1602,12 @@ class ThreeDNeuronSpace(nn.Module):
         "按连接构建、禁止 materialize dense 权重矩阵"这一约束的可执行判据：
         扫描 `named_parameters()` 与 `named_buffers()`，除显式豁免的几何量
         `syn_dist`（预计算的突触距离矩阵，非权重）外，任何该形状的张量都视为违规。
+
+        `fc_dim != 0` 的兼容性说明：该判据只针对**突触空间**的 `[N*y_out, N*y_in]` dense 矩阵，
+        而新增的全连接层张量活在**特征空间**（`[H, input_dim]` / `[|S_in|, H]` /
+        `[H, |S_out|]` / `[output_dim, H]`）。因 `|S_in| <= N < N*y_out`，这些形状
+        **不可能**等于 `[N*y_out, N*y_in]`，故判据无需豁免、仍恒为 0；
+        `verify_fc_alignment.py` 另有实测断言。
 
         返回
         ----
@@ -1571,6 +1728,8 @@ class ThreeDNeuronSpace(nn.Module):
             * "num_edges"：神经元级连接数；"edge_dist_mean/min/max"：代表连接间距分布；
             * "dual_copy_count"：同时进入 `S_in` 与有上游连接的神经元数
               （双副本展开真正生效的神经元数 —— **不是**被覆盖，两种版本都参与传播）。
+             * **"fc_dim"**：两端全连接包裹开关的原始取值（`0`=关闭 / `-1`=跟随 N / `>0`=显式宽度）；
+             * **"fc_width"**：两端全连接的有效宽度 `H`（关闭时恒为 0）。
         """
         edge_dist = self.edge_dist
         axis = self.flow_axis_index
@@ -1614,6 +1773,8 @@ class ThreeDNeuronSpace(nn.Module):
             "readout_scope": 0.0 if self.readout_scope == "any_isolated" else 1.0,
             "num_in_scope": float(self.num_in_scope),
             "num_out_scope": float(self.num_out_scope),
+            "fc_dim": float(self.fc_dim),
+            "fc_width": float(self.fc_width),
             "num_edges": float(self.num_edges),
             "edge_dist_mean": float(edge_dist.mean().item()),
             "edge_dist_min": float(edge_dist.min().item()),

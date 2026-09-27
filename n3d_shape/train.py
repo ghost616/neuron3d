@@ -181,6 +181,10 @@ def smoke_fingerprint(config: Config) -> str:
     radius_part = (
         f"_R{config.space_radius:g}" if float(config.space_radius) > 0.0 else ""
     )
+    # [!] fc_dim（第 3 轮新增）**必须入指纹**：否则同 N/seed/scope 的不同 fc_dim
+    #     会写同一个文件名而互相覆盖（历史纠正 #1 的同类缺陷）。
+    #     口径：`fc_dim == 0`（默认关闭）**不加段**，从而既有产物名逐字不变。
+    fc_part = f"_fc{int(config.fc_dim)}" if int(config.fc_dim) != 0 else ""
     return (
         f"{config.shape_tag()}_"
         f"N{config.N}_y{config.y_in}x{config.y_out}"
@@ -190,6 +194,7 @@ def smoke_fingerprint(config: Config) -> str:
         f"_is{scope_abbrev(config.input_scope)}"
         f"_rs{scope_abbrev(config.readout_scope)}"
         f"_bs{config.batch_size}"
+        f"{fc_part}"
         f"{radius_part}"
         f"_s{config.seed}"
     )
@@ -428,6 +433,24 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "cylinder 时会报错并退出码 2（拒绝静默无效参数）。lambda < 1 为扁平圆柱、"
             "lambda > 1 为细高圆柱；极端 lambda 会使形状尺寸窗口 [R_min, R_max] 变窄甚至为空"
             "（构造期报错）。"
+        ),
+    )
+    # ---- fc_dim（第 3 轮新增）：两端全连接包裹开关 ----
+    # [!] `default=None` 表示"未提供"，与 `0`（= 关闭）**必须区分**：
+    #     若用 0 作哨兵，则"显式要求关闭"与"未提供"无法区分，无法做 explicit 判定。
+    parser.add_argument(
+        "--fc-dim",
+        dest="fc_dim",
+        type=int,
+        default=None,
+        help=(
+            "两端全连接包裹开关（缺省 = None，不覆盖；缺省预设值为 0 = 关闭）："
+            "0 = 关闭（默认，走现状路径，参数集与数值逐位不变）；"
+            "-1 = 宽度跟随 N（两端有效宽度 H = N）；> 0 = 显式宽度 H = 该值。"
+            "启用后结构为 x -> Linear(784->H)+b+ReLU -> 投影 P(|S_in|,H) -> "
+            "N3D 核心（不变） -> h = a_up[S_out]（索引收集） -> "
+            "Linear(|S_out|->H)+b+ReLU -> Linear(H->10)+b -> logits。"
+            "启用时不再创建 W_in / W_out / W_out_bias。仅 --arch neuron3d 生效。"
         ),
     )
     parser.add_argument(
@@ -777,6 +800,23 @@ def validate_override_args(args: argparse.Namespace) -> None:
             f"--space-radius 必须 >= 0（-1 表示未提供、0 表示取公式下界 R_min），"
             f"当前 --space-radius={args.space_radius}"
         )
+    # ---- fc_dim 校验（第 3 轮新增）----
+    # [!] 上述"负数一律报错"的通用规则**必须为 `--fc-dim` 单独放宽到 >= -1**：
+    #     `fc_dim = -1` 是**有意义的取值**（宽度跟随 N），不是错误输入。
+    #     故 `--fc-dim` 不进上面的 rules 列表，只在下面对 `< -1` 报错。
+    if args.fc_dim is not None and int(args.fc_dim) < -1:
+        raise ValueError(
+            f"--fc-dim 只允许 -1（跟随 N）或 >= 0（0 表示关闭），"
+            f"当前 --fc-dim={args.fc_dim}"
+        )
+    # 拒绝静默无效参数（与本模块 `--cyl-aspect` 的既有纪律一致）：
+    # `fc_dim != 0` 只作用于 neuron3d 主模型，MLP 基线不读取该字段。
+    if args.fc_dim is not None and int(args.fc_dim) != 0 and args.arch == "mlp":
+        raise ValueError(
+            f"--fc-dim 仅在 --arch neuron3d 时生效：当前 --arch=mlp 但 "
+            f"--fc-dim={args.fc_dim}（非 0）。请移除 --fc-dim 或改用 --arch neuron3d"
+            f"（拒绝静默无效参数）。"
+        )
     # ---- 形状参数校验（本模块新增）----
     # `--cyl-aspect` 哨兵 -1.0 = 未提供；显式给出时必须 > 0，且形状必须是 cylinder。
     # [!] 这里做"非 cylinder + 显式 λ"的前置拒绝：Config 只能看到"非默认值"，看不到
@@ -872,6 +912,10 @@ def apply_overrides(
     if args.cyl_aspect != -1.0:
         overrides["cyl_aspect"] = args.cyl_aspect
         changed = True
+    # ---- fc_dim 覆盖（第 3 轮新增；None = 未提供；`0` 是**合法覆盖值**）----
+    if args.fc_dim is not None:
+        overrides["fc_dim"] = int(args.fc_dim)
+        changed = True
     if args.seed_override > 0:
         log_info(f"seed 覆盖：{overrides['seed']} -> {args.seed_override}")
         overrides["seed"] = args.seed_override
@@ -955,6 +999,8 @@ def build_smoke_config(args: argparse.Namespace) -> Config:
         # 形状参数（本模块新增）：必须计入 explicit，否则 --shape cube 会被静默丢弃
         or bool(args.shape)
         or args.cyl_aspect != -1.0
+        # fc_dim（第 3 轮新增）：必须计入 explicit，否则 --fc-dim 会被静默丢弃
+        or args.fc_dim is not None
     )
     if not explicit:
         return SMALL_CONFIG
@@ -964,7 +1010,7 @@ def build_smoke_config(args: argparse.Namespace) -> Config:
         warn_message=(
             "冒烟测试配置已被显式覆盖（--preset/--n/--y-in/--y-out/--h/--d/--seed/--lr/"
             "--flow-axis/--space-radius/--input-scope/--readout-scope/--placement/"
-            "--shape/--cyl-aspect 之一）："
+            "--shape/--cyl-aspect/--fc-dim 之一）："
             f"预设={args.preset}；阶段 A 的默认基线仅在默认组合下成立"
         ),
     )
@@ -1142,7 +1188,15 @@ def run_smoke_test(
     #        时不成立 —— 此时其 ReLU 输出为 0，`h` 的对应列合法地为 0，故该列不参与 loss、
     #        梯度为 0（ReLU 的正常行为，spec 与 README 均已写明）。现改为**下界断言**：
     #        非零梯度列数必须 >= 1（且必须 <= |S_out|，因为非 S_out 列结构性为 0）。
-    out_layer_names = ("W_out",) if is_neuron3d else ("fc2.weight", "fc2.bias")
+    # [!] fc_dim 路径没有 `W_out`（输出层是 (5)(6) 两个全连接层），故按启用状态解析名字；
+    #     `fc_dim == 0` 时该分支与改动前**逐字等价**，默认路径行为不变。
+    _fc_on = bool(is_neuron3d and getattr(model, "fc_enabled", False))
+    if _fc_on:
+        out_layer_names = ("head_weight", "head_bias")
+    elif is_neuron3d:
+        out_layer_names = ("W_out",)
+    else:
+        out_layer_names = ("fc2.weight", "fc2.bias")
     out_layer_gnorms = [float(grad_norms.get(n, -1.0)) for n in out_layer_names]
     other_gnorms = {
         n: v for n, v in grad_norms.items() if n not in set(out_layer_names)
@@ -1152,11 +1206,11 @@ def run_smoke_test(
     # neuron3d 额外核对"非零梯度列数落在 [1, |S_out|]"（严格 readout 的结构性下界/上界）
     out_col_participating = (
         None
-        if not is_neuron3d
+        if (not is_neuron3d or _fc_on)
         else int((model.W_out.grad.abs().sum(dim=0) > 0).sum().item())
     )
     grad_positive_ok = out_layer_ok and len(zero_others) == 0
-    if is_neuron3d:
+    if is_neuron3d and not _fc_on:
         s_out_size = int(topo_stats["num_out_scope"])
         grad_positive_ok = grad_positive_ok and (
             1 <= int(out_col_participating) <= s_out_size
@@ -1171,7 +1225,7 @@ def run_smoke_test(
                     f"W_out 非零梯度列数={out_col_participating}"
                     f"（须落在 [1, |S_out|={int(topo_stats['num_out_scope'])}]，"
                     f"等式不成立是 ReLU 死神经元的正常行为）；"
-                    if is_neuron3d
+                    if (is_neuron3d and not _fc_on)
                     else ""
                 )
                 + f"其余参数梯度范数={'全部 > 0' if not zero_others else zero_others}"
@@ -1380,6 +1434,9 @@ def run_smoke_test(
         # 指纹与默认判定的维度必须严格对齐（与二期 batch_size / space_radius 的历史缺陷同源）。
         and config.shape == small.shape
         and float(config.cyl_aspect) == float(small.cyl_aspect)
+        # fc_dim（第 3 轮新增）**必须纳入默认判定**：否则 `--smoke-test --fc-dim -1`
+        # 会静默覆盖 `smoke.pt`（用"两端全连接包裹"的结果冒充默认产物）。
+        and int(config.fc_dim) == int(small.fc_dim)
         # batch_size 进指纹粒度之外，但它直接影响探针 batch 的规模，故一并比对，
         # 避免"几何相同但批大小不同"的配置覆盖默认产物
         and int(config.batch_size) == int(small.batch_size)
@@ -1508,6 +1565,8 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
     """
     if tag and not re.fullmatch(r"[A-Za-z0-9_-]+", tag):
         raise ValueError(f"--tag 仅允许字母/数字/下划线/连字符，当前 tag={tag!r}")
+    # fc_dim != 0 时插入 `_fc{n}` 段；`fc_dim == 0` 不加段 -> 既有产物名逐字不变。
+    fc_part = f"_fc{int(config.fc_dim)}" if int(config.fc_dim) != 0 else ""
     name = (
         f"verify_{max_batches}"
         f"_{config.shape_tag()}"
@@ -1519,6 +1578,7 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
         f"_ax{config.flow_axis}"
         f"_is{scope_abbrev(config.input_scope)}"
         f"_rs{scope_abbrev(config.readout_scope)}"
+        f"{fc_part}"
         f"_s{config.seed}"
     )
     if tag:
@@ -1536,6 +1596,9 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
     * **`{shape_tag}`（本模块新增）**：形状段（含圆柱长径比），防"同配置不同形状互覆"；
     * 历史缺陷（离朱第 2 轮 D4）：早期实现直接复用 `config_fingerprint`，产出
       `full_verify_0_...` 这种带限批前缀的误导性名字；此处独立构造、不带该前缀。
+    * **`{fc_part}`（第 3 轮新增）**：`fc_dim != 0` 时插入 `_fc{n}` 段，防止同
+      `N`/`seed` 的不同 `fc_dim` 同名互覆；`fc_dim == 0` **不加段**，从而既有产物名
+      （含 10 个三期正式产物与 22 个 N 阶梯产物）**逐字不变**。
 
     参数
     ----
@@ -1549,6 +1612,7 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
     str
         产物文件名（不含目录）。
     """
+    fc_part = f"_fc{int(config.fc_dim)}" if int(config.fc_dim) != 0 else ""
     name = (
         f"full_{config.shape_tag()}"
         f"_N{config.N}"
@@ -1559,6 +1623,7 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
         f"_ax{config.flow_axis}"
         f"_is{scope_abbrev(config.input_scope)}"
         f"_rs{scope_abbrev(config.readout_scope)}"
+        f"{fc_part}"
         f"_s{config.seed}"
     )
     if tag:
@@ -1939,6 +2004,9 @@ def _run_training_with_config(
             "shape": config.shape,
             "cyl_aspect": config.cyl_aspect,
             "shape_tag": config.shape_tag(),
+            # ---- fc_dim（第 3 轮新增；产物自带开关与有效宽度取证）----
+            "fc_dim": int(config.fc_dim),
+            "fc_width": int(config.fc_width),
             "circum_coef": config.circum_coef,
             "shape_circum_radius": config.shape_circum_radius,
             "selection_metric": float(getattr(model, "selection_metric", float("nan"))),

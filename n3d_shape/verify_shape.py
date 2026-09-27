@@ -739,10 +739,16 @@ def check_phase2_equality(rep: Report) -> None:
                 continue
             mine = ThreeDNeuronSpace(make_config(size_kw, shape, lam))
             # 二期 Config 只接受二期的字段：按 to_dict 逐字段过滤
+            # [!] **每新增一个三期专属字段都必须加进本过滤元组**：否则
+            #     `Phase2Config(**phase2_kw)` 会抛
+            #     `TypeError: Config.__init__() got an unexpected keyword argument`，
+            #     使 S12 整段异常（X1 捕获）而**失去逐张量比对**。
+            #     第 3 轮新增 `fc_dim`（仅三期字段）时实际发生了该回归，已在此修好 ——
+            #     该过滤是"跨模块字段差异"的唯一登记点，故刻意保持集中、可审计。
             mine_dict = make_config(size_kw, shape, lam).to_dict()
             phase2_kw = {
                 k: v for k, v in mine_dict.items()
-                if k not in ("shape", "cyl_aspect")
+                if k not in ("shape", "cyl_aspect", "fc_dim")
             }
             other = Phase2Model(Phase2Config(**phase2_kw))
             bad = [n for n in tensors + params
