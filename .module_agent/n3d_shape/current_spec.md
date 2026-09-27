@@ -314,3 +314,63 @@
 4. 不得覆盖既有正式产物（`model.pt`、`full_N*`、`_verify/` 下既有取证文件）
 5. **报告中不得出现无产物支撑的实测数字**；前置探针数字必须显式标注为"探针、非实测"
 6. 涉及多组对比须标注共享 seed 前提
+## 训练对照实验
+
+
+### N 阶梯 × 多 seed 同预算对照（`run_ladder.py` / `verify_ladder.py`）
+
+**职责**：在同一训练预算下回答"三期（`n3d_shape`）仅通过提高 `N` 能否达到同预算 MLP 的性能"，
+并把口径、逐点实测、区间统计与达标点清单全部落成**可复核证据**（台账 + 逐轮日志 + 现跑复核脚本）。
+
+**固定口径（开工前固定，不得事后挑选或更改）**：`preset=highacc`（`epochs=20` / `batch_size=128` /
+`lr=2e-3` / AdamW `weight_decay=1e-4` / `lr_schedule=cosine` / `grad_clip=1.0` / `readout_bias=True`；
+三期 `Config` **无 dropout 字段**，不得引入）、`shape=sphere`（**不传** `--cyl-aspect`）、
+`flow_axis=z`、`H=D=0.10`、**不传** `--space-radius`（取公式下界 `R_min`）、`y_in=y_out=8`、
+`input_dim=784`、`output_dim=10`、`num_workers=0`、`input_scope=readout_scope=any_isolated`；
+`N ∈ {256, 512, 1024, 2048, 2976}`、`seed ∈ {1, 2, 3, 7, 42, 43, 99, 123, 2024}`；
+MLP 基线每个 seed 各一次（`784 -> 2048 -> 10`，`hidden_dim` 用默认 `2048`）。
+
+**档位与判据（事先固定）**：档 1 = `N` 阶梯 × `seed=42`（5 次 N3D + 1 次 MLP）；
+档 2 = 其余 8 个 seed × **档 1 最优 `N`**（判据：`test_acc` 最高，**并列取较大 `N`**），每 seed 各 1 次 MLP；
+达标判定 = 某 `(N, seed)` 的 `test_acc >= 该 seed 的 MLP test_acc`。
+
+**产物防撞名**：`train.full_checkpoint_name` **不含 preset / epochs / batch_size / lr**，也**不含 `arch`**；
+故 N3D 运行带 `--tag ladder_hacc`、MLP 运行带 `--tag ladder_hacc_mlp` ——
+否则 (a) 不加 tag 的 `highacc + N=256 + seed=42` 会覆盖既有
+`full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt`（历史纠正 #1 同类缺陷），
+(b) N3D 与 MLP 共用同一 tag 时同 `N`/`seed` 的两种架构会写同一文件名而互相覆盖。
+
+**接口**：
+
+* `run_ladder.py --stage {1,2,all} [--force] [--dry-run] [--extract <ckpt>]`：顺序驱动运行器。
+  每轮用**独立子进程**执行 `train.py`（进程退出即释放模型与优化器，规避 `N=2976` 构造期
+  `syn_dist` 同量级临时量导致的峰值累积）；逐轮独立 **UTF-8** 日志（文件名含 `arch`/`N`/`seed`，
+  末尾写入**真实退出码**）；台账 `checkpoints/n3d_shape/_verify/ladder_runs.json`
+  （`N`/`seed`/`arch`/`test_acc`/`E`/`K`/`|S_in|`/`|S_out|`/`params`/产物名/`SHA256`/退出码/耗时，
+  **全部现场取数**）；**断点续跑**（产物存在且磁盘 SHA256 == 台账 SHA256 则跳过训练）；
+  失败轮（退出码非 0 / 产物缺失 / 日志命中 NaN-Inf）**如实记录并附原始日志路径，不静默重试**；
+  运行前后对既有产物取 SHA256 快照并断言**零回归**；退出码 `0`（全绿）/`1`（有失败轮或零回归破坏）/
+  `2`（前置条件不满足或台账口径漂移）。
+* `verify_ladder.py`：只读**现跑复核**。核验台账逐条（产物存在、磁盘 SHA256 == 台账、
+  产物 `config` 与固定口径逐字段一致、`exit_code` 字段齐全）、产物名**两两唯一**且与既有产物零冲突、
+  既有 11 个产物（10 个三期 + `_control/mlp_highacc_ep12_seed42.pt`）SHA256 **冻结常量**承重断言、
+  用**现场重建模型**独立复算 `E/K/|S_in|/|S_out|/params` 并与台账比对、按固定规则**现算**达标判定与
+  每 `N` 的 mean/min/max/σ 并与台账 `summary` 交叉校验；退出码 `0`/`1`。
+
+**实测结论（真实执行，22 轮全部退出码 0、既有产物零回归）**：13 个有效点中 **1 个达标**
+（`N=2048, seed=3`，`Δ=+0.00 pp` —— 恰与 MLP **并列**）、12 个未达标（`Δ=-0.38 ~ -0.02 pp`）；
+`N=2048`（档 1 最优）9-seed 配对均值 `Δ=-0.0922 pp`（stdev `0.0642 pp`）；
+`N=2048` 9-seed `test_acc` mean 98.5367% / min 98.48% / max 98.58% / σ 0.0316%，
+MLP 9-seed mean 98.6289% / min 98.54% / max 98.73% / σ 0.0595%。
+
+**必须同时声明的三条限制**：① 提高 `N` 会**同时**改变 `E`(736->9,963) / `K`(9->23) /
+`|S_in|`(193->2,019) / `|S_out|`(187->2,057) / `params`(154,874->1,625,605)，且因不传
+`--space-radius`，`R_min` 本身也随 `N` 增大；`N=2976` 与 MLP 的 `params`（1,628,170）虽接近但
+**结构完全不同源**，故差异**不可单独归因于 `N`**；② 一期 `98.64%` 是 `epochs=12` 且
+`dropout=0.1` 的口径（`_control/mlp_highacc_ep12_seed42.pt` 产物内实测），与本次 20 epoch、
+无 dropout **不同源**，只能作**参考线**，**不得**当作同预算达标线；③ 本对照为**同类比较**，
+**不下**架构优劣的因果结论，`Δ` 量级与 seed 噪声带（MLP 9-seed 极差 `0.19 pp`）同量级。
+
+**验证链**：`compileall` 退码 0；`verify_ladder.py` 退码 0；既有 `verify_shape.py` 全量 **145/145**、
+`verify_full_runs.py` 退码 0（零回归）。
+
