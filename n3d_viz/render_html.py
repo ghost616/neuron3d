@@ -35,6 +35,7 @@ def render_html(
     threshold: float = core.DEFAULT_THRESHOLD,
     include_planes: bool = True,
     assets_dir: str | Path | None = None,
+    fc_top_k: int = core.DEFAULT_FC_TOP_K,
 ) -> str:
     """生成单文件自包含 HTML 文本。
 
@@ -43,12 +44,14 @@ def render_html(
         threshold: 初始边权重阈值。
         include_planes: False 时把默认的层平面开关关闭。
         assets_dir: 资源目录，默认 ``n3d_viz/assets``。
+        fc_top_k: 两端全连接包裹的抽样口径 k（无 FC 产物无影响）。
 
     Returns:
         完整 HTML 文本（UTF-8 字符串）。
     """
     return core.build_html(
-        data, threshold=threshold, assets_dir=assets_dir, include_planes=include_planes
+        data, threshold=threshold, assets_dir=assets_dir,
+        include_planes=include_planes, fc_top_k=fc_top_k,
     )
 
 
@@ -57,6 +60,7 @@ def write_html(
     path: str | Path,
     threshold: float = core.DEFAULT_THRESHOLD,
     include_planes: bool = True,
+    fc_top_k: int = core.DEFAULT_FC_TOP_K,
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """把单文件 HTML 写到磁盘。
@@ -66,6 +70,7 @@ def write_html(
         path: 目标路径。
         threshold: 初始边权重阈值。
         include_planes: 是否默认显示层平面。
+        fc_top_k: 两端全连接包裹的抽样口径 k。
         log: 日志回调。
 
     Returns:
@@ -77,7 +82,8 @@ def write_html(
     existed = target.exists()
     if existed:
         emit(f"[提示] 产物已存在，将被覆盖：{target}")
-    html = render_html(data, threshold=threshold, include_planes=include_planes)
+    html = render_html(data, threshold=threshold, include_planes=include_planes,
+                       fc_top_k=fc_top_k)
     target.write_text(html, encoding="utf-8")
     return {"path": str(target), "bytes": target.stat().st_size, "existed": existed}
 
@@ -127,19 +133,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default=None, help="输出 HTML 路径（默认由 ckpt 名派生）")
     parser.add_argument("--threshold", type=float, default=core.DEFAULT_THRESHOLD)
     parser.add_argument("--no-plan-planes", action="store_true", help="默认关闭层平面")
+    parser.add_argument(
+        "--fc-top-k", type=int, default=core.DEFAULT_FC_TOP_K,
+        help="两端全连接包裹的抽样口径 k（fc_dim != 0 时生效）",
+    )
     args = parser.parse_args(argv)
 
     try:
-        data = core.load_topology(args.checkpoint)
+        data = core.load_topology(args.checkpoint, fc_top_k=args.fc_top_k)
     except core.CheckpointError as exc:
         print(f"[错误] {exc}")
         return 3
+    except ValueError as exc:
+        print(f"[错误] {exc}")
+        return 2
     paths = core.resolve_output_paths(args.checkpoint, out=args.out)
     info = write_html(
         data,
         paths["html"],
         threshold=args.threshold,
         include_planes=not args.no_plan_planes,
+        fc_top_k=args.fc_top_k,
         log=lambda m: print(m),
     )
     html = Path(info["path"]).read_text(encoding="utf-8")

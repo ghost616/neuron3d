@@ -44,6 +44,11 @@ python -m n3d_viz --checkpoint checkpoints/n3d_sphere/model.pt --out D:\tmp\viz_
 # 非「二期默认产物」的用法：任意符合 N3D 拓扑 schema 的产物同一套逻辑渲染
 # 下例是 K=15 的非均匀分层异构几何产物（走「K > 9 按均匀色相扩展」的层色板）
 python -m n3d_viz -c checkpoints/n3d_shape/full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt
+
+# 两端全连接包裹（config.fc_dim != 0）：额外展示两片 H 单元面板 + 边界块 + 抽样连线
+# 下例实测 fc_dim=-1（宽度跟随 N）-> H=825、抽样 3,510 条（详见 §2.5）
+python -m n3d_viz -c checkpoints/n3d_shape/full_shapesphere_N825_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_fc-1_s42_fc_align.pt
+python -m n3d_viz -c <fc产物>.pt --fc-top-k 5     # 抽样口径 k（范围 1..8，默认 3）
 ```
 
 | 参数 | 说明 |
@@ -55,9 +60,10 @@ python -m n3d_viz -c checkpoints/n3d_shape/full_shapecylinder_a2_N256_y8x8_H0.1_
 | `--no-plan-planes` | 默认不显示层参考平面（写入负载 `meta.showPlanes`，渲染器据此初始化复选框与绘制状态） |
 | `--ply-ascii` | PLY 用 ascii 写出（默认 `binary_little_endian`） |
 | `--with-ply-edges` | PLY 中附加 `edge` 元素（顶点索引对 + 权重），已经 CLI 透传至 `write_ply` |
+| `--fc-top-k`, `-k` | **两端全连接包裹的抽样口径 k**（默认 `3`，合法范围 `1..8`）；仅 `fc_dim != 0` 的产物生效。非法值一律报错退出非 0，**不做静默截断** |
 | `--quiet`, `-q` | 只输出最终摘要 |
 
-退出码：`0` 成功 / `2` 参数错误或无法启动 GUI / `3` checkpoint 相关错误（路径不存在、文件损坏、非二期产物缺拓扑键）。
+退出码：`0` 成功 / `2` 参数错误或无法启动 GUI / `3` checkpoint 相关错误（路径不存在、文件损坏、非二期产物缺拓扑键、`fc_dim != 0` 但缺 FC 键）。
 
 ### 1.2 图形界面（GUI）
 
@@ -71,6 +77,7 @@ python n3d_viz/gui.py      # 等价入口
 - `.pt` 文件输入框 + **浏览…**（`filedialog.askopenfilename`）
 - 输出文件夹输入框 + **浏览…**（`filedialog.askdirectory`）
 - 边权重阈值滑块 + **默认显示层平面** 勾选框
+- **全连接层抽样 k** 输入（`ttk.Spinbox`，`from_=1, to=8`，默认 `3`）；仅 `fc_dim != 0` 的产物生效
 - **开始生成** 按钮、状态提示文字、可滚动日志区
 - **打开 HTML**（默认浏览器）与 **打开输出文件夹** 按钮
 
@@ -280,6 +287,178 @@ HTML 内嵌的 `meta.checkpoint` 记录的是**调用时给出的路径字符串
 因此 `[2d]` 的层 2 重渲固定使用相对路径常量 `ANCHOR_RERENDER_CKPT`
 （见 `verify_viz.py`），不使用命令行传入的 `--checkpoint`。
 
+### 2.5 两端全连接层（`config.fc_dim != 0`）的三维展示
+
+`n3d_shape` 第三轮引入的 `fc_dim` 把 N3D 核心**夹在两个全连接层之间**。本模块据此
+额外展示「全连接输入层 / 投影到 S_in / 从 S_out 收集 / 线性输出」这套结构。
+
+#### 触发判定（三态，**只看 `fc_dim != 0`**）
+
+| 产物状态 | 判定 | 行为 |
+|---|---|---|
+| `config` 无 `fc_dim` 键 | 无 FC | 走既有展示，**不报错**（二期与三期未启用产物实测都是这一形态） |
+| `config.fc_dim == 0` | 无 FC | 走既有展示，**不报错** |
+| `config.fc_dim != 0` 且 FC 键齐全 | **有 FC** | 展示 FC 层（本节主体） |
+| `config.fc_dim != 0` 但缺 FC 键 | **产物损坏/不完整** | **报错并退出非 0**，不静默降级为无 FC 展示 |
+
+**重要**：判定**只用 `fc_dim != 0`**，不依赖「FC 键是否存在」来启用；否则「产物损坏」
+会被误判成「无 FC」。`fc_dim = -1` 是**有意义的取值**（有效宽度 `H` 跟随 `N`），
+不是「关闭」。`H` 由 FC 张量的**实际形状**推出（`proj_weight` 的列数 /
+`fc_out_weight` 的行数 / `fc_in_weight` 的行数 / `config.fc_width` 四者必须一致），
+因为 `fc_dim = -1` 时 `config` 里不存在直接等于 `H` 的字段。
+
+FC 键完整性由 `core.FC_REQUIRED_KEYS` 定义：`proj_weight`、`fc_out_weight`、
+`fc_in_weight`、`fc_out_bias`。
+
+#### 几何与不重叠判据（硬断言）
+
+```
+[输入边界块 784] ──▶ [H 单元面板·输入侧] ──(抽样连线)──▶ S_in 神经元
+                                                       │ N3D 核心（既有展示不变）
+[输出边界块 10] ◀── [H 单元面板·输出侧] ◀──(抽样连线)── S_out 神经元
+```
+
+- **H 单元面板**：两片平面，**垂直于流向轴**（`config.flow_axis`，默认 `z`）；分别置于
+  神经元云流向轴跨度 `[lo, hi]` 的**两端外侧**；面板内按 `ceil(sqrt(H))` 列做网格排布
+  （`H=825` → `29×29`）；面板在平面内的跨度取云在对应轴上的跨度 ×
+  `FC_PANEL_SPAN_RATIO`（`1.0`），使面板与云**同尺度**。
+- **间隙** = 云跨度 × `FC_PANEL_GAP_RATIO`（`0.15`）；面板自身在流向轴上的厚度 =
+  单元中心间距 × `FC_PANEL_THICKNESS_RATIO`（`0.20`），夹在
+  `[FC_PANEL_MIN_THICKNESS, 云跨度 × FC_PANEL_MAX_THICKNESS_RATIO(0.10)]` 之间。
+- **不重叠判据（硬断言，构造期执行）**：把面板厚度也算进去，要求
+  `面板输入侧区间 ∩ 神经元云区间 = ∅` 且 `神经元云区间 ∩ 面板输出侧区间 = ∅`，
+  即 `in_hi < cloud_lo` 且 `cloud_hi < out_lo`。几何参数一旦被改坏会**立即抛错**，
+  而不是画出一张重叠的图。厚度下界的作用是让「不相交」不退化成「不接触」。
+- **边界块**：784 输入 / 10 输出各一块（块中心 + 三轴尺寸），置于面板**外侧**，
+  以**聚合箭头**与面板块相连。
+- **面板单元着色**：按该单元的**权重范数**映射（输入侧用 `fc_in_weight` 的行范数、
+  输出侧用 `fc_out_weight` 的行范数），所用**配色函数复用既有实现**——
+  Python 侧唯一实现在 `export_geometry.weight_color_rgb`，`assets/viewer_fc.js` 的
+  `normToRgb` 是同一条公式的 JS 镜像（`r = 0.20+0.75t`、`g = 0.60-0.45t`、
+  `b = 0.95-0.85t`，`t = (|w| - lo)/(hi - lo)`；`hi == lo` 时按 `t = 0`）。
+  层色仍由 `core.layer_palette_hex` / `layer_palette_rgb` 提供，模块内**不存在第二份色表**。
+
+#### 抽样口径（**抽样显示（每神经元 top-k），非全部连接**）
+
+> **必须显式声明**：图形中的 FC 连线是**抽样显示（每神经元 top-k），非全部连接**。
+> 该声明同时写进 **HTML 负载 `meta.fcDeclaration`**、**OBJ 伴随注释**、**PLY 头部注释**
+> 与本文档；`verify_viz.py` 的 `[2f]` 组对此有专门断言（`meta 声明存在且含「非全部连接」`、
+> `OBJ 伴随说明含「非全部连接」`、`PLY 头部注释含抽样口径与参数量`）。
+
+| 侧别 | 抽取方式 | 默认 `k=3` 实测条数 |
+|---|---|---|
+| 输入侧 | 对每个 `S_in` 神经元，取 `proj_weight` 该**行**内 `\|w\|` 最大的 top-k | 582 × 3 = **1,746** |
+| 输出侧 | 对每个 `S_out` 神经元，取 `fc_out_weight` 该**列**内 `\|w\|` 最大的 top-k | 588 × 3 = **1,764** |
+| 合计 | —— | **3,510** |
+
+`k` 由 CLI `--fc-top-k` 与 GUI「全连接层抽样 k」控制，范围 `[1, 8]`，越界报错退出非 0。
+
+**为什么用 top-k 而不是全局阈值**（开工前实测，来源
+`checkpoints/n3d_shape/full_shapesphere_N825_..._fc-1_s42_fc_align.pt`，seed=42）：
+
+| 口径 | 保留条数 | 问题 |
+|---|---|---|
+| `\|w\| >= 0.30` | **1,308**（proj 942 + fc_out 366） | 阈值极敏感，且**静默丢掉整个神经元** |
+| `\|w\| >= 0.20` | **12,688**（proj 9,376 + fc_out 3,312） | 阈值稍松即暴涨约 10 倍 |
+| top-k（k=3） | 3,510 | **保证每个 S_in / S_out 神经元都至少有一条连线** |
+
+`k=8` 时抽样 (582+588)×8 = **9,360** 条，实测仍可渲染（HTML 仍 < 2MB）。
+
+#### 产物差异（有 FC vs 无 FC）
+
+| 产物 | 无 FC（`fc_dim` 缺失或为 0） | 有 FC（`fc_dim != 0`） |
+|---|---|---|
+| HTML | 既有形态，**逐字节不变** | 追加内联 FC 叠加渲染器 + 负载含 `"fc"` 段与 FC meta 字段 |
+| PLY | 既有形态，**逐字节不变** | `vertex` 元素后追加 `fc_node`（`2×H + 2` 点，带 `uchar kind` 分类标记：0=输入面板 / 1=输出面板 / 2=输入边界块 / 3=输出边界块）与 `fc_edge`（抽样连线）两个元素 |
+| OBJ | 既有形态，**逐字节不变** | 追加 `2×H + 2` 个 `v` 行（面板单元 + 边界块中心）+ 抽样 `l` 行，并用 `g` / `o` 分组区分「核心边」（`n3d_viz_core_edges`）与「FC 抽样边」（`n3d_viz_fc_sampled_edges`）；附抽样口径说明 |
+
+**零回归是硬约束**：无 FC 产物的 HTML / PLY / OBJ 必须**逐字节不变**。
+由于 `assets/viewer.js` 与 `assets/viewer.html` 都被**逐字内联**进每一份 HTML，
+改动它们的任何一个字节都会破坏该约束——因此 FC 渲染被完整隔离在
+**独立的** `assets/viewer_fc.js` 中，`core.py` 只在 `data.fc` 非 None 时才把它
+内联成**追加的一段脚本块**（`viewer.js` 与 `viewer.html` 本轮**零改动**）。
+
+该叠加渲染器与基础渲染器共用同一套相机口径（同一组 `cam` 参数、同一旋转顺序
+`R = RotX(pitch)·RotY(yaw)`、同一透视公式与 `dpr` 缩放），画在一块
+`pointer-events: none` 的透明叠加 canvas 上，因此旋转 / 缩放 / 平移 / 悬停仍由
+基础渲染器处理，**3D 交互与既有元素完全一致**。自动取景把面板与边界块一并纳入半径
+（否则 FC 元素会落到视野之外，表现为「开关打开但什么都看不见」）。
+
+#### 有 FC 产物的实测值（来源与 seed 可追溯）
+
+来源 `checkpoints/n3d_shape/full_shapesphere_N825_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_fc-1_s42_fc_align.pt`
+（**seed=42**，`config.fc_dim = -1`，`config.hidden_dim = 2048` 是预设默认值、**与实测 `H` 不等**）：
+
+| 指标 | 实测值 |
+|---|---|
+| `N` / `E` / `K` | 825 / 2,588 / 15 |
+| `\|S_in\|` / `\|S_out\|` | 582 / 588 |
+| `fc_dim` / 有效宽度 `H`（=`fc_width`） | -1 / **825** |
+| `fc_in_weight` 形状 / 参数量 | `[825, 784]` / 646,800 |
+| `proj_weight` 形状 / 参数量 | `[582, 825]` / **480,150** |
+| `fc_out_weight` 形状 / 参数量 | `[825, 588]` / **485,100** |
+| 面板点数（构造量） | 2×825 = 1,650（+2 个边界块中心 = PLY 中 1,652） |
+| 抽样连线（构造量，k=3） | 3,510 |
+| 云流向轴（z）区间 | `[-0.9899, 0.9899]`（跨度 1.9799） |
+| 输入面板流向轴**区间** | `[-1.2938, -1.2801]`（中心 -1.2869，厚度 0.01365；与云区间**不相交**） |
+| 输出面板流向轴**区间** | `[1.2801, 1.2938]`（中心 1.2869；与云区间**不相交**） |
+| 面板网格 | 29 × 29（`ceil(sqrt(825)) = 29`），单元中心间距 0.06827，面板横向跨度 ±0.9558 |
+| 输入 / 输出边界块中心 z | -1.5511 / 1.5511（块尺寸 1.1879 × 1.1879 × 0.2772） |
+| 三件套字节数（渲染实测） | HTML 591,709 / PLY 81,681 / OBJ 154,372 |
+| 测试准确率 | 0.9853 |
+
+**口径区分（重要）**：
+
+1. **「区间」与「中心」是两个不同的量**，引用时必须写清。面板在流向轴上的位置有两种口径：
+   `panels[].flow`（**中心**坐标，单点）与 `panels[].flow_interval`（**区间**，即
+   `[中心 − 厚度/2, 中心 + 厚度/2]`）。不重叠判据用的是**区间**；
+   本文档表格中凡写「区间」的均是 `flow_interval`。实测中心为 `∓1.2869`、区间为
+   `[-1.2938, -1.2801]` / `[1.2801, 1.2938]`，两者不可混引。
+2. **「参数量」与「抽样条数」是两个不同的量**：上表中「参数量」是
+   `proj_weight` / `fc_out_weight` 的**全部**元素数（480,150 + 485,100 = 965,250），
+   「抽样连线」是**渲染出来的**条数（3,510）——产物 meta、CLI 日志、OBJ 注释与本节
+   都分别标注，**不得混用**。
+
+#### 真实浏览器视觉验证与四个「只有真跑浏览器才会暴露」的缺陷（实测留档）
+
+`checkpoints/n3d_viz/_verify/viewer_fc_screenshot.png`（547,213 字节）是在 Chromium
+（`bun x playwright screenshot`，一次性图形验证工具，未引入任何依赖）中以 1440×900 打开
+FC 产物得到的：可见**两片 29×29 面板**（色彩 = 单元权重范数）、输入 784 / 输出 10
+两个边界块（线框方盒 + 标签）、以及从面板到 S_in / S_out 的抽样连线；右侧是独立的
+FC 统计面板，底部图例含 FC 条目，左上工具栏有「全连接层（抽样）」开关。
+
+**这张图不是装饰 —— 它暴露了 4 个 Node/DOM 桩测不出来的缺陷**（桩只验证「函数被调用」，
+不验证「画到了可见区域」）：
+
+| # | 缺陷 | 症状 | 根因与修复 |
+|---|---|---|---|
+| 1 | 叠加层 `z-index` 不够 | 改动 FC 绘制颜色后**截图字节数完全不变** → FC 一个像素都看不见 | `#view` 是 `position:absolute; inset:0` 且 z-index 为 auto；叠加层 `z-index:5` 仍排在它**之后**（同层叠上下文内定位元素并不必然压过未设 z-index 的定位元素）。改为 `z-index:20` |
+| 2 | `draw()` 里的**正反馈环** | 面板被缩到几乎不可见（实测叠加层 `cam.dist` 由正确的 6.7565 涨到 12.2015 = 滚轮 clamp 上限 `radius*40`） | 原实现每帧「用上一帧的 dist 反推用户缩放倍率」：第 1 帧把 dist 归一到 `radiusWithFc*3.6`，第 2 帧又把它当「已缩放的距离」再乘一次 `radiusWithFc/radius`，逐帧放大。改为**自带 `userZoom` 倍率**（默认 1），滚轮/重置按钮通过捕获阶段事件同步 |
+| 3 | 面板相对云太小 | 面板只占云横向尺寸的约 40%，在 825 神经元 + 2,588 边的视图里读不出「两端包裹」 | 新增 `FC_PANEL_SPAN_RATIO = 1.0`：单元间距改为「面板目标跨度 / 网格边长」，使面板与云同尺度 |
+| 4 | 抽样连线密度压过面板 | alpha 0.95 时输出侧面板完全糊成一片青蓝雾，网格结构不可辨 | 连线降为 `rgba(150,240,255,0.16)`、线宽 0.6px、虚线间隔拉大；面板单元改为**不透明**填充 + 亮边框并按 0.88 收缩留缝（29×29 等距实心会糊成一块色板） |
+
+第 1、2 条是**功能性缺陷**（FC 结构在真实浏览器里根本看不见），由「截图字节数异常不变」
+与「在页面内注入诊断盒读回叠加层的 `cam.dist`」两条独立手段定位；修复后全量自检与
+渲染器冒烟重跑均通过。
+
+#### 独立测试（离朱 R22）暴露的 3 类契约缺陷与修复
+
+离朱以 731 项独立断言复核后，报告 **3 类真实缺陷**（均属「文档/规范声明了明确报错，
+实际是未包装异常或静默截断」，**无功能性错误、无产物错误**）：
+
+| 优先级 | 缺陷 | 实测症状 | 修复 |
+|---|---|---|---|
+| P1 | `core.validate_fc_top_k` 对**非整数浮点静默截断** | 原实现 `value = int(k)`，于是 `2.5→2`、`1.5→1`、`8.7→8`、`3.0→3`、`True→1` 全部被**接受**，与「非整数一律报错、不静默截断」相悖（CLI 不受影响，argparse `type=int` 已在入口拦下；受影响的是 Python API 调用方） | 改为**严格要求 `int` 且非 `bool`**：`bool` / `float` / `str` / 容器一律抛可读 `ValueError`（含 `3.0` 这类「值非法但类型是 float」的输入，不静默强转） |
+| P2 | 同函数 `validate_fc_top_k(None)` 抛**裸 `TypeError`** | docstring 只声明 `ValueError`，按契约只捕获 `ValueError` 的调用方（CLI / GUI）会**漏接** | `None` 与其它非法类型统一抛 `ValueError` |
+| P3 | `core._fc_panel_geometry(H<=0)` **逃逸未包装异常** | 在 `_place_units_in_panel` 的 `cell <= 0` 哨兵之前先算 `max(cols, rows)` / `math.sqrt(H)`，于是 `H=0` 抛裸 `ZeroDivisionError`、`H=-1` 抛裸 `ValueError: math domain error`。**主链路不受影响**（`extract_fc` 经 `_fc_hidden_width` 已用 `H<=0` 兜住），仅直接调用该几何函数时违约 | 把 `H` 为正整数、流向轴合法等校验**提到任何算术之前**，与既有的「云跨度为 0 / 面板相交」统一为 `CheckpointSchemaError` |
+
+**回归防线**：`verify_viz.py` 的 `[2f]` 组新增 5 条承重断言
+（`validate_fc_top_k` 拒绝 13 类非法输入且异常类型集合恒为 `{"ValueError"}`、
+FC 几何入口对 `H=0` / `H=-1` / `H=True` / 流向轴非法 / 云跨度为 0 全部给可读
+`CheckpointSchemaError`、且 `H=1` 与共线点云这类**合法边界仍不得误报**）。
+修复后实测：`verify_viz.py` **通过 490 / 失败 0 / 跳过 1**，退出码 0；
+无 FC 零回归、FC 三件套**逐字节不变**（HTML 591,709 / PLY 81,681 / OBJ 154,372）。
+
 ---
 
 ## 3. 交互能力（HTML 视图）
@@ -289,10 +468,15 @@ HTML 内嵌的 `meta.checkpoint` 记录的是**调用时给出的路径字符串
 | 左键拖拽 | 旋转（yaw 绕屏幕竖直轴，pitch 俯仰带限幅） |
 | 滚轮 | 缩放（距离按 `exp(Δy·0.0012)` 变化，并夹在 `0.35R ~ 40R`） |
 | 右键拖拽 | 平移（视图矩阵平移列叠加） |
-| 悬停神经元 | 弹出详情：id、所在层、z 坐标、入度 / 出度、是否 S_in / S_out |
-| 图层开关 | 神经元 / 连接 / 层平面分别显示隐藏 |
-| 阈值滑块 | 只显示 `\|edge_weight\| ≥` 阈值的边，实时刷新保留边数 |
+| 悬停神经元 | 弹出详情：id、所在层、z 坐标、入度 / 出度、是否 S_in / S_out（有 FC 时 S_in / S_out 额外注明「连接输入/输出全连接层」） |
+| 图层开关 | 神经元 / 连接 / 层平面分别显示隐藏；**有 FC 时多一个「全连接层（抽样）」开关**（由叠加渲染器动态注入） |
+| 阈值滑块 | 只显示 `\|edge_weight\| ≥` 阈值的边，实时刷新保留边数（不影响 FC 抽样连线） |
 | 重置视角 | 恢复初始 yaw / pitch / 距离 / 平移 |
+
+有 FC 时页面额外呈现（详见 §2.5）：两片 H 单元面板（小方块，色 = 权重范数）、
+两个边界块（半透明线框方盒 + 标签）、聚合箭头，以及**每神经元 top-k 的抽样连线**
+（细虚线，虚线即「抽样显示，非全部连接」的视觉提示）；右侧另有**独立的 FC 统计面板**
+（`#fc-stats`）显示 `fc_dim` / `H` / `top-k` / 面板点数 / 两个矩阵形状与参数量 / 抽样条数 / 声明文本。
 
 配色约定：神经元按所在**层**着色（层色板由 `core.layer_palette_hex` 给出，与 PLY 顶点色**同源**：`K <= 9` 用既有 9 色，`K > 9` 按均匀色相扩展为 K 个两两不同的颜色）；**S_in** 以品红 `#ff5ec7` 同心小圆叠加（半径 0.55r），**S_out** 以金黄 `#ffd84d` 同心叠加（仅 S_out 时 0.55r，兼属两者时 0.26r 作为内圈），因此即便被高亮也能看出其所属层色；边按 `|w|` 归一化映射粗细（0.6~3.2 px）与颜色（弱=青蓝 → 强=橙红）；每层绘制一张参考平面并标注 `L1..L{K}`。
 
@@ -309,8 +493,19 @@ HTML 内嵌的 `meta.checkpoint` 记录的是**调用时给出的路径字符串
 
 `n3d_viz/assets/viewer_smoke.js` 用最小 DOM / Canvas 桩**真实执行** HTML 里内联的 `viewer.js`，断言：
 圆形总数 == N + S_in + S_out、绘制线段数 ≥ 阈值内边数、投影 bbox 有限且落在画布附近、投影质心接近画布中心、
-阈值滑块联动（阈值 0 时保留全部 736 条边）、**S_in 高亮圈数 == 193**、**S_out 高亮圈数 == 187**、悬停命中并填充详情、图例色块数 == K+3。
+阈值滑块联动（阈值 0 时保留全部边）、**S_in 高亮圈数 == n_s_in**、**S_out 高亮圈数 == n_s_out**、悬停命中并填充详情、
+图例色块数 == K+3（有 FC 时再 +2）。
+
+**第三个参数给出 FC 叠加渲染器源码时**（`node viewer_smoke.js <viewer.js> <data.json> <viewer_fc.js>`），
+额外断言 7 条：叠加画布已创建且尺寸与基础画布同步、面板单元点 == 2×H、抽样连线数 == `meta.fcSampleEdges`
+== `(|S_in|+|S_out|)×k`、**面板流向轴区间与神经元云区间不相交**、`meta` 声明含「非全部连接」、
+FC 统计面板独立存在且含声明与矩阵形状、叠加层实际产生绘制调用（方块 + 采样线）与标签。
 由 `verify_viz.py` 自动调用（需要 `node`，缺失时该条标记 SKIP，不影响其它断言）。
+
+**桩必须比实现更严格（本轮实测教训）**：早期桩的 `document.getElementById` 会「取不到就顺手创建一个」，
+而真实 DOM 返回 `null`——于是渲染器里 `if (!document.getElementById("fc-stats"))` 这类**存在性判断永远为假**，
+被守卫的代码块被静默跳过，而其他断言仍然全绿（典型的假绿灯，实测 FC 统计面板因此从未被创建）。
+现在桩严格实现该语义（已存在才返回），并补齐 `document.body` 与 `document.createTextNode`。
 
 ### 真实浏览器截图（视觉证据）
 
@@ -335,19 +530,27 @@ bun x playwright screenshot --browser chromium --viewport-size "1280,760" \
 n3d_viz/
 ├── __init__.py          # 包声明、零依赖与自包含约束
 ├── core.py              # checkpoint 加载 / 拓扑键校验 / 拓扑抽取 / 产物命名派生 / 层配色 / HTML 数据负载
+│                        # + 两端全连接包裹（fc_dim != 0）：三态判定 / FC 抽取 / 面板几何与不重叠硬断言 / top-k 抽样
 ├── export_geometry.py   # 零依赖 PLY（二进制/ascii）与 OBJ 线框写出器 + 回读解析器（层色取自 core）
+│                        # + FC 附加点 / FC 抽样边 / 独立 group 名 / FC 元素回读解析器
 ├── render_html.py       # 单文件 HTML 生成 + 自包含断言
-├── gui.py               # tkinter 界面（后台线程 + queue + after 轮询）
+├── gui.py               # tkinter 界面（后台线程 + queue + after 轮询；全连接层抽样 k 控件）
 ├── __main__.py          # CLI 入口；不带参数启动 GUI
 ├── verify_viz.py        # 全部硬断言验证脚本（真实执行，末尾汇总退出码）
 ├── assets/
 │   ├── viewer.html      # HTML 模板（含两个占位标记）
 │   ├── viewer.js        # 三维交互渲染器（构建时内联进产物）
+│   ├── viewer_fc.js     # 两端全连接包裹的**叠加渲染器**（仅在 fc_dim != 0 时内联）
 │   └── viewer_smoke.js  # 渲染器逻辑冒烟脚本（Node + DOM 桩）
 └── README.md
 ```
 
 构建时 `render_html` 读取 `assets/viewer.html` 与 `assets/viewer.js`，把 `/*__N3D_DATA_JSON__*/` 替换为 JSON 负载、`/*__N3D_VIEWER_JS__*/` 替换为渲染器源码，因此产物不含任何外部引用。
+
+**为什么 FC 渲染器是独立的第三个资源文件**：`viewer.html` 与 `viewer.js` 都被**逐字内联**进每一份 HTML，
+改动它们任何一个字节都会破坏「无 FC 产物逐字节零回归」的硬约束。因此 FC 渲染被完整隔离在
+`assets/viewer_fc.js` 中，只在 `data.fc` 非 None 时作为**追加的一段脚本块**内联到「内联数据」块内
+（从而在 DOM 中排在 `viewer.js` **之前**执行）。无 FC 产物因此连一个字节都不变。
 
 ---
 
@@ -360,12 +563,15 @@ python n3d_viz/verify_viz.py --report checkpoints/n3d_viz/_verify/verify_report.
 
 断言项数构成：几何无关化前的 **77 项**（其中二期基准组含写死的 `EXPECTED_N=256` /
 `EXPECTED_E=736` / `EXPECTED_LAYER_COUNTS=[13,24,37,35,39,34,37,24,13]`，作为原验收口径不变）
-\+ 几何无关化轮 **81 项** + 修复轮 **12 项** + 收尾轮 **3 项** = **173 项**。新增项全部
-**从 checkpoint 读实际 N / E / K / 层规模，不写死任何值**；构成：`[2a]` 5 项（层配色可扩展性
-+ 撞色回退分支）+ `[2b]` 42 项（5 类非规整几何合成样本 × 8 项 + 2 项临时产物清理）+
-`[2c]` 32 项（5 个真实异构产物 × 6 项 + 产物名两两不同 + K=15 去重数）+ `[2d]` 14 项
-（磁盘完整性 6 项 + 用共享入口重渲 6 项 + 重渲临时产物清理 2 项）+ `[2e]` 3 项
-（CLI 默认形式 / `render_default` 实际参数 / CLI 选项表面 三者的一致性）。
+\+ 几何无关化轮 **81 项** + 修复轮 **12 项** + 收尾轮 **3 项** = 既有 **173 项**；
+本轮在全连接层支持下 `[2c]` 由 32 → 261 项（**+229**）、新增 `[2f]` **88 项**
+（其中 5 项为离朱独立测试修复轮补入的契约回归防线），
+故全连接层支持轮汇总为 **485 项**，再经离朱独立测试修复轮 **+5 项**（[2f] 契约回归防线）→ **现行 490 项**（实测通过 **490** / 失败 **0** / 跳过 **1**，退出码 **0**；
+唯一 SKIP 是 `[2c]` 的「非 N3D 拓扑产物已明确跳过（逐个计入报告）」说明行）。
+新增项全部**从 checkpoint 读实际 N / E / K / 层规模，不写死任何值**；既有构成：`[2a]` 5 项
+（层配色可扩展性 + 撞色回退分支）+ `[2b]` 42 项（5 类非规整几何合成样本 × 8 项 +
+2 项临时产物清理）+ `[2d]` 14 项（磁盘完整性 6 项 + 用共享入口重渲 6 项 + 重渲临时产物清理 2 项）
++ `[2e]` 3 项（CLI 默认形式 / `render_default` 实际参数 / CLI 选项表面 三者的一致性）。
 
 | 断言 | 口径 | 实测 |
 |---|---|---|
@@ -400,21 +606,45 @@ python n3d_viz/verify_viz.py --report checkpoints/n3d_viz/_verify/verify_report.
 | `[2b]` 非规整几何合成组 | 5 类样本 × 8 项（顶点数 / `l` 行数 / 层数 / HTML 层色去重数 / PLY 层色去重数 / 坐标逐位一致 / payload 长度自洽 / 产物名派生） | 40 项全部通过 + 2 项临时产物清理 |
 | `[2c]` 真实异构几何组 | 5 个产物 × 6 项泛化不变量（**不断言形状标签**） | 30 项全部通过 + 产物名两两不同 + K=15 去重数 == 15 |
 | `[2d]` 零回归锚点（两层） | 层 1 磁盘产物完整性 6 项；层 2 **用共享入口 `core.render_default` 重渲**并与同一组锚点常量比对 6 项 + 清理 2 项 | 14 项全部通过；注入 `LEVEL_PALETTE_BASE` 对调缺陷后层 2 的 html/ply 两条 FAIL、退出码 1（见 §2「零回归锚点」） |
-| `[2e]` 参数集一致性 | CLI 默认形式 == `core.DEFAULT_WRITE_OPTIONS` == `render_default` 实际参数；CLI 选项表面 == 冻结清单 | 3 项全部通过（`{'threshold':0.3,'ply_binary':True,'with_ply_edges':False,'include_planes':True}`；15 个 option string）；三种注入（`--no-plan-planes` 默认改 True / `--threshold` 默认改 0.5 / 新增一个 CLI 开关）均使对应条目 FAIL、退出码 1，恢复后源文件 SHA256 逐字节相同（见 §2「参数集一致性」） |
+| `[2e]` 参数集一致性 | CLI 默认形式 == `core.DEFAULT_WRITE_OPTIONS` == `render_default` 实际参数；CLI 选项表面 == 冻结清单 | 3 项全部通过（`{'threshold':0.3,'ply_binary':True,'with_ply_edges':False,'include_planes':True,'fc_top_k':3}`；17 个 option string）；三种注入（`--no-plan-planes` 默认改 True / `--threshold` 默认改 0.5 / 新增一个 CLI 开关）均使对应条目 FAIL、退出码 1，恢复后源文件 SHA256 逐字节相同（见 §2「参数集一致性」） |
+| `[2f]` 触发判定三态 | 无 `fc_dim` 键 / `fc_dim == 0` → 无 FC 段、不报错；`fc_dim != 0` 且键齐全 → 有 FC 段 | 三态全部通过；两态无 FC 产物的 HTML / PLY / OBJ **两两一致**（归一化掉 ckpt 文件名后逐字节比对） |
+| `[2f]` 面板点数 == 2×H | PLY `fc_node` 中的面板单元 / 内联负载 `panels.units` 之和两条独立口径 | 1,650 == 2×825 |
+| `[2f]` 抽样条数 | == `\|S_in\|×k + \|S_out\|×k`（负载 / OBJ group / PLY `fc_edge` 三条独立口径） | 582×3 + 588×3 = **3,510** |
+| `[2f]` 抽样覆盖性 | 每个 S_in / S_out 神经元都至少有一条连线 | 582 / 582 与 588 / 588 全部覆盖（top-k 口径的保证） |
+| `[2f]` 抽样权重正确性 | 独立回读 `proj_weight` / `fc_out_weight`，按 `(side, unit, neuron)` 直接取矩阵元素比对 | max\|diff\| ≤ 1e-6 |
+| `[2f]` 面板与云不相交 | 面板流向轴区间 ∩ 云流向轴区间 == ∅（内存结构 + **落盘 PLY 坐标**两条口径） | 云 `[-0.9899, 0.9899]`；输入面板 **区间** `[-1.2938, -1.2801]`（中心 -1.2869）、输出 `[1.2801, 1.2938]`（中心 1.2869） |
+| `[2f]` 间隙与网格 | 间隙 == 云跨度 × 0.15；列数 == `ceil(sqrt(H))` | 误差 < 1e-6；29 == `ceil(sqrt(825))` |
+| `[2f]` 抽样声明 | `meta` / OBJ / PLY 三处都必须含「非全部连接」并写出两侧参数量 | 三处全部通过（参数量 480,150 + 485,100 分别标注） |
+| `[2f]` PLY / OBJ FC 元素 | PLY 含 `fc_node`（2×H+2）+ `fc_edge`；OBJ 两个 group 名正确且行数分派正确 | `fc_node` 1,652 / `fc_edge` 3,510；核心边 2,588 + FC 边 3,510，`v` 行 2,477 == N + 2H + 2 |
+| `[2f]` `fc_dim != 0` 缺 FC 键 | 5 个负例（缺 `proj_weight` / `fc_out_weight` / `fc_in_weight` / `fc_out_bias` / 两个同时缺）→ 退出码非 0、报错含缺失键名、无 traceback、**不产生任何产物** | 20 项全部通过（**不静默降级为无 FC 展示**） |
+| `[2f]` `--fc-top-k` 边界 | `1` / `8` 合法；`0` / `9` / `-1` / `abc` / `1.5` 非法 → 退出码非 0 且无 traceback | 全部通过；k=1 → 1,170 条、k=8 → 9,360 条，且 k=1 与 k=8 产物**不同**（开关不得是空操作） |
+| `[2f]` 临时产物清理 | 负例与三态临时 checkpoint 用完即删 | `_fc/` 下无 `.pt` 残留 |
+| `[2c]` 预分拣 | `checkpoints/n3d_shape/*.pt` 中的非 N3D 拓扑产物（MLP 基线）**明确 SKIP 并计入报告**，不产生一堆 `KeyError` | 拓扑产物 9 个 + 非拓扑 18 个 == 总数 27 个 |
+
+`[2c]` 真实异构几何组本轮由 32 项**扩展为 261 项**：`checkpoints/n3d_shape/` 新增了
+MLP 基线与 10 个 `fc_align` 产物后，旧口径（「目录里所有 `.pt` 都是 N3D 拓扑产物、OBJ `l` 行数 == E」）
+会成片误报。现在改为**预分拣**（`_non_topology_reason`）+ 拓扑产物跑完整泛化不变量，
+其中「OBJ 核心边行数 == E」按 group 计数、「OBJ 总行数 == E + FC 抽样数」，
+FC 产物另加「面板点数 == 2×H + 2」不变量 —— 因此 **FC 路径同样被真实产物覆盖**。
 
 ### 一键复现（口径要点）
 
 ```bash
 # 1) 全量硬断言（含 [2d] 用当前代码重渲并与锚点常量比对）
 python -m compileall -q n3d_viz
-python n3d_viz/verify_viz.py --report checkpoints/n3d_viz/_verify/verify_report.md   # 期望 173/0/0，退出码 0
+python n3d_viz/verify_viz.py --report checkpoints/n3d_viz/_verify/verify_report.md   # 期望 490/0/1，退出码 0
 
 # 2) JS 语法 + 渲染器逻辑冒烟
 node --check n3d_viz/assets/viewer.js
+node --check n3d_viz/assets/viewer_fc.js
 node --check n3d_viz/assets/viewer_smoke.js
 
 # 3) 重新生成某产物（字节级复核时 --checkpoint 必须是**相对仓库根**的路径，理由见 §2）
 python -m n3d_viz -c checkpoints/n3d_sphere/model.pt --out-dir checkpoints/n3d_viz/_verify/_repro
+
+# 4) 有 FC 产物的三件套（含面板 / 边界块 / 抽样连线）
+python -m n3d_viz -c checkpoints/n3d_shape/full_shapesphere_N825_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_fc-1_s42_fc_align.pt \
+    --out-dir checkpoints/n3d_viz --fc-top-k 3
 ```
 
 三条口径要点：
@@ -422,8 +652,8 @@ python -m n3d_viz -c checkpoints/n3d_sphere/model.pt --out-dir checkpoints/n3d_v
 1. **必须用相对路径** `--checkpoint`：HTML 内嵌 `meta.checkpoint` 记录调用时的路径字符串，
    绝对路径会让 HTML 多 14 字节（PLY / OBJ 不受影响）——实测对照表见 §2「字节级复现口径」。
 2. **`verify_viz.py` 的验证产出一律写入 `--out-dir`（默认 `checkpoints/n3d_viz/_verify/`）**，
-   不覆盖 `checkpoints/n3d_viz/` 下的正式交付件；`[2b]`/`[2d]` 的临时 checkpoint 与产物比对完即删
-   （各有「无文件残留 / 残留体积 0 字节」两条断言把守）。
+   不覆盖 `checkpoints/n3d_viz/` 下的正式交付件；`[2b]`/`[2d]`/`[2f]` 的临时 checkpoint 与产物
+   比对完即删（各有「无文件残留 / 残留体积 0 字节」类断言把守）。
 3. `[2d]` 的层 2 重渲固定使用常量 `ANCHOR_RERENDER_CKPT`（相对路径），
    **不跟随**命令行传入的 `--checkpoint`，因此换个 ckpt 跑验证也仍会守护 K ≤ 9 路径。
 
@@ -512,8 +742,8 @@ broadcast_neuron_to_in / neuron_of_output_syn / neuron_of_input_syn / ln_s_in.we
 | 阈值过滤保留边数 | ≥0.05 → 681；≥0.10 → 620；≥0.20 → 517；**≥0.30 → 379**；≥0.50 → 140 |
 | `syn_dist` 体积 | 16,777,216 字节（未进入内存、未嵌入 HTML） |
 | HTML / PLY / OBJ 大小 | 88,521 / 4,120 / 15,695 字节 |
-| 产物 SHA256 | HTML `15A80EBBF2FD586B…` / PLY `9A097D16306160F9…` / OBJ `1F594ECF466E28F7…`（几何无关化前后**逐位相同**） |
-| 验证汇总 | 通过 **173** / 失败 0 / 跳过 0（退出码 0）。按 `verify_report.md` 的**断言清单序号**定位（序号由断言插入顺序决定，新增断言会使后续序号顺移，故**以断言名称为准**）：序号 **14** = `[2a]` 撞色回退分支；序号 **90/91** = `[2b]` 合成组临时产物清理；序号 **136/137** = `[2d]` 重渲临时产物清理；序号 **138/139/140** = `[2e]` 参数集一致性三项；序号 **141** = 渲染器逻辑冒烟（内含 12 条子断言，均通过）；序号 **167/168** = 负例临时产物清理（`_bad_index/` 无文件残留 / 残留体积 0 字节） |
+| 产物 SHA256 | HTML `15A80EBBF2FD586B…` / PLY `9A097D16306160F9…` / OBJ `1F594ECF466E28F7…`（几何无关化前后、以及本轮全连接层支持前后**逐位相同**） |
+| 验证汇总 | 通过 **490** / 失败 0 / 跳过 1（退出码 0）。按 `verify_report.md` 的**断言清单序号**定位（序号由断言插入顺序决定，新增断言会使后续序号顺移，故**以断言名称为准**）：渲染器逻辑冒烟 = 名称「内联渲染器可执行且投影正确」（内含 13 条子断言，均通过）；`[2f]` 组共 **88** 项；`[2c]` 组共 **261** 项（含 1 条 SKIP 说明） |
 
 **6.2 非规整 / 异构几何产物（`checkpoints/n3d_shape/`，seed=42）**
 
@@ -533,6 +763,17 @@ broadcast_neuron_to_in / neuron_of_output_syn / neuron_of_input_syn / ln_s_in.we
 
 - 就地构造、跑完即删，不依赖任何既有产物；N / E / K 与实测结果见 §2「非规整几何实测」表。
 
+**6.4 两端全连接包裹产物（`checkpoints/n3d_shape/…_fc-1_s42_fc_align.pt`，seed=42）**
+
+- **来源 checkpoint**：`checkpoints/n3d_shape/full_shapesphere_N825_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_fc-1_s42_fc_align.pt`
+- **seed = 42**（取自该产物 `config.seed`；记录 `test_acc = 0.9853`）
+- **`fc_dim = -1`**（有效宽度 `H` 跟随 `N`，即 `H = 825`）；CLI 渲染命令与参数见 §1.1 / §5「一键复现」
+- 全部指标见 §2.5「有 FC 产物的实测值」表（`|S_in|=582` / `|S_out|=588`、
+  `proj_weight [582,825]` = 480,150 条、`fc_out_weight [825,588]` = 485,100 条、
+  抽样 3,510 条、面板点 1,650、HTML 591,709 / PLY 81,681 / OBJ 154,372 字节）
+- 真实浏览器渲染证据：`checkpoints/n3d_viz/_verify/viewer_fc_screenshot.png`（1440×900，
+  547,213 字节，含两片面板 / 两个边界块 / 抽样连线 / FC 统计面板；见 §2.5 末节的缺陷留档）
+
 **引用纪律**：
 
 - **边集（E）、边权重、突触位置随 seed 变化**：任何边级数字（E=736、阈值保留边数、`|w|` 统计、层入边数）都必须连同其来源 checkpoint 与 `seed=42` 一起引用，换 seed 后这些数字会变。
@@ -540,6 +781,7 @@ broadcast_neuron_to_in / neuron_of_output_syn / neuron_of_input_syn / ln_s_in.we
 - 引用本 README 的数字时，请注明"来源 `<checkpoint 相对路径>`，seed=42"。
 - `S_in` / `S_out` 计数（193 / 187）依赖 `input_scope=any_isolated` 与 `readout_scope=any_isolated` 及随机采样，**随 seed 变化**。
 - `[2b]` 合成样本的坐标与边由 `SYNTH_SEED = 20250925` 决定，报告中的样本规模（N/E/K）必须与该 seed 一并引用。
+- **`fc_dim != 0` 产物的 FC 数字（`H`、`|S_in|`、`|S_out|`、`proj_weight` / `fc_out_weight` 参数量、抽样条数）随 N 与 seed 变化**：引用时同样必须标注来源 checkpoint 与 seed；其中「参数量」与「抽样条数」是两个不同量（前者是矩阵元素数、后者是渲染出来的连线数），**不得混用**（见 §2.5）。
 
 ---
 
@@ -552,5 +794,8 @@ broadcast_neuron_to_in / neuron_of_output_syn / neuron_of_input_syn / ln_s_in.we
 - **产物覆盖**：同名产物存在时 CLI 打印提示、GUI 在日志与状态栏提示，verify 脚本打印 `existed` 标记；不做静默覆盖。
 - **`verify_viz.py` 默认把产物写到 `checkpoints/n3d_viz/_verify/`**（含 `verify_report.md` 报告）**，避免与正式产物互相污染（对齐"验证类命令一律写入 `_verify/`"的产物纪律）。`[2b]` 合成组的临时 checkpoint 与产物跑完立即删除，`_synthetic/` 不残留文件（有 2 条断言把守）。
 - **零回归锚点**：`checkpoints/n3d_viz/viz_model.{html,ply,obj}` 的 SHA256 记录在 `verify_viz.py` 的 `PHASE2_ANCHOR_SHA256`；任何使 `K <= 9` 路径输出变化的改动都会被 `[2d]` 组直接判失败。
+- **无 FC 产物必须逐字节零回归**：`config` 无 `fc_dim` 键或 `fc_dim == 0` 的产物，三件套必须与改动前**逐字节相同**。由于 `assets/viewer.html` 与 `assets/viewer.js` 都被**逐字内联**进每一份 HTML，**不得**为了 FC 功能改动这两个文件；FC 渲染一律放在独立资源 `assets/viewer_fc.js` 中、只在 `data.fc` 非 None 时追加内联（详见 §2.5 与 §4）。
+- **`fc_dim != 0` 时不得静默降级**：缺任一 `core.FC_REQUIRED_KEYS` 键必须报错退出非 0 且不产生任何产物，**不得**当作「无 FC」继续画一张不完整的图。
+- **抽样口径必须显式声明**：FC 连线是「抽样显示（每神经元 top-k），**非全部连接**」，该声明写进 HTML `meta.fcDeclaration`、PLY 头部注释、OBJ 伴随注释与文档三处，`[2f]` 组有专门断言把守。
 - **平台**：Windows 上"打开输出文件夹"用 `os.startfile`；Linux 用 `xdg-open`；macOS 用 `open`。
 - **无图形环境**：`--skip-gui` 可跳过 GUI 冒烟断言；CLI 入口不受影响。

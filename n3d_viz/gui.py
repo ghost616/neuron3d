@@ -94,6 +94,8 @@ class VizApp:
         self.status_var = tk.StringVar(value="就绪：选择 .pt 产物与输出文件夹后点击「开始生成」。")
         self.threshold_var = tk.DoubleVar(value=core.DEFAULT_THRESHOLD)
         self.planes_var = tk.BooleanVar(value=True)
+        # 两端全连接包裹的抽样口径（StringVar + 取值域校验：非法输入明确报错，不静默截断）。
+        self.fc_top_k_var = tk.StringVar(value=str(core.DEFAULT_FC_TOP_K))
 
         self._build_widgets()
         self.root.after(100, self._pump)
@@ -126,6 +128,22 @@ class VizApp:
         self.threshold_label = ttk.Label(row3, text=f"{core.DEFAULT_THRESHOLD:.2f}", width=5)
         self.threshold_label.pack(side="left")
         ttk.Checkbutton(row3, text="默认显示层平面", variable=self.planes_var).pack(side="left", padx=(10, 0))
+
+        # 全连接层抽样口径控件（与 CLI 的 --fc-top-k 同一条校验；GUI 与 CLI 行为一致）。
+        row5 = ttk.Frame(root)
+        row5.pack(fill="x", **pad)
+        ttk.Label(row5, text="全连接层抽样 k（每神经元 top-k）：").pack(side="left")
+        self.fc_top_k_box = ttk.Spinbox(
+            row5, from_=core.MIN_FC_TOP_K, to=core.MAX_FC_TOP_K, width=4,
+            textvariable=self.fc_top_k_var,
+        )
+        self.fc_top_k_box.pack(side="left")
+        ttk.Label(
+            row5,
+            text=(f"范围 {core.MIN_FC_TOP_K}..{core.MAX_FC_TOP_K}；仅 fc_dim != 0 的产物生效"
+                  "（抽样显示，非全部连接）"),
+            foreground="#666666",
+        ).pack(side="left", padx=(8, 0))
 
         row4 = ttk.Frame(root)
         row4.pack(fill="x", **pad)
@@ -224,23 +242,34 @@ class VizApp:
             self._append_log(f"[错误] checkpoint 路径不存在：{ckpt}")
             self.status_var.set("失败：checkpoint 路径不存在。")
             return
+        # 抽样口径：与 CLI 共用 core.validate_fc_top_k，非法输入明确报错（不静默截断）。
+        try:
+            fc_top_k = core.validate_fc_top_k(int(self.fc_top_k_var.get().strip()))
+        except (ValueError, TypeError) as exc:
+            self._append_log(f"[错误] 全连接层抽样 k 非法：{exc}")
+            self.status_var.set(f"失败：全连接层抽样 k 非法（{self.fc_top_k_var.get()!r}）。")
+            messagebox.showerror(_WINDOW_TITLE, f"全连接层抽样 k 非法：{exc}")
+            return
         self.start_btn.configure(state="disabled")
         self.open_html_btn.configure(state="disabled")
         self.open_dir_btn.configure(state="disabled")
         self.set_status(f"生成中…（{ckpt.name}）")
         self.log(f"[开始] checkpoint = {ckpt}")
         self.log(f"[开始] 输出目录 = {out_dir}")
+        self.log(f"[开始] 全连接层抽样 k = {fc_top_k}（抽样显示，非全部连接）")
         self.worker = threading.Thread(
             target=self._run_job,
-            args=(ckpt, out_dir, float(self.threshold_var.get()), bool(self.planes_var.get())),
+            args=(ckpt, out_dir, float(self.threshold_var.get()), bool(self.planes_var.get()),
+                  fc_top_k),
             daemon=True,
         )
         self.worker.start()
 
-    def _run_job(self, ckpt: Path, out_dir: Path, threshold: float, planes: bool) -> None:
+    def _run_job(self, ckpt: Path, out_dir: Path, threshold: float, planes: bool,
+                 fc_top_k: int) -> None:
         """后台线程体：加载 -> 抽取 -> 写三件套；结果通过队列回传主线程。"""
         try:
-            data = core.load_topology(ckpt)
+            data = core.load_topology(ckpt, fc_top_k=fc_top_k)
             self.log(
                 f"[数据] N={data.n_neurons} E={data.n_edges} K={data.n_layers} "
                 f"S_in={data.n_s_in} S_out={data.n_s_out} seed={data.config.get('seed')} "
@@ -250,9 +279,38 @@ class VizApp:
             self.log(f"[数据] 阈值过滤统计 = {data.edge_threshold_stats((0.05, 0.10, 0.20, 0.30, 0.50))}")
             stats = data.edge_threshold_stats((threshold,))
             self.log(f"[数据] 当前阈值 {threshold:.2f} 保留 {list(stats.values())[0]} / {data.n_edges} 条边")
+            # 信息面板：显示 fc_dim / fc_width / 4 个矩阵形状与参数量 / 抽样条数
+            if data.fc is None:
+                self.log("[数据] 两端全连接包裹：未启用（config 无 fc_dim 或 fc_dim == 0）")
+            else:
+                fcd = data.fc
+                self.log(
+                    f"[数据] 两端全连接包裹：fc_dim={fcd.fc_dim} fc_width(H)={fcd.fc_width} "
+                    f"input_dim={fcd.input_dim} output_dim={fcd.output_dim}"
+                )
+                self.log(
+                    f"[数据] fc_in_weight={tuple(fcd.fc_in_weight_shape)} "
+                    f"参数量={fcd.fc_in_count:,}；"
+                    f"proj_weight={tuple(fcd.proj_weight_shape)} 参数量={fcd.proj_count:,}；"
+                    f"fc_out_weight={tuple(fcd.fc_out_weight_shape)} 参数量={fcd.fc_out_count:,}"
+                )
+                self.log(
+                    f"[数据] 面板点={fcd.n_panel_points}（2×H）"
+                    f" 样本连线={fcd.n_edges} 条（top-k={fcd.top_k}，"
+                    f"期望 (|S_in|+|S_out|)×k="
+                    f"({len(fcd.s_in_order)}+{len(fcd.s_out_order)})×{fcd.top_k}"
+                    f"={fcd.expected_sample_edges}）"
+                )
+                self.log(f"[数据] {fcd.declared_statement()}")
+                for nm, pn in (("输入侧", fcd.panels["input"]), ("输出侧", fcd.panels["output"])):
+                    self.log(
+                        f"[数据] {nm}面板：流向轴 {pn.axis}={pn.flow:.6f} "
+                        f"区间=({pn.flow_interval[0]:.6f}, {pn.flow_interval[1]:.6f}) "
+                        f"网格={pn.cols}×{pn.rows} 单元间距={pn.cell_size:.6f}"
+                    )
             reports = core.write_outputs(
                 data, out_dir=out_dir, threshold=threshold,
-                include_planes=planes, log=self.log,
+                include_planes=planes, fc_top_k=fc_top_k, log=self.log,
             )
             self.log_queue.put(("done", {"ok": True, "reports": reports, "out_dir": str(out_dir)}))
         except core.CheckpointError as exc:
@@ -282,9 +340,13 @@ class VizApp:
                 f"完成（已覆盖同名产物：{', '.join(sorted(existed))}）："
                 if existed else "完成："
             )
+            fc_part = ""
+            if reports.get("obj", {}).get("fc_lines"):
+                fc_part = f"，FC 抽样连线 {reports['obj']['fc_lines']} 条（非全部连接）"
             self.status_var.set(
                 f"{prefix}{self.last_html.name}（{reports['html']['bytes']} 字节）"
-                f"，PLY {reports['ply']['vertices']} 项点，OBJ {reports['obj']['lines']} 条 l 行。"
+                f"，PLY {reports['ply']['vertices']} 项点，OBJ {reports['obj']['lines']} 条 l 行"
+                f"{fc_part}。"
             )
             self.log("[完成] 三件套已写出。")
         else:

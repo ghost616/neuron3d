@@ -10,6 +10,13 @@
 #   python -m n3d_viz -c checkpoints/n3d_shape/full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt
 #   python -m n3d_viz                       # 不带参数 -> 启动 tkinter GUI
 #
+# 两端全连接包裹（`config.fc_dim != 0`）：
+#   python -m n3d_viz -c checkpoints/n3d_shape/full_shapesphere_N825_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_fc-1_s42_fc_align.pt
+#   抽样口径由 `--fc-top-k`（默认 3，范围 1..8）决定：对每个 S_in / S_out 神经元
+#   各取 |w| 最大的 top-k 条连线 —— **抽样显示，非全部连接**。
+#   `config` 无 `fc_dim` 键或 `fc_dim == 0` 的产物不展示 FC 层（不报错）；
+#   `fc_dim != 0` 但缺 FC 键的产物报错退出非 0（不静默降级）。
+#
 # 几何口径：本模块对几何零假设——图形完全由 neuron_pos 决定，不假设球 / 立方体 /
 # 圆柱，也不假设晶格或分层规整性；但仍需符合 N3D 拓扑 schema（键名与形状契约），
 # 一期（n3d_proto）产物仍以退出码 3 报错。
@@ -68,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="PLY 中附加 edge 元素（顶点索引对）",
     )
     parser.add_argument(
+        "--fc-top-k", "-k", type=int, default=core.DEFAULT_FC_TOP_K,
+        help=(f"两端全连接包裹的抽样口径 k（范围 {core.MIN_FC_TOP_K}..{core.MAX_FC_TOP_K}，"
+              "仅 fc_dim != 0 的产物生效；抽样显示，非全部连接）"),
+    )
+    parser.add_argument(
         "--quiet", "-q", action="store_true", help="只输出最终摘要",
     )
     return parser
@@ -88,6 +100,7 @@ def write_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
     """
     options = dict(core.DEFAULT_WRITE_OPTIONS)
     options["threshold"] = float(args.threshold)
+    options["fc_top_k"] = int(args.fc_top_k)
     if args.ply_ascii:
         options["ply_binary"] = False
     if args.with_ply_edges:
@@ -117,9 +130,16 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
 
     emit = (lambda _m: None) if args.quiet else (lambda m: print(m))
 
+    # 抽样口径的取值域校验（1..8）：越界一律报参数错误、退出码 2，不静默截断。
+    try:
+        core.validate_fc_top_k(args.fc_top_k)
+    except ValueError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
     try:
         emit(f"[加载] {args.checkpoint}")
-        data = core.load_topology(args.checkpoint)
+        data = core.load_topology(args.checkpoint, fc_top_k=args.fc_top_k)
     except core.CheckpointNotFoundError as exc:
         print(f"[错误] {exc}", file=sys.stderr)
         return EXIT_CHECKPOINT
@@ -139,6 +159,16 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     emit(f"[数据] 层入边 = {'/'.join(str(c) for c in data.layer_edge_counts)}")
     emit(f"[数据] 阈值过滤统计 = {data.edge_threshold_stats((0.05, 0.10, 0.20, 0.30, 0.50))}")
     emit(f"[数据] syn_dist 体积 = {data.syn_dist_bytes} 字节（不嵌入 HTML）")
+    if data.fc is None:
+        emit("[数据] 两端全连接包裹：未启用（config 无 fc_dim 或 fc_dim == 0）")
+    else:
+        emit(
+            f"[数据] 两端全连接包裹：fc_dim={data.fc.fc_dim} H={data.fc.fc_width} "
+            f"proj_weight={tuple(data.fc.proj_weight_shape)} "
+            f"fc_out_weight={tuple(data.fc.fc_out_weight_shape)} "
+            f"参数量={data.fc.proj_count}/{data.fc.fc_out_count} "
+            f"抽样={data.fc.n_edges} 条（top-k={data.fc.top_k}）"
+        )
 
     options = write_options_from_args(args)
     if options == core.DEFAULT_WRITE_OPTIONS:
@@ -165,6 +195,15 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             d=Path(reports["html"]["path"]).parent,
         )
     )
+    if data.fc is not None:
+        print(
+            "[完成] FC 抽样连线={fe}条（top-k={k}，面板点={fp}），{decl}".format(
+                fe=reports["obj"].get("fc_lines", 0),
+                k=data.fc.top_k,
+                fp=reports["ply"].get("fc_nodes", 0),
+                decl=data.fc.declared_statement(),
+            )
+        )
     return EXIT_OK
 
 
