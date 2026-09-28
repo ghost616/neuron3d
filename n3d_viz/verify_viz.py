@@ -183,6 +183,15 @@ ANCHOR_GROUPS: tuple[dict[str, Any], ...] = (
 #: :func:`_check_ply_obj_unchanged` 会用**当前代码**重新渲染每一组并与这里的恒定值
 #: 逐项比对（因此这不是「只比常量」，而是真实的重渲回归断言）；**只比 PLY/OBJ**：
 #: HTML 因 ``viewer.js`` 新增 1 行已按批准重基线（登记在 :data:`ANCHOR_REBASE_LOG`）。
+#:
+#: **承重前提（与 [2d] 锚点组同口径，必须一并声明）**：这 8 项的恒定值取自
+#: ``HEAD = 927d32f``（「相机单一事实来源」轮之前的最后一次提交，即 ``viewer.js``
+#: 新增 ``window.__n3d_cam = cam;`` **之前**）当时用真实 checkpoint 渲染出的产物。
+#: 因此本组**仅在「上游 checkpoints 产物逐字节不变」的前提下才具承重意义**：
+#: 一旦上游把 ``checkpoints/`` 破坏性重建 / 清空重训（几何、边集、层结构跟着变），
+#: 这 8 项会**集体 FAIL**，而失败原因**不在渲染器**，不能据此判定 n3d_viz 回归。
+#: 判读顺序固定为：**先**核对上游 checkpoint 是否仍是同一份产物，**再**怀疑渲染路径。
+#: 换言之：本常量测量的是「渲染器 + 上游产物」这一对的稳定性，不是渲染器单独的稳定性。
 PLY_OBJ_BASELINE: tuple[tuple[str, str, dict[str, tuple[str, int]]], ...] = (
     ("二期 model.pt", ANCHOR_RERENDER_CKPT, {
         "viz_model.ply": (
@@ -1068,8 +1077,13 @@ def _check_ply_obj_unchanged(work_dir: Path | None = None) -> str:
     任何字节变化都视为**回归**（而不是「重基线」）。
 
     **承重方式**：用**当前代码**重新渲染 :data:`PLY_OBJ_BASELINE` 里每一组产物，
-    再把磁盘字节与 ;data:`PLY_OBJ_BASELINE` 的恒定值逐项比对，因此能抓住
+    再把磁盘字节与 :data:`PLY_OBJ_BASELINE` 的恒定值逐项比对，因此能抓住
     「几何/写出路径被改动」这类回归，而不只是「常量没被改」。
+
+    **承重前提（与 [2d] 锚点组同口径）**：本组恒定值取自 ``HEAD = 927d32f`` 当时用
+    真实 checkpoint 渲染出的产物，故**仅在「上游 checkpoints 产物逐字节不变」的前提下
+    才具承重意义**。上游若破坏性重建 / 清空重训，这 8 项会集体 FAIL 而原因不在渲染器 ——
+    判读顺序固定为「先核对上游产物是否同一份，再怀疑渲染路径」。
 
     Args:
         work_dir: 临时输出目录；None 时用 ``checkpoints/n3d_viz/_verify/_plyobj_chk``。
@@ -2573,6 +2587,33 @@ def verify(
               lambda: _assert_true(_fc_geometry_h1_ok()),
               "退化输入必须报错，但合法边界（H=1）与共线点云走兜底间距、不得误报")
 
+    # ------------------------------------------ [2g] 内联脚本块序不变式（可执行约束）
+    # 背景：FC 叠加渲染器必须排在 viewer.js 之后（否则读不到共享相机 window.__n3d_cam）。
+    # 2026-09-27 之前这只是一条**中文注释**；本轮把它升级为 core.build_html 的构建期断言。
+    # 这里把守两件事：① 正常产物的探针顺序；② 人为把 FC 块挪到 viewer.js 之前时判据判否。
+    print("\n[2g] 内联脚本块序不变式（FC 块必须在 viewer.js 之后）")
+    block_order_html = fc_htmlp.read_text(encoding="utf-8") if fc_reports else ""
+    chk.check("[2g] 正常产物：FC 块探针排在 viewer.js 探针之后（构建期断言通过）",
+              _guarded(fc_err, lambda: _block_order_ok(block_order_html)),
+              f"来源 {Path(FC_PRODUCT_CKPT).name}；探针串取自 core._VIEWER_CAM_PROBE / _FC_MAIN_PROBE")
+    chk.check("[2g] 注入拒绝：FC 块前置时块序判据判否（旧顺序会被当场拦下）",
+              _block_order_injection_rejected,
+              "注入不改动 core 源码：用真实资产按旧顺序拼一份文本，再交给同一条判据")
+    chk.check("[2g] 块序断言是活断言：伪造「FC 在前」的探针位置后 build_html 抛 ValueError",
+              lambda: _block_order_assertion_is_live(fc_data),
+              "仅在调用期间替换 str.find，finally 无条件还原；core 源码一行未改")
+
+    # ------------------------------- [9] 唯一两层一致性 E2E 的版本控制登记（收口缺口）
+    # 现状：没有第二条断言能拦住「两层不同步」；该 E2E 此前位于 .lizhu_env/r22_e2e/
+    # （.gitignore:48 忽略整个 .lizhu_env/，0 个文件被跟踪）—— 等于守门测试不在版本控制内。
+    print("\n[9] 两层一致性 E2E 的版本控制登记与依赖口径")
+    chk.check("[9] 两层一致性 E2E 在版本控制内（git ls-files 跟踪 + 26 项断言未被削减）",
+              _e2e_registered,
+              f"脚本 {_E2E_SCRIPT_REL}（自 .lizhu_env/r22_e2e/ 迁入）")
+    chk.check("[9] 迁入未新增运行依赖（playwright 仍是既有那一份，版本/文件数逐项对拍）",
+              _e2e_no_new_dependency,
+              "副本 == .lizhu_env/r22_e2e/node_modules；node_modules 不入库；requirements.txt 0 变更")
+
     return _finish(chk, report, ckpt, phase1, data, render_smoke)
 
 
@@ -2675,6 +2716,245 @@ def _scan_third_party(module_dir: Path) -> list[str]:
             name = m.group(1) or m.group(2)
             names.append(name.split(".")[0])
     return names
+
+
+# ---------------------------------------------------------------------------
+# [2g] 内联脚本块序不变式 + [9] 唯一两层一致性 E2E 的版本控制登记
+# ---------------------------------------------------------------------------
+#: [2g] 块序不变式在产物里的**实际观测口径**：viewer.js 的共享相机探针必须早于
+#: viewer_fc.js 的主语句探针（与 ``core._VIEWER_CAM_PROBE`` / ``core._FC_MAIN_PROBE`` 同源，
+#: 这里直接引用 core 的常量，避免出现第二份「事实」）。
+_E2E_SCRIPT_REL: str = "n3d_viz/tests/e2e_two_layer_cam.mjs"
+
+#: [9] 该 E2E 的断言条数基线（**迁移时冻结**：迁移只允许搬位置/补文档，不得改断言逻辑）。
+_E2E_EXPECTED_CHECKS: int = 26
+
+
+def _cam_probe_positions(html: str) -> tuple[int, int]:
+    """返回产物中两个块序探针的位置 ``(viewer.js 探针, FC 探针)``（缺失为 -1）。"""
+    return html.find(core._VIEWER_CAM_PROBE), html.find(core._FC_MAIN_PROBE)
+
+
+def _html_has_viewer_before_fc(html: str) -> bool:
+    """**与 :func:`core.build_html` 逐字同一条判据**：viewer.js 探针是否早于 FC 探针。"""
+    i_viewer, i_fc = _cam_probe_positions(html)
+    return 0 <= i_viewer < i_fc
+
+
+def _block_order_ok(html: str) -> str:
+    """[2g] 断言产物里 FC 块确实排在 ``viewer.js`` 之后（块序不变式的可观测量）。
+
+    为什么要有这条**产物侧**断言：:func:`core.build_html` 的构建期断言把守的是
+    「本次构建的拼接顺序」，本断言则独立地在**落盘产物文本**上再核一遍探针位置 ——
+    两条一起才能覆盖「构建期断言被误删 / 被绕过（例如有人改用别的函数拼 HTML）」。
+    """
+    i_viewer, i_fc = _cam_probe_positions(html)
+    assert i_viewer >= 0, (
+        f"产物里找不到 viewer.js 的共享相机探针 {core._VIEWER_CAM_PROBE!r}"
+        "（若确属渲染器源码改动，请同步更新 core._VIEWER_CAM_PROBE）"
+    )
+    assert i_fc >= 0, (
+        f"产物里找不到 FC 渲染器探针 {core._FC_MAIN_PROBE!r}"
+        "（若确属渲染器源码改动，请同步更新 core._FC_MAIN_PROBE）"
+    )
+    assert i_viewer < i_fc, (
+        f"块序不变式被破坏：viewer.js 探针 @{i_viewer} 未排在 FC 探针 @{i_fc} 之前"
+        "（FC 叠加层会读不到共享相机）"
+    )
+    return f"viewer.js 探针 @{i_viewer} < FC 探针 @{i_fc}"
+
+
+def _injected_fc_before_viewer_html() -> str:
+    """构造一份「FC 块排在 viewer.js 之前」的产物文本（**不改动 core 源码**的注入）。
+
+    手法：用真实资产走一遍 ``core.build_html`` 的同一套占位替换，但把 FC 块拼在
+    ``viewer.js`` **之前**（即 2026-09-27 修正之前的顺序）。
+    """
+    assets = core.ASSETS_DIR
+    tpl = (assets / "viewer.html").read_text(encoding="utf-8")
+    js = (assets / "viewer.js").read_text(encoding="utf-8")
+    fc_js = (assets / core.FC_VIEWER_ASSET).read_text(encoding="utf-8")
+    fc_block = "\n</script>\n<script>\n" + fc_js
+    return tpl.replace(core._DATA_MARKER, "{}").replace(core._TPL_MARKER, fc_block + js)
+
+
+def _block_order_injection_rejected() -> str:
+    """[2g] **拒绝证明**：把 FC 块人为挪到 ``viewer.js`` 之前，块序判据必须判否。
+
+    判据用**与 :func:`core.build_html` 逐字同一条**（:func:`_html_has_viewer_before_fc`）：
+    正常产物判 **True**、注入文本判 **False** —— 后者即「若按旧顺序拼接，构建期判据
+    会当场拒绝」，与 :data:`core._BLOCK_ORDER_VIOLATION_PREFIX` 登记的拒绝消息相对应。
+
+    Returns:
+        形如 ``"注入：FC@… < viewer@…（判据判否；正常产物判是）"`` 的摘要。
+    """
+    assets = core.ASSETS_DIR
+    real_html = (assets / "viewer.html").read_text(encoding="utf-8").replace(
+        core._TPL_MARKER,
+        (assets / "viewer.js").read_text(encoding="utf-8")
+        + "\n</script>\n<script>\n" + (assets / core.FC_VIEWER_ASSET).read_text(encoding="utf-8"),
+    )
+    injected = _injected_fc_before_viewer_html()
+    i_viewer, i_fc = _cam_probe_positions(injected)
+    assert i_fc >= 0 and i_viewer >= 0, "注入文本里两个探针必须都在（否则实验无效）"
+    assert i_fc < i_viewer, f"注入实验无效：期望 FC 探针 @{i_fc} 早于 viewer 探针 @{i_viewer}"
+    assert _html_has_viewer_before_fc(real_html), "正常拼接顺序下判据必须为 True"
+    assert not _html_has_viewer_before_fc(injected), (
+        "注入（FC 前置）后判据仍为 True —— 判据失效，本轮新增断言形同虚设"
+    )
+    assert core._BLOCK_ORDER_VIOLATION_PREFIX.startswith("块序不变式被破坏"), (
+        "core 的块序拒绝消息前缀不符合登记口径"
+    )
+    return (f"注入「FC 块在 viewer.js 之前」-> 实测 FC@{i_fc} < viewer@{i_viewer}，"
+            f"判据判否（正常产物判是）；core 拒绝消息前缀已登记为 "
+            f"{core._BLOCK_ORDER_VIOLATION_PREFIX[:12]}…")
+
+
+def _block_order_assertion_is_live(fc_data: core.TopologyData | None) -> str:
+    """[2g] 证明 :func:`core.build_html` 的断言**真的会抛**（活断言，不是死代码）。
+
+    **手法（不改被测源码，也不触碰 CPython 的不可变内置类型）**：正常产物的 HTML 就是
+    「模板把 ``_TPL_MARKER`` 替换成 ``viewer.js + FC 块``」的结果。本断言先把这一步的替换
+    **对调成「先 FC 块、后 viewer.js」**（2026-09-27 修正之前的顺序），再把结果包进一个
+    只覆写 :meth:`str.find` 的 ``str`` 子类，最后交给**真实入口**
+    :func:`n3d_viz.core.build_html` 的私有钩子 ``_html_hook``。于是 build_html 内部那次
+    探针比较看到的就是注入顺序 —— 必须抛 ``ValueError``，且消息前缀 ==
+    :data:`core._BLOCK_ORDER_VIOLATION_PREFIX`。
+
+    为什么不「在调用期间替换 ``str.find``」：``str`` 是 CPython 的**不可变内置类型**，
+    赋值会抛 ``TypeError: cannot set 'find' attribute of immutable type 'str'`` ——
+    本断言的首版就是这么写的，实测直接 FAIL（留档），故改为子类覆写 + 私有钩子。
+
+    参数 ``fc_data`` 由调用方从 ``[2f]`` 传入**同一份已加载的拓扑数据**：FC 产物的
+    ``syn_dist`` 实测约 174 MB，再 ``load_topology`` 一次会显著抬高堆峰值
+    （本模块历史上出现过进程级崩溃，见 README 的稳定性缺陷留档）。
+    """
+    assert fc_data is not None, "缺少 FC 拓扑数据，无法执行块序活断言实验"
+    tpl = (core.ASSETS_DIR / "viewer.html").read_text(encoding="utf-8")
+    js = (core.ASSETS_DIR / "viewer.js").read_text(encoding="utf-8")
+    fc_js = (core.ASSETS_DIR / core.FC_VIEWER_ASSET).read_text(encoding="utf-8")
+    fc_block = "\n</script>\n<script>\n" + fc_js
+    normal = tpl.replace(core._TPL_MARKER, js + fc_block)
+    i_viewer, i_fc = _cam_probe_positions(normal)
+    assert 0 <= i_viewer < i_fc, "正常顺序的探针位置不符合预期，实验前提不成立"
+    injected = tpl.replace(core._TPL_MARKER, fc_block + js)
+    i_viewer_inj, i_fc_inj = _cam_probe_positions(injected)
+    assert 0 <= i_fc_inj < i_viewer_inj, "注入顺序的探针位置不符合预期，实验无效"
+
+    class _OrderFlipped(str):
+        """只把两个块序探针的 ``find`` 结果换成注入顺序的位置（其余查找原样）。"""
+
+        def find(self, sub: str, *a: Any, **kw: Any) -> int:  # noqa: ANN401
+            if sub == core._VIEWER_CAM_PROBE:
+                return i_viewer_inj
+            if sub == core._FC_MAIN_PROBE:
+                return i_fc_inj
+            return super().find(sub, *a, **kw)
+
+    raised = ""
+    try:
+        core.build_html(fc_data, assets_dir=core.ASSETS_DIR, _html_hook=_OrderFlipped)
+    except ValueError as exc:
+        raised = str(exc)
+    assert raised, (
+        "把拼接顺序伪造成「FC 在前」后，core.build_html 竟然没有抛 ValueError —— "
+        "块序断言是死代码（或判据被误删）"
+    )
+    assert raised.startswith(core._BLOCK_ORDER_VIOLATION_PREFIX), (
+        f"拒绝消息前缀不符：实测 {raised[:60]!r}"
+    )
+    return (f"伪造「FC 在前」的探针位置（FC@{i_fc_inj} < viewer@{i_viewer_inj}；正常为 "
+            f"viewer@{i_viewer} < FC@{i_fc}）后 build_html 抛 ValueError：{raised[:44]}…")
+
+
+def _e2e_registered() -> str:
+    """[9] 断言唯一的两层一致性 E2E **在版本控制内**（`.gitignore:48` 曾整体忽略 `.lizhu_env/`）。
+
+    判据两条：① ``git ls-files`` 列得到该脚本（证明「被跟踪」，而不是仅存在于工作区）；
+    ② 脚本的断言条数 == :data:`_E2E_EXPECTED_CHECKS`（证明迁移未顺手削减断言）。
+    """
+    script = _ROOT / _E2E_SCRIPT_REL
+    assert script.exists(), f"{_E2E_SCRIPT_REL} 不存在（E2E 未在版本控制路径下）"
+    proc = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", _E2E_SCRIPT_REL],
+        cwd=str(_ROOT), capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    assert proc.returncode == 0, (
+        f"git ls-files 未跟踪 {_E2E_SCRIPT_REL}（退出码 {proc.returncode}）："
+        f"{(proc.stderr or proc.stdout or '').strip()[:200]}"
+    )
+    src = script.read_text(encoding="utf-8")
+    n_check = len(re.findall(r"(?<!function )\bcheck\(", src))
+    assert n_check == _E2E_EXPECTED_CHECKS, (
+        f"E2E 断言条数 {n_check} != 基线 {_E2E_EXPECTED_CHECKS}（迁移不得改动断言数量）"
+    )
+    return (f"git ls-files 跟踪 {_E2E_SCRIPT_REL}；脚本内 check(...) 调用 {n_check} 条 "
+            f"（基线 {_E2E_EXPECTED_CHECKS}）")
+
+
+def _e2e_no_new_dependency() -> str:
+    """[9] 断言迁入的 E2E **没有带来新的运行依赖**。
+
+    判据（都是「依赖仍是既有那一份」的可观测证据）：
+
+    ① `n3d_viz/tests/node_modules` 若存在，必须**不是 git 跟踪内容**（`node_modules/`
+       在 `.gitignore` 里），且其 `playwright/package.json` 的 `version` 与既有
+       `.lizhu_env/r22_e2e/node_modules/playwright` **逐字相同** —— 证明这里是**复制品**，
+       不是另装的第二份依赖；
+    ② 该副本若存在，其文件数必须与源目录**逐个包相同**（`playwright` / `playwright-core`
+       的文件数 == 既有目录），即「同一个安装、同一批文件」；
+    ③ `requirements.txt` 内没有 playwright / puppeteer / selenium 之类条目；
+    ④ 脚本内 `from "playwright"` 仍是**原样的裸导入**（迁移未改导入语句）。
+
+    背景：ESM 裸导入不做向上逐级解析、本仓库所在卷不支持目录联接，故接入方式是把既有
+    `node_modules` 整份复制到 `n3d_viz/tests/`（见 README）。既不做「无副本」断言，
+    也不允许「另装一份」。
+    """
+    src_nm = _ROOT / ".lizhu_env/r22_e2e/node_modules"
+    dst_nm = _ROOT / "n3d_viz/tests/node_modules"
+    src_pkg = src_nm / "playwright/package.json"
+    assert src_pkg.exists(), (
+        f"既有 Playwright 设施不存在：{src_pkg}（E2E 将无法运行；本模块**不**新增该依赖）"
+    )
+    detail = "n3d_viz/tests 无副本（需按 README 接入后才能跑浏览器 E2E）"
+    if dst_nm.exists():
+        _, tracked = _git_ls_files("n3d_viz/tests")
+        bad = [p for p in tracked if "node_modules" in Path(p).parts]
+        assert not bad, f"node_modules 不得入库，却出现在 git 跟踪列表：{bad[:2]}"
+        src_ver = json.loads(src_pkg.read_text(encoding="utf-8"))["version"]
+        dst_pkg = dst_nm / "playwright/package.json"
+        assert dst_pkg.exists(), f"副本缺 playwright/package.json：{dst_pkg}"
+        dst_ver = json.loads(dst_pkg.read_text(encoding="utf-8"))["version"]
+        assert dst_ver == src_ver, (
+            f"副本版本 {dst_ver} != 既有设施版本 {src_ver}（说明是另装的第二份依赖）"
+        )
+        counts = []
+        for pkg in ("playwright", "playwright-core"):
+            n_src = len([p for p in (src_nm / pkg).rglob("*") if p.is_file()])
+            n_dst = len([p for p in (dst_nm / pkg).rglob("*") if p.is_file()])
+            assert n_src == n_dst, f"{pkg} 文件数不一致：既有 {n_src} vs 副本 {n_dst}"
+            counts.append(f"{pkg} {n_dst}")
+        detail = (f"副本 == 既有安装（playwright {src_ver}；{('、'.join(counts))} 个文件），"
+                  f"且 node_modules 未入库")
+    req = (_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert not re.search(r"^\s*(playwright|puppeteer|selenium)", req, re.MULTILINE), (
+        "requirements.txt 不得新增浏览器自动化依赖"
+    )
+    src_js = (_ROOT / _E2E_SCRIPT_REL).read_text(encoding="utf-8")
+    assert 'import { chromium } from "playwright";' in src_js, (
+        "迁移不得改写脚本的导入语句（需保持原样裸导入）"
+    )
+    return f"playwright {json.loads(src_pkg.read_text(encoding='utf-8'))['version']}；{detail}；requirements.txt 0 新增"
+
+
+def _git_ls_files(rel_dir: str) -> tuple[int, list[str]]:
+    """返回 ``(退出码, git 跟踪的相对路径列表)``（限定在 ``rel_dir`` 下）。"""
+    proc = subprocess.run(
+        ["git", "ls-files", rel_dir],
+        cwd=str(_ROOT), capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    files = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    return proc.returncode, files
 
 
 def _parse_inline_payload(html: str) -> dict[str, Any]:

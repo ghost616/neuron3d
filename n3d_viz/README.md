@@ -434,7 +434,7 @@ FC 统计面板，底部图例含 FC 条目，左上工具栏有「全连接层�
 | # | 缺陷 | 症状 | 根因与修复 |
 |---|---|---|---|
 | 1 | 叠加层 `z-index` 不够 | 改动 FC 绘制颜色后**截图字节数完全不变** → FC 一个像素都看不见 | `#view` 是 `position:absolute; inset:0` 且 z-index 为 auto；叠加层 `z-index:5` 仍排在它**之后**（同层叠上下文内定位元素并不必然压过未设 z-index 的定位元素）。改为 `z-index:20` |
-| 2 | `draw()` 里的**正反馈环** | 面板被缩到几乎不可见（实测叠加层 `cam.dist` 由正确的 6.7565 涨到 12.2015 = 滚轮 clamp 上限 `radius*40`） | 原实现每帧「用上一帧的 dist 反推用户缩放倍率」：第 1 帧把 dist 归一到 `radiusWithFc*3.6`，第 2 帧又把它当「已缩放的距离」再乘一次 `radiusWithFc/radius`，逐帧放大。改为**自带 `userZoom` 倍率**（默认 1），滚轮/重置按钮通过捕获阶段事件同步 |
+| 2 | `draw()` 里的**正反馈环** | 面板被缩到几乎不可见（实测叠加层 `cam.dist` 由正确的 6.7565 涨到 12.2015 = 滚轮 clamp 上限 `radius*40`） | 原实现每帧「用上一帧的 dist 反推用户缩放倍率」：第 1 帧把 dist 归一到 `radiusWithFc*3.6`，第 2 帧又把它当「已缩放的距离」再乘一次 `radiusWithFc/radius`，逐帧放大。**当时**改为自带 `userZoom` 倍率（默认 1），滚轮/重置按钮通过捕获阶段事件同步 —— 该机制已在 §2.6 连同「自建相机」一并**删除**（现改为每帧从共享相机 `window.__n3d_cam` 直读，`userZoom` / `ZOOM_FACTOR` 在现行代码中**不存在**）。本行只是缺陷 1–4 的历史留档，现行口径以 §2.6 为准 |
 | 3 | 面板相对云太小 | 面板只占云横向尺寸的约 40%，在 825 神经元 + 2,588 边的视图里读不出「两端包裹」 | 新增 `FC_PANEL_SPAN_RATIO = 1.0`：单元间距改为「面板目标跨度 / 网格边长」，使面板与云同尺度 |
 | 4 | 抽样连线密度压过面板 | alpha 0.95 时输出侧面板完全糊成一片青蓝雾，网格结构不可辨 | 连线降为 `rgba(150,240,255,0.16)`、线宽 0.6px、虚线间隔拉大；面板单元改为**不透明**填充 + 亮边框并按 0.88 收缩留缝（29×29 等距实心会糊成一块色板） |
 
@@ -496,6 +496,21 @@ FC 几何入口对 `H=0` / `H=-1` / `H=True` / 流向轴非法 / 云跨度为 0 
 **内联脚本顺序**：`core.build_html` 把 FC 块追加在 **`viewer.js` 之后**
 （`viewer.js` 是共享相机的写入方，必须先执行）。实测产物块序：
 数据块 → `viewer.js` → FC 块。
+
+**块序不变式已是可执行断言（2026-09-28）**：该顺序不再只靠注释约定 ——
+`core.build_html` 在返回 HTML 之前**显式断言**「`viewer.js` 的
+`window.__n3d_cam = cam;` 出现在 `viewer_fc.js` 的 `var DATA = window.N3D_DATA;` 之前」，
+违反即抛 `ValueError`（构建期失败，而不是产出一份两层不同步的 HTML）。
+相应地，**上面那个「相机不可用」告警分支在当前产物里结构上不可达**：
+
+| 场景 | 告警分支是否可达 |
+|---|---|
+| 正常产物（`core.build_html` 产出） | **不可达** —— 块序断言保证 FC 块排在 `viewer.js` 之后，首帧就能读到相机 |
+| 手工注入 / 手改拼接顺序把 FC 块移到 `viewer.js` 之前 | **可达** —— `core.build_html` 直接抛 `ValueError`（构建期即被拦下，产物根本不会生成） |
+| 把 `assets/viewer_fc.js` 单独加载到页面（不经 `build_html`） | **可达** —— 此时没有任何断言把关，只能靠页面内告警 + E2E 的「无告警面板」断言 |
+
+因此该告警分支是**纵深防御的第二道**（第一道是块序断言）：断言覆盖「本模块自己拼 HTML」，
+告警覆盖「脚本被单独加载 / 页面被手改」这类绕过构建路径的场景。
 
 ### 2.7 锚点重基线记录（2026-09-27「相机单一事实来源」轮）
 
@@ -599,9 +614,40 @@ FC 统计面板独立存在且含声明与矩阵形状、叠加层实际产生�
 「基础画布与 FC 叠加画布是否用同一套相机」，因此「FC 图层不跟随旋转」这个缺陷
 **全部自检都通过**（渲染器冒烟只验证函数被调用、不验证两层是否同源）。本组断言专门补这个盲区。
 
-脚本：`.lizhu_env/r22_e2e/e2e_two_layer_cam.mjs`（Playwright + Chromium headless，**既有测试设施**，
-`playwright` 来自离朱 r22 轮已安装的 `.lizhu_env/r22_e2e/node_modules`，**不是本次新增的运行依赖**；
-`requirements.txt` 实测 0 变更行）。
+脚本：**`n3d_viz/tests/e2e_two_layer_cam.mjs`**（2026-09-28 从 `.lizhu_env/r22_e2e/e2e_two_layer_cam.mjs`
+**迁入版本控制** —— `.gitignore:48` 忽略了整个 `.lizhu_env/`，该目录 0 个文件被跟踪，
+放在那里等于「唯一的守门测试不在版本控制内」）。Playwright + Chromium headless，
+**运行依赖仍是既有那一份**：`playwright` 来自离朱 r22 轮已安装在
+**`.lizhu_env/r22_e2e/node_modules`** 的安装（≈17.7 MB、183 个文件），**不是本次新增的运行依赖**，
+`requirements.txt` 实测 0 变更行。
+
+**Node 的 ESM 解析要求（接入时必须知道）**：ESM 的**裸导入不做「向上逐级」解析** —— 实测把脚本放在
+`n3d_viz/tests/` 后，`node n3d_viz/tests/e2e_two_layer_cam.mjs …` 直接报
+`ERR_MODULE_NOT_FOUND: Cannot find package 'playwright'`；`NODE_PATH`、`--preserve-symlinks` 也都无效
+（`NODE_PATH` 只对 CJS 生效）。本仓库所在卷**不支持**目录联接（实测 `mklink /J`：
+`Local NTFS volumes are required to complete the operation`），因此接入方式为：
+把既有的 `.lizhu_env/r22_e2e/node_modules` **复制**到 `n3d_viz/tests/node_modules`
+（`node_modules/` 在 `.gitignore` 中，不会入库；`n3d_viz/tests/` 下**不出现在 git 跟踪列表**里），
+脚本**一个字符都不用改**（导入语句仍是原样的裸导入）。
+
+```bash
+# 0) 一次性接入（仅新克隆/新环境需要；依赖仍是既有 .lizhu_env 里的那一份）
+cp -r .lizhu_env/r22_e2e/node_modules n3d_viz/tests/node_modules     # Windows: Copy-Item -Recurse -Force
+
+# 1) 产出两件待测 HTML（默认写入 checkpoints/n3d_viz/，k 取默认 3）
+python -m n3d_viz --checkpoint checkpoints/n3d_sphere/model.pt --out-dir checkpoints/n3d_viz --quiet
+python -m n3d_viz --checkpoint checkpoints/n3d_shape/full_shapesphere_N825_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_fc-1_s42_fc_align.pt --out-dir checkpoints/n3d_viz --quiet
+
+# 2) 跑两层几何一致性 E2E（在仓库根执行；实测 通过 26 / 失败 0，退出码 0）
+node n3d_viz/tests/e2e_two_layer_cam.mjs \
+    checkpoints/n3d_viz/viz_model.html \
+    checkpoints/n3d_viz/viz_full_shapesphere_N825_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_fc-1_s42_fc_align.html
+```
+
+无 FC 时 `viewer.js` 也暴露共享相机，故**两件产物都必须传**（第 1–4 项断言专门守无 FC 回归）。
+需要 `node` 与上一步的 `n3d_viz/tests/node_modules`；两者缺一时该 E2E **不参与**自动断言
+（`verify_viz.py` 的 `[9]` 组只断言「脚本在版本控制内、断言数未被削减、未新增运行依赖」，
+**不**自动执行浏览器 E2E）。
 
 | # | 断言 | 口径 |
 |---|---|---|
@@ -618,7 +664,8 @@ FC 统计面板独立存在且含声明与矩阵形状、叠加层实际产生�
 | 23–24 | **点击重置** | 基础层与叠加层都**回到初始取景**（与初始缓冲**逐字节相同**） |
 | 25 | 交互不崩 | 四种交互全程**无 JS 报错** |
 
-**实测（真实 Chromium）**：**通过 26 / 失败 0**，退出码 0。
+**实测（真实 Chromium）**：**通过 26 / 失败 0**，退出码 0（迁移后以 `n3d_viz/tests/e2e_two_layer_cam.mjs`
+在仓库根重跑复核，脚本断言逻辑与断言数均未改动）。
 **方向一致性的容差标定**：平移用「变化像素质心」单位向量点积 > 0.5（实测 0.971，余量充足）；
 旋转**不**用该口径 —— 两层渲染的是不同世界特征（神经元云 vs 端部面板），旋转时它们的
 质心位移方向本就不同（实测点积可达 −0.78），改用上面的「预测位置命中」决定性口径。
@@ -630,6 +677,19 @@ FC 统计面板独立存在且含声明与矩阵形状、叠加层实际产生�
 | 注释掉 `viewer.js` 的 `window.__n3d_cam = cam;`（模拟「忘记暴露」） | E2E **14 项 FAIL / 12 项 PASS**（共享相机 `typeof=undefined`、叠加层**0 像素**、四类交互断言全失败、告警面板出现）、退码 1，**且能正常打印汇总行** |
 | 把 `viewer_fc.js` 改回「自建相机副本（yaw/pitch 恒定、不跟随旋转）」的旧形态（**精确复现原缺陷**） | E2E **2 项 FAIL**：`旋转：叠加层也发生了明显变化` 实测**变化像素 0**；`旋转后：旧位置已不再是…` 实测旧位置仍有像素且新位置旋转前也有像素、退码 1 |
 | 恢复后 | `viewer.js` / `viewer_fc.js` SHA256 **逐字节回到注入前**，`node --check` 退出码 0，E2E 回到 26/0 |
+
+**块序不变式的拒绝证明（2026-09-28 收口轮，实测留档）**：把 `core.build_html` 里那一次替换
+从 `js + fc_block`（现行）改为 `fc_block + js`（2026-09-27 修正之前的顺序），
+`core.py` SHA256 `35359CDA…` → `0327C9CD…`：
+
+| 观测点 | 注入后实测 |
+|---|---|
+| `core.build_html` | 抛 `ValueError`：`块序不变式被破坏：FC 叠加渲染器（viewer_fc.js）必须排在 viewer.js **之后**（实测探针位置 viewer.js@571362 > FC@547944）` —— **产物根本生成不出来** |
+| `[2g]` 产物侧探针断言 | FAIL：`viewer.js 探针 @27838 未排在 FC 探针 @4420 之前（FC 叠加层会读不到共享相机）` |
+| 全量 `verify_viz.py` | 大批 FAIL（每个 FC 产物在 `[2c]` 的 8 项泛化不变量上都报同一条 `ValueError`，`[2d]` 的 PLY/OBJ 重渲亦 FAIL） |
+| 恢复后 | `core.py` SHA256 **逐字节回到 `35359CDA…`**，`python -m compileall -q n3d_viz` 退出码 0 |
+
+> 该实验只在**一次命令内**改一行、随即还原（见本节「验收命令」），不留任何中间产物。
 
 > **脚本健壮性（离朱 R24 的 F1，已修）**：上表第一种注入下，脚本原先会在格式化
 > 「预测屏幕位置」时抛 `TypeError: Cannot read properties of null (reading 'toFixed')`
@@ -674,6 +734,8 @@ n3d_viz/
 │   ├── viewer.js        # 三维交互渲染器（构建时内联进产物）
 │   ├── viewer_fc.js     # 两端全连接包裹的**叠加渲染器**（仅在 fc_dim != 0 时内联）
 │   └── viewer_smoke.js  # 渲染器逻辑冒烟脚本（Node + DOM 桩）
+├── tests/
+│   └── e2e_two_layer_cam.mjs  # 两层几何一致性 E2E（Playwright；26 项断言；**在版本控制内**）
 └── README.md
 ```
 
@@ -681,8 +743,8 @@ n3d_viz/
 
 **为什么 FC 渲染器是独立的第三个资源文件**：`viewer.html` 与 `viewer.js` 都被**逐字内联**进每一份 HTML，
 改动它们任何一个字节都会破坏「无 FC 产物逐字节零回归」的硬约束。因此 FC 渲染被完整隔离在
-`assets/viewer_fc.js` 中，只在 `data.fc` 非 None 时作为**追加的一段脚本块**内联到「内联数据」块内
-（从而在 DOM 中排在 `viewer.js` **之前**执行）。无 FC 产物因此连一个字节都不变。
+`assets/viewer_fc.js` 中，只在 `data.fc` 非 None 时作为**追加的一段脚本块**内联进产物
+（`core.build_html` 把它追加在 **`viewer.js` 之后**，见 §2.6 与 core.py 的块序断言）。无 FC 产物因此连一个字节都不变。
 
 ---
 
@@ -701,8 +763,10 @@ python n3d_viz/verify_viz.py --report checkpoints/n3d_viz/_verify/verify_report.
 故全连接层支持轮汇总为 **485 项**，再经离朱独立测试修复轮 **+5 项**（[2f] 契约回归防线）→ **490 项**，
 再经**相机单一事实来源轮 +27 项**：`[2d]` 由单一锚点的 14 项改为**多锚点组**结构
 （3 组 × 「磁盘 6 项 + 重渲 6 项」+ 清理 2 项 = 38 项）+ 新增 3 条承重断言
-（锚点组覆盖 K≤9 与 K>9 / PLY·OBJ 逐字节不变 / HTML 重基线登记齐备）→ **现行 517 项**
-（实测通过 **517** / 失败 **0** / 跳过 **1**，退出码 **0**；
+（锚点组覆盖 K≤9 与 K>9 / PLY·OBJ 逐字节不变 / HTML 重基线登记齐备）→ **517 项**，
+再经**收口轮 +5 项**：新增 `[2g]` 3 项（块序不变式的产物侧探针顺序 / 注入拒绝证明 /
+**活断言证明**）+ `[9]` 2 项（E2E 在版本控制内且 26 项断言未削减 / 迁入未新增运行依赖）
+→ **现行 522 项**（实测通过 **522** / 失败 **0** / 跳过 **1**，退出码 **0**；
 唯一 SKIP 是 `[2c]` 的「非 N3D 拓扑产物已明确跳过（逐个计入报告）」说明行）。
 新增项全部**从 checkpoint 读实际 N / E / K / 层规模，不写死任何值**；既有构成：`[2a]` 5 项
 （层配色可扩展性 + 撞色回退分支）+ `[2b]` 42 项（5 类非规整几何合成样本 × 8 项 +
@@ -766,14 +830,22 @@ FC 产物另加「面板点数 == 2×H + 2」不变量 —— 因此 **FC 路径
 ### 一键复现（口径要点）
 
 ```bash
-# 1) 全量硬断言（含 [2d] 用当前代码重渲并与锚点常量比对）
+# 1) 全量硬断言（含 [2d] 用当前代码重渲并与锚点常量比对、[2g] 块序不变式、[9] E2E 版本控制登记）
 python -m compileall -q n3d_viz
-python n3d_viz/verify_viz.py --report checkpoints/n3d_viz/_verify/verify_report.md   # 期望 517/0/1，退出码 0
+python n3d_viz/verify_viz.py --report checkpoints/n3d_viz/_verify/verify_report.md   # 期望 522/0/1，退出码 0
 
 # 2) JS 语法 + 渲染器逻辑冒烟
 node --check n3d_viz/assets/viewer.js
 node --check n3d_viz/assets/viewer_fc.js
 node --check n3d_viz/assets/viewer_smoke.js
+
+# 3) 两层几何一致性 E2E（26 项断言，在真实 Chromium 中执行）
+#    需要先按「E2E 两层几何一致性」小节把既有 node_modules 复制到 n3d_viz/tests/
+node --check n3d_viz/tests/e2e_two_layer_cam.mjs
+node n3d_viz/tests/e2e_two_layer_cam.mjs \
+    checkpoints/n3d_viz/viz_model.html \
+    checkpoints/n3d_viz/viz_full_shapesphere_N825_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_fc-1_s42_fc_align.html
+# 实测：通过 26 / 失败 0，退出码 0
 
 # 3) 重新生成某产物（字节级复核时 --checkpoint 必须是**相对仓库根**的路径，理由见 §2）
 python -m n3d_viz -c checkpoints/n3d_sphere/model.pt --out-dir checkpoints/n3d_viz/_verify/_repro
@@ -877,9 +949,9 @@ broadcast_neuron_to_in / neuron_of_output_syn / neuron_of_input_syn / ln_s_in.we
 | `\|edge_weight\|`（min / median / max） | 0.002693684 / 0.307065487 / 0.845361531（median 口径见 §5「数值口径（唯一化）」） |
 | 阈值过滤保留边数 | ≥0.05 → 681；≥0.10 → 620；≥0.20 → 517；**≥0.30 → 379**；≥0.50 → 140 |
 | `syn_dist` 体积 | 16,777,216 字节（未进入内存、未嵌入 HTML） |
-| HTML / PLY / OBJ 大小 | 88,521 / 4,120 / 15,695 字节 |
-| 产物 SHA256 | HTML `15A80EBBF2FD586B…` / PLY `9A097D16306160F9…` / OBJ `1F594ECF466E28F7…`（几何无关化前后、以及本轮全连接层支持前后**逐位相同**） |
-| 验证汇总 | 通过 **517** / 失败 0 / 跳过 1（退出码 0）。按 `verify_report.md` 的**断言清单序号**定位（序号由断言插入顺序决定，新增断言会使后续序号顺移，故**以断言名称为准**）：渲染器逻辑冒烟 = 名称「内联渲染器可执行且投影正确」（内含 13 条子断言，均通过）；`[2f]` 组共 **88** 项；`[2c]` 组共 **261** 项（含 1 条 SKIP 说明） |
+| HTML / PLY / OBJ 大小 | 88,521 / 4,120 / 15,695 字节（HTML 为相机轮前旧值；现行 88,741 字节，见 §2.7） |
+| 产物 SHA256 | HTML `15A80EBBF2FD586B…`（**相机单一事实来源轮前的旧值**；现行锚点为 `A5FEE937B8023B98…`，见 §2.7）/ PLY `9A097D16306160F9…` / OBJ `1F594ECF466E28F7…`（PLY·OBJ 在几何无关化、全连接层支持、相机轮与本收口轮前后**逐位相同**） |
+| 验证汇总 | 通过 **522** / 失败 0 / 跳过 1（退出码 0）。按 `verify_report.md` 的**断言清单序号**定位（序号由断言插入顺序决定，新增断言会使后续序号顺移，故**以断言名称为准**）：渲染器逻辑冒烟 = 名称「内联渲染器可执行且投影正确」（内含 13 条子断言，均通过）；`[2f]` 组共 **88** 项；`[2c]` 组共 **261** 项（含 1 条 SKIP 说明）；本收口轮新增 `[2g]` **3** 项 + `[9]` **2** 项 |
 
 **6.2 非规整 / 异构几何产物（`checkpoints/n3d_shape/`，seed=42）**
 
@@ -906,7 +978,8 @@ broadcast_neuron_to_in / neuron_of_output_syn / neuron_of_input_syn / ln_s_in.we
 - **`fc_dim = -1`**（有效宽度 `H` 跟随 `N`，即 `H = 825`）；CLI 渲染命令与参数见 §1.1 / §5「一键复现」
 - 全部指标见 §2.5「有 FC 产物的实测值」表（`|S_in|=582` / `|S_out|=588`、
   `proj_weight [582,825]` = 480,150 条、`fc_out_weight [825,588]` = 485,100 条、
-  抽样 3,510 条、面板点 1,650、HTML 591,709 / PLY 81,681 / OBJ 154,372 字节）
+  抽样 3,510 条、面板点 1,650、HTML 591,709 / PLY 81,681 / OBJ 154,372 字节；
+  **HTML 591,709 是相机轮前旧值，现行 594,926 字节**，见 §2.7）
 - 真实浏览器渲染证据：`checkpoints/n3d_viz/_verify/viewer_fc_screenshot.png`（1440×900，
   547,213 字节，含两片面板 / 两个边界块 / 抽样连线 / FC 统计面板；见 §2.5 末节的缺陷留档）
 
@@ -935,3 +1008,14 @@ broadcast_neuron_to_in / neuron_of_output_syn / neuron_of_input_syn / ln_s_in.we
 - **抽样口径必须显式声明**：FC 连线是「抽样显示（每神经元 top-k），**非全部连接**」，该声明写进 HTML `meta.fcDeclaration`、PLY 头部注释、OBJ 伴随注释与文档三处，`[2f]` 组有专门断言把守。
 - **平台**：Windows 上"打开输出文件夹"用 `os.startfile`；Linux 用 `xdg-open`；macOS 用 `open`。
 - **无图形环境**：`--skip-gui` 可跳过 GUI 冒烟断言；CLI 入口不受影响。
+- **块序不变式（可执行）**：`core.build_html` 保证 FC 块排在 `viewer.js` **之后**，并在返回前用探针串
+  （`core._VIEWER_CAM_PROBE` / `core._FC_MAIN_PROBE`）**断言**该顺序，违反即抛 `ValueError`
+  （有 FC 时才有该断言；无 FC 产物字节不变）。配套的「相机不可用」告警分支因此**在当前产物里不可达**，
+  仅在「手改拼接顺序」或「把 `viewer_fc.js` 单独加载」时可达 —— 见 §2.6。
+- **零回归锚点的承重前提**：`PHASE2_ANCHOR_*` / `ANCHOR_GROUPS` / `PLY_OBJ_BASELINE` 的恒定值都取自
+  「上游 checkpoints 产物逐字节不变」这一前提（`PLY_OBJ_BASELINE` 采集于 `HEAD = 927d32f`）。
+  上游若**破坏性重建 / 清空重训** `checkpoints/`，这些条目会**集体 FAIL 而原因不在渲染器** ——
+  判读顺序固定为「先核对上游产物是否同一份，再怀疑渲染路径」。
+- **两层一致性 E2E 在版本控制内**：`n3d_viz/tests/e2e_two_layer_cam.mjs`（26 项断言）是唯一能拦住
+  「两层不同步」回归的测试，已由 `.lizhu_env/r22_e2e/` 迁入（`.gitignore:48` 忽略整个 `.lizhu_env/`）。
+  接入与运行方式见 §3「E2E 两层几何一致性」；`[9]` 组把守「在版本控制内 + 断言数未削减 + 未新增运行依赖」。

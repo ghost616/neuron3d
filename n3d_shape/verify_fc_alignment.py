@@ -7,6 +7,12 @@ A. **fc_dim 语义与关闭路径零回归**（预先定义的硬断言）：
    * `fc_dim < -1` 在 `Config` 构造期被拒；
    * `fc_dim == 0` 时**不创建任何 FC 参数 / buffer**，且模型逐张量与**改动前快照**
      (`_verify/fc_pre_change_snapshot.json`，由改动前的源码现场生成) **逐位一致**；
+   * **承重前置断言：该快照"确属改动前"** —— 快照 `source_sha256` 中的 `config.py` /
+     `model.py` / `train.py` 必须与**当前**三个源文件的 SHA256 **两两不等**
+     （佐证判据：快照 `config` 不含本次改动新增的 `fc_dim` 键）。**理由**：上面的逐位
+     比对是"关闭路径零回归"的**全部**证据，其效力完全依赖"快照早于改动"这一前提；
+     若快照恰在含改动的源码上生成，该比对会退化为"实现与自身一致"的**自洽性检查**
+     （不报错但证明力归零），故把该前提写成硬断言而非人工目视；
    * `fc_dim == 0` 的产物名**不含** `_fc` 段（既有命名规则逐字不变），
      `fc_dim != 0` 的产物名**含** `_fc{n}` 段且与关闭路径不同名；
    * 解析式参数量公式 == `count_parameters()`；`count_dense_weight_tensors() == 0`。
@@ -17,6 +23,9 @@ C. **搜索块复核**：逐 seed 的 `chosen_N` 必须等于其 17 行实测表
    （含"记录的表"与"现场重建该 N 的实测值"两重核对）。
 D. **零回归**：33 个既有产物（10 个三期 + 22 个 N 阶梯 + 1 个一期 MLP）SHA256 的
    **代码内冻结常量**承重断言。
+E. **汇总块交叉校验**：`summary.per_seed` 与逐条记录一致；**配对差符号计数**（正 / 负 / 零）
+   由 `per_seed[*].delta_pp` **现场统计**，并与**台账登记值**及 **README §18 声明值**
+   三方比对（承重断言，防止"4 正 5 负"被写成"5 正 4 负"这类无产物支撑的方向计数再犯）。
 
 用法
 ----
@@ -36,6 +45,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -45,6 +55,18 @@ CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints", "n3d_shape")
 VERIFY_DIR = os.path.join(CHECKPOINT_DIR, "_verify")
 LEDGER = os.path.join(VERIFY_DIR, "fc_alignment_runs.json")
 SNAPSHOT = os.path.join(VERIFY_DIR, "fc_pre_change_snapshot.json")
+README = os.path.join(MODULE_DIR, "README.md")
+
+# 快照"确属改动前"的承重断言所覆盖的源文件（与快照 source_sha256 的键一一对应）。
+SNAPSHOT_SOURCE_FILES: Tuple[str, ...] = ("config.py", "model.py", "train.py")
+
+# 配对差符号计数的**冻结期望**（承重断言：README / 台账登记值 / 现场复算三者必须同时等于它）。
+# 期望值来源：README §18.5 实测配对表（9 对）—— 正：seed 1/3/43/2024，负：seed 2/7/42/99/123。
+# 之所以允许在此**硬编码期望条数**：它正是"防止 README 方向计数被写错"的锚点；
+# 除此之外的一切数值（mean/stdev/min/max、逐 seed 的 delta_pp）都现场从台账取数、不得硬编码。
+EXPECT_SIGN_POS = 4
+EXPECT_SIGN_NEG = 5
+EXPECT_SIGN_ZERO = 0
 
 # ----------------------------------------------------------------------
 # 固定口径（**独立复述**；与 README §18 的表头一一对应）
@@ -307,6 +329,150 @@ def rebuild_metrics(rec: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def check_snapshot_precedes_change(snap: Dict[str, Any]) -> List[str]:
+    """**承重断言**：证明 ``fc_pre_change_snapshot.json`` 确属"改动前"生成的快照。
+
+    职责
+    ----
+    A3 段用该快照做 ``fc_dim == 0`` **关闭路径逐位零回归**证明；该证明的**全部效力**都
+    建立在"快照是在**尚未引入 `fc_dim` 的源码**上生成"这一前提上。若快照恰在**含改动的
+    源码**上生成，A3 就退化为"实现与自身一致"的自洽性检查（与既有"同源比对"同类的
+    失效模式）：不报错，但**零回归证明归零**。故此处把该前提写成硬断言。
+
+    判据（主判据 + 佐证判据，两者都参与失败判定）
+    --------------------------------------------
+    * **主判据**：快照 ``source_sha256`` 的三个源文件（``config.py`` / ``model.py`` /
+      ``train.py``）必须**都存在**，且当前磁盘上同名文件的 SHA256 与快照值**两两不等**
+      —— 直接、可复现、与源码内容一一对应；源码一旦回退到改动前状态即 FAIL。
+    * **佐证判据**：快照 ``config`` **不含** ``fc_dim`` 键 —— `fc_dim` 是本次改动新增的
+      ``Config`` 字段，改动前的 ``config`` 不可能带该键（结构性证据）。
+
+    参数
+    ----
+    snap : Dict[str, Any]
+        已加载的快照 JSON。
+
+    返回
+    ----
+    List[str]
+        问题列表；**空列表 = 快照确属改动前**（调用方据此决定 A3 是否仍是零回归证明）。
+    """
+    problems: List[str] = []
+    src = snap.get("source_sha256") or {}
+    if not src:
+        problems.append("[快照] 快照缺少 source_sha256 段 —— 无法证明其早于改动")
+    else:
+        for name in SNAPSHOT_SOURCE_FILES:
+            frozen = str(src.get(name, ""))
+            if not frozen:
+                problems.append(f"[快照] 快照 source_sha256 缺少 {name} —— 无法证明其早于改动")
+                continue
+            path = os.path.join(MODULE_DIR, name)
+            if not os.path.isfile(path):
+                problems.append(f"[快照] 当前源文件缺失：{name}")
+                continue
+            live = sha256_of(path)
+            if live == frozen:
+                problems.append(
+                    f"[快照] {name} 当前 SHA256 与快照相同（{live[:12]}）—— 该快照**不是**"
+                    f"改动前生成的，A3 的零回归证明退化为自洽性检查")
+                print(f"        [!] {name}: 快照={frozen[:12]} 当前={live[:12]}（相同 -> FAIL）")
+            else:
+                print(f"        [ok] {name}: 快照={frozen[:12]} 当前={live[:12]}（不同）")
+    if "fc_dim" in (snap.get("config") or {}):
+        problems.append("[快照] 快照 config 含 fc_dim 键（佐证判据失败）—— 快照非改动前生成")
+    return problems
+
+
+def readme_paired_sign_declaration() -> Optional[Tuple[int, int, int]]:
+    """从 README §18.5 解析配对差**符号计数**声明。
+
+    匹配形如 ``<n> 对中 <p> 对为正、<m> 对为负`` 的句子（允许 Markdown 粗体包裹）。
+
+    返回
+    ----
+    Optional[Tuple[int, int, int]]
+        ``(n_total, n_pos, n_neg)``；README 未声明该计数时返回 ``None``（调用方记为问题）。
+    """
+    if not os.path.isfile(README):
+        return None
+    with open(README, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    hits = re.findall(r"(\d+)\s*对中\s*(\d+)\s*对为正[、,]\s*(\d+)\s*对为负", text)
+    if not hits:
+        return None
+    uniq = {(int(a), int(b), int(c)) for a, b, c in hits}
+    # 必须**唯一**：若文档既写了新口径、又原样引用了旧口径的**同一句式**，视为声明矛盾，
+    # 交由断言 FAIL 提示人工统一（避免"谁先出现谁生效"的隐式口径）。
+    if len(uniq) != 1:
+        return None
+    return uniq.pop()
+
+
+def check_paired_sign_counts(summ: Dict[str, Any], report: List[str]) -> List[str]:
+    """**承重断言**：配对差符号计数的「现场复算 == 台账登记值 == README 声明值」。
+
+    背景：README §18.5 曾把实测的「4 对为正、5 对为负」写成「5 对为正、4 对为负」
+    （无产物支撑的方向计数）。本函数用三重比对把该口径钉住：
+
+    1. **现场复算**：由 ``summary.per_seed[*].delta_pp`` 现数正 / 负 / 零的条数；
+    2. **台账登记值**：``summary.paired_delta_vs_mlp`` 的 ``n_pos`` / ``n_neg`` / ``n_zero``；
+    3. **README 声明值**：§18.5 文本中的「N 对中 P 对为正、M 对为负」。
+
+    三者必须同时等于冻结期望（``EXPECT_SIGN_POS`` / ``EXPECT_SIGN_NEG`` / ``EXPECT_SIGN_ZERO``），
+    且 ``n_total`` 必须等于现场复算的配对条数。
+
+    参数
+    ----
+    summ : Dict[str, Any]
+        台账 ``summary`` 块。
+    report : List[str]
+        报告行收集器（本函数会 append 一行）。
+
+    返回
+    ----
+    List[str]
+        问题列表（空 = 三方一致）。
+    """
+    problems: List[str] = []
+    deltas = [float(it["delta_pp"]) for it in (summ.get("per_seed") or []) if "delta_pp" in it]
+    n_pos = sum(1 for d in deltas if d > 0)
+    n_neg = sum(1 for d in deltas if d < 0)
+    n_zero = sum(1 for d in deltas if d == 0)
+    reg = summ.get("paired_delta_vs_mlp") or {}
+    reg_triplet = (reg.get("n_pos"), reg.get("n_neg"), reg.get("n_zero"))
+    readme_triplet = readme_paired_sign_declaration()
+    if not deltas:
+        problems.append("[汇总] 台账 summary.per_seed 中没有 delta_pp，无法统计配对差符号计数")
+        report.append("  [FAIL] 配对差符号计数：台账无可统计的 delta_pp")
+        print(report[-1])
+        return problems
+    if reg_triplet != (n_pos, n_neg, n_zero):
+        problems.append(
+            f"[汇总] 配对差符号计数：台账登记值 {reg_triplet} != 现场复算 {(n_pos, n_neg, n_zero)}")
+    if readme_triplet is None:
+        problems.append(
+            "[汇总] README 未声明「N 对中 P 对为正、M 对为负」符号计数"
+            "（或声明**不唯一/自相矛盾**，例如纠错说明里原样引用了旧口径的同一句式）")
+    else:
+        if readme_triplet != (len(deltas), n_pos, n_neg):
+            problems.append(
+                f"[汇总] README §18.5 符号计数声明 {readme_triplet} != 现场复算 "
+                f"{(len(deltas), n_pos, n_neg)}")
+    expect = (EXPECT_SIGN_POS, EXPECT_SIGN_NEG, EXPECT_SIGN_ZERO)
+    if (n_pos, n_neg, n_zero) != expect:
+        problems.append(
+            f"[汇总] 配对差符号计数 {n_pos} 正 / {n_neg} 负 / {n_zero} 零 != 冻结期望 "
+            f"{EXPECT_SIGN_POS} 正 / {EXPECT_SIGN_NEG} 负 / {EXPECT_SIGN_ZERO} 零")
+    ok = not problems
+    report.append(
+        f"  [{' ok ' if ok else 'FAIL'}] 配对差符号计数（承重断言）：现场复算 {n_pos} 正 / "
+        f"{n_neg} 负 / {n_zero} 零（n={len(deltas)}）；台账登记 {reg_triplet}；"
+        f"README §18.5 声明 {readme_triplet}")
+    print(report[-1])
+    return problems
+
+
 def check_fc_semantics(problems: List[str], report: List[str]) -> None:
     """A 段：fc_dim 语义 + 关闭路径逐位零回归 + 命名不变式。"""
     Config, ThreeDNeuronSpace, _, _ = load_modules()
@@ -344,7 +510,20 @@ def check_fc_semantics(problems: List[str], report: List[str]) -> None:
     print(report[-1])
 
     # A3: 关闭路径无 FC 参数/buffer，且与**改动前快照**逐位一致
+    #
+    # [!] 承重前置断言（本轮补上）：先证明"快照确属改动前"，再做逐位比对。
+    #     否则若快照在含改动的源码上生成，下方比对会退化为"实现与自身一致"（证明力归零）。
     snap = json.load(io.open(SNAPSHOT, encoding="utf-8"))
+    snap_pre_problems = check_snapshot_precedes_change(snap)
+    snap_pre_ok = not snap_pre_problems
+    problems.extend(snap_pre_problems)
+    report.append(
+        f"  [{' ok ' if snap_pre_ok else 'FAIL'}] 快照确属改动前（承重断言）：三个源文件当前 "
+        f"SHA256 与快照 source_sha256 两两不等={snap_pre_ok}；"
+        f"快照 config 无 fc_dim 键={'fc_dim' not in (snap.get('config') or {})}")
+    print(report[-1])
+    if not snap_pre_ok:
+        print("        [!] 快照前置断言失败 —— 下方逐位比对已退化为**自洽性检查**，不再构成零回归证明")
     s_cfg = snap["config"]
     cfg0 = Config(**s_cfg)
     m0 = ThreeDNeuronSpace(cfg0)
@@ -380,11 +559,12 @@ def check_fc_semantics(problems: List[str], report: List[str]) -> None:
     same_count = int(m0.count_parameters()) == int(snap["params_count"])
     if not same_count:
         problems.append(f"[fc 语义] fc_dim=0 参数量 {m0.count_parameters()} != 快照 {snap['params_count']}")
+    a3_ok = (not (mism or extra or missing or fw_mism or fc_names or not same_count)) and snap_pre_ok
     report.append(
-        f"  [{' ok ' if not (mism or extra or missing or fw_mism or fc_names or not same_count) else 'FAIL'}] "
-        f"fc_dim=0 与改动前快照逐位一致：张量 {len(cur)} 个全等={not (mism or extra or missing)}，"
-        f"前向 {len(fw)} 个全等={not fw_mism}，参数量 {m0.count_parameters()}"
-        f"（快照 {snap['params_count']}），无 FC 参数/buffer={not fc_names}")
+        f"  [{' ok ' if a3_ok else 'FAIL'}] fc_dim=0 与**改动前**快照逐位一致：张量 {len(cur)} 个"
+        f"全等={not (mism or extra or missing)}，前向 {len(fw)} 个全等={not fw_mism}，"
+        f"参数量 {m0.count_parameters()}（快照 {snap['params_count']}），"
+        f"无 FC 参数/buffer={not fc_names}，快照前置断言成立={snap_pre_ok}")
     print(report[-1])
     del m0
     gc.collect()
@@ -567,11 +747,30 @@ def check_search(problems: List[str], ledger: Dict[str, Any]) -> None:
         table = res.get("table") or []
         ns = [int(r[0]) for r in table]
         ok_range = ns == list(range(N_SEARCH_LO, N_SEARCH_HI + 1))
+        # [!] 缺 `chosen_N` / `chosen_params` 时**不得崩溃**（本轮修复）：
+        #     原先以 `int(res.get("chosen_N", 0))` 兜底调用 `live_params(seed, 0, FC_DIM)`，
+        #     而 `Config` 对 `N <= 0` 会 raise ValueError 且此处不捕获 → 整个复核脚本
+        #     **traceback 崩溃**，而不是以退码 1 报告"[搜索] seed=… 不一致"。
+        #     现改为：先判 `chosen_N` 存在且 > 0（`chosen_params` 同步判），
+        #     不满足则记 problem 并 `continue`（跳过该 seed 的现场重建，不中断其余核对）。
+        chosen_n_raw = res.get("chosen_N")
+        chosen_p_raw = res.get("chosen_params")
+        if (not isinstance(chosen_n_raw, int) or isinstance(chosen_n_raw, bool)
+                or chosen_n_raw <= 0
+                or not isinstance(chosen_p_raw, int) or isinstance(chosen_p_raw, bool)):
+            problems.append(
+                f"[搜索] seed={seed}: chosen_N / chosen_params 缺失或非法"
+                f"（chosen_N={chosen_n_raw!r}、chosen_params={chosen_p_raw!r}）"
+                f"—— 无法现场重建该 N 做核对")
+            print(f"  [FAIL] seed={seed:<6d} chosen_N={chosen_n_raw!r} chosen_params={chosen_p_raw!r} "
+                  f"-> 缺失/非法，跳过现场重建（记 problem，不崩溃）")
+            continue
         best = min(table, key=lambda r: abs(int(r[1]) - TARGET_PARAMS)) if table else None
-        ok_argmin = best is not None and int(best[0]) == int(res.get("chosen_N")) and int(best[1]) == int(res.get("chosen_params"))
-        live = live_params(seed, int(res.get("chosen_N", 0)), FC_DIM)
-        ok_live = int(live["params"]) == int(res.get("chosen_params"))
-        dev = (int(res.get("chosen_params", 0)) - TARGET_PARAMS) / TARGET_PARAMS * 100.0
+        ok_argmin = (best is not None and int(best[0]) == chosen_n_raw
+                     and int(best[1]) == chosen_p_raw)
+        live = live_params(seed, chosen_n_raw, FC_DIM)
+        ok_live = int(live["params"]) == chosen_p_raw
+        dev = (chosen_p_raw - TARGET_PARAMS) / TARGET_PARAMS * 100.0
         ok_tol = abs(dev) <= DEV_TOL_PCT
         if not (ok_range and ok_argmin and ok_live and ok_tol):
             problems.append(
@@ -625,7 +824,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ---- 汇总块交叉校验 ----
     print("-" * 100)
-    print("E. 汇总块交叉校验（与台账 summary 逐字段比对）")
+    print("E. 汇总块交叉校验（与台账 summary 逐字段比对 + 配对差符号计数承重断言）")
     mlp = {int(r["seed"]): r for r in ledger.get("runs", [])
            if r.get("arch") == "mlp" and r.get("status") == "ok"}
     summ = ledger.get("summary") or {}
@@ -643,6 +842,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 problems.append(f"[汇总] seed={it['seed']} params/dev 与记录不一致")
         print(f"  [{' ok ' if per_seed_ok else 'FAIL'}] per_seed "
               f"{len(summ.get('per_seed', []))} 条与记录一致={per_seed_ok}")
+        # 配对差符号计数：现场复算（per_seed.delta_pp）== 台账登记值 == README §18.5 声明值
+        problems.extend(check_paired_sign_counts(summ, report))
     if mlp:
         accs = [float(r["test_acc"]) for r in mlp.values()]
         print(f"  MLP 基线（同预算同 seed）：n={len(accs)} min={min(accs) * 100:.2f}% "
@@ -654,8 +855,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         for p in problems:
             print(f"  - {p}")
         return 1
-    print("[PASS] fc_dim 语义与关闭路径零回归成立、台账逐条与产物现场复核一致（含同参偏差 <= 0.5%）、"
-          "搜索块 argmin 属性成立、产物名两两唯一、既有 33 个产物零回归")
+    print("[PASS] fc_dim 语义与关闭路径零回归成立（**含**「快照确属改动前」承重断言）、"
+          "台账逐条与产物现场复核一致（含同参偏差 <= 0.5%）、搜索块 argmin 属性成立、"
+          "配对差符号计数三方一致（现场复算 == 台账登记 == README §18.5）、"
+          "产物名两两唯一、既有 33 个产物零回归")
     return 0
 
 

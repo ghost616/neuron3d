@@ -184,11 +184,11 @@
 - `cyl_aspect: float = 1.0`（圆柱长径比 `λ = c/r`，仅 `cylinder` 生效）
 - CLI：`--shape {sphere,cube,cylinder}`、`--cyl-aspect R`；**两者都必须纳入 `explicit` 判定与 `apply_overrides`**，否则会被静默丢弃。
 - `to_dict()` / `describe()` / 预设同步。
-
+- **交叉引用（`fc_dim` 族，细则见「两端全连接包裹（fc_dim）」节）**：`--fc-dim` 是形状无关的第三个 CLI 覆盖项，两条易错约束须在此索引节点明：① 通用规则「负数一律报错」对 `--fc-dim` **单独豁免** —— **`-1` 合法**（表示"跟随 `N`"，即两端有效宽度 `H = N`），仅 `< -1` 报错；② **`--arch mlp` 搭配非 0 `--fc-dim` 在 CLI 层直接拒绝**（拒绝静默无效参数）。另：`--fc-dim` 的 `default=None`（`None` 与 `0` 必须区分），且必须纳入 `explicit` 判定与 `apply_overrides`，`to_dict()` / `describe()` 必须含该字段。
 ## 产物指纹（防撞名硬要求）
 
 指纹**必须新增形状维度**（`cylinder` 还须含长径比），否则 N/H/D/seed/scope 相同的三种形状会**互相覆盖**（历史纠正记录中的 `verify_<bpe>.pt` 同名互覆同类缺陷）。须附"同配置不同形状产物名互不相同"的可区分性断言。
-
+- **交叉引用（`_fc{n}` 段，细则见「两端全连接包裹（fc_dim）」节）**：`fc_dim != 0` 时 `full_checkpoint_name` / `config_fingerprint` / `smoke_fingerprint` 额外插入 `_fc{n}` 段（`-1` 亦按 `_fc-1` 落名），`fc_dim == 0` **不加段**，故既有产物名**逐字不变**；"关闭路径与改动前快照逐位一致"的取证口径同见该节。同时注意 CLI 侧两条约束：`--fc-dim` 的 **`-1` 是「负数一律报错」通用规则的豁免值**，而 **`--arch mlp` 搭配非 0 `--fc-dim` 被拒绝**。
 ## 冒烟判据
 
 把二期 15 条冒烟判据同构为形状感知版本，退出码语义保持 0 / 1 / 2。三形状冒烟全绿，且 `sphere` 分支与二期数值一致。
@@ -375,7 +375,6 @@ MLP 9-seed mean 98.6289% / min 98.54% / max 98.73% / σ 0.0595%。
 `verify_full_runs.py` 退码 0（零回归）。
 ## 两端全连接包裹（fc_dim）
 
-
 ### 两端全连接包裹（单一配置 `fc_dim`）
 
 **职责**：在 N3D 主模型上新增**单一配置 `fc_dim`**，实现"**两端全连接包裹 N3D 核心**"的结构，
@@ -433,6 +432,13 @@ x [B,784]
 （第 3 轮把 `fc_dim` 加入 `("shape", "cyl_aspect", "fc_dim")`；否则 `Phase2Config(**phase2_kw)`
 会抛 `TypeError` 使 S12 整段异常 —— 该回归由本轮 `verify_shape.py` 首次运行捕获并修复）。
 
+**[R22 承重前置断言] 快照「确属改动前」**：上述逐位比对的**全部**证明力都依赖"快照是在**尚未引入
+`fc_dim` 的源码**上生成"这一前提；若快照恰在含改动的源码上生成，该比对会退化为"实现与自身一致"的
+**自洽性检查**（不报错但证明力归零）。故 `verify_fc_alignment.py` 的 A3 段在比对**之前**先做硬断言
+`check_snapshot_precedes_change()`：当前 `config.py` / `model.py` / `train.py` 的 SHA256 与快照
+`source_sha256` **两两不等**（主判据）＋ 快照 `config` **不含** `fc_dim` 键（佐证判据）；
+任一不满足即 FAIL（A3 行同时标注"已退化为自洽性检查"）并退码 1。
+
 ### fc_dim 同参对齐对照（`run_fc_alignment.py` / `verify_fc_alignment.py`）
 
 **职责**：逐 seed 搜索 `N` 使 `fc_dim=-1` 的总参数最接近 MLP 基线，再在同预算下做配对对照。
@@ -446,24 +452,40 @@ x [B,784]
 
 **接口**：
 
-* `run_fc_alignment.py --stage {search,train,all} [--force] [--dry-run] [--extract <ckpt>]`：
+* `run_fc_alignment.py --stage {search,train,all} [--force] [--dry-run] [--allow-partial] [--extract <ckpt>]`：
   `search` 档为**构造探测**（只构造不训练，逐 N 实测 `params`）；`train` 档按解出的 `N`
   跑 9 组 N3D+FC 与 9 组 MLP；每轮**独立子进程** + 逐轮 UTF-8 日志（末尾真实退出码）+
   台账 `_verify/fc_alignment_runs.json`（`N`/`seed`/`arch`/`fc_dim`/`params`/偏差/`E`/`K`/
   `|S_in|`/`|S_out|`/`test_acc`/产物名/`SHA256`/退出码/耗时 + 逐 seed 的 17 行搜索表，
   **全部现场取数**）+ **断点续跑** + 失败轮如实记录不静默重试 + 运行前后 **33 个既有产物**
   SHA256 零回归快照断言；退出码 `0`/`1`/`2`。
-* `verify_fc_alignment.py`：现跑复核。A 段 `fc_dim` 语义与关闭路径逐位零回归（对改动前快照）；
-  B 段台账逐条（SHA/命名/字段/产物 `config` 口径/现场重建复算/**同参偏差 ≤ 0.5% 断言**）；
-  C 段搜索块（`chosen_N` 必须等于 17 行实测表的 `argmin`，且现场重建该 `N` 的 `params` 一致）；
-  D 段 **33 个既有产物 SHA256 冻结常量**承重断言；退出码 `0`/`1`。
+  **[R22] 覆盖度硬断言**：退出码除"已存在记录是否成功"外还要求**覆盖度** ——
+  `search` 档须 **9/9** 个 seed 有合法搜索解（`chosen_N` 为正整数、`chosen_params` 为整数、
+  `within_tol` 为真）；`train` / `all` 档须 **18/18** 轮齐备（9 组 N3D `fc_dim=-1` + 9 组 MLP，
+  `status="ok"` 且 `exit_code=0`）**且 9/9 个 seed 的搜索解齐备**；不满足默认退码 **1**
+  （新增 CLI `--allow-partial` 可把覆盖度缺口**显式降级为信息**，默认不降级）。
+  **[R22] 前置条件强化**：`train` 档在**构造计划之前**校验 `missing_search_solutions()`，
+  任一 seed 缺合法解即以人类可读报文退码 **2**（不猜测 `N`、不部分执行）；
+  训练循环对"待搜索"哨兵 `-1` 亦做防御式处理（最终仍无解 -> 打印 `[FAIL]`、跳过该轮并计入失败判定），
+  不再抛未捕获 `KeyError`（该缺陷由离朱 R22 独立测试发现）。
+  **[R22] 汇总块新增字段**：`summary.paired_delta_vs_mlp` 追加现场统计的
+  `n_pos` / `n_neg` / `n_zero`（配对差符号计数登记值）。
+* `verify_fc_alignment.py`：现跑复核。A 段 `fc_dim` 语义与关闭路径逐位零回归（对改动前快照，
+  **含 R22 的"快照确属改动前"承重前置断言**）；B 段台账逐条（SHA/命名/字段/产物 `config` 口径/
+  现场重建复算/**同参偏差 ≤ 0.5% 断言**）；C 段搜索块（`chosen_N` 必须等于 17 行实测表的 `argmin`，
+  且现场重建该 `N` 的 `params` 一致；**缺 `chosen_N` / `chosen_params` 时记问题并跳过该 seed，
+  不崩溃**）；D 段 **33 个既有产物 SHA256 冻结常量**承重断言；E 段汇总块交叉校验**含 R22 的
+  配对差符号计数三方一致承重断言**（现场复算 == 台账登记值 == README §18.5 声明值 == 冻结期望
+  `4 正 / 5 负 / 0 零`）；退出码 `0`/`1`。
 
 **实测结论（真实执行，18 轮全部退出码 0、33 个既有产物零回归）**：
 选中 `N ∈ [822, 828]`（跨度 1.1%，逐 seed 不同），偏差 `-0.3166% ~ +0.0209%`（**9/9 ≤ 0.5%**）；
 N3D+FC 9-seed `test_acc` mean **98.6344%** / min 98.52% / max 98.75% / σ 0.0875%，
 MLP 9-seed mean 98.6289% / min 98.54% / max 98.73% / σ 0.0595%；
 **配对差**（同 seed 逐对）mean **+0.0056 pp**、stdev 0.1374 pp、min −0.21 pp、max +0.21 pp
-（9 对中 5 正 4 负）。消耗：搜索 106.9 s + 训练 7,796.7 s ≈ 2.17 h。
+（**9 对中 4 对为正、5 对为负**：正 = `seed` 1/3/43/2024，负 = `seed` 2/7/42/99/123；
+该计数为 R22 更正的实测口径，早前误写为"5 正 4 负"，现由 README §18.5、台账登记值与
+`verify_fc_alignment.py` E 段断言三方钉住）。消耗：搜索 106.9 s + 训练 7,796.7 s ≈ 2.17 h。
 
 **两条限制**：① 同参对齐只是"参数量接近"（±0.5%），`E`(2,566–2,611) / `K`(恒 15) /
 `|S_in|`(576–600) / `|S_out|`(566–597) 与逐 seed 的 `N` 仍各不相同，且 MLP 是 dense 全连接、
@@ -474,3 +496,30 @@ N3D+FC 是"全连接 + 稀疏 DAG + 全连接"的混合结构，两者**完全�
 **验证链**：`compileall` 退码 0；`verify_fc_alignment.py` 退码 0；`verify_shape.py` 全量 **145/145**、
 `verify_full_runs.py` 退码 0；`fc_dim=-1` 冒烟 **16/16** 退码 0。
 
+**R22 收口轮证据（`_verify/` 下）**：拒绝证明驱动 `r22_guard_proofs.py`（`--only p1|p2|p3|p4|p5`）
+与日志 `r22_proof_p1..p5.log`、复核全程日志 `r22_verify_fc_alignment.log`、
+改前台账备份 `fc_alignment_runs.pre_r22.json`、改前 spec 备份 `r22_spec_preimage.md`。
+**已知未决项**：`lizhu_r21_scripts/t4_audit.py` 的 `T4-22` 仍按旧口径断言"5 正 4 负"（本轮不改），
+口径以台账登记值 + README §18.5 + E 段断言为权威。
+**[R22 第二轮补强] 搜索档对"非法既有记录"的处置**：`--stage search` / `--stage all` 的 `[跳过]` 分支
+**不得对 `ledger['search'][str(seed)]['chosen_N']` 直接下标**（缺键会抛未捕获 `KeyError`：traceback + 退码 1、
+无人类可读 `[FAIL]`，且该行在本轮之前即已存在）。现行口径：搜索档按**查表取值**判断该 seed 是否已完成；
+若台账中"该 seed **有记录但记录非法**"（缺 `chosen_N` / 非正整数 / `chosen_params` 非整数），
+则**显式打印 `[FAIL]` 报告该非法记录并重算该 seed**（不静默沿用、不崩溃），该 seed 计入
+`repaired_seeds` 参与最终失败判定（**退码 1**）—— 即"输入台账异常如实判失败，但脚本不崩溃、
+且把可算的解算出来落盘，供复核后重跑"。合法台账下 `--stage search` 行为逐字不变（9 个 seed 全 `[跳过]`、退码 0）。
+**[R22 第三轮补强] 覆盖度判据与"证据版本标识"的两处口径固定（离朱 R22 第三轮 G1/G2 后）**：
+① **G1 —— 证明用例与新增路径重叠的教训（判据未变，仅证明方式改写）**：`--only p3` 的 P3c 原以
+"把 `search[seed].chosen_params` 改成非整数"造 search 档覆盖度缺口，而该形态**同时命中**
+「非法既有记录」判据；本轮 F1 口径下脚本在覆盖度判定**之前**先重算该 seed（行序：
+`repaired_seeds.append` 早于 `coverage_problems`），重算后 search 档覆盖度恢复 `9/9`，
+遂使"端到端观测 search 档覆盖度 FAIL"不再可行。**判据本身未变**：`search` 档缺口仍由
+`coverage_problems()` 记问题（默认退码 1）、`--allow-partial` 仍降级为 `[WARN]`；已把该证明改为
+**函数级**并补一条**端到端**断言把两种台账形态区分开 —— **缺失**（整条记录不存在）= 搜索档
+"正常补齐"（补齐后覆盖度 `9/9`、**退码 0**）vs **非法**（记录存在但 `chosen_N` 非法）=
+"如实报告 + 重算"（**退码 1**）。② **G2 —— 拒绝证明日志必须带版本标识**：日志若早于被测源码的
+最后一次写入，会出现"日志声称成立、当前代码不可复现"的**证据陈旧**。现行口径：拒绝证明驱动
+`r22_guard_proofs.py` **每次运行开头**打印被测源码的 SHA256（前 16）与 mtime
+（`[版本] run_fc_alignment.py SHA256=… mtime=…`），且**任何源码改动后必须重跑受影响的证明并刷新日志**。
+③ `--allow-partial` 的口径补充：它**只降级覆盖度断言**，既**不放宽** `train` 档前置条件（缺解仍退码 2），
+也**不改变**「台账搜索记录非法并已重算」所导致的退码 1（`--help` 与模块 docstring 均已明示）。

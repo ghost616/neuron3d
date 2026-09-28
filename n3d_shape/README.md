@@ -1380,6 +1380,7 @@ x [B,784]
 | 命名不变式 | `fc_dim=0` 的产物名**不含** `_fc` 段（既有 10 个三期产物名与 22 个 N 阶梯产物名逐字不变）；`fc_dim!=0` **含** `_fc{n}` 段且与关闭路径**不同名** |
 | dense 权重判据 | `fc_dim=-1` 时 `count_dense_weight_tensors() == 0` |
 | 解析式参数量 | `H·784 + H + |S_in|·H + E + N + H·|S_out| + H + 10·H + 10` == `count_parameters()` |
+| 快照**确属改动前**（承重断言，第 R22 轮补） | A3 段在做逐位比对**之前**先断言：当前 `config.py` / `model.py` / `train.py` 的 SHA256 与快照 `source_sha256` **两两不等**（佐证判据：快照 `config` **不含** `fc_dim` 键）。**理由**：逐位比对的**全部**证明力都建立在"快照早于改动"这一前提上 —— 若快照恰在含改动的源码上生成，该比对会退化为"实现与自身一致"的**自洽性检查**（不报错但证明力归零），故把该前提落成硬断言而非人工目视。拒绝证明：注入一份 `source_sha256` == 当前源码的快照 -> 断言 **FAIL**、退码 **1** |
 | 冒烟（fc 路径） | `python n3d_shape/train.py --smoke-test --fc-dim -1` -> **16/16 全绿、退出码 0**（写入**新文件** `smoke_shapesphere_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_bs32_fc-1_s42.pt`，未覆盖既有 `smoke*.pt`） |
 | 既有整链回归 | `compileall` 退码 0；`verify_shape.py` 全量 **145/145** 退码 0（含 S12 与二期逐张量 `torch.equal`）；`verify_full_runs.py` 退码 0；33 个既有产物 SHA256 逐位不变 |
 
@@ -1433,8 +1434,20 @@ MLP 基线（每个 seed 各一次；`--arch mlp`，`hidden_dim=2048`，与三�
 | stdev（`ddof=1`） | 0.0875% | 0.0595% |
 
 **与 MLP 的配对差（同 seed 逐对相减，9 对）**：mean **+0.0056 pp**、stdev **0.1374 pp**、
-min **-0.21 pp**、max **+0.21 pp** —— 即 **9 对中 5 对为正、4 对为负**，
+min **-0.21 pp**、max **+0.21 pp** —— 即 **9 对中 4 对为正、5 对为负**
+（正：`seed` 1 `+0.10 pp`、3 `+0.15 pp`、43 `+0.08 pp`、2024 `+0.21 pp`；
+负：`seed` 2 `-0.05 pp`、7 `-0.12 pp`、42 `-0.08 pp`、99 `-0.03 pp`、123 `-0.21 pp`），
 配对均值与 0 的差距远小于 seed 噪声（MLP 自身 9-seed 极差 0.19 pp、N3D+FC 自身极差 0.23 pp）。
+
+**符号计数口径（第 R22 轮纠错 + 承重断言）**：本节此前的「**5 对为正、4 对为负**」与台账
+逐条实测不符（**无产物支撑**），已按上表逐对方向更正为「**4 对为正、5 对为负**」。
+现在该计数由**三方比对**钉住：① `verify_fc_alignment.py` E 段由台账 `summary.per_seed[*].delta_pp`
+**现场复算**；② 台账 `summary.paired_delta_vs_mlp.n_pos` / `n_neg` / `n_zero` 的**登记值**
+（由 `run_fc_alignment.py::summarize_ledger` 现场统计写入）；③ **本节文本声明值**
+（`verify_fc_alignment.py` 直接解析本 README）。三者同时等于冻结期望
+`4 正 / 5 负 / 0 零`，任一不符即 FAIL。
+[!] 已知未决项：`lizhu_r21_scripts/t4_audit.py` 的 `T4-22` 仍按旧口径写「5 正 4 负」，
+该文件属离朱上一轮取证脚本、本轮**未改**（口径以台账与本节为准）。
 
 **读数须知（构造探测值与训练实测值必须分别标注）**：
 §18.3 的 `params` / `E` / `|S_in|` / `|S_out|` 是**构造探测值**（只构造不训练）；
@@ -1470,3 +1483,63 @@ MLP 是 `784 → 2048 → 10` 的**dense 全连接**，N3D+FC 是"全连接 + �
 （MLP 极差 0.19 pp）**同量级**，故**不足以支撑因果结论**。
 另外：本轮**未**与一期 `98.64%`（`epochs=12` + `dropout=0.1` 口径，见 §17.7 限制 ②）
 做同源比较；一期该值只能作**参考线**。
+
+### 18.7 第 R22 轮收口：断言加固与符号计数纠错（**未改动任何实测数据与产物字节**）
+
+本轮只改**文档与断言/校验逻辑**：不改 `config.py` / `model.py` / `train.py` 的实现行为、
+不改动任何 `checkpoints` 产物字节（`verify_fc_alignment.py` D 段 33 个既有产物 SHA256 冻结断言全绿、
+台账 18 条记录的磁盘 SHA 现场一致、`--stage train` 端到端复跑 **18 次 `[跳过]` / 0 次 `[运行]`**）。
+全部拒绝证明由 `_verify/r22_guard_proofs.py` 真实执行产出，日志见 `_verify/r22_proof_p1..p4.log`。
+
+| 编号 | 问题（皋陶对 `plan_5c92ab70` 的遗留项） | 处置（**承重断言**，非"打印提醒"） | 拒绝证明（真实执行） |
+| --- | --- | --- | --- |
+| B1 | 读改动前快照做逐位比对，却**从不校验快照自身记录的三源文件 SHA256**，"快照早于改动"只靠人工目视 —— 若快照在含改动源码上生成，零回归证明退化为"实现与自身一致" | A3 段前置硬断言 `check_snapshot_precedes_change()`：当前 `config.py` / `model.py` / `train.py` 的 SHA256 与快照 `source_sha256` **两两不等**（主判据）＋ 快照 `config` 不含 `fc_dim` 键（佐证判据） | 注入 `source_sha256` == 当前源码的快照 -> 3 项问题；A3 行 **FAIL** 并显式标注"下方逐位比对已退化为**自洽性检查**"；`main()` 退码 **1** |
+| B2 | `check_search` 以 `int(res.get("chosen_N", 0))` 兜底，而 `Config` 对 `N <= 0` raise 且不被捕获 -> 复核脚本 **traceback 崩溃**，而非退码 1 报"不一致" | 先判 `chosen_N` 存在且 > 0（`chosen_params` 同步判），不满足则记 problem 并 `continue` | 删除副本 `search['42'].chosen_N`：修复前路径复现 `ValueError: Config.N 必须为正整数，当前 N=0`；修复后 1 项人类可读问题、**无 traceback**、`main()` 退码 **1** |
+| B3 | 退出码只看"**已存在**记录是否成功"：`--stage search` 全程零记录也退码 0；`--stage train` 少跑 seed 不被判失败 | 新增 `coverage_problems()` 覆盖度硬断言（`search` 档 9/9 个 seed 有合法解、`train` 档 18/18 轮齐备），并新增 `--allow-partial` **显式**降级开关（默认不降级） | ① 字面删除一条训练记录 -> FAIL"缺失 seed=[42]"；② 端到端跑篡改台账 -> 覆盖度 FAIL、退码 **1**，且 `[跳过]=18`、`[运行]=0`（**零重训、零产物写入**）；③ search 档缺口：**函数级** `coverage_problems(led, "search")` 默认记问题（退码 **1** 语义）／`--allow-partial` 降级为 `[WARN]` 且返回 `[]`；端到端由 **P6**（非法既有记录 → 报告 + 重算 + 退码 **1**）与 **P3c-e2e**（整条记录缺失 → 补齐后覆盖度 `9/9`、退码 **0**）承担 |
+| B4 | `scan_log_health` 用 `open(...).read()` 不关句柄 | 统一 `with open(...) as fh` | `python -m py_compile` 退码 **0**（行为不变） |
+| B5 | spec 索引节未收录 `fc_dim` / `--fc-dim` / `_fc{n}` 的交叉引用 | 「配置与 CLI」「产物指纹（防撞名硬要求）」两节各补一行，指向「两端全连接包裹（fc_dim）」节，并点明 `--fc-dim` 的 **`-1` 豁免**与 **`--arch mlp` 搭配非 0 `--fc-dim` 被拒** | `read_spec_section` 复核（两节均含交叉引用行） |
+| B6 | §18.5 原文的**方向计数**"**5 对为正、4 对为负**"与台账逐条实测 **4 对为正、5 对为负** 不符（旧计数**无产物支撑**） | README 更正为 **4 对为正、5 对为负** 并列明逐对方向；`summarize_ledger()` 登记 `n_pos`/`n_neg`/`n_zero`；`verify_fc_alignment.py` E 段增加**三方一致**承重断言（现场复算 == 台账登记值 == README 声明值 == 冻结期望 `4/5/0`） | 三方一致 = `True`：现场复算 **4 正 / 5 负 / 0 零**（n=9）、台账登记 `(4, 5, 0)`、README §18.5 声明 `(9, 4, 5)` |
+
+**B3 补强（离朱 R22 独立测试发现的产品侧低危项，已修）**：`--stage train` 的原实现**只检查**
+`search` 块非空，于是**单个** seed 缺 `chosen_N` 时，计划退化为哨兵值 `-1`，
+随后训练循环执行 `int(ledger["search"][str(seed)]["chosen_N"])` 会抛**未捕获的 `KeyError`**
+（真实 CLI = traceback + 退码 1，**没有**人类可读的 `[FAIL]`）。修复分四处：
+① 新增 `missing_search_solutions()`，把"每个 seed 都须有正整数 `chosen_N` + 整数 `chosen_params`"
+集中为一处判据；② `train` 档**在构造计划之前**做前置检查，不满足即以人类可读报文退码 **2**
+（前置条件不满足；不猜测 `N`、不部分执行）；③ 训练循环对哨兵 `-1` 改为防御式处理
+（搜索档最终仍无解 -> 如实打印 `[FAIL]`、跳过该轮并把该 seed 计入失败判定），
+不再抛 `KeyError`；④ `coverage_problems` 的 `train` / `all` 档**同时**要求 `9/9` 个 seed 的搜索解齐备。
+拒绝证明（真实执行 `r22_guard_proofs.py --only p5`）：删除副本 `search['42'].chosen_N` ->
+修复前路径复现 `KeyError: 'chosen_N'`；修复后 `main(['--stage','train'])` 打印
+`[FAIL] train 档的前置条件不满足：… 缺/非法 seed=[42]`、**无 traceback**、退码 **2**、
+`[运行]` 次数 **0**（零重训、零产物写入）。日志 `_verify/r22_proof_p5.log`。
+
+**F1 补强（离朱 R22 第二轮发现，已修）**：`--stage search` / `--stage all` 的 `[跳过]` 打印原对
+`ledger['search'][str(seed)]['chosen_N']` **直接下标**，当台账中该 seed **有记录但记录非法**
+（缺 `chosen_N`）时抛未捕获 `KeyError`（traceback + 退码 1、无人类可读 `[FAIL]`；该行 R22 前即存在），
+并使训练循环的哨兵防御分支在 `--stage all` 下不可达。修复：搜索档改为**查表取值 + 非法记录显式报告并重算**
+（不静默沿用非法记录、不崩溃），非法记录对应的 seed 计入 `repaired_seeds` 参与最终失败判定（退码 1）；
+`--stage search` 在合法台账上的行为逐字不变（全部 `[跳过]`、退码 0）。
+
+**G1/G2 处置（离朱 R22 第三轮发现，已修）**：① **G1（中危）**：`--only p3` 的 P3c 原以
+`search['42'].chosen_params = "1625373"` 造 search 档缺口，而该形态**同时命中**本轮 F1 新增的
+「非法既有记录」判据 —— 新代码在覆盖度判定**之前**先重算该 seed，重算后覆盖度恢复 `9/9`，
+遂使 P3c 原先"要求默认档出现 search 档 FAIL 行"的断言失效。性质是**证明用例与新增路径重叠**，
+**覆盖度断言的函数级语义未变**（默认记问题、`--allow-partial` 降级）。已把 P3c 改为**函数级**
+（整条删除 `search['42']` → `coverage_problems(led, "search")` 记问题并点名 `seed=[42]`；
+`allow_partial=True` 返回空列表并打印 `[WARN]`），并补一条**端到端**断言把两种形态区分开：
+**缺失** = "正常补齐"（补齐后覆盖度 `9/9`、退码 **0**）vs **非法** = "报告 + 重算"（退码 **1**，见 P6）。
+② **G2（低危）**：拒绝证明日志原先**不带版本标识**，出现过"日志 mtime 早于源码最后一次写入"的
+**证据陈旧**问题。现 `r22_guard_proofs.py` 每次运行开头打印被测源码的 **SHA256（前 16）与 mtime**
+（`[版本] run_fc_alignment.py SHA256=… mtime=…`），使日志自带版本标识；并已重跑 `p3` / `p6` 刷新日志。
+
+**未决项（如实登记）**：`lizhu_r21_scripts/t4_audit.py` 的 `T4-22` 仍按旧口径断言"5 正 4 负"
+（该文件属离朱上一轮取证脚本，用户明确**本轮不改**）—— 其口径与台账 / §18.5 / E 段断言**不一致**，
+以**台账登记值 + 本节 + `verify_fc_alignment.py` E 段**为权威口径。
+
+**本轮证据文件（全部在 `_verify/`）**：`r22_guard_proofs.py`（拒绝证明驱动，`--only p1|p2|p3|p4|p5|p6|all`，
+另有 `--quick`、`--log`）、`r22_proof_p1.log` / `r22_proof_p2.log` / `r22_proof_p3.log` /
+`r22_proof_p4.log` / `r22_proof_p5.log` / `r22_proof_p6.log`、`r22_verify_fc_alignment.log`（复核脚本全程输出）、
+`fc_alignment_runs.pre_r22.json`（**本轮改动前的台账备份**，供逐行对比）、
+`r22_spec_preimage.md`（改前 spec 镜像，供 §18 节替换的 unified diff 复核）、
+`r22_tamper_*.json`（**临时**篡改副本，可安全删除）。

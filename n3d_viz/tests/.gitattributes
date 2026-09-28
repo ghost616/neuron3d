@@ -1,0 +1,7 @@
+# n3d_viz/tests/ 下的测试脚本一律按**字节原样**入库，禁止行尾自动转换。
+#
+# 为什么必须显式声明：本目录的 e2e_two_layer_cam.mjs 由 .lizhu_env/r22_e2e/ 迁入，
+# 其证据口径是「逐字节与迁移前相同」。本仓库若启用 core.autocrlf，入库的 LF 会在
+# 工作区被还原成 CRLF，使迁移后文件的 SHA256 与原文不再相同（离朱 R24 的差异归因
+# 首败因正是 write_text 的 LF-CRLF 转换）。-text 关闭该文件的所有行尾转换。
+* -text

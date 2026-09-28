@@ -147,6 +147,23 @@ FC_VIEWER_ASSET: str = "viewer_fc.js"
 _TPL_MARKER: str = "/*__N3D_VIEWER_JS__*/"
 _DATA_MARKER: str = "/*__N3D_DATA_JSON__*/"
 
+#: **块序不变式**的两个探针串（见 :func:`build_html` 的构建期断言）。
+#:
+#: 为什么不靠注释约定：FC 块若被拼到 ``viewer.js`` **之前**，叠加渲染器首帧读不到
+#: 共享相机 ``window.__n3d_cam``、会（正确地）拒绝绘制并打出「相机不可用」告警 ——
+#: 这类顺序回归在旧实现里**没有任何构建期断言**拦截，只有真跑浏览器的 E2E 能发现。
+#: 现在把它变成可执行约束：``build_html`` 返回前断言下面两个探针在最终 HTML 中
+#: 的出现顺序为「viewer.js 的探针在前」。
+#:
+#: 选串原则：各自**唯一且只属于本文件**（viewer.js 的共享相机暴露行、viewer_fc.js
+#: 的第一条语句），且**不含 ``</``** —— 避免与 ``</`` 转义、字符串字面量混淆。
+_VIEWER_CAM_PROBE: str = "window.__n3d_cam = cam;"
+_FC_MAIN_PROBE: str = "var DATA = window.N3D_DATA;"
+
+#: 块序不变式被破坏时抛出的 ``ValueError`` 消息**前缀**（用于让自检登记这一口径，
+#: 而不是在测试里复制一份消息文本）。
+_BLOCK_ORDER_VIOLATION_PREFIX: str = "块序不变式被破坏：FC 叠加渲染器（viewer_fc.js）必须排在 viewer.js **之后**"
+
 
 # ---------------------------------------------------------------------------
 # 层配色（HTML 与 PLY 的唯一同源实现）
@@ -1900,6 +1917,7 @@ def build_html(
     assets_dir: str | Path | None = None,
     include_planes: bool = True,
     fc_top_k: int = DEFAULT_FC_TOP_K,
+    _html_hook: type = str,
 ) -> str:
     """读取 assets 模板与渲染器，生成单文件自包含 HTML 文本。
 
@@ -1907,18 +1925,28 @@ def build_html(
     （``/*__N3D_DATA_JSON__*/`` 与 ``/*__N3D_VIEWER_JS__*/``），构建时分别替换为
     JSON 数据负载与 ``assets/viewer.js`` 源码，因而产物不含任何外部引用。
 
+    有 FC（``data.fc is not None``）时，``assets/viewer_fc.js`` 作为**追加的一段
+    ``<script>``** 内联在 ``viewer.js`` **之后**；返回前会执行**块序不变式断言**
+    （见 :data:`_VIEWER_CAM_PROBE` / :data:`_FC_MAIN_PROBE`），违反即抛 ``ValueError``。
+
     Args:
         data: 拓扑数据。
         threshold: 初始边权重阈值。
         assets_dir: 资源目录，默认 ``n3d_viz/assets``。
         include_planes: 层参考平面的初始开关状态。
         fc_top_k: 两端全连接包裹的抽样口径 k（无 FC 产物无影响）。
+        _html_hook: **仅供本模块自检使用的私有钩子**（默认 ``str``，公开路径行为恒等）：
+            最终 HTML 会包成该类型，从而让 :func:`verify_viz` 能在**不改动本源码**的前提下
+            用一个只覆写 ``str.find`` 的子类，把「拼接顺序被颠倒」这一场景喂进真实的
+            块序判据，证明该断言不是死代码。
 
     Returns:
         完整 HTML 文本。
 
     Raises:
         FileNotFoundError: 模板或渲染器缺失。
+        ValueError: 模板缺少占位标记，或有 FC 时**块序不变式被破坏**
+            （FC 块未排在 ``viewer.js`` 之后）——见 :data:`_VIEWER_CAM_PROBE`。
     """
     base = Path(assets_dir) if assets_dir is not None else ASSETS_DIR
     tpl = (base / "viewer.html").read_text(encoding="utf-8")
@@ -1946,6 +1974,7 @@ def build_html(
     # 它的首帧读不到相机、会（正确地）拒绝绘制并打出「相机不可用」告警
     # ——实测该告警面板会永久留在页面上（曾因此被 E2E 抓到）。因此把 FC 块
     # 追加在 **viewer.js 之后**：即替换 ``_TPL_MARKER`` 之后的位置。
+    # 该顺序由下方的**块序断言**把守（2026-09-28 由注释约定升级为可执行约束）。
     fc_block = ""
     if data.fc is not None:
         fc_js = (base / FC_VIEWER_ASSET).read_text(encoding="utf-8")
@@ -1953,6 +1982,29 @@ def build_html(
         # （悬停详情标签），转义会破坏它。该文件由本模块自行维护，不含 </script>。
         fc_block = "\n</script>\n<script>\n" + fc_js
     html = tpl.replace(_DATA_MARKER, blob).replace(_TPL_MARKER, js + fc_block)
+    if _html_hook is not str:
+        # 自检钩子：让探针查找走替代实现（公开路径恒为 str，行为逐字节不变）
+        html = _html_hook(html)
+    if fc_block:
+        # 块序不变式：可执行断言（不是注释约定）。
+        # 原理：FC 块由上面的 fc_block 追加在**替换位置之后**，即排在 viewer.js 之后；
+        # 一旦有人把 fc_block 拼到 js 之前（例如改为 tpl.replace(_TPL_MARKER, fc_block + js)），
+        # 产物里的探针顺序就会翻转 —— 这里当场抛错，而不是产出一份叠加层读不到共享相机、
+        # 需要靠浏览器 E2E 才能发现的 HTML。
+        i_viewer = html.find(_VIEWER_CAM_PROBE)
+        i_fc = html.find(_FC_MAIN_PROBE)
+        if i_viewer < 0 or i_fc < 0:
+            raise ValueError(
+                f"块序断言无法执行：产物中未找到探针串（viewer.js={i_viewer}，FC={i_fc}）。"
+                f"若确属渲染器源码改动，请同步更新 core._VIEWER_CAM_PROBE / _FC_MAIN_PROBE。"
+            )
+        if i_viewer > i_fc:
+            raise ValueError(
+                f"{_BLOCK_ORDER_VIOLATION_PREFIX}"
+                f"（实测探针位置 viewer.js@{i_viewer} > FC@{i_fc}）。viewer.js 是共享相机"
+                " window.__n3d_cam 的唯一写入方；顺序颠倒会让叠加层首帧读不到相机、"
+                "拒绝绘制并弹出「相机不可用」告警（两层不同步）。"
+            )
     return html
 
 

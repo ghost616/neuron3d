@@ -537,3 +537,42 @@ README 的注入表已按实测数字更正（原写 5 项）。更强的判别�
 - **F3（离朱侧）**：离朱首版自研 E2E 有 4 处断言级缺陷（事件驱动重绘需 dispatch resize /
   自研投影 Rx·Ry 符号写反 / 旧相机口径过严 / 重置基线取错），修正后通过；
   差异归因首败因 `write_text` 的 LF→CRLF 转换。**对产品结论无影响**。
+## 内联脚本块序不变式与两层一致性 E2E 登记
+
+内联脚本块序不变式与两层几何一致性 E2E 的版本控制登记（2026-09-28 收口轮）。
+
+**块序不变式（注释约定 → 构建期可执行约束）**：`core.build_html` 生成的 HTML 里块序固定为
+「数据块 → `viewer.js` → FC 块」；其中 `viewer.js` 是共享相机 `window.__n3d_cam` 的**唯一写入方**，
+FC 叠加渲染器（`assets/viewer_fc.js`）必须排在它**之后**执行。该约束此前只是一段中文注释，
+现改为显式断言：返回 HTML 之前，用探针串比较在最终产物中的位置 ——
+`core._VIEWER_CAM_PROBE`（`window.__n3d_cam = cam;`）必须早于
+`core._FC_MAIN_PROBE`（`var DATA = window.N3D_DATA;`），违反即抛前缀为
+`core._BLOCK_ORDER_VIOLATION_PREFIX` 的 `ValueError`（消息内给出实测两个探针位置）；
+探针缺失同样抛可读 `ValueError`（提示同步更新探针常量）。有 FC 时才有该断言，
+**无 FC 产物仍逐字节不变**。
+
+`build_html` 另有一个仅供自检使用的私有钩子 `_html_hook`（默认 `str`，公开路径行为恒等）：
+它让 `verify_viz.py` 在**不改动 core 源码**的前提下，用一个只覆写 `str.find` 的 `str` 子类
+把「拼接顺序被颠倒」这一场景喂进**真实入口**，从而证明断言不是死代码
+（不用 `str.find = ...` 的方式：`str` 是 CPython 不可变内置类型，赋值会抛 `TypeError`）。
+
+**告警分支的可达条件**：「FC 叠加渲染器读不到共享相机 → 拒绝绘制 + `#fc-cam-warning` 告警面板」
+这一分支在当前产物里**结构上不可达**（块序断言保证 FC 块在后），仅在两种场景可达 ——
+① 手工注入 / 手改拼接顺序把 FC 块移到 `viewer.js` 之前（此时 `build_html` 直接抛 `ValueError`，
+产物根本生成不出来）；② 把 `assets/viewer_fc.js` 单独加载进页面（绕过 `build_html` 构建路径）。
+因此它是纵深防御的第二道（第一道是构建期块序断言），其余细节由 E2E 的「无告警面板」断言把守。
+
+**两层几何一致性 E2E**：唯一能拦住「两层不同步」回归的测试脚本，2026-09-28 由
+`.lizhu_env/r22_e2e/e2e_two_layer_cam.mjs`（`.gitignore:48` 忽略整个 `.lizhu_env/`，该目录
+0 个文件被跟踪）迁入**版本控制** `n3d_viz/tests/e2e_two_layer_cam.mjs`；迁移只搬位置 + 补注释，
+**断言逻辑与断言条数（26）逐字未改**（见 `[9]` 组把守）。运行方式与接入方式登记在
+`n3d_viz/README.md`：Playwright 仍是既有 `.lizhu_env/r22_e2e/node_modules` 里的那一份
+（`playwright 1.63.0`，**不新增运行依赖**、`requirements.txt` 0 变更；`n3d_viz/tests/node_modules`
+是它的副本、被 `.gitignore` 忽略不入库）。`n3d_viz/tests/.gitattributes` 用 `* -text`
+关闭该目录的行尾转换，保证迁移后的脚本**逐字节**等于原文件。
+
+**回归防线**（`verify_viz.py`，本轮 +5 项，现行汇总 522 项）：
+`[2g]` 3 项 / `[9]` 2 项 —— 各自的拒绝证明与实测口径见 README 的对应小节
+（`[2g]` 的注入实验：把替换改为 `fc_block + js` 后 `core.py` SHA256 `35359CDA…` → `0327C9CD…`，
+`build_html` 抛 `ValueError` 且 `[2g]` 两条断言 FAIL，恢复后 SHA256 逐字节回到 `35359CDA…`）。
+
