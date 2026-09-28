@@ -35,7 +35,7 @@
     },
     {
       "path": "n3d_viz/assets/viewer.js",
-      "description": "三维交互渲染器（Canvas 2D，零依赖）：手写轨道相机视图矩阵、透视投影与按深度排序的画家算法；鼠标拖拽旋转、滚轮缩放、右键平移、悬停神经元详情；按 z 分层着色（S_in/S_out 以同心小圆叠加高亮）、按 |edge_weight| 映射边粗细与颜色、绘制 K 层参考平面；图层开关与阈值滑块实时刷新保留边数；关键算法含中文原理注释。"
+      "description": "三维交互渲染器（Canvas 2D，零依赖）：手写轨道相机视图矩阵、透视投影与按深度排序的画家算法；鼠标拖拽旋转、滚轮缩放、右键平移、悬停神经元详情；按 z 分层着色（S_in/S_out 以同心小圆叠加高亮）、按 |edge_weight| 映射边粗细与颜色、绘制 K 层参考平面；图层开关与阈值滑块实时刷新保留边数；关键算法含中文原理注释。**相机单一事实来源（`window.__n3d_cam`）**：本文件是共享相机的**唯一写入方**，把 `var cam = {...}` 对象**本身**（同一引用、不得拷贝）挂到 `window.__n3d_cam`，供 FC 叠加渲染器 `viewer_fc.js` 每帧只读，使两层的 yaw/pitch/dist/pan 永远一致；该改动为**仅新增 1 行**（`git diff --numstat` = `1 0`），既有绘制/交互/重置/滚轮逻辑一字未改（零回归锚点的 HTML 因此按批准重基线，PLY/OBJ 逐字节不变）。"
     },
     {
       "path": "n3d_viz/assets/viewer_smoke.js",
@@ -47,7 +47,7 @@
     },
     {
       "path": "n3d_viz/assets/viewer_fc.js",
-      "description": "两端全连接包裹的**叠加渲染器**（Canvas 2D 透明覆盖层，零依赖，无外部 URL 引用）。**仅在 `DATA.fc` 存在（`config.fc_dim != 0`）时才被 core.py 内联**成追加的一段脚本块——这是「无 FC 产物 HTML 逐字节零回归」硬约束的实现方式：`viewer.html` 与 `viewer.js` 都被逐字内联进每一份 HTML，改动它们任何一个字节都会破坏该约束，故 FC 渲染完整隔离在本文件。它按与 `viewer.js` **等价**的相机口径（同一组 cam 参数、同一旋转顺序 RotX(pitch)*RotY(yaw)、同一透视公式与 dpr 缩放）重算投影，把结果画在 `pointer-events:none` 的叠加 canvas 上，因此旋转/缩放/平移/悬停仍由基础渲染器处理、3D 交互与既有元素完全一致；自动取景把面板与边界块一并纳入半径（否则 FC 元素落到视野外，表现为「开关打开但什么都看不见」）。绘制内容：两片 H 单元面板（按 ceil(sqrt(H)) 列网格排布的小方块，颜色按单元权重范数映射，公式与 export_geometry.weight_color_rgb 同源）、输入 784 / 输出 10 边界块（半透明线框方盒 + 标签）、聚合箭头、每神经元 top-k 的抽样连线（细虚线 = 「抽样显示，非全部连接」的视觉提示）；动态注入「全连接层（抽样）」开关、图例项与独立 FC 统计面板 #fc-stats。含「同步 requestAnimationFrame 递归」防护（真实浏览器 RAF 必然异步，但最小 DOM 桩可能同步调用，实测会导致栈溢出/堆耗尽）。"
+      "description": "两端全连接包裹的**叠加渲染器**（Canvas 2D 透明覆盖层，零依赖，无外部 URL 引用）。**仅在 `DATA.fc` 存在（`config.fc_dim != 0`）时才被 core.py 内联**成追加的一段脚本块（追加在 `viewer.js` **之后**：`viewer.js` 是共享相机的写入方，必须先执行）。它按与 `viewer.js` **同一套相机参数**重算投影（同一旋转顺序 RotX(pitch)*RotY(yaw)、同一透视公式与 dpr 缩放），把结果画在 `pointer-events:none` 的 z-index:20 叠加 canvas 上，因此旋转/缩放/平移/悬停由基础渲染器处理、两层始终同步；面板与边界块一并纳入取景范围。**相机单一事实来源（2026-09-27 修复「旋转时 FC 图层不跟随」）**：本文件**不自建相机**，改为每帧经 `sharedCam()` **只读** `window.__n3d_cam`（由 `viewer.js` 唯一写入，同一对象引用），`fcViewMatrix(camera)` / `fcProject(m, camera, …)` 只接收参数、不写入共享对象；自建的 `yaw/pitch/dist/panX/panY` 与为打补丁存在的 `userZoom`、wheel 监听、reset 监听已全部删除（消除了「每帧用上一帧 dist 反推缩放倍率」的正反馈隐患）。取不到相机时**拒绝绘制**并给出可读告警（`console.warn` + 页面内 `#fc-cam-warning`），告警按 `CAM_WARN_AFTER_FRAMES=30` 去抖且相机就绪即自动撤销。绘制内容：两片 H 单元面板（按 ceil(sqrt(H)) 列网格排布的小方块，颜色按单元权重范数映射，公式与 export_geometry.weight_color_rgb 同源）、输入 784 / 输出 10 边界块（半透明线框方盒 + 标签）、聚合箭头、每神经元 top-k 的抽样连线（细虚线 = 「抽样显示，非全部连接」的视觉提示）；动态注入「全连接层（抽样）」开关、图例项与独立 FC 统计面板 `#fc-stats`（独立面板而非追加进共享 `#stats`，因为基础渲染器每次重绘会整体重写它）。含「同步 requestAnimationFrame 递归」深度防护（真实浏览器 RAF 必然异步，但最小 DOM 桩可能同步调用，实测会导致栈溢出/堆耗尽）。"
     }
   ]
 }

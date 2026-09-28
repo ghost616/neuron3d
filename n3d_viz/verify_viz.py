@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -89,21 +90,163 @@ SHAPE_DIR = "checkpoints/n3d_shape"
 #: 不使用命令行传入的 ``--checkpoint``。
 PHASE2_ANCHOR_DIR = "checkpoints/n3d_viz"
 PHASE2_ANCHOR_SHA256: dict[str, str] = {
-    "viz_model.html": "15A80EBBF2FD586BFB3C4C41E25F79F0E3E8F0C19D3B60AE22BE3F296EDA518C",
+    # 旧值 15A80EBBF2FD586BFB3C4C41E25F79F0E3E8F0C19D3B60AE22BE3F296EDA518C（88,521 字节）：
+    # 2026-09-27「相机单一事实来源」轮重基线（viewer.js 新增 1 行 window.__n3d_cam = cam;），
+    # 详见 ANCHOR_REBASE_LOG；PLY / OBJ 的哈希**重基线前后逐字节相同**。
+    "viz_model.html": "A5FEE937B8023B986497F8D7C9E6F34D8E3472C9DA03F98F69020251BA4C4F87",
     "viz_model.ply": "9A097D16306160F95C9E15826CB11ABED57C6809F2904660B700573889398801",
     "viz_model.obj": "1F594ECF466E28F751C174A85A8A4E5459A304973F6266B3E11C567C25A09FED",
 }
 
 #: 零回归锚点对应的字节数（与 :data:`PHASE2_ANCHOR_SHA256` 同源、一并比对）。
+#:
+#: **2026-09-27 相机单一事实来源轮的锚点重基线（已获用户批准）**：为修复
+#: 「旋转神经元时 FC 叠加层不跟随」，``assets/viewer.js`` 新增 1 行
+#: ``window.__n3d_cam = cam;``。该行使**每一份**产物的 HTML 内联渲染器源码变大，
+#: 故所有 HTML 锚点必然变化；**PLY / OBJ 不受影响、必须逐字节不变**
+#: （几何与写出路径与本次改动无关）。口径因此放宽为
+#: 「**PLY/OBJ 逐字节不变 + HTML 锚点重新基线（登记旧→新与原因）**」。
+#: 旧值登记在 :data:`ANCHOR_REBASE_LOG`，PLY/OBJ 的不变证据在 :data:`PLY_OBJ_PRE_REBASE`。
 PHASE2_ANCHOR_BYTES: dict[str, int] = {
-    "viz_model.html": 88521,
-    "viz_model.ply": 4120,
-    "viz_model.obj": 15695,
+    "viz_model.html": 88741,   # 旧 88,521（+220 字节 = 新增那一行的注释+代码）
+    "viz_model.ply": 4120,     # 重基线前后**不变**
+    "viz_model.obj": 15695,    # 重基线前后**不变**
 }
 
 #: [2d] **代码回归层**重渲用的 checkpoint —— 必须是**相对仓库根**的路径字符串，
 #: 以与锚点产物内嵌的 ``meta.checkpoint`` 形式一致（原因见上方口径说明）。
 ANCHOR_RERENDER_CKPT = "checkpoints/n3d_sphere/model.pt"
+
+#: [2d] **锚点组表**（2026-09-27 新增）：每组 = 一个 checkpoint + 其派生的三件套恒定值。
+#:
+#: 为什么要按「组」而不再只有单一二期锚点：单组锚点只覆盖 ``K <= 9`` 的层色路径；
+#: 一旦该组被替换或删除，``K > 9``（走色相扩展色板）的代码回归就会**失去承重覆盖**
+#: ——历史上正是「9 色 + ``k % 9`` 循环」在新几何下退化为重复色。故显式登记三组，
+#: 并由 :func:`_check_anchor_groups_cover_k` 断言**必须同时覆盖 K<=9 与 K>9 两类**。
+#: 每组的 ``ckpt`` 用**相对路径**（与字节级复现口径一致）。
+ANCHOR_GROUPS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "二期 model.pt（K=9）",
+        "ckpt": ANCHOR_RERENDER_CKPT,
+        "kind": "lt9",
+        "sha256": PHASE2_ANCHOR_SHA256,
+        "bytes": PHASE2_ANCHOR_BYTES,
+    },
+    {
+        "name": "三期 sphere N256（config 无 fc_dim，K=9）",
+        "ckpt": (
+            "checkpoints/n3d_shape/"
+            "full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt"
+        ),
+        "kind": "lt9",
+        "sha256": {
+            "viz_full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.html":
+                "63B9CD4D4CEDB24925173429A200A28F2919F4205BA96E06DDE6999B7940125C",
+            "viz_full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.ply":
+                "28034930AAC972C7F8D1CC5110FACF7322A8C709C2EC1A46909DF8CC32777F61",
+            "viz_full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.obj":
+                "5893E8825BE53C75DE39A344E68A5BA677EF57FA6A350F284BC2CA0C5C66BA5B",
+        },
+        "bytes": {
+            "viz_full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.html": 88854,
+            "viz_full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.ply": 4177,
+            "viz_full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.obj": 15752,
+        },
+    },
+    {
+        "name": "三期 cylinder λ=2 N256（config 无 fc_dim，**K=15 -> K>9 路径**）",
+        "ckpt": (
+            "checkpoints/n3d_shape/"
+            "full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt"
+        ),
+        "kind": "gt9",
+        "sha256": {
+            "viz_full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.html":
+                "9606F91E52AC405349C504D43389190D294D84F2DF9DB66C1E90CFC528041706",
+            "viz_full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.ply":
+                "C4ED6E86461E7BCAAD99BBFF2E1070F6CB7239417083EE35063275E8D5FFAC9F",
+            "viz_full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.obj":
+                "F650ADE9662AAD9D0954A344A304AF8EF2FE1ECBF540CBD804E03331F6C53997",
+        },
+        "bytes": {
+            "viz_full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.html": 88649,
+            "viz_full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.ply": 4182,
+            "viz_full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.obj": 15613,
+        },
+    },
+)
+
+#: 「**PLY / OBJ 逐字节不变**」的承重证据表（本次放宽后的零回归口径）。
+#:
+#: 结构：``[(清单名, ckpt 相对路径, {三件套文件名: (sha256, bytes)}), ...]``。
+#: 覆盖 **4 组产物 × 2 个文件 = 8 项**（3 个无 FC 锚点组 + 1 个 FC 产物）。
+#: :func:`_check_ply_obj_unchanged` 会用**当前代码**重新渲染每一组并与这里的恒定值
+#: 逐项比对（因此这不是「只比常量」，而是真实的重渲回归断言）；**只比 PLY/OBJ**：
+#: HTML 因 ``viewer.js`` 新增 1 行已按批准重基线（登记在 :data:`ANCHOR_REBASE_LOG`）。
+PLY_OBJ_BASELINE: tuple[tuple[str, str, dict[str, tuple[str, int]]], ...] = (
+    ("二期 model.pt", ANCHOR_RERENDER_CKPT, {
+        "viz_model.ply": (
+            "9A097D16306160F95C9E15826CB11ABED57C6809F2904660B700573889398801", 4120),
+        "viz_model.obj": (
+            "1F594ECF466E28F751C174A85A8A4E5459A304973F6266B3E11C567C25A09FED", 15695),
+    }),
+    ("三期 sphere N256（K=9）",
+     "checkpoints/n3d_shape/"
+     "full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt", {
+        "viz_full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.ply": (
+            "28034930AAC972C7F8D1CC5110FACF7322A8C709C2EC1A46909DF8CC32777F61", 4177),
+        "viz_full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.obj": (
+            "5893E8825BE53C75DE39A344E68A5BA677EF57FA6A350F284BC2CA0C5C66BA5B", 15752),
+    }),
+    ("三期 cylinder λ=2 N256（K=15，K>9 路径）",
+     "checkpoints/n3d_shape/"
+     "full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt", {
+        "viz_full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.ply": (
+            "C4ED6E86461E7BCAAD99BBFF2E1070F6CB7239417083EE35063275E8D5FFAC9F", 4182),
+        "viz_full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.obj": (
+            "F650ADE9662AAD9D0954A344A304AF8EF2FE1ECBF540CBD804E03331F6C53997", 15613),
+    }),
+    ("FC 产物（fc_dim=-1，H=825）",
+     "checkpoints/n3d_shape/"
+     "full_shapesphere_N825_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_fc-1_s42_fc_align.pt", {
+        "viz_full_shapesphere_N825_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_fc-1_s42_fc_align.ply": (
+            "25C1008C7C412F0AFDBEC359186548A2B0317523C7AE55557DBC77C2D44C52E5", 81681),
+        "viz_full_shapesphere_N825_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_fc-1_s42_fc_align.obj": (
+            "4E0C2A2F125F7C4F637C7ECB3F5C0F3498065B39B8438EB045C03DA7EA75A503", 154372),
+    }),
+)
+
+#: 兼容别名：只保留「文件名 -> (sha, bytes)」的扁平视图（供报告/文档引用）。
+PLY_OBJ_PRE_REBASE: dict[str, tuple[str, int]] = {
+    fname: want for _n, _c, files in PLY_OBJ_BASELINE for fname, want in files.items()
+}
+
+
+#: 锚点重基线时**已登记**的 HTML 变更（旧值 + 原因），供 [2d] 断言「登记齐备」。
+#: 维护约定：任何使 HTML 锚点变化且**并非回归**的改动，都必须在此登记旧值/原因，
+#: 并同步 README 与 current_spec；**PLY / OBJ 若变化一律视为回归**（须定位根因）。
+ANCHOR_REBASE_LOG: dict[str, dict[str, Any]] = {
+    "viz_model.html": {
+        "old_sha256": "15A80EBBF2FD586BFB3C4C41E25F79F0E3E8F0C19D3B60AE22BE3F296EDA518C",
+        "old_bytes": 88521,
+        "reason": "修复「旋转时 FC 叠加层不跟随」：viewer.js 新增 1 行 window.__n3d_cam = cam;",
+    },
+    "viz_full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.html": {
+        "old_sha256": "F9535DAD22FA1C01436CDC251B729CE61BB7B5DAF491F0BAD9BA2BF3FDBB8C6A",
+        "old_bytes": 88634,
+        "reason": "同上（viewer.js 新增 1 行，内联渲染器源码变大）",
+    },
+    "viz_full_shapecylinder_a2_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.html": {
+        "old_sha256": "FA5D5426C2064D79B09B5ED69C23267832861273C794F60A652E0003C7508C9E",
+        "old_bytes": 88429,
+        "reason": "同上（viewer.js 新增 1 行，内联渲染器源码变大）",
+    },
+}
+
+#: FC 产物 HTML 的**改动前**值（面板尺度调整后、相机修复前）。它不参与 [2d]
+#: 的三组锚点（那三组都无 FC），仅用于文档溯源。
+FC_HTML_PRE_CAM_FIX: tuple[str, int] = (
+    "34CDDB922807787D3071043D46410545BF30DE923C84A559E2D51295D6A10A87", 591709)
 
 #: [2d] 代码回归层的临时输出目录名（位于 ``--out-dir`` 之下，比对完即清理）。
 ANCHOR_RERENDER_DIRNAME = "_anchor_rerender"
@@ -891,6 +1034,114 @@ def _ply_header_has_sampling(path: Path) -> bool:
     )
 
 
+def _check_anchor_groups_cover_k() -> str:
+    """[2d] 断言锚点组**同时覆盖** ``K <= 9`` 与 ``K > 9`` 两类产物。
+
+    为什么必须承重：层色实现有两条分支 —— ``K <= 9`` 取既有 9 色前 K 个（逐字节不变），
+    ``K > 9`` 走均匀色相扩展（去重数恒等于 K）。历史上「9 色 + ``k % 9`` 循环」正是在
+    ``K > 9`` 的真实几何（cylinder λ=2，K=15）上退化为只有 9 种颜色。若锚点组只剩
+    K<=9 的产物，那条分支的代码回归就会**失去承重覆盖**（断言全绿而产物已经错了）。
+
+    Returns:
+        形如 ``"锚点组 3 个：K<=9 2 组 / K>9 1 组"`` 的摘要。
+    """
+    kinds = [str(g.get("kind")) for g in ANCHOR_GROUPS]
+    assert "lt9" in kinds, (
+        f"锚点组缺少覆盖 K<=9 路径的产物（现有 kinds={kinds}）"
+    )
+    assert "gt9" in kinds, (
+        f"锚点组缺少覆盖 K>9 路径的产物（现有 kinds={kinds}）——"
+        "K>9 的色相扩展分支将失去承重覆盖"
+    )
+    assert all(g.get("sha256") and g.get("bytes") and g.get("ckpt") for g in ANCHOR_GROUPS), (
+        "每个锚点组都必须同时给出 ckpt / sha256 / bytes"
+    )
+    return (f"锚点组 {len(ANCHOR_GROUPS)} 个：K<=9 {kinds.count('lt9')} 组 / "
+            f"K>9 {kinds.count('gt9')} 组")
+
+
+def _check_ply_obj_unchanged(work_dir: Path | None = None) -> str:
+    """[2d] 断言所有锚点/登记组的 **PLY / OBJ 与改动前快照逐项相同**。
+
+    这是「相机单一事实来源」轮放宽后的零回归口径的**核心硬断言**：本次只改渲染
+    （HTML 内联脚本），几何与写出路径一行未动，因此 PLY / OBJ 必须逐字节不变。
+    任何字节变化都视为**回归**（而不是「重基线」）。
+
+    **承重方式**：用**当前代码**重新渲染 :data:`PLY_OBJ_BASELINE` 里每一组产物，
+    再把磁盘字节与 ;data:`PLY_OBJ_BASELINE` 的恒定值逐项比对，因此能抓住
+    「几何/写出路径被改动」这类回归，而不只是「常量没被改」。
+
+    Args:
+        work_dir: 临时输出目录；None 时用 ``checkpoints/n3d_viz/_verify/_plyobj_chk``。
+
+    Returns:
+        形如 ``"4 组 × 2 文件 = 8 项 PLY/OBJ 重渲后逐项相同"`` 的摘要。
+    """
+    tmp = work_dir or (_ROOT / "checkpoints/n3d_viz/_verify/_plyobj_chk")
+    tmp.mkdir(parents=True, exist_ok=True)
+    checked = 0
+    try:
+        for label, ckpt, files in PLY_OBJ_BASELINE:
+            ckpt_path = _ROOT / ckpt
+            assert ckpt_path.exists(), f"[{label}] checkpoint 不存在：{ckpt_path}"
+            reports = core.render_default(ckpt, out_dir=tmp)
+            for fname, (want_sha, want_bytes) in files.items():
+                key = "ply" if fname.endswith(".ply") else "obj"
+                got = Path(reports[key]["path"])
+                got_sha = _sha256(got)
+                got_bytes = got.stat().st_size
+                assert got_bytes == want_bytes, (
+                    f"[{label}] {fname} 字节数变化 {want_bytes} -> {got_bytes}"
+                    "（PLY/OBJ 必须逐字节不变；变化即为回归，须定位原因）"
+                )
+                assert got_sha == want_sha, (
+                    f"[{label}] {fname} SHA256 变化 {want_sha[:16]} -> {got_sha[:16]}"
+                    "（PLY/OBJ 必须逐字节不变；变化即为回归，须定位原因）"
+                )
+                checked += 1
+    finally:
+        for p in tmp.rglob("*"):
+            if p.is_file():
+                p.unlink(missing_ok=True)
+        leftover = [p for p in tmp.rglob("*") if p.is_file()]
+        assert not leftover, f"临时产物未清理干净：{leftover[:3]}"
+    return (f"{len(PLY_OBJ_BASELINE)} 组 × 2 文件 = {checked} 项 PLY/OBJ "
+            f"用当前代码重渲后逐项相同（含 K<=9 / K>9 / FC 三类）")
+
+
+def _check_anchor_rebase_logged() -> str:
+    """[2d] 断言每个**发生变化**的 HTML 锚点都已登记「旧值 + 原因」。
+
+    维护约定：使 HTML 锚点变化且并非回归的改动必须登记（否则「锚点悄悄漂移」无从追溯）；
+    PLY / OBJ 不在登记之列 —— 它们**不允许**变化。
+
+    Returns:
+        形如 ``"3 条 HTML 重基线登记齐备（旧值 + 原因）"`` 的摘要。
+    """
+    html_names: list[str] = []
+    for group in ANCHOR_GROUPS:
+        html_names.extend(n for n in group["sha256"] if n.endswith(".html"))
+    missing = [n for n in html_names if n not in ANCHOR_REBASE_LOG]
+    assert not missing, (
+        f"以下 HTML 锚点未在 ANCHOR_REBASE_LOG 中登记旧值/原因：{missing}"
+    )
+    for name, rec in ANCHOR_REBASE_LOG.items():
+        assert rec.get("old_sha256") and rec.get("old_bytes") and rec.get("reason"), (
+            f"{name} 的重基线登记不完整（需 old_sha256 / old_bytes / reason）"
+        )
+        new_sha = None
+        for group in ANCHOR_GROUPS:
+            if name in group["sha256"]:
+                new_sha = group["sha256"][name]
+        assert new_sha is not None, f"{name} 已登记但不在任何锚点组中"
+        assert new_sha != rec["old_sha256"], (
+            f"{name} 的新旧 SHA256 相同（{new_sha[:16]}）—— 要么未真正重基线，要么登记陈旧"
+        )
+    assert FC_HTML_PRE_CAM_FIX[0] and FC_HTML_PRE_CAM_FIX[1] > 0, "FC 产物旧值登记缺失"
+    return (f"{len(ANCHOR_REBASE_LOG)} 条 HTML 重基线登记齐备（旧值 + 原因）；"
+            f"覆盖 {len(html_names)} 个 HTML 锚点")
+
+
 def _html_self_contained_ok(html: str) -> bool:
     """HTML 自包含静态检查（无外部引用 / 无 syn_dist / 体积 < 2MB）。"""
     from n3d_viz import render_html as _render_html
@@ -1088,10 +1339,17 @@ def _make_fc_checkpoint(
     obj = torch.load(str(src_ckpt), map_location="cpu", weights_only=False)
     sd = obj["model_state_dict"]
     keep = tuple(core.REQUIRED_KEYS) + tuple(core.FC_REQUIRED_KEYS) + ("head_weight", "out_scope_index")
-    slim = {k: sd[k] for k in keep if k in sd and k not in tuple(drop_keys)}
+    slim = {k: sd[k].clone() for k in keep if k in sd and k not in tuple(drop_keys)}
     config = dict(obj.get("config") or {})
+    test_acc = obj.get("test_acc")
+    # **显式释放巨型产物**：FC 产物的 ``syn_dist`` 实测约 174 MB（`[6600,6600]` float32），
+    # 若不在这里断开引用，它会一直活到函数返回才由 GC 回收；[2f] 组会调用本函数 7 次，
+    # 叠加 [2d] 的 4 组重渲，堆峰值会显著抬高（曾观察到一次进程级崩溃 0xC0000409）。
+    del sd
+    del obj
+    gc.collect()
     path = out_dir / f"{name}.pt"
-    torch.save({"model_state_dict": slim, "config": config, "test_acc": obj.get("test_acc")}, str(path))
+    torch.save({"model_state_dict": slim, "config": config, "test_acc": test_acc}, str(path))
     return path
 
 
@@ -1122,10 +1380,13 @@ def _rotate_fc_config(src_ckpt: Path, out_dir: Path, name: str, fc_dim: Any) -> 
         config.pop("fc_dim", None)
     else:
         config["fc_dim"] = fc_dim
-    torch.save(
-        {"model_state_dict": obj["model_state_dict"], "config": config, "test_acc": obj.get("test_acc")},
-        str(path),
-    )
+    slim = obj["model_state_dict"]
+    test_acc = obj.get("test_acc")
+    torch.save({"model_state_dict": slim, "config": config, "test_acc": test_acc}, str(path))
+    # 与 _make_fc_checkpoint 同一套内存纪律：断开对大对象的引用后立即回收。
+    del slim
+    del obj
+    gc.collect()
     return path
 
 
@@ -1677,67 +1938,82 @@ def verify(
                       lambda: _assert_all_eq([n - 2 * h for h, n in fc_prods], 2),
                       f"有 FC 的产物 {len(fc_prods)} 个；H 与面板点数逐产物核对")
 
-    # ---------------------------------------------- [2d] 零回归锚点（两层）
+    # ---------------------------------------------- [2d] 零回归锚点（两层 × 多锚点组）
     # 教训：旧版 [2d] 只把**磁盘上已有**的产物与常量比对、不重渲，因此对「代码侧的
     # K <= 9 回归」完全无感（把 LEVEL_PALETTE_BASE 前两项对调后 [2a] 四项与磁盘比对
     # 全部 PASS，而重渲出来的 HTML / PLY 已与锚点不同）。现在拆成两层：
     #   层 1 产物完整性：磁盘锚点存在且 SHA256 / 字节数 == 常量（守护交付件未被改动）
     #   层 2 代码回归（承重）：用**当前代码**重渲到临时目录，与**同一组锚点常量**比对
     # 层 2 必须用相对路径 checkpoint（见 ANCHOR_RERENDER_CKPT 的口径说明）。
-    print("\n[2d] 零回归锚点：磁盘产物完整性 + 用当前代码重渲的逐字节回归")
-    for fname, want in PHASE2_ANCHOR_SHA256.items():
-        fpath = _ROOT / PHASE2_ANCHOR_DIR / fname
-        if not fpath.exists():
-            chk.skip(f"[2d][磁盘] {fname} SHA256 == 锚点", f"{fpath} 不存在")
-            continue
-        chk.check(f"[2d][磁盘] {fname} SHA256 == 锚点",
-                  _guarded(None, lambda p=fpath, w=want: _assert_eq(_sha256(p), w)),
-                  f"{PHASE2_ANCHOR_DIR}/{fname}")
-        chk.check(f"[2d][磁盘] {fname} 字节数 == 锚点",
-                  _guarded(None, lambda p=fpath, w=PHASE2_ANCHOR_BYTES[fname]:
-                           _assert_eq(p.stat().st_size, w)),
-                  f"{PHASE2_ANCHOR_DIR}/{fname}")
+    #
+    # 2026-09-27 扩展为**多锚点组**（ANCHOR_GROUPS）：单组只覆盖 K<=9 的层色路径，
+    # 一旦被替换就会让 K>9（色相扩展色板）的回归失去承重覆盖。现按组分别做两层校验，
+    # 并断言「锚点组必须同时覆盖 K<=9 与 K>9」，另加「PLY/OBJ 重基线前后逐字节不变」。
+    print("\n[2d] 零回归锚点：磁盘产物完整性 + 用当前代码重渲的逐字节回归（多锚点组）")
+    chk.check("[2d] 锚点组同时覆盖 K<=9 与 K>9 两类（防止丢掉色板扩展覆盖）",
+              _check_anchor_groups_cover_k,
+              f"{len(ANCHOR_GROUPS)} 组：{[(g['kind'], g['name']) for g in ANCHOR_GROUPS]}")
+    chk.check("[2d] 锚点组的 PLY/OBJ 与改动前快照逐项相同（本次改动不得动几何）",
+              lambda: _check_ply_obj_unchanged(out_path / "_plyobj_chk"),
+              f"{len(PLY_OBJ_BASELINE)} 组 × 2 文件，用当前代码重渲后比对")
+    chk.check("[2d] HTML 锚点变更全部已登记（旧值 + 原因）",
+              _check_anchor_rebase_logged,
+              f"登记 {len(ANCHOR_REBASE_LOG)} 条：全部注明「viewer.js 新增 1 行」")
 
     anchor_dir = out_path / ANCHOR_RERENDER_DIRNAME
-    anchor_ckpt = _ROOT / ANCHOR_RERENDER_CKPT
-    a_err: str | None = None
-    a_files: dict[str, tuple[Path, str, int]] = {}
-    if not anchor_ckpt.exists():
-        chk.skip("[2d][重渲] 用当前代码重渲并比对锚点", f"{anchor_ckpt} 不存在")
-    else:
-        try:
-            # 走**共享渲染入口** core.render_default（不再手写参数集）：
-            # 锚点的语义是「CLI 默认形式的产物」，因此重渲必须与 CLI 默认路径同路。
-            # 相对路径加载：meta.checkpoint 记录的就是这个字符串，必须与锚点同形式。
-            a_reports = core.render_default(ANCHOR_RERENDER_CKPT, out_dir=anchor_dir)
-            for fname, key in (("viz_model.html", "html"), ("viz_model.ply", "ply"),
-                               ("viz_model.obj", "obj")):
-                p = Path(a_reports[key]["path"])
-                a_files[fname] = (p, _sha256(p), p.stat().st_size)
-        except Exception as exc:  # noqa: BLE001 - 把失败原因带到每条断言上
-            a_err = f"{type(exc).__name__}: {exc}"
+    group_summaries: list[tuple[str, dict[str, tuple[Path, str, int]], str | None, dict]] = []
+    for gi, group in enumerate(ANCHOR_GROUPS):
+        gckpt = _ROOT / group["ckpt"]
+        g_dir = anchor_dir / f"g{gi}"
+        # ---- 层 1：磁盘产物完整性 ----
+        for fname, want in group["sha256"].items():
+            fpath = _ROOT / PHASE2_ANCHOR_DIR / fname
+            tag = f"[2d][磁盘][组{gi}]"
+            if not fpath.exists():
+                chk.skip(f"{tag} {fname} SHA256 == 锚点", f"{fpath} 不存在")
+                continue
+            chk.check(f"{tag} {fname} SHA256 == 锚点",
+                      _guarded(None, lambda p=fpath, w=want: _assert_eq(_sha256(p), w)),
+                      f"{PHASE2_ANCHOR_DIR}/{fname}（{group['name']}）")
+            chk.check(f"{tag} {fname} 字节数 == 锚点",
+                      _guarded(None, lambda p=fpath, w=group['bytes'][fname]:
+                               _assert_eq(p.stat().st_size, w)),
+                      f"{PHASE2_ANCHOR_DIR}/{fname}")
+        # ---- 层 2：用当前代码重渲 ----
+        g_err: str | None = None
+        g_files: dict[str, tuple[Path, str, int]] = {}
+        if not gckpt.exists():
+            chk.skip(f"[2d][重渲][组{gi}] 用当前代码重渲并比对锚点", f"{gckpt} 不存在")
+        else:
+            try:
+                g_reports = core.render_default(group["ckpt"], out_dir=g_dir)
+                for key in ("html", "ply", "obj"):
+                    p = Path(g_reports[key]["path"])
+                    g_files[p.name] = (p, _sha256(p), p.stat().st_size)
+            except Exception as exc:  # noqa: BLE001 - 把失败原因带到每条断言上
+                g_err = f"{type(exc).__name__}: {exc}"
+            for fname, want in group["sha256"].items():
+                entry = g_files.get(fname)
+                chk.check(f"[2d][重渲][组{gi}] {fname} SHA256 == 锚点（{group['kind']} 承重）",
+                          _guarded(g_err, lambda e=entry, w=want: _assert_eq(e[1], w) if e
+                                   else _assert_true(False)),
+                          f"core.render_default @ {group['ckpt']}")
+                chk.check(f"[2d][重渲][组{gi}] {fname} 字节数 == 锚点",
+                          _guarded(g_err, lambda e=entry, w=group['bytes'][fname]:
+                                   _assert_eq(e[2], w) if e else _assert_true(False)),
+                          f"core.render_default @ {group['ckpt']}")
+            for p, _sha, _size in g_files.values():
+                p.unlink(missing_ok=True)
+        group_summaries.append((group["name"], g_files, g_err, group))
 
-        for fname, want in PHASE2_ANCHOR_SHA256.items():
-            entry = a_files.get(fname)
-            chk.check(f"[2d][重渲] {fname} SHA256 == 锚点（K<=9 路径承重）",
-                      _guarded(a_err, lambda e=entry, w=want: _assert_eq(e[1], w) if e else
-                               _assert_true(False)),
-                      f"core.render_default @ {ANCHOR_RERENDER_CKPT}")
-            chk.check(f"[2d][重渲] {fname} 字节数 == 锚点",
-                      _guarded(a_err, lambda e=entry, w=PHASE2_ANCHOR_BYTES[fname]:
-                               _assert_eq(e[2], w) if e else _assert_true(False)),
-                      f"core.render_default @ {ANCHOR_RERENDER_CKPT}")
-
-        # 比对完成后清理临时产物（与负例/合成组同一套产物纪律）
-        for p, _sha, _size in a_files.values():
-            p.unlink(missing_ok=True)
-        leftover_anchor = [p for p in anchor_dir.rglob("*") if p.is_file()]
-        chk.check("[2d] 重渲临时产物已清理（无文件残留）",
-                  lambda: _assert_eq(len(leftover_anchor), 0),
-                  f"清理前 {len(a_files)} 个文件")
-        chk.check("[2d] 重渲临时残留体积 == 0 字节",
-                  lambda: _assert_eq(sum(p.stat().st_size for p in leftover_anchor), 0),
-                  "不污染 _verify 目录")
+    leftover_anchor = [p for p in anchor_dir.rglob("*") if p.is_file()] if anchor_dir.exists() else []
+    total_anchor_files = sum(len(f) for _n, f, _e, _g in group_summaries)
+    chk.check("[2d] 重渲临时产物已清理（无文件残留）",
+              lambda: _assert_eq(len(leftover_anchor), 0),
+              f"清理前 {total_anchor_files} 个文件（{len(ANCHOR_GROUPS)} 组）")
+    chk.check("[2d] 重渲临时残留体积 == 0 字节",
+              lambda: _assert_eq(sum(p.stat().st_size for p in leftover_anchor), 0),
+              "不污染 _verify 目录")
 
     # ---------------------------------------------- [2e] 参数集一致性（承重）
     # 动机：[2d] 的锚点语义是「CLI 默认形式的产物」。若 __main__ 的 argparse 默认值

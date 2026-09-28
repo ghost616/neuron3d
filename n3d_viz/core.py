@@ -1940,15 +1940,19 @@ def build_html(
     #   两者都被逐字内联进每一份 HTML，任何改动都会让**无 FC 产物**的字节数变化，
     #   破坏「无 FC 产物逐字节零回归」的硬约束。独立脚本块在无 FC 时完全不出现，
     #   因此既有产物一个字节都不变，而 FC 产物仍然保持单文件自包含。
-    # 顺序要求：该块必须**先于** viewer.js 执行（viewer.js 末尾会同步完成首帧），
-    # 因此它被插到「内联数据」块里（数据赋值之前），从而在 DOM 中排在 viewer.js 之前。
+    #
+    # **执行顺序（2026-09-27 修正）**：FC 叠加渲染器必须**在 viewer.js 之后**执行。
+    # viewer.js 是共享相机 `window.__n3d_cam` 的唯一写入方；若叠加层先跑，
+    # 它的首帧读不到相机、会（正确地）拒绝绘制并打出「相机不可用」告警
+    # ——实测该告警面板会永久留在页面上（曾因此被 E2E 抓到）。因此把 FC 块
+    # 追加在 **viewer.js 之后**：即替换 ``_TPL_MARKER`` 之后的位置。
     fc_block = ""
     if data.fc is not None:
         fc_js = (base / FC_VIEWER_ASSET).read_text(encoding="utf-8")
         # 注意：这里**不**做 </ 转义 —— 渲染器源码里存在合法的 "</b>" 这类字符串
         # （悬停详情标签），转义会破坏它。该文件由本模块自行维护，不含 </script>。
-        fc_block = ";\n</script>\n<script>\n" + fc_js + "\n"
-    html = tpl.replace(_TPL_MARKER, js).replace(_DATA_MARKER, blob + fc_block)
+        fc_block = "\n</script>\n<script>\n" + fc_js
+    html = tpl.replace(_DATA_MARKER, blob).replace(_TPL_MARKER, js + fc_block)
     return html
 
 

@@ -2,27 +2,29 @@
  *
  * ============================ 为什么是叠加层 ============================
  * 硬约束：**无 FC 产物（config 无 fc_dim 或 fc_dim == 0）的 HTML 必须逐字节零回归**。
- * 而本模块的 HTML 是把 assets/viewer.js 逐字内联进模板的，因此哪怕只在 viewer.js
- * 里多写一行注释，无 FC 产物的字节数也会变化 -> 破坏零回归锚点。
+ * 而本模块的 HTML 是把 assets/viewer.js 逐字内联进模板的，因此哪怕只改它一行，
+ * 无 FC 产物的字节数也会变化。故这里把 FC 相关渲染**完全隔离在本文件**：
+ * core.py 只在 DATA.fc 存在时才把它内联进 HTML 追加的一段脚本块。
+ * 代价是基础渲染器的内部函数（viewMatrix / project / draw）在本 IIFE 作用域内
+ * 不可见，需要按**同一套相机口径**重算投影 —— 下面的 fcViewMatrix / fcProject
+ * 与 viewer.js 的 viewMatrix / project 等价（同一组相机参数、同一旋转顺序、
+ * 同一透视公式），并把结果画到一块透明的叠加 canvas 上；指针事件全部透传给
+ * 底层画布（pointer-events:none），因此交互仍由基础渲染器处理。
  *
- * 故这里把 FC 相关渲染**完全隔离在本文件**：core.py 只在 DATA.fc 存在时才把它
- * 内联进 HTML 追加的一段脚本块，无 FC 产物的 HTML 因此连一个字节都不变。
- * 代价是基础渲染器（viewer.js）的内部函数（viewMatrix / project / draw）在本
- * IIFE 作用域内不可见，需要按**同一套相机口径**重算投影 —— 下面的
- * fcViewMatrix / fcProject 与 viewer.js 的 viewMatrix / project 等价
- * （同一组 cam 参数、同一旋转顺序、同一透视公式），并把结果画到一块透明的
- * 叠加 canvas 上；指针事件全部透传给底层画布（pointer-events:none），
- * 因此旋转 / 缩放 / 平移 / 悬停仍由基础渲染器处理，交互完全一致。
- *
- * 相机同步口径（不修改 viewer.js 的前提下）：基础渲染器从 canvas#view 的
- * clientWidth / clientHeight 与 devicePixelRatio 直接推导全部投影参数，
- * 因此本文件直接读取同样的值即可得到完全相同的投影，不需要任何共享状态：
- *   * 取景（自动缩放）：基础渲染器用 radius = 神经元云最大半径、dist = radius × 3.6；
- *     本文件把面板与边界块也纳入半径（否则 FC 元素会落到视野之外，表现为
- *     「开关打开但什么都看不见」），并按**同一系数 3.6** 回写 dist；
- *   * 缩放比例的衔接：底层画布尺寸不变、dist 只在其内部变化，故本文件**自带**
- *     一个「用户缩放倍率」userZoom，并通过滚轮 / 重置按钮事件与基础渲染器同步
- *     （**不得**从上一帧的 dist 反推倍率 —— 那会形成正反馈，见 draw() 内的说明）。
+ * ====================== 相机：单一事实来源（window.__n3d_cam） ======================
+ * **本文件不自建相机**。基础渲染器 `viewer.js` 把它的 cam 对象**原样引用**挂到
+ * `window.__n3d_cam`（那里是唯一写入方），本文件每帧**只读**该对象，
+ * yaw / pitch / dist / panX / panY / focal / tx,ty,tz 全部直读，因此：
+ *   * **左键旋转、右键平移、滚轮缩放、点击重置**四种交互与基础层天然同步；
+ *   * 无正反馈风险 —— 不再需要「用上一帧 dist 反推用户缩放倍率」这类补丁
+ *     （旧实现正是这么做的：既自建相机、又额外监听 wheel/重置维护 `userZoom`，
+ *     结果旋转与平移都不同步 —— 这是被修复的真实缺陷，真实浏览器实测叠加层
+ *     非透明像素 bbox 在拖拽前后完全不变）；
+ *   * 取景（自动缩放）也交给基础层：它的 dist 已包含「神经元云最大半径 × 3.6」，
+ *     而 FC 面板与边界块本就位于云的两端外侧、处于同一取景范围内。
+ * 约定（必须遵守）：**写入方只有 viewer.js**；本文件不得写 `__n3d_cam` 的任何字段。
+ * 若取不到该对象（例如本脚本被单独加载），**不绘制**并与控制台 + 页面内给出一次
+ * 可读告警，绝不画出一张与基础层不同步的错图。
  *
  * 绘制内容（与 README「几何与不重叠判据」一节对应）：
  *   * 面板单元：垂直于流向轴的两片平面，按 ceil(sqrt(H)) 列网格排布的小方块，
@@ -63,12 +65,74 @@
   var host = base.parentNode || document.body;
   if (host && host.insertBefore) { host.insertBefore(canvas, base.nextSibling || null); }
 
-  // ---------------------------------------------------------------- 相机口径
-  // 与 viewer.js 完全一致的初始轨道相机参数（viewer.js: yaw=-0.62, pitch=0.42, ...）。
-  var cam = {
-    yaw: -0.62, pitch: 0.42, dist: 3.6,
-    panX: 0, panY: 0, focal: 900, tx: 0, ty: 0, tz: 0
-  };
+  // ---------------------------------------------------------------- 相机（共享）
+  // **不再自建相机**。基础渲染器 `viewer.js` 把它的 cam 对象原样挂在
+  // `window.__n3d_cam` 上（同一对象引用），本文件每帧**只读**该对象，
+  // 因此 yaw / pitch / dist / panX / panY / focal / tx,ty,tz 与基础画布
+  // 永远一致 —— 左键旋转、右键平移、滚轮缩放、重置四种交互天然同步。
+  //
+  // 为什么不能自建一份等价相机（旧实现的缺陷）：那样旋转/平移只会作用于
+  // 基础层，叠加层恒停在初始视角，表现为「旋转神经元时全连接层不跟随」
+  // （真实浏览器实测：叠加层非透明像素 bbox 在拖拽前后完全不变）。
+  //
+  // 约定：**写入方只有 `viewer.js`**，本文件不得写 `__n3d_cam` 的任何字段。
+  /** 每帧读取共享相机（**惰性、实时**）。
+   *
+   *  为什么不在这里一次性捕获到闭包变量：`__n3d_cam` 由 `viewer.js` 在脚本执行时
+   *  定义；若本脚本被执行顺序变化（例如被单独加载、或两者顺序被调换），一次性捕获
+   *  会让叠加层**永久**拿不到相机。做成每帧直读后，只要基础渲染器开始运行就立刻
+   *  恢复同步，同时也便于「共享相机尚未就绪」时给出一次告警。
+   */
+  function sharedCam() {
+    var c = window.__n3d_cam;
+    return (c && typeof c === "object") ? c : null;
+  }
+  /** 「相机不可用」的连续帧计数与告警去抖阈值。
+   *
+   *  为什么要去抖：本脚本与 `viewer.js` 在同一页面内是**先后执行的两段**内联脚本，
+   *  正常产物已把本块排在 `viewer.js` **之后**（见 core.build_html），但若执行顺序
+   *  被改动（或本文件被单独加载），首帧会读不到相机。此时若立刻弹告警面板，就会
+   *  在「只是晚一帧就绪」的场景下留下一个永久误报（E2E 抓到过该误报）。
+   *  故：先只重试不告警，连续若干帧仍取不到才告警；**相机一旦出现就撤掉告警**。
+   */
+  var camMissFrames = 0;
+  var CAM_WARN_AFTER_FRAMES = 30;
+  /** 已注入的告警面板（存在时用于撤销）。 */
+  var camWarnEl = null;
+
+  /** 注入 / 撤销「相机不可用」告警（控制台只发一次）。 */
+  function setCamWarning(on) {
+    if (on) {
+      if (camWarnEl) { return; }
+      var warnMsg = "[n3d_viz] FC 叠加渲染器未找到共享相机 window.__n3d_cam，" +
+        "为避免绘制与基础层不同步的错误图形，本次不绘制全连接层。" +
+        "请确认 assets/viewer.js 已在本脚本之前执行（正常产物的内联顺序满足该条件）。";
+      if (window.console && console.warn) { console.warn(warnMsg); }
+      if (document.body && document.body.appendChild) {
+        var warn = document.createElement("div");
+        warn.id = "fc-cam-warning";
+        warn.style.position = "absolute";
+        warn.style.left = "12px";
+        warn.style.bottom = "12px";
+        warn.style.zIndex = "30";
+        warn.style.background = "rgba(90,20,20,0.92)";
+        warn.style.color = "#ffd9d9";
+        warn.style.border = "1px solid #c66";
+        warn.style.borderRadius = "6px";
+        warn.style.padding = "8px 10px";
+        warn.style.fontSize = "12px";
+        warn.style.maxWidth = "46vw";
+        warn.textContent = warnMsg;
+        document.body.appendChild(warn);
+        camWarnEl = warn;
+      }
+      return;
+    }
+    if (camWarnEl && camWarnEl.parentNode && camWarnEl.parentNode.removeChild) {
+      camWarnEl.parentNode.removeChild(camWarnEl);
+    }
+    camWarnEl = null;
+  }
 
   var neurons = DATA.neurons || [];
   var centroid = { x: 0, y: 0, z: 0 };
@@ -84,7 +148,8 @@
     var dx = neurons[i].x - centroid.x, dy = neurons[i].y - centroid.y, dz = neurons[i].z - centroid.z;
     radius = Math.max(radius, Math.sqrt(dx * dx + dy * dy + dz * dz));
   }
-  // 含 FC 节点的半径（自动取景用；见文件头的「取景」说明）
+  // 含 FC 节点的半径：**仅用于告警信息里的诊断输出**（取景由共享相机的 dist 决定，
+  // 不再由本文件自行推导）。
   var fcNodes = [];
   var pi, uu;
   for (pi = 0; pi < (FC.panels || []).length; pi++) {
@@ -99,15 +164,6 @@
       fz = fcNodes[i].z - centroid.z;
     radiusWithFc = Math.max(radiusWithFc, Math.sqrt(fx * fx + fy * fy + fz * fz));
   }
-  cam.tx = centroid.x; cam.ty = centroid.y; cam.tz = centroid.z;
-
-  /** 与 viewer.js 的 dist = radius * 3.6 同源（两边必须用同一系数）。 */
-  var ZOOM_FACTOR = 3.6;
-  /** 用户缩放倍率（默认 1 = 与基础渲染器一致的取景）。见 draw() 里的「不许有反馈环」。 */
-  var userZoom = 1.0;
-  /** 缩放倍率的夹取范围，与 viewer.js 的滚轮 clamp（radius*0.35 ~ radius*40）一致。 */
-  var ZOOM_MIN = 0.35 / ZOOM_FACTOR;
-  var ZOOM_MAX = 40.0 / ZOOM_FACTOR;
 
   /** 行主序矩阵乘法 C[r][c] = sum_k A[r][k]*B[k][c]（与 viewer.js 的 mat4Mul 同式）。 */
   function mat4Mul(a, b) {
@@ -136,28 +192,31 @@
   /** 视图矩阵：p_cam = R*(p - center) + (0,0,-dist)，R = RotX(pitch)*RotY(yaw)。
    *
    *  与 viewer.js 的 viewMatrix() 等价（同一旋转顺序、同一平移列构造）。
+   *  相机由参数传入（来自共享对象 `window.__n3d_cam`），**函数内不写入**它。
+   *
+   *  @param {Object} camera 共享相机对象（yaw/pitch/dist/panX/panY/tx/ty/tz）。
    */
-  function fcViewMatrix() {
-    var rot = mat4Mul(mat4RotX(cam.pitch), mat4RotY(cam.yaw));
+  function fcViewMatrix(camera) {
+    var rot = mat4Mul(mat4RotX(camera.pitch), mat4RotY(camera.yaw));
     var m = rot.slice();
-    m[12] = -(rot[0] * cam.tx + rot[4] * cam.ty + rot[8] * cam.tz) + cam.panX;
-    m[13] = -(rot[1] * cam.tx + rot[5] * cam.ty + rot[9] * cam.tz) + cam.panY;
-    m[14] = -(rot[2] * cam.tx + rot[6] * cam.ty + rot[10] * cam.tz) - cam.dist;
+    m[12] = -(rot[0] * camera.tx + rot[4] * camera.ty + rot[8] * camera.tz) + camera.panX;
+    m[13] = -(rot[1] * camera.tx + rot[5] * camera.ty + rot[9] * camera.tz) + camera.panY;
+    m[14] = -(rot[2] * camera.tx + rot[6] * camera.ty + rot[10] * camera.tz) - camera.dist;
     return m;
   }
 
   /** 世界坐标 -> 屏幕坐标 + 深度（depth = -zCam，越大越靠近相机）。
    *
    *  与 viewer.js 的 project() 等价：同样的 cz > -0.001 剔除、同样的屏幕中心
-   *  偏移与 y 轴翻转、同样的 dpr 缩放。
+   *  偏移与 y 轴翻转、同样的 dpr 缩放；焦距也取自共享相机（不再自算）。
    */
-  function fcProject(m, x, y, z) {
+  function fcProject(m, camera, x, y, z) {
     var cz = m[2] * x + m[6] * y + m[10] * z + m[14];
     if (cz > -0.001) { return null; }
     var cx = m[0] * x + m[4] * y + m[8] * z + m[12];
     var cy = m[1] * x + m[5] * y + m[9] * z + m[13];
     var dpr = window.devicePixelRatio || 1;
-    var k = cam.focal / (-cz);
+    var k = camera.focal / (-cz);
     return {
       x: canvas.width * 0.5 + cx * k * dpr,
       y: canvas.height * 0.5 - cy * k * dpr,
@@ -266,28 +325,33 @@
    *  深度口径与基础渲染器一致（线段取两端均值、方块取四角均值），因此叠加层
    *  内部的前后关系正确；与底层元素之间的遮挡由「叠加层整体画在最上面」决定
    *  —— 这也正是「全连接层是包裹在核心两端的外层结构」的直观表达。
+   *
+   *  相机**全部来自共享对象** `window.__n3d_cam`（基础渲染器是唯一写入方）：
+   *  yaw / pitch / dist / panX / panY / focal / tx,ty,tz 一律直读，
+   *  本函数**不写入**其中任何字段。因此旋转 / 平移 / 缩放 / 重置四种交互
+   *  与基础画布天然同步（旧实现自建相机时旋转与平移都不同步）。
    */
   function draw() {
     if (!ctx) { return; }
     var dpr = dprOf();
     if (ctx.setTransform) { ctx.setTransform(1, 0, 0, 1, 0, 0); }
     if (ctx.clearRect) { ctx.clearRect(0, 0, canvas.width, canvas.height); }
+
+    // ---- 共享相机不可用：去抖后告警、**不画错图** -------------------------
+    // 触发场景：`viewer_fc.js` 被单独加载、或内联脚本执行顺序被改动。此时若沿用
+    // 「自建相机兜底」就会画出与基础层不同步的图（正是被修复的缺陷形态），
+    // 故明确拒绝绘制；告警按 `CAM_WARN_AFTER_FRAMES` 去抖，且相机一旦就绪即撤销。
+    var cam = sharedCam();
+    if (!cam) {
+      camMissFrames++;
+      if (camMissFrames >= CAM_WARN_AFTER_FRAMES) { setCamWarning(true); }
+      return;
+    }
+    camMissFrames = 0;
+    setCamWarning(false);
     if (!showFc) { return; }
 
-    cam.focal = Math.max(canvas.height * 0.9, 300);
-
-    // ---- 缩放衔接（**不许有反馈环**）----------------------------------
-    // 叠加层看不到基础渲染器内部的 cam.dist（它是 IIFE 私有变量），所以不能每帧
-    // 从「上一帧的 dist」反推缩放倍率——那会形成正反馈：第 1 帧把 dist 归一到
-    // radiusWithFc*3.6，第 2 帧又把这个值当成「用户已缩放后的距离」再乘一次比值，
-    // 于是 dist 每帧按 radiusWithFc/radius 的倍数放大，最终钉死在滚轮缩放的
-    // clamp 上限（实测 dist 由正确的 6.7565 涨到 12.2015 = radius*40 的上限，
-    // 面板因此被缩到看不见）。
-    // 正确做法：自带一个**用户缩放倍率** userZoom（默认 1），叠加层据此
-    // 与基础渲染器保持相同的取景口径；滚轮/重置通过事件同步（见下方绑定）。
-    cam.dist = radiusWithFc * ZOOM_FACTOR * userZoom;
-
-    var m = fcViewMatrix();
+    var m = fcViewMatrix(cam);
     var items = [];
     var j, k, sc;
 
@@ -299,10 +363,10 @@
       for (k = 0; k < units.length; k++) {
         var un = units[k];
         var qs = [
-          fcProject(m, un.x - half, un.y - half, un.z),
-          fcProject(m, un.x + half, un.y - half, un.z),
-          fcProject(m, un.x + half, un.y + half, un.z),
-          fcProject(m, un.x - half, un.y + half, un.z)
+          fcProject(m, cam, un.x - half, un.y - half, un.z),
+          fcProject(m, cam, un.x + half, un.y - half, un.z),
+          fcProject(m, cam, un.x + half, un.y + half, un.z),
+          fcProject(m, cam, un.x - half, un.y + half, un.z)
         ];
         if (!qs[0] || !qs[1] || !qs[2] || !qs[3]) { continue; }
         items.push({
@@ -325,7 +389,7 @@
       ];
       var proj = [], ok = true, acc = 0;
       for (k = 0; k < 8; k++) {
-        sc = fcProject(m, corners[k][0], corners[k][1], corners[k][2]);
+        sc = fcProject(m, cam, corners[k][0], corners[k][1], corners[k][2]);
         if (!sc) { ok = false; break; }
         proj.push(sc); acc += sc.depth;
       }
@@ -344,7 +408,7 @@
     for (j = 0; j < blocks.length; j++) {
       var b2 = blocks[j], ctr = centers[b2.name];
       if (!ctr) { continue; }
-      var pa = fcProject(m, b2.x, b2.y, b2.z), pb = fcProject(m, ctr.x, ctr.y, ctr.z);
+      var pa = fcProject(m, cam, b2.x, b2.y, b2.z), pb = fcProject(m, cam, ctr.x, ctr.y, ctr.z);
       if (!pa || !pb) { continue; }
       items.push({ kind: "arrow", d: (pa.depth + pb.depth) / 2, a: pa, b: pb });
     }
@@ -365,8 +429,8 @@
       var unit = (pnl.units || [])[fe.unit];
       var nn = neurons[fe.neuron];
       if (!unit || !nn) { continue; }
-      var p1 = fcProject(m, unit.x, unit.y, unit.z);
-      var p2 = fcProject(m, nn.x, nn.y, nn.z);
+      var p1 = fcProject(m, cam, unit.x, unit.y, unit.z);
+      var p2 = fcProject(m, cam, nn.x, nn.y, nn.z);
       if (!p1 || !p2) { continue; }
       items.push({
         kind: "sample", d: (p1.depth + p2.depth) / 2, a: p1, b: p2,
@@ -462,7 +526,7 @@
       var pnl3 = FC.panels[j], us3 = pnl3.units || [];
       if (!us3.length) { continue; }
       var last = us3[us3.length - 1];
-      var ls = fcProject(m, last.x, last.y, last.z);
+      var ls = fcProject(m, cam, last.x, last.y, last.z);
       if (ls) {
         ctx.fillText(
           (pnl3.name === "input" ? "输入侧 H=" : "输出侧 H=") + us3.length +
@@ -522,24 +586,9 @@
   }
 
   if (window.addEventListener) { window.addEventListener("resize", scheduleDraw); }
-  // 缩放同步：基础渲染器的滚轮处理挂在 `#view` 上（气泡阶段），这里用**捕获阶段**
-  // 监听同一个元素，先按同样的百分比更新叠加层的 userZoom，再让基础渲染器处理自己的
-  // cam.dist（两者是不同对象，不会互相干扰）。用百分比而非绝对值是为了让两边的
-  // 「缩放比例」保持一致（各自的基准距离不同）。
-  if (base.addEventListener) {
-    base.addEventListener("wheel", function (ev) {
-      var factor = Math.exp(ev.deltaY * 0.0012);
-      userZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, userZoom * factor));
-    }, { capture: true, passive: true });
-  }
-  // 「重置视角」按钮由基础渲染器绑定；这里用捕获阶段抢先复位叠加层的缩放倍率。
-  var resetBtn = document.getElementById("btn-reset");
-  if (resetBtn && resetBtn.addEventListener) {
-    resetBtn.addEventListener("click", function () {
-      userZoom = 1.0;
-      scheduleDraw();
-    }, { capture: true });
-  }
+  // 旋转 / 平移 / 缩放 / 重置**都不需要在这里打补丁**：两层的取景参数来自同一个
+  // `window.__n3d_cam` 对象，基础渲染器（唯一写入方）改动它，叠加层下一帧即读到新值。
+  // 旧实现为此额外监听 wheel 与重置按钮维护自有的 userZoom —— 已随自建相机一并删除。
   injectControls();
   loop();
 })();
