@@ -105,7 +105,13 @@ PROJECT_ROOT: str = os.path.abspath(os.path.join(os.path.dirname(__file__), os.p
 # 本模块产物目录与一期物理隔离（一期产物 n3d_model_*.pt 位于 checkpoints/ 根）
 MODULE_CHECKPOINT_DIR_NAME: str = "n3d_sphere"
 CHECKPOINT_DIR: str = os.path.join(PROJECT_ROOT, "checkpoints", MODULE_CHECKPOINT_DIR_NAME)
-CHECKPOINT_PATH: str = os.path.join(CHECKPOINT_DIR, "model.pt")
+# 本轮产物格式段（"no synapse"）：checkpoint 不再落盘突触类 buffer（`state_dict` 瘦身）。
+# 目的：避免新版瘦身产物与旧版同名产物**同名覆盖**（旧产物上的冻结 SHA256 断言依赖"字节不变"）。
+# 默认组合特例：原 `model.pt` → `model_nosyn.pt`；`<产物名>.pt.bak` 备份机制保持不变。
+NOSYN_FORMAT_SEGMENT: str = "nosyn"
+CHECKPOINT_PATH: str = os.path.join(
+    CHECKPOINT_DIR, f"model_{NOSYN_FORMAT_SEGMENT}.pt"
+)
 # 验证类运行（冒烟测试 / 限批短跑）的独立写入目录，避免覆盖正式产物
 VERIFY_CHECKPOINT_DIR: str = os.path.join(CHECKPOINT_DIR, "_verify")
 
@@ -136,7 +142,9 @@ def smoke_fingerprint(config: Config) -> str:
 
     命名段：
     `N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{axis}_is{scope}_rs{scope}`
-    `_bs{batch_size}[_R{space_radius}]_s{seed}`。
+    `_bs{batch_size}[_R{space_radius}]_{NOSYN_FORMAT_SEGMENT}_s{seed}`
+    —— `_nosyn` 是**产物格式段**（checkpoint 不再落盘突触类 buffer），插在 `_s{seed}`
+    之前，使新版瘦身产物与旧版同名产物不互相覆盖。
 
     设计动机（皋陶审查 info 项）：冒烟产物原先只由 `flow_axis` / 两个 scope / `arch`
     决定，改变 `N` / `y` / `H` / `D` / `seed` 会写同一文件而互相覆盖；后续把容量与几何
@@ -171,6 +179,7 @@ def smoke_fingerprint(config: Config) -> str:
         f"_rs{scope_abbrev(config.readout_scope)}"
         f"_bs{config.batch_size}"
         f"{radius_part}"
+        f"_{NOSYN_FORMAT_SEGMENT}"
         f"_s{config.seed}"
     )
 
@@ -182,13 +191,15 @@ def smoke_checkpoint_path(
     arch: str = "neuron3d",
     fingerprint: str = "",
 ) -> str:
-    """返回冒烟测试产物的路径（文件名含配置指纹，防止不同配置互覆）。
+    """返回冒烟测试产物的路径（文件名含配置指纹与格式段，防止不同配置互覆）。
 
     命名规则：
     * 默认配置（`neuron3d` + `flow_axis=z` + 两个 `any_isolated` + 无指纹）退化为
-      历史文件名 `smoke.pt`（保持既有产物路径与既有验证脚本的可读性）；
-    * 其它情形：`smoke[_ar{arch}]_{fingerprint}_ax{axis}_is{scope[:3]}_rs{scope[:3]}.pt`
-      —— 传入 `fingerprint`（见 `smoke_fingerprint`）时容量与几何维度也进文件名。
+      `smoke_{NOSYN_FORMAT_SEGMENT}.pt`（原 `smoke.pt`，加格式段后与旧版瘦身前产物
+      分开留痕；`is_default_smoke` 判定维度不变）；
+    * 其它情形：`smoke[_ar{arch}]_{fingerprint}.pt`
+      —— `fingerprint`（见 `smoke_fingerprint`）的首段已含 `{NOSYN_FORMAT_SEGMENT}`
+      格式段，其后才是 `_s{seed}`。
 
     **arch 维度**（离朱第 8 轮实测 M3，已修复）：冒烟产物名原先只由 flow_axis 与两个
     scope 决定，`--arch mlp` 与主模型会写同一个 `smoke.pt` 而互相覆盖（先跑 mlp 冒烟
@@ -220,7 +231,9 @@ def smoke_checkpoint_path(
         and arch == "neuron3d"
         and not fingerprint
     ):
-        return os.path.join(VERIFY_CHECKPOINT_DIR, "smoke.pt")
+        return os.path.join(
+            VERIFY_CHECKPOINT_DIR, f"smoke_{NOSYN_FORMAT_SEGMENT}.pt"
+        )
     arch_part = "" if arch == "neuron3d" else f"_ar{arch}"
     if fingerprint:
         # 指纹本身已含 N/y/H/D/pl/ax/is/rs/s 全部维度，无需再拼接一遍
@@ -427,7 +440,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=str,
         default="",
         help=(
-            "checkpoint 保存路径（默认 checkpoints/n3d_sphere/model.pt）。"
+            "checkpoint 保存路径（默认 checkpoints/n3d_sphere/model_nosyn.pt）。"
             "冒烟测试与 --max-batches 限批模式不会写入该路径，"
             "而是写入 checkpoints/n3d_sphere/_verify/ 下，避免覆盖正式产物。"
         ),
@@ -916,7 +929,7 @@ def run_smoke_test(
     产物保护
     --------
     冒烟测试只跑 1 个 batch，其 checkpoint 写入
-    `checkpoints/n3d_sphere/_verify/`，**不会覆盖 `checkpoints/n3d_sphere/model.pt`
+    `checkpoints/n3d_sphere/_verify/`，**不会覆盖 `checkpoints/n3d_sphere/model_nosyn.pt`
     等正式产物，也绝不触碰一期 `checkpoints/` 下的任何文件**。
     """
     if config_override is not None:
@@ -1222,8 +1235,9 @@ def run_smoke_test(
     # ---- 冒烟测试产物写入独立目录，避免覆盖正式 checkpoint ----
     # 命名规则（唯一事实来源 = `smoke_checkpoint_path`，本处只决定是否退化）：
     #   * **完全默认组合**（neuron3d + SMALL_CONFIG 规模 + flow_axis=z + 两个
-    #     any_isolated）→ `_verify/smoke.pt`（保持历史语义，供 README/spec 与
-    #     `verify_sphere_dag.py` 的既有引用直接复核）；
+    #     any_isolated）→ `_verify/smoke_nosyn.pt`（本轮起加 `_nosyn` 格式段：
+    #     checkpoint 不再落盘突触类 buffer，故与旧版 `smoke.pt` 分开留痕，
+    #     旧产物与其上的冻结 SHA256 断言不被触碰）；
     #   * 其它任何组合（换 arch / 流向轴 / scope / **N、y、H、D、seed 被覆盖**）→
     #     `_verify/smoke[_ar{arch}]_{完整配置指纹}.pt`，保证不同配置不互相覆盖。
     # ⚠️ 历史缺陷（离朱第 9 轮 M2）：曾无条件传入指纹，使默认路径**永远不再写**
@@ -1315,8 +1329,10 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
     """生成限批验证产物的配置指纹文件名（保证不同配置互不覆盖）。
 
     命名格式：
-    `verify_<bpe>_N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{flow_axis}_is{scope}_rs{scope}_s{seed}[_<tag>].pt`
+    `verify_<bpe>_N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{flow_axis}_is{scope}_rs{scope}_{NOSYN_FORMAT_SEGMENT}_s{seed}[_<tag>].pt`
 
+    * `_{NOSYN_FORMAT_SEGMENT}`：**产物格式段**（checkpoint 不再落盘突触类 buffer），
+      插在 `_s{seed}` 之前，使新版瘦身产物与旧版同名产物不互相覆盖；
     * `_s{seed}`：种子影响突触采样（边集与边数随 seed 变），指纹必须含 seed，
       否则只改 `--seed` 的限批跑会互相覆盖；
     * `_ax{flow_axis}` / `_is{input_scope}` / `_rs{readout_scope}`：几何与判据维度，
@@ -1354,6 +1370,7 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
         f"_ax{config.flow_axis}"
         f"_is{scope_abbrev(config.input_scope)}"
         f"_rs{scope_abbrev(config.readout_scope)}"
+        f"_{NOSYN_FORMAT_SEGMENT}"
         f"_s{config.seed}"
     )
     if tag:
@@ -1365,7 +1382,12 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
     """生成正式全量产物的文件名（配置指纹，去掉限批语义前缀）。
 
     命名格式：
-    `full_N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{flow_axis}_is{...}_rs{...}_s{seed}[_tag].pt`
+    `full_N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{flow_axis}_is{...}_rs{...}_{NOSYN_FORMAT_SEGMENT}_s{seed}[_tag].pt`
+
+    `_{NOSYN_FORMAT_SEGMENT}` 是**产物格式段**（checkpoint 不再落盘突触类 buffer：
+    `state_dict` 瘦身，见 `n3d_sphere/model.py` 的 buffer 持久性契约），插在 `_s{seed}`
+    之前；其作用是让新版瘦身产物与旧版同名产物**不互相覆盖**（旧产物上的冻结
+    SHA256 断言依赖"字节不变"，必须保持可复核）。
 
     历史缺陷（离朱第 2 轮 D4）：早期实现直接复用 `config_fingerprint`，产出
     `full_verify_0_...` 这种带限批前缀的误导性名字；此处独立构造、不带该前缀。
@@ -1391,6 +1413,7 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
         f"_ax{config.flow_axis}"
         f"_is{scope_abbrev(config.input_scope)}"
         f"_rs{scope_abbrev(config.readout_scope)}"
+        f"_{NOSYN_FORMAT_SEGMENT}"
         f"_s{config.seed}"
     )
     if tag:
@@ -1413,8 +1436,10 @@ def resolve_checkpoint_path(
        否则使用带配置指纹的 `verify_<...>.pt`（`config` 为 None 时退化为 `verify_<bpe>.pt`），
        **绝不覆盖正式产物**；发生重定位时会打印「重定位前路径 -> 重定位后路径」；
     2. `checkpoint_override` 非空 -> 使用用户显式指定的路径（相对路径按工程根目录解析）；
-    3. 否则 -> 正式全量默认路径：与 `DEFAULT_CONFIG` 完全同配置时用 `model.pt`，
-       其它配置使用 `full_<指纹>.pt`，保证不同几何/判据/容量的实验点各自留痕。
+    3. 否则 -> 正式全量默认路径：与 `DEFAULT_CONFIG` 完全同配置时用
+       `model_{NOSYN_FORMAT_SEGMENT}.pt`（原 `model.pt`；本轮起加 `_nosyn` 格式段，
+       与旧版产物分开留痕），其它配置使用 `full_<指纹>.pt`，
+       保证不同几何/判据/容量的实验点各自留痕。
 
     参数
     ----
@@ -1463,8 +1488,8 @@ def resolve_checkpoint_path(
 def is_default_config(config: Config) -> bool:
     """判断配置是否与 `DEFAULT_CONFIG` 完全一致（仅影响默认产物文件名）。
 
-    该判定只影响**默认产物文件名**（与 `DEFAULT_CONFIG` 一致时保持 `model.pt` 语义），
-    不影响任何数值计算。
+    该判定只影响**默认产物文件名**（与 `DEFAULT_CONFIG` 一致时保持
+    `model_{NOSYN_FORMAT_SEGMENT}.pt` 语义），不影响任何数值计算。
 
     参数
     ----
@@ -1577,7 +1602,8 @@ def run_full_training(
         每个 epoch 最多处理的 batch 数（0 表示全量）。> 0 时 checkpoint 会写入
         `checkpoints/n3d_sphere/_verify/`，避免覆盖正式产物。
     checkpoint_path : str
-        checkpoint 保存路径（空串表示使用默认 `checkpoints/n3d_sphere/model.pt`）。
+        checkpoint 保存路径（空串表示使用默认
+        `checkpoints/n3d_sphere/model_{NOSYN_FORMAT_SEGMENT}.pt`）。
     backup : bool
         覆盖已有 checkpoint 前是否先备份为 `<path>.bak`。默认 True。
     preset : str

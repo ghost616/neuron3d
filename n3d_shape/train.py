@@ -149,13 +149,14 @@ def smoke_fingerprint(config: Config) -> str:
 
     命名段：
     `N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{axis}_is{scope}_rs{scope}`
-    `_bs{batch_size}[_R{space_radius}]_s{seed}`，**非 sphere 形状前置 `{shape_tag}_`**。
+    `_bs{batch_size}[_fc{n}]_nosyn[_R{space_radius}]_s{seed}`，**非 sphere 形状前置
+    `{shape_tag}_`**。`_nosyn` 为第 4 轮新增的**格式段（恒定插入）**，紧随 `_fc{n}` 段之后。
 
     设计动机（皋陶审查 info 项）：冒烟产物原先只由 `flow_axis` / 两个 scope / `arch`
     决定，改变 `N` / `y` / `H` / `D` / `seed` 会写同一文件而互相覆盖；后续把容量与几何
     维度纳入指纹。
 
-    [!] 历史缺陷（离朱第 10 轮 D1）：`is_default_smoke`（决定是否退化为 `smoke.pt`）已把
+    [!] 历史缺陷（离朱第 10 轮 D1）：`is_default_smoke`（决定是否退化为默认冒烟产物名）已把
     `batch_size` 与 `space_radius` 纳入判定，但指纹**未**包含这两个维度 —— 于是
     `--batch-size 64`、`--space-radius 0.9`、以及两者同时覆盖的配置会落回**同一个文件名**
     而互相覆盖（实测后者会重写前者的取证产物）。指纹必须与默认判定**维度严格对齐**：
@@ -166,7 +167,8 @@ def smoke_fingerprint(config: Config) -> str:
     否则 `N / H / D / seed / scope` 相同的三种形状会**互相覆盖**同一份取证产物 ——
     正是历史纠正记录中 `verify_<bpe>.pt` 同名互覆导致取证失效的同一类缺陷。
     形状段放在指纹**开头**，便于目视区分；`sphere` 分支仍带 `shapesphere_` 段，
-    但 `is_default_smoke` 退化路径（默认组合 → `smoke.pt`）不受影响。
+    但 `is_default_smoke` 退化路径（默认组合 → `smoke_nosyn.pt`，见
+    `smoke_checkpoint_path`）不受影响。
 
     参数
     ----
@@ -183,8 +185,15 @@ def smoke_fingerprint(config: Config) -> str:
     )
     # [!] fc_dim（第 3 轮新增）**必须入指纹**：否则同 N/seed/scope 的不同 fc_dim
     #     会写同一个文件名而互相覆盖（历史纠正 #1 的同类缺陷）。
-    #     口径：`fc_dim == 0`（默认关闭）**不加段**，从而既有产物名逐字不变。
+    #     口径：`fc_dim == 0`（默认关闭）**不加段**（该段口径与改动前逐字相同；
+    #     但产物名整体因下一行的 `_nosyn` 段而不再与旧格式产物同名）。
     fc_part = f"_fc{int(config.fc_dim)}" if int(config.fc_dim) != 0 else ""
+    # [!] `nosyn`（第 4 轮新增）**格式段，恒定插入**：产物不再落盘 8 个突触类张量
+    #     （`persistent=False`），故产物名必须与旧格式产物可区分（防"新旧格式同名互覆"）。
+    #     口径：**无条件下加段**；与 `_fc{n}` 段的相对位置 = `_nosyn` **紧随 `_fc{n}` 之后**
+    #     （`fc_dim == 0` 时紧随 scope 段之后）、位于 `_s{seed}` 之前。同一口径已同步
+    #     `config_fingerprint` / `full_checkpoint_name` 与 README §19。
+    nosyn_part = "_nosyn"
     return (
         f"{config.shape_tag()}_"
         f"N{config.N}_y{config.y_in}x{config.y_out}"
@@ -195,6 +204,7 @@ def smoke_fingerprint(config: Config) -> str:
         f"_rs{scope_abbrev(config.readout_scope)}"
         f"_bs{config.batch_size}"
         f"{fc_part}"
+        f"{nosyn_part}"
         f"{radius_part}"
         f"_s{config.seed}"
     )
@@ -210,13 +220,17 @@ def smoke_checkpoint_path(
     """返回冒烟测试产物的路径（文件名含配置指纹，防止不同配置互覆）。
 
     命名规则：
-    * 默认配置（`neuron3d` + `flow_axis=z` + 两个 `any_isolated` + 无指纹）退化为
-      历史文件名 `smoke.pt`（保持既有产物路径与既有验证脚本的可读性）；
+    * 默认配置（`neuron3d` + `flow_axis=z` + 两个 `any_isolated` + 无指纹）用
+      默认产物名 `smoke_nosyn.pt`（原历史名 `smoke.pt`）—— 第 4 轮加入 `_nosyn`
+      格式段（8 个突触类张量 `persistent=False`、不落盘），使**新版瘦身产物与旧版
+      同名产物分开留痕**，旧产物上的冻结 SHA256 断言不被触碰；`is_default_smoke`
+      判定的**维度不变**（`_nosyn` 是格式常量，与 config 无关），其职责仍是
+      **防止非默认配置静默覆盖**该默认产物；
     * 其它情形：`smoke[_ar{arch}]_{fingerprint}_ax{axis}_is{scope[:3]}_rs{scope[:3]}.pt`
       —— 传入 `fingerprint`（见 `smoke_fingerprint`）时容量与几何维度也进文件名。
 
     **arch 维度**（离朱第 8 轮实测 M3，已修复）：冒烟产物名原先只由 flow_axis 与两个
-    scope 决定，`--arch mlp` 与主模型会写同一个 `smoke.pt` 而互相覆盖（先跑 mlp 冒烟
+    scope 决定，`--arch mlp` 与主模型会写同一个产物名而互相覆盖（先跑 mlp 冒烟
     会让 `verify_sphere_dag.py` 的 R7 读到 mlp 产物、缺 `topology_stats` 而误报 FAIL）。
     现把 arch 纳入指纹：非 `neuron3d` 时文件名插入 `_ar{arch}`，两种架构各自留痕。
 
@@ -245,7 +259,10 @@ def smoke_checkpoint_path(
         and arch == "neuron3d"
         and not fingerprint
     ):
-        return os.path.join(VERIFY_CHECKPOINT_DIR, "smoke.pt")
+        # [!] 第 4 轮：默认产物名由历史名 `smoke.pt` 改为 `smoke_nosyn.pt`（加格式段），
+        #     使新版瘦身产物与旧版同名产物**不互相覆盖**（旧产物与其上的冻结 SHA256
+        #     断言保持可复核）。这是**名字变更**，`is_default_smoke` 的判定维度不变。
+        return os.path.join(VERIFY_CHECKPOINT_DIR, "smoke_nosyn.pt")
     arch_part = "" if arch == "neuron3d" else f"_ar{arch}"
     if fingerprint:
         # 指纹本身已含 N/y/H/D/pl/ax/is/rs/s 全部维度，无需再拼接一遍
@@ -934,7 +951,7 @@ def apply_overrides(
         #     `"any_isolated"` 字符串对象，第二次出现被写成 memo 引用（`h\xfd`）；
         #   * 显式传 `--input-scope any_isolated` 时，取值来自 argparse 构造的**等值新
         #     字符串**，两个位置分别内联写出（`X\x0c\0\0\0any_isolated`）。
-        # 于是"语义完全相同"的两次运行产出**不同字节**的 `smoke.pt`（离朱第 11 轮 D1：
+        # 于是"语义完全相同"的两次运行产出**不同字节**的冒烟产物（离朱第 11 轮 D1：
         # data.pkl 4097 vs 4117 字节、1520 字节差异，而 loss/config/grad_norms/全部张量
         # 逐位相等）。复用基线对象即让"同一语义配置 => 同一字节"，
         # 使产物 SHA256 重新成为可靠的等价判据。
@@ -1404,16 +1421,19 @@ def run_smoke_test(
     # ---- 冒烟测试产物写入独立目录，避免覆盖正式 checkpoint ----
     # 命名规则（唯一事实来源 = `smoke_checkpoint_path`，本处只决定是否退化）：
     #   * **完全默认组合**（neuron3d + SMALL_CONFIG 规模 + flow_axis=z + 两个
-    #     any_isolated）→ `_verify/smoke.pt`（保持历史语义，供 README/spec 与
-    #     `verify_sphere_dag.py` 的既有引用直接复核）；
+    #     any_isolated）→ `_verify/smoke_nosyn.pt`（第 4 轮起：原历史名 `smoke.pt`
+    #     加 `_nosyn` 格式段，使新版瘦身产物与旧版同名产物分开留痕，
+    #     旧产物上的冻结 SHA256 断言不被触碰）；
     #   * 其它任何组合（换 arch / 流向轴 / scope / **N、y、H、D、seed 被覆盖**）→
     #     `_verify/smoke[_ar{arch}]_{完整配置指纹}.pt`，保证不同配置不互相覆盖。
     # [!] 历史缺陷（离朱第 9 轮 M2）：曾无条件传入指纹，使默认路径**永远不再写**
     #    `smoke.pt`，而 README/spec 与 `verify_sphere_dag.py` 仍指向它 —— 于是读到
     #    上一版代码留下的陈旧产物（数值与文档不符且含已删除字段）。
+    #    [第 4 轮提醒] 本次是**有意**改名（`smoke.pt` -> `smoke_nosyn.pt`），故 README /
+    #    spec 中的默认产物名必须**同步改名**，不得再指向旧名（否则重演 M2 的陈旧产物缺陷）。
     # [!] 历史缺陷（皋陶第 2 轮 F12）：`is_default_smoke` 原先只比较 arch / flow_axis /
     #    两个 scope，未纳入容量与 seed —— 于是 `--smoke-test --n 32`、`--preset default`、
-    #    `--seed 7` 等会**静默覆盖** `smoke.pt`（用一个不同配置的结果冒充默认产物）。
+    #    `--seed 7` 等会**静默覆盖**默认冒烟产物（用一个不同配置的结果冒充默认产物）。
     #    故现按 `SMALL_CONFIG` 的全部几何/容量维度逐一比对。
     small = SMALL_CONFIG
     is_default_smoke = (
@@ -1430,17 +1450,33 @@ def run_smoke_test(
         and config.readout_scope == small.readout_scope
         and float(config.space_radius) == float(small.space_radius)
         # 形状维度（本模块新增）**必须纳入默认判定**：否则 `--smoke-test --shape cube`
-        # 会静默覆盖 `smoke.pt`（用立方体结果冒充"默认球体产物"），使既有引用读到错误取证。
+        # 会静默覆盖默认产物（用立方体结果冒充"默认球体产物"），使既有引用读到错误取证。
         # 指纹与默认判定的维度必须严格对齐（与二期 batch_size / space_radius 的历史缺陷同源）。
         and config.shape == small.shape
         and float(config.cyl_aspect) == float(small.cyl_aspect)
         # fc_dim（第 3 轮新增）**必须纳入默认判定**：否则 `--smoke-test --fc-dim -1`
-        # 会静默覆盖 `smoke.pt`（用"两端全连接包裹"的结果冒充默认产物）。
+        # 会静默覆盖默认产物（用"两端全连接包裹"的结果冒充默认产物）。
         and int(config.fc_dim) == int(small.fc_dim)
         # batch_size 进指纹粒度之外，但它直接影响探针 batch 的规模，故一并比对，
         # 避免"几何相同但批大小不同"的配置覆盖默认产物
         and int(config.batch_size) == int(small.batch_size)
     )
+    # [!] `_nosyn`（第 4 轮新增）是**格式常量**（与 config 无关），因此**不进入**上式判定：
+    #     默认组合写 `_verify/smoke_nosyn.pt`（**判定维度不变，仅默认产物名加格式段**）。
+    #     但"默认判定必须覆盖指纹的全部 config 维度"这条不变式仍须成立：一旦某个维度只进了
+    #     `smoke_fingerprint` 而漏了 `is_default_smoke`，一个**非默认配置**就会被当成默认，
+    #     从而**静默覆盖默认冒烟产物**（用不同配置的结果冒充默认产物）。
+    #     故此处加一道等价守卫（指纹是 config 的纯函数，故"指纹与默认配置逐字相同" <=>
+    #     "判定覆盖了指纹的全部 config 维度"）；守卫自动覆盖**今后**往指纹里加维度却忘记
+    #     同步判定的情形，无需再维护一张手写维度清单。
+    if is_default_smoke and smoke_fingerprint(config) != smoke_fingerprint(small):
+        raise ValueError(
+            "is_default_smoke 与 smoke_fingerprint 的维度不对齐："
+            f"当前指纹={smoke_fingerprint(config)!r}，默认配置指纹="
+            f"{smoke_fingerprint(small)!r}，但 `is_default_smoke` 判定为真 —— "
+            "继续执行会**静默覆盖默认冒烟产物** `_verify/smoke_nosyn.pt`。"
+            "请把该维度补进 `is_default_smoke` 判定（指纹与默认判定的维度必须严格对齐）。"
+        )
     fingerprint = "" if is_default_smoke else smoke_fingerprint(config)
     smoke_path = smoke_checkpoint_path(
         config.flow_axis,
@@ -1490,6 +1526,12 @@ def run_smoke_test(
     )
     log_info(f"[产物保护] 冒烟测试 checkpoint 写入独立路径（不覆盖正式产物）：{smoke_path}")
     log_info(
+        "[产物格式] nosyn：8 个突触类张量（syn_dist / input_syn_pos / output_syn_pos / "
+        "representative_syn_out / representative_syn_input / input_isolated_mask / "
+        "output_isolated_mask / neuron_conn_mask）为 persistent=False、不进入 state_dict；"
+        "edge_dist 与全部索引拓扑量仍持久化（n3d_viz 契约）"
+    )
+    log_info(
         f"[产物保护] 正式 checkpoint 默认路径未被写入：{CHECKPOINT_PATH}"
         f"（该路径仅在正式全量训练时写入）"
     )
@@ -1530,7 +1572,7 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
 
     命名格式：
     `verify_<bpe>_{shape_tag}_N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{flow_axis}`
-    `_is{scope}_rs{scope}_s{seed}[_<tag>].pt`
+    `_is{scope}_rs{scope}[_fc{n}]_nosyn_s{seed}[_<tag>].pt`
 
     * **`{shape_tag}`（本模块新增，防撞名硬要求）**：形状段
       （`shapesphere` / `shapecube` / `shapecylinder_a{λ}`）。缺少该段时，
@@ -1565,8 +1607,11 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
     """
     if tag and not re.fullmatch(r"[A-Za-z0-9_-]+", tag):
         raise ValueError(f"--tag 仅允许字母/数字/下划线/连字符，当前 tag={tag!r}")
-    # fc_dim != 0 时插入 `_fc{n}` 段；`fc_dim == 0` 不加段 -> 既有产物名逐字不变。
+    # fc_dim != 0 时插入 `_fc{n}` 段；`fc_dim == 0` 不加段 -> 该段口径与改动前逐字相同。
     fc_part = f"_fc{int(config.fc_dim)}" if int(config.fc_dim) != 0 else ""
+    # `_nosyn`（第 4 轮新增）恒定插入，紧随 `_fc{n}` 段之后、`_s{seed}` 之前
+    # （产物不再落盘 8 个突触类张量，格式段必须进名字以与旧格式产物区分）。
+    nosyn_part = "_nosyn"
     name = (
         f"verify_{max_batches}"
         f"_{config.shape_tag()}"
@@ -1579,6 +1624,7 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
         f"_is{scope_abbrev(config.input_scope)}"
         f"_rs{scope_abbrev(config.readout_scope)}"
         f"{fc_part}"
+        f"{nosyn_part}"
         f"_s{config.seed}"
     )
     if tag:
@@ -1591,14 +1637,17 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
 
     命名格式：
     `full_{shape_tag}_N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{flow_axis}`
-    `_is{...}_rs{...}_s{seed}[_tag].pt`
+    `_is{...}_rs{...}[_fc{n}]_nosyn_s{seed}[_tag].pt`
 
     * **`{shape_tag}`（本模块新增）**：形状段（含圆柱长径比），防"同配置不同形状互覆"；
     * 历史缺陷（离朱第 2 轮 D4）：早期实现直接复用 `config_fingerprint`，产出
       `full_verify_0_...` 这种带限批前缀的误导性名字；此处独立构造、不带该前缀。
     * **`{fc_part}`（第 3 轮新增）**：`fc_dim != 0` 时插入 `_fc{n}` 段，防止同
-      `N`/`seed` 的不同 `fc_dim` 同名互覆；`fc_dim == 0` **不加段**，从而既有产物名
-      （含 10 个三期正式产物与 22 个 N 阶梯产物）**逐字不变**。
+      `N`/`seed` 的不同 `fc_dim` 同名互覆；`fc_dim == 0` **不加段**（该段口径与改动前逐字相同）。
+    * **`_nosyn`（第 4 轮新增，恒定插入）**：产物格式段 —— 8 个突触类张量自本轮起
+      `persistent=False`、不再落盘，故产物名必须与旧格式产物可区分（防"新旧格式同名互覆"）。
+      位置口径：**紧随 `_fc{n}` 段之后**（`fc_dim == 0` 时紧随 scope 段之后）、
+      位于 `_s{seed}` 之前；与 `smoke_fingerprint` / `config_fingerprint` 三处一致。
 
     参数
     ----
@@ -1613,6 +1662,9 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
         产物文件名（不含目录）。
     """
     fc_part = f"_fc{int(config.fc_dim)}" if int(config.fc_dim) != 0 else ""
+    # `_nosyn`（第 4 轮新增）恒定插入，紧随 `_fc{n}` 段之后、`_s{seed}` 之前
+    # （产物不再落盘 8 个突触类张量，格式段必须进名字以与旧格式产物区分）。
+    nosyn_part = "_nosyn"
     name = (
         f"full_{config.shape_tag()}"
         f"_N{config.N}"
@@ -1624,6 +1676,7 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
         f"_is{scope_abbrev(config.input_scope)}"
         f"_rs{scope_abbrev(config.readout_scope)}"
         f"{fc_part}"
+        f"{nosyn_part}"
         f"_s{config.seed}"
     )
     if tag:

@@ -95,13 +95,13 @@
 | 名称                      | 形状                  | 类型           |
 |---------------------------|-----------------------|----------------|
 | neuron_pos                | [N, 3]                | buffer         |
-| input_syn_pos             | [N*y_in, 3]           | buffer         |
-| output_syn_pos            | [N*y_out, 3]          | buffer         |
-| syn_dist                  | [N*y_out, N*y_in]     | buffer         |
+| input_syn_pos             | [N*y_in, 3]           | buffer（**nosyn: persistent=False**） |
+| output_syn_pos            | [N*y_out, 3]          | buffer（**nosyn: persistent=False**） |
+| syn_dist                  | [N*y_out, N*y_in]     | buffer（**nosyn: persistent=False**） |
 | edge_src / edge_dst       | [E_neuron]            | buffer (int64) |
 | edge_dist                 | [E_neuron]            | buffer         |
-| representative_syn_out    | [E_neuron]            | buffer (int64) |
-| representative_syn_input  | [E_neuron]            | buffer (int64) |
+| representative_syn_out    | [E_neuron]            | buffer (int64)（**nosyn: persistent=False**） |
+| representative_syn_input  | [E_neuron]            | buffer (int64)（**nosyn: persistent=False**） |
 | edge_weight               | [E_neuron]            | Parameter      |
 | neuron_bias               | [N]                   | Parameter      |
 | W_in                      | [input_dim, |S_in|]   | Parameter      |
@@ -115,6 +115,29 @@
 | head_weight               | [output_dim, H]       | Parameter（仅 fc_dim!=0） |
 | head_bias                 | [output_dim]          | Parameter（仅 fc_dim!=0） |
 | out_scope_index           | [|S_out|]             | buffer (int64)（仅 fc_dim!=0） |
+
+产物持久性（`nosyn` 口径）
+--------------------------
+**8 个突触类 buffer 一律 `persistent=False`**：`syn_dist` / `input_syn_pos` / `output_syn_pos` /
+`representative_syn_out` / `representative_syn_input` / `input_isolated_mask` /
+`output_isolated_mask` / `neuron_conn_mask`。它们**不进入 `state_dict()`**，
+故训练产物**不再自证突触几何**——复核（如 `n3d_viz` 的突触级几何、`S_in`/`S_out` 归属）
+必须回到 **`config` + `seed` 重算**，不能用产物里的张量反查。
+
+* **只改持久性**：不删除、不改名、不改形状、不改 dtype，`named_buffers()` 键集合与改前**逐字相同**，
+  仅 `state_dict()` 少这 8 个键；这 8 个张量在 `__init__` 中的**计算与全部契约断言一律保留**
+  （含 `_build_neuron_edges` 的 3 处契约断言、2H 两道防线、连通性下限）——
+  **`persistent=False` 只影响落盘，不影响构造、校验与 `forward` 数值**。
+* **`edge_dist` 保持 `persistent=True`**：它是 `n3d_viz/core.py` 的 `REQUIRED_KEYS` 之一，
+  移出会直接破坏可视化入口的 schema 校验。
+* **索引拓扑量一律不动**（仍是 `persistent=True`）：`topo_index` / `edge_offset` / `edge_perm` /
+  `edge_perm_in` / `neuron_in_edge_reach` / `edge_dst_in` / `level_edge_reach` /
+  `level_node_reach` / `in_scope_mask` / `out_scope_mask` / `in_degree` / `out_degree` /
+  `edge_src` / `edge_dst` / `neuron_pos` / `out_scope_index`。
+* **兼容性边界**：改用本代码后，**既有旧产物**（仍含这 8 个键）以 `strict=True` 加载会报
+  `unexpected key(s) in state_dict`；如需复用旧产物须显式 `strict=False`。
+* 与同期 `n3d_sphere` 的改造口径**逐字同名同口径**（仅持久性 + 产物名 `_nosyn` 段），
+  其**张量数值与 `forward` 结果仍逐位不变**。
 
 稀疏实现约束
 ------------
@@ -286,13 +309,18 @@ class ThreeDNeuronSpace(nn.Module):
             neuron_pos, self.y_out, gen, hemisphere=+1.0
         )
         self.register_buffer("neuron_pos", neuron_pos, persistent=True)
-        self.register_buffer("input_syn_pos", input_syn_pos, persistent=True)
-        self.register_buffer("output_syn_pos", output_syn_pos, persistent=True)
+        # [!] 突触类 buffer（nosyn 口径）：`persistent=False` -> 不进入 `state_dict()`，
+        #     训练产物不再落盘突触几何（产物体积与 `n3d_sphere` 同期同步改造后一致）。
+        #     **只改持久性**：不删除、不改名、不改形状、不改 dtype，`named_buffers()` 键集合
+        #     与改前逐字相同；`__init__` 中的计算与契约断言全部保留，复核须回到 `config + seed` 重算。
+        self.register_buffer("input_syn_pos", input_syn_pos, persistent=False)
+        self.register_buffer("output_syn_pos", output_syn_pos, persistent=False)
 
         # ---------------- 神经元级拓扑（全部在 __init__ 预计算） ----------------
         # syn_dist[o, j] = ||output_syn_pos[o] - input_syn_pos[j]||，形状 [N*y_out, N*y_in]
         syn_dist = torch.cdist(output_syn_pos, input_syn_pos, p=2)
-        self.register_buffer("syn_dist", syn_dist, persistent=True)
+        # nosyn 口径：不落盘（persistent=False），但仍逐个构造并参与下方全部契约断言。
+        self.register_buffer("syn_dist", syn_dist, persistent=False)
 
         (
             edge_src,
@@ -313,12 +341,15 @@ class ThreeDNeuronSpace(nn.Module):
             )
         self.register_buffer("edge_src", edge_src, persistent=True)
         self.register_buffer("edge_dst", edge_dst, persistent=True)
+        # [!] `edge_dist` **保持 `persistent=True`**：它是 `n3d_viz` 的 `REQUIRED_KEYS`
+        #     之一（可视化契约键），移出 state_dict 会直接破坏渲染入口的 schema 校验。
         self.register_buffer("edge_dist", edge_dist, persistent=True)
-        self.register_buffer("representative_syn_out", rep_syn_out, persistent=True)
-        self.register_buffer("representative_syn_input", rep_syn_input, persistent=True)
-        self.register_buffer("neuron_conn_mask", neuron_conn_mask, persistent=True)
-        self.register_buffer("input_isolated_mask", input_isolated_mask, persistent=True)
-        self.register_buffer("output_isolated_mask", output_isolated_mask, persistent=True)
+        # nosyn 口径：以下 5 个突触类 buffer 一律 persistent=False（不落盘、仍参与断言）。
+        self.register_buffer("representative_syn_out", rep_syn_out, persistent=False)
+        self.register_buffer("representative_syn_input", rep_syn_input, persistent=False)
+        self.register_buffer("neuron_conn_mask", neuron_conn_mask, persistent=False)
+        self.register_buffer("input_isolated_mask", input_isolated_mask, persistent=False)
+        self.register_buffer("output_isolated_mask", output_isolated_mask, persistent=False)
 
         # ---------------- 拓扑序与 CSR 风格分组（按源神经元分组的连续切片） ----------------
         topo_index = self._build_topo_order()

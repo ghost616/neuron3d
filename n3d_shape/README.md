@@ -12,7 +12,9 @@
 | **seed 与共享前提** | 五组对照**共享 `seed=42`**、同一 `--preset default`、同为 `N=256 / H=D=0.10 / y=8x8 / flow_axis=z / bs=64 / lr=1e-3 / Adam / 10 epoch / CPU`。**只在形状维度上不同。** |
 | **`\|S_in\|` / `\|S_out\|` 的性质** | 这两个量是**逐 seed 的随机量**（随突触采样变），**不得当作设计常数**。本文件所有数值均标注 seed=42；跨 seed 波动范围见 §7.3。 |
 | **数字来源** | 所有实测数字来自本机真实执行，日志/产物落盘于 `checkpoints/n3d_shape/`。**前置探针数字**（§2 表末）已显式标注为"探针、非实测"。 |
-| **上游零改动** | `n3d_proto` 与 `n3d_sphere` 的**源码与既有产物零改动**（git 干净；62 个既有 `.pt` 的 SHA256 逐位不变），两期冒烟判据仍全绿（见 §8）。 |
+| **上游口径（第 19 轮修订）** | `n3d_proto`（一期）源码与产物**零改动**；`n3d_sphere`（二期）**与本模块同批同步改造**（**仅**突触类 buffer 持久性 + 产物名 `_nosyn` 段），其**张量数值与 `forward` 结果仍逐位不变**，S12 逐张量比对仍成立。修订理由与完整口径见 **§19.3**（原“上游零改动”表述已因二期同步改造而失效，不得再按原文理解）。 |
+| **产物格式（第 19 轮新增）** | 自本轮起训练产物为 **nosyn 格式**：8 个突触类 buffer `persistent=False`、**不进入 `state_dict()`**，产物**不再自证突触几何**；复核须回到 **`config` + `seed` 重算**。产物名**一律**带 `_nosyn` 段（含默认冒烟产物 `_verify/smoke_nosyn.pt`，原 `smoke.pt`）。**兼容性边界**：旧格式产物以 `strict=True` 加载会报 `Unexpected key(s) in state_dict`，复用须显式 `strict=False`（§19）。 |
+| **产物 SHA256 的可比性（第 19 轮实测披露）** | 产物字节**不只是配置的函数**：`torch.save`（本副本 torch 2.14）的 zip 条目名带**产物基名**（实测 `smoke_nosyn/data.pkl`），故**改名必然改 SHA256**；同名复跑逐位相同。故跨名字/跨 torch 版本**不得**用文件 SHA256 判等价 —— 应回到**张量级 `torch.equal`**（仓库 D1 口径）。 |
 
 ## 1 核心机制：形状 = 生长度量，不是裁剪掩码
 
@@ -202,16 +204,44 @@
 三种形状会**互相覆盖** —— 正是历史纠正记录中 `verify_<bpe>.pt` 同名互覆导致取证失效的同一类缺陷。
 
 ```text
-verify_{bpe}_{shape_tag}_N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{axis}_is{scope}_rs{scope}_s{seed}[_tag].pt
-full_{shape_tag}_N{N}_...                                                                  .pt
-_verify/smoke[_ar{arch}]_{shape_tag}_N{N}_...                                              .pt
+verify_{bpe}_{shape_tag}_N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{axis}_is{scope}_rs{scope}[_fc{n}]_nosyn_s{seed}[_tag].pt
+full_{shape_tag}_N{N}_...                                                                    [_fc{n}]_nosyn_s{seed}.pt
+_verify/smoke[_ar{arch}]_{shape_tag}_N{N}_...                                                [_fc{n}]_nosyn_s{seed}.pt
 ```
 
 `shape_tag`：`shapesphere` / `shapecube` / `shapecylinder_a{λ}`（**始终**输出，含 sphere）。
 实测同配置下 5 种形状 x 3 类产物名 = **15 个名字全部互不相同**（`verify_shape.py` S11）。
-默认组合（`SMALL_CONFIG` 规模 + sphere + `flow_axis=z` + 两个 `any_isolated`）仍退化为历史
-文件名 `_verify/smoke.pt`，保持既有引用可读；`is_default_smoke` 判定**已纳入 shape 与 λ**
-（否则 `--smoke-test --shape cube` 会静默覆盖 `smoke.pt`）。
+
+### 5.1 `_nosyn` 格式段（第 19 轮新增）与 `_fc{n}` 段的相对位置
+
+**段序口径（三处函数一致，实测钉住）**：
+
+* `_fc{n}`（第 3 轮新增）：仅在 `fc_dim != 0` 时插入，`fc_dim == 0` **仍不加该段**（该段口径未变）；
+* `_nosyn`（第 19 轮新增）：**恒定插入**（与 config 无关），位置 = **紧随 `_fc{n}` 段之后**
+  （`fc_dim == 0` 时即紧随 `_rs{scope}` 段之后）、**位于 `_s{seed}` 之前**。
+
+实测（`checkpoints/n3d_shape/_verify/nosyn_probe/probe_names.log`，退出码 0）：
+
+| 配置 | `full_checkpoint_name` |
+| --- | --- |
+| `sphere` / `fc_dim=0` | `full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isall_rsall_nosyn_s42.pt` |
+| `sphere` / `fc_dim=-1` | `full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isall_rsall_fc-1_nosyn_s42.pt` |
+| `cube` / `fc_dim=8`（SMALL） | `full_shapecube_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_fc8_nosyn_s42.pt` |
+
+**加段理由**：产物不再落盘 8 个突触类张量（§19.1），格式变了，名字必须随之可区分 ——
+否则新旧格式产物**同名互覆**（历史纠正记录中同类缺陷）。**既有名字类记录**（§7.1、§16.2、
+§17.1、§18.1/§18.4 等处的产物名）均属旧格式实测记录，**已随本轮改名**：同配置新名为旧名在
+`_s{seed}` 前插入 `_nosyn`（`fc_dim != 0` 时插在 `_fc{n}` 之后）。既有实测数字一律保留。
+
+默认组合（`SMALL_CONFIG` 规模 + sphere + `flow_axis=z` + 两个 `any_isolated`）的冒烟产物名
+**也随本轮改名**：`_verify/smoke.pt` → **`_verify/smoke_nosyn.pt`**（加格式段，使新版瘦身产物与
+旧版同名产物分开留痕、旧产物上的冻结断言不被触碰）。`is_default_smoke` 判定的**维度不变**
+（`_nosyn` 是格式常量、不入判定），其职责仍是防止非默认配置**静默覆盖默认冒烟产物**
+（否则 `--smoke-test --shape cube` 会覆盖 `smoke_nosyn.pt`）；并新增与 `smoke_fingerprint` 的
+**维度对齐守卫**（若今后有人往指纹加维度却漏了判定，守卫会立即报错而不是静默覆盖默认产物）。
+**注**：正式默认产物 `checkpoints/n3d_shape/model.pt` 本轮**未改名**（计划只要求三个指纹函数与冒烟默认名；
+`model.pt` 是"保存逻辑/正式产物路径"，见硬约束第 4 条与 §19.2 的口径说明）。
+
 
 ## 6 产物隔离
 
@@ -246,11 +276,14 @@ Adam、10 epoch、**`seed=42`**、CPU。**五组共享同一 seed 前提**，只
 
 五组 `test_acc` 区间 **97.40% ~ 97.86%**，全部 **>= 90%**（二期阶段 B 门槛）。
 `params` 为**可学习参数**总数（`model.count_parameters()`），非 `state_dict` 元素总数
-（后者还含 `syn_dist [N*y_out, N*y_in]` 等几何 buffer）。
+（自第 19 轮起后者**不再包含** 8 个突触类 buffer —— 旧格式下它还含
+`syn_dist [N*y_out, N*y_in]` 等几何 buffer，见 §19.1；本条为该口径变化的历史留档）。
 
 **独立产物**（名字互不相同；SHA256 互不相同 —— 同名互覆缺陷的可复核证据）：
+**下表为第 19 轮之前的旧格式产物名与 SHA256 实测记录（数字保留不动），
+自第 19 轮起同配置产物名在 `_s{seed}` 前插入 `_nosyn` 段（见 §5.1）**。
 
-| 组 | 产物文件名 | SHA256 前缀 |
+| 组 | 产物文件名（旧格式实测记录，**已随本轮改名**） | SHA256 前缀 |
 | --- | --- | --- |
 | ① | `full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt` | `c96a25d2e8bc86ec` |
 | ② | `full_shapecube_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt` | `9d11e7dd07c10c9e` |
@@ -337,7 +370,7 @@ python -m compileall -q n3d_shape     # 退出码 0
 ### 8.2 冒烟测试（形状感知判据 16 条，退出码 0 / 1 / 2）
 
 ```bash
-python n3d_shape/train.py --smoke-test                                    # sphere（默认，写 _verify/smoke.pt）
+python n3d_shape/train.py --smoke-test                                    # sphere（默认，写 _verify/smoke_nosyn.pt）
 python n3d_shape/train.py --smoke-test --shape cube
 python n3d_shape/train.py --smoke-test --shape cylinder --cyl-aspect 1.0
 python n3d_shape/train.py --smoke-test --shape cylinder --cyl-aspect 0.5
@@ -350,6 +383,17 @@ python n3d_shape/train.py --smoke-test --shape cylinder --cyl-aspect 2.0
 
 **实测**：五种形状（sphere / cube / cylinder λ=1 / 0.5 / 2）冒烟**全部全绿，退出码 0**
 （sphere 为 16/16 PASS；其余形状同样 16/16）。
+
+**第 19 轮复跑（nosyn 格式，真实执行）**：
+
+```bash
+python n3d_shape/train.py --smoke-test                 # 16/16 PASS，退出码 0 -> _verify/smoke_nosyn.pt
+python n3d_shape/train.py --smoke-test --fc-dim -1     # 16/16 PASS，退出码 0 -> _verify/smoke_..._fc-1_nosyn_s42.pt
+```
+
+产物名与 SHA256（`checkpoints/n3d_shape/_verify/`）见 §19.2。
+默认冒烟产物名由 `smoke.pt` 改为 `smoke_nosyn.pt`（§5.1）；非默认组合的产物名一律带
+`_nosyn` 段（§5.1）。
 
 ### 8.3 独立验证脚本
 
@@ -401,24 +445,29 @@ python n3d_shape/verify_shape.py --quick   # 只跑 SMALL 规模
 参数 `edge_weight` / `neuron_bias` / `W_in` / `W_out`（共 27 个），
 `DEFAULT`（`E=736`, `params=154864`）与 `SMALL`（`E=106`, `params=43930`）**全部一致，无不匹配项**。
 
-### 8.4 上游回归
+### 8.4 上游回归（**第 19 轮修订：二期由“零改动”改为“同批同步改造”**）
 
-| 检查 | 实测结果 |
+| 检查 | 口径（修订后） |
 | --- | --- |
-| `n3d_sphere` / `n3d_proto` 源码改动 | `git status` **干净**（0 项变更） |
-| 既有产物 SHA256 | `checkpoints/n3d_sphere/` 下全部 `.pt` + 一期三个 `n3d_model_*.pt`，共 **62 个文件逐位不变** |
+| `n3d_proto`（一期）源码改动 | **零改动**（`git status` 干净，0 项变更） |
+| `n3d_sphere`（二期）源码改动 | **与本模块同批同步改造**（仅突触类 buffer 持久性 + 产物名 `_nosyn` 段）；**张量数值与 `forward` 结果仍逐位不变**（S12 逐张量比对仍成立，§19.3） |
+| 上游既有产物 SHA256 | 上游产物**一律不改写**；历史口径“62 个 `.pt` 逐位不变”见 §19.3 的**不可复现声明** |
 | `requirements.txt` | **零新增依赖**（git 干净） |
-| 一期冒烟 `python n3d_proto/train.py --smoke-test` | **全部通过，退出码 0** |
-| 二期冒烟 `python n3d_sphere/train.py --smoke-test` | **全部通过，退出码 0** |
+| 一期冒烟 `python n3d_proto/train.py --smoke-test` | 历史记录：**全部通过，退出码 0**（本轮未复跑，见 §19.4 不可复现声明） |
+| 二期冒烟 `python n3d_sphere/train.py --smoke-test` | 历史记录：**全部通过，退出码 0**（本轮未复跑，见 §19.4 不可复现声明） |
 
-上游 SHA256 基线快照：`checkpoints/n3d_shape/_verify/phase2_artifacts_sha256_before.json`。
+上游 SHA256 基线快照：`checkpoints/n3d_shape/_verify/phase2_artifacts_sha256_before.json`
+（**本工作副本中不存在**，见 §19.4）。
 
 ## 9 与二期 `n3d_sphere` 的关系
 
 * **自包含**：照"二期从一期拷贝"的既有做法，从 `n3d_sphere` 拷贝 `__init__ / utils / data /
   config / model / train` 后独立演进；**不 import 一期 `n3d_proto` 或二期 `n3d_sphere`**
   （验证脚本 `verify_shape.py` 为做张量级比对而导入二期，属**验证侧**依赖，生产代码不受影响）。
-* **零改动**：`n3d_sphere` / `n3d_proto` 的源码与既有产物零改动（§8.4）。
+* **上游口径（第 19 轮修订）**：`n3d_proto`（一期）源码与产物**零改动**；
+  `n3d_sphere`（二期）**与本模块同批同步改造**（仅突触类 buffer 持久性 + 产物名 `_nosyn` 段），
+  其**张量数值与 `forward` 结果仍逐位不变**（§19.3）。**原文“`n3d_sphere` / `n3d_proto`
+  源码与既有产物零改动”已失效**（其二期源码本轮确实被改动），不得再按原文理解。
 * **默认行为逐位一致**：`shape="sphere"` 时与二期在相同配置下**张量级逐位相等**（§8.3 S12）。
   实现路径：形状度量 `sphere` 分支与二期**逐位同式**（`points.norm(dim=1)`），
   搜索半径在球体口径下取 `max(shape_circum_radius, config.max_space_radius)`
@@ -462,8 +511,10 @@ python n3d_shape/train.py --preset default --epochs 10 --seed 42 --device cpu --
    默认分支直接无法构造 —— 而二期能正常工作正是因为其搜索半径取 `max_space_radius`。
 9. **窗口边界比较需要容差**：`space_radius` 按显示值（6 位小数）回填会与公式值差约 1e-7，
    严格比较会把合法值误判越界（§7.4 实测 `4.57e-7`）。
-10. **`params` 要区分"可学习参数"与"`state_dict` 元素"**：后者还含
-    `syn_dist [N*y_out, N*y_in]`（`N=256,y=8` 时为 4.19M 元素），会让参数量看起来膨胀 28 倍。
+10. **`params` 要区分"可学习参数"与"`state_dict` 元素"** —— **口径已于第 19 轮变化**：
+    现（nosyn 格式）`state_dict` 只含持久化的拓扑/索引张量与参数，**不再含 8 个突触类 buffer**；
+    旧格式下它还含 `syn_dist [N*y_out, N*y_in]`（`N=256,y=8` 时为 4.19M 元素），
+    会让参数量看起来膨胀 28 倍 —— 该历史数字保留于此仅作旧口径留档（§19.1）。
 11. **`shape_spec` 的 `circum_coef` 不能用"非 cylinder 一律 1.0"简化** —— 实测缺陷
     （离朱 D1）：cube 少除一个 `√3`，使 `R_max` 与校验窗口放大 `√3` 倍，
     `Config(shape="cube", space_radius=1.0/1.2/1.403681)` 这类**越界配置被静默接受**。
@@ -555,6 +606,10 @@ python n3d_shape/train.py --preset default --epochs 10 --seed 42 --device cpu --
   "逆序位置数"与"拓扑序/严格上行仍成立"做成可复核判据。
 * **需风后决策的事项**：若要求 `neuron_pos` 严格按流向轴升序，则须**同时**修改二期
   `n3d_sphere` 并重跑二期全部取证（与"二期零改动"冲突，需显式豁免）。
+  （**第 19 轮修订**：本句为该**历史轮次**的决策记录；原"二期零改动"硬约束第 1 条已改写为
+  "一期零改动 + 二期同批同步改造"，见 §19.3。本决策项的状态**未变**：即便二期源码已可同批修改，
+  该注解（`_build_edge_groups` 3 元/4 元）与 D2 的排序口径**仍不在本轮同步改造范围内**，
+  且单方面改字典序仍会破坏"默认分支与二期逐位一致"硬约束。）
 
 ### 12.3 信息项（不构成失败）
 
@@ -590,7 +645,7 @@ python n3d_shape/train.py --preset default --epochs 10 --seed 42 --device cpu --
 | `python n3d_shape/verify_full_runs.py` | 退出码 **0**（含 E1 回归 5+4 项核验全通过） |
 | sphere vs 二期 27 张量 `torch.equal` | DEFAULT 与 SMALL **全等**（`E=736/154864`、`106/43930`） |
 | W1 拒绝证明（注入 E1 → 恢复） | 注入退码 **1**（S3b/S3e 失败）；恢复后 `config.py` SHA256 **逐字节相同**、全绿退码 0 |
-| 上游零改动 | `git status` 空；既有 **62 个 `.pt` SHA256 逐位不变** |
+| 上游零改动 | `git status` 空；既有 **62 个 `.pt` SHA256 逐位不变**（**第 19 轮修订**：本行是**该历史轮次**的实测记录；本轮起 `n3d_sphere` 改为同批同步改造，口径见 §19.3） |
 | 五组 `test_acc` | 97.59 / 97.57 / 97.86 / 97.40 / 97.70 %，**与修复前逐项相同**（gate 9，未重跑训练） |
 
 ### 13.1 E1（error，**已修复**）：cylinder 的 `R_min` 与模块自身体积推导不符，误拒合法配置
@@ -676,7 +731,9 @@ python n3d_shape/train.py --preset default --epochs 10 --seed 42 --device cpu --
 * **I5 `_build_edge_groups` 注解与 docstring 声明 3 元组、实际返回 4 元组**：
   **已修复**（本模块内）—— 返回注解改为 4 元 `Tuple[Tensor, Tensor, Tensor, Tensor]`，
   "返回"小节补上 `edge_perm_in [E]`，并显式注明**该不一致继承自二期**
-  （`n3d_sphere` 注解 3 元、实返 4 元），受"上游零改动"硬约束**不得修改上游**，故仅改正本模块。
+  （`n3d_sphere` 注解 3 元、实返 4 元），受当时"上游零改动"硬约束**不得修改上游**，故仅改正本模块。
+  （**第 19 轮修订**：该硬约束第 1 条已改写 —— `n3d_proto` 仍零改动，`n3d_sphere` 改为同批同步改造；
+  本次同步改造**只碰突触类 buffer 持久性与产物名**，**不含**该注解，故本行结论不变。见 §19.3。）
 
 ## 14 离朱第 3 轮回归测试与收尾（第 5 轮修订记录）
 
@@ -715,7 +772,9 @@ W2 **以故障注入证明 sphere 硬断言是活代码**（覆写放置半径�
 
 修复 F1/F2 后复跑全部门槛：`compileall` 退码 0；`verify_shape.py` 全绿退码 0；
 `--quick` **78/78** 退码 0；五形状冒烟各 16/16 退码 0；负例退码 2；
-`verify_full_runs.py` 退码 0；sphere 与二期 27 张量全等；上游 git 干净、62 个产物 SHA256 不变；并已把 F1/F2 一并修复（见 §14.1 / §14.2）。
+`verify_full_runs.py` 退码 0；sphere 与二期 27 张量全等；上游 git 干净、62 个产物 SHA256 不变
+（**第 19 轮修订**：本段为**该历史轮次**的实测记录；本轮起 `n3d_sphere` 改为同批同步改造，
+口径见 §19.3）；并已把 F1/F2 一并修复（见 §14.1 / §14.2）。
 
 ### 14.4 观察项（非缺陷，如实留档）
 
@@ -804,7 +863,9 @@ float32 距离域累加误差**。准确表述：N≤1024 的实测范围内呈�
 * 既有 **5 组 any/any 产物 SHA256 逐位不变**（与修复前账本逐条比对通过）；
 * `verify_shape.py` **145/145** 退码 0；`--quick` **78/78** 退码 0（S15/S16 仅全量模式运行）；
   `verify_full_runs.py` 退码 0；五形状冒烟各 16/16 退码 0；负例退码 2；
-* `n3d_sphere` / `n3d_proto` git 干净、62 个既有产物 SHA256 不变。
+* `n3d_sphere` / `n3d_proto` git 干净、62 个既有产物 SHA256 不变
+  （**第 19 轮修订**：本行是**该历史轮次**的实测记录；本轮起 `n3d_sphere` 改为同批同步改造，
+  见 §19.3）。
 
 ### 15.5 阶段 1 门槛实测（`cylinder lam=2, D=0.10, all/all`）
 
@@ -908,6 +969,8 @@ batch_size=64   lr=1e-3   Adam   10 epoch   seed=42   CPU
 * 独立日志：`_verify/log_full_shape_{shape}_isall_rsall.txt`；
   独立产物：`full_shape{tag}_N1024_y8x8_H0.1_D{D}_plfcc_axz_isall_rsall_s42.pt`
   （10 组产物名与 SHA256 **两两唯一**，见 `verify_full_runs.py`）。
+  **第 19 轮修订**：上列为旧格式实测产物名（**已随本轮改名** —— 同配置新名在 `_s{seed}` 前
+  插入 `_nosyn` 段，见 §5.1）；旧的 10 组名字/SHA256 记录按原样保留。
 
 ### 16.3 判定规则（事先固定，不得事后挑选有利结果）
 
@@ -1069,7 +1132,8 @@ batch_size=64   lr=1e-3   Adam   10 epoch   seed=42   CPU
 **为什么必须带 tag**：`train.full_checkpoint_name` **不含 preset / epochs / batch_size / lr**，
 故不加 tag 时 `highacc + N=256 + seed=42` 会**覆盖**既有
 `full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_s42.pt`
-（历史纠正 #1 的同类缺陷）。
+（历史纠正 #1 的同类缺陷）。**第 19 轮修订**：该既有产物名为旧格式实测记录（**已随本轮改名** ——
+新格式同配置名在 `_s{seed}` 前插入 `_nosyn` 段）；防撞名论证与 `_nosyn` 段无关，故结论不变。
 
 **为什么 MLP 还要再换一个 tag**：`full_checkpoint_name` 同样**不含 `arch`**。
 若 N3D 与 MLP 共用同一 tag，同 `N`/`seed` 的两种架构会写**同一个文件名**而互相覆盖
@@ -1303,7 +1367,7 @@ x [B,784]
 | `to_dict()` / `describe()` | `fc_dim` **必须**在 `to_dict()` 中（否则 `train.apply_overrides` 经 `Config(**base.to_dict())` 往返会**静默丢字段**），并在 `describe()` 中输出 |
 | CLI | `--fc-dim`，`default=None`（**`None` = 不覆盖**，与 `0` = 关闭**必须区分**）；`train.validate_override_args` 的"负数一律报错"通用规则**为 `--fc-dim` 单独放宽到 `>= -1`**（`-1` 是有意义取值） |
 | 静默无效参数 | `--arch mlp` 搭配非 0 `--fc-dim` 在 CLI 层**直接拒绝**（退出码 2）—— MLP 基线不读取该字段 |
-| 产物指纹 | `full_checkpoint_name` / `config_fingerprint` / `smoke_fingerprint` **均纳入 `fc_dim`**：`fc_dim != 0` 时插入 `_fc{n}` 段；**`fc_dim == 0` 不加段**，故既有产物名（10 个三期 + 22 个 N 阶梯 + `_control/` 一期 MLP）**逐字不变** |
+| 产物指纹 | `full_checkpoint_name` / `config_fingerprint` / `smoke_fingerprint` **均纳入 `fc_dim`**：`fc_dim != 0` 时插入 `_fc{n}` 段；**`fc_dim == 0` 仍不加段**（该段口径未变）。**第 19 轮修订**：三处指纹同时**恒定插入 `_nosyn` 格式段**（紧随 `_fc{n}` 之后、`_s{seed}` 之前，见 §5.1），故“`fc_dim == 0` 时既有产物名逐字不变”这一旧结论**已失效** —— 所有新产物名都比旧名多 `_nosyn` 段（既有 10 个三期 + 22 个 N 阶梯 + `_control/` 一期 MLP 的旧名字与 SHA256 实测记录按原样保留为历史留档） |
 | 派生量 / 诊断 | `Config.fc_enabled` / `Config.fc_width`；`get_topology_stats()` 暴露 `fc_dim` 与 `fc_width`；产物载荷新增顶层 `fc_dim` / `fc_width` 取证字段 |
 
 ### 18.2 六段形状契约与参数拆解
@@ -1377,11 +1441,11 @@ x [B,784]
 | 参数量 | `43940` == 快照值 |
 | 不创建 FC 参数/buffer | 关闭时**一个都没有**（名字集合与快照完全相同） |
 | 宽度语义 | `fc_dim=-1 → H=N`；`fc_dim>0 → H=该值`；`fc_dim=0 → 关闭（`fc_width=0`）`；`fc_dim<-1` 构造期报错 |
-| 命名不变式 | `fc_dim=0` 的产物名**不含** `_fc` 段（既有 10 个三期产物名与 22 个 N 阶梯产物名逐字不变）；`fc_dim!=0` **含** `_fc{n}` 段且与关闭路径**不同名** |
+| 命名不变式 | `fc_dim=0` 的产物名**不含** `_fc` 段；`fc_dim!=0` **含** `_fc{n}` 段且与关闭路径**不同名**。**第 19 轮修订**：原括注“既有 10 个三期产物名与 22 个 N 阶梯产物名逐字不变”**已失效**（三处指纹现恒定插入 `_nosyn` 段，见 §5.1）—— 该不变式的**当前成立部分**是“`_fc` 段的有无”，与 `_nosyn` 段无关 |
 | dense 权重判据 | `fc_dim=-1` 时 `count_dense_weight_tensors() == 0` |
 | 解析式参数量 | `H·784 + H + |S_in|·H + E + N + H·|S_out| + H + 10·H + 10` == `count_parameters()` |
 | 快照**确属改动前**（承重断言，第 R22 轮补） | A3 段在做逐位比对**之前**先断言：当前 `config.py` / `model.py` / `train.py` 的 SHA256 与快照 `source_sha256` **两两不等**（佐证判据：快照 `config` **不含** `fc_dim` 键）。**理由**：逐位比对的**全部**证明力都建立在"快照早于改动"这一前提上 —— 若快照恰在含改动的源码上生成，该比对会退化为"实现与自身一致"的**自洽性检查**（不报错但证明力归零），故把该前提落成硬断言而非人工目视。拒绝证明：注入一份 `source_sha256` == 当前源码的快照 -> 断言 **FAIL**、退码 **1** |
-| 冒烟（fc 路径） | `python n3d_shape/train.py --smoke-test --fc-dim -1` -> **16/16 全绿、退出码 0**（写入**新文件** `smoke_shapesphere_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_bs32_fc-1_s42.pt`，未覆盖既有 `smoke*.pt`） |
+| 冒烟（fc 路径） | `python n3d_shape/train.py --smoke-test --fc-dim -1` -> **16/16 全绿、退出码 0**（第 3 轮写入**新文件** `smoke_shapesphere_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_bs32_fc-1_s42.pt`，未覆盖既有 `smoke*.pt`；**第 19 轮实测重跑**的新格式名为 `…_fc-1_nosyn_s42.pt`，见 §19.2） |
 | 既有整链回归 | `compileall` 退码 0；`verify_shape.py` 全量 **145/145** 退码 0（含 S12 与二期逐张量 `torch.equal`）；`verify_full_runs.py` 退码 0；33 个既有产物 SHA256 逐位不变 |
 
 **梯度覆盖率（如实报告）**：`fc_dim != 0` 时，输入侧 (2) 的投影行中，
@@ -1543,3 +1607,199 @@ MLP 是 `784 → 2048 → 10` 的**dense 全连接**，N3D+FC 是"全连接 + �
 `fc_alignment_runs.pre_r22.json`（**本轮改动前的台账备份**，供逐行对比）、
 `r22_spec_preimage.md`（改前 spec 镜像，供 §18 节替换的 unified diff 复核）、
 `r22_tamper_*.json`（**临时**篡改副本，可安全删除）。
+
+## 19 产物不再落盘突触信息（nosyn 口径）与「上游零改动」硬约束修订（第 19 轮）
+
+### 19.0 目标与口径
+
+训练产物**不再保存突触类张量**，与同期 `n3d_sphere`（二期）保持**完全相同的口径**；
+同时修订本模块文档中因**二期同步改造**而失效的硬约束（原文"上游零改动"）。
+
+**本轮的硬边界（不得违反）**：
+
+| 编号 | 约束 | 实测证据 |
+| --- | --- | --- |
+| a | **只改持久性**：不删除 buffer、不改名、不改形状、不改 dtype；`named_buffers()` 键集合与改前**逐字相同**，仅 `state_dict()` 少这 8 键（**不多不少**） | §19.1 表 |
+| b | `edge_dist` **保持 `persistent=True`** | 它是 `n3d_viz/core.py` 的 `REQUIRED_KEYS` 之一（§19.5 用 `python -m n3d_viz -c <模拟新格式产物>` 实测退出码 **0**） |
+| c | **绝不触碰**索引拓扑量（`topo_index` / `edge_offset` / `edge_perm` / `edge_perm_in` / `neuron_in_edge_reach` / `edge_dst_in` / `level_edge_reach` / `level_node_reach` / `in_scope_mask` / `out_scope_mask` / `in_degree` / `out_degree` / `edge_src` / `edge_dst` / `neuron_pos` / `out_scope_index`） | 这些键的 `persistent` 标记与逐位哈希均未变（§19.1） |
+| d | `train.py` 保存逻辑**零改动**（仅产物名与日志文案变化） | 冒烟 16/16、退出码 0（§19.2） |
+| e | 这 8 个张量在 `__init__` 中的计算与断言**一律保留**（含 `_build_neuron_edges` 的 3 处契约断言、2H 两道防线、连通性下限） | 冒烟判据 [7]/[9]/[11] 与 `verify_shape.py` 143+2 条断言全部通过 |
+| f | **不得改动 `fc_dim` 相关的一切逻辑** | `fc_dim=-1` 冒烟 16/16、退出码 0；`fc_dim` 族参数仍为 Parameter、`out_scope_index` 仍为 persistent buffer |
+
+### 19.1 变更点 1：8 个突触类 buffer 改为 `persistent=False`
+
+`n3d_shape/model.py` 中以下 8 个 buffer 的 `register_buffer(..., persistent=True)`
+改为 `persistent=False`（**逐字同名同口径**于同期 `n3d_sphere`）：
+
+```text
+syn_dist / input_syn_pos / output_syn_pos / representative_syn_out /
+representative_syn_input / input_isolated_mask / output_isolated_mask / neuron_conn_mask
+```
+
+**逐位取证**（临时探针 `checkpoints/n3d_shape/_verify/nosyn_probe/probe_snapshot.py`，
+改动前先落盘 `baseline.json`，改动后以 `after` 模式逐项断言；实测**全部 PASS、退出码 0**）：
+
+| 断言 | 实测结果（5 个配置：SMALL/DEFAULT × sphere/cube/cylinder λ=2 × fc0/fc-1） |
+| --- | --- |
+| `state_dict()` **恰好少 8 键、不多不少** | fc0 组 28 -> **20**；fc-1 组 34 -> **26**；差集逐键 == 这 8 个、并集为空 |
+| `named_buffers()` 键集合**逐字相同** | fc0 组 24、fc-1 组 25，两侧集合全等；每个 buffer 的 **shape / dtype 未变**（只有 `persistent` 标记变化） |
+| 8 个张量**逐位相同** | 改前/改后 8 个张量的 float32 原始字节 SHA256 全部相等 |
+| 其余 buffer 与**全部参数**逐位相同 | 全部 buffer + 全部 Parameter 的字节 SHA256 全等；参数量不变（`43930` / `58036` / `211690` / `156409` / `160333`） |
+| `forward` **逐位相同** | 同一 config、同一固定输入下 `a_in` / `a_up` / `h` / `logits` 四个中间量的字节 SHA256 全等（5 个配置全过） |
+| 构造**确定性** | 同配置两次构造的全部张量逐位相同（探针内置核验，5/5 True） |
+| 非这 8 个 buffer 的 `persistent` 标记 | 仍**全部为 True**（含 `edge_dist`） |
+
+**[!] 基线文件的已知瑕疵（离朱 R23 观察 O1，如实留档）**：`baseline.json` 中
+`buffer_meta[*].persistent` 字段**不可用** —— 探针首版把持久性判据写反
+（`persistent = name in model._non_persistent_buffers_set`，正确应为 `not in`，见
+`probe_snapshot.py` 内的修复注释），故该文件里改前（全为 `persistent=True`）也被记成了 `false`。
+该字段**未参与任何结论**：本文的持久性结论来自 `after` 模式下对
+`_non_persistent_buffers_set` / `state_dict()` 的**直接复算**（并已由离朱 R23 以
+`_non_persistent_buffers_set` 独立复算复核，5 种配置下**恰好**等于这 8 个）；
+`baseline.json` 中的**键集合、逐张量 SHA256、参数量、forward 哈希**等字段均有效且已被使用。
+按"取证文件不得事后美化"纪律，该文件**保持原样不修改**，仅在此披露其失效字段。
+
+**产物体积的实测收益**（`probe_size.py`，现场 `torch.save` 对比同一模型的
+nosyn 载荷 vs 模拟旧格式载荷）：
+
+| 配置 | nosyn 载荷 | 模拟旧格式载荷 | 差额 |
+| --- | --- | --- | --- |
+| SMALL sphere（`N=64,y=4x4,fc0`） | 190,143 B | 498,733 B | **-308,590 B（-61.9%）** |
+| DEFAULT sphere（`N=256,y=8x8,fc0`） | 673,407 B | 18,070,253 B | **-17,396,846 B（-96.3%）** |
+| DEFAULT sphere all/all（`fc-1`） | 902,037 B | 18,298,965 B | **-17,396,928 B（-95.1%）** |
+
+其中 `syn_dist` 一项即 `[2048, 2048]` float32 = **16,777,216 B**（DEFAULT 规模）。
+
+### 19.2 变更点 2：产物名恒定插入 `_nosyn` 格式段
+
+`smoke_fingerprint` / `config_fingerprint` / `full_checkpoint_name` 三处插入恒定 `_nosyn` 段，
+位置口径见 §5.1（**紧随 `_fc{n}` 之后、`_s{seed}` 之前**；`fc_dim == 0` 仍不加 `_fc` 段）。
+另外**默认冒烟产物名同步加段**：`_verify/smoke.pt` → **`_verify/smoke_nosyn.pt`**（该改名
+使新版瘦身产物与旧版同名产物分开留痕，旧的 `smoke.pt` 不被覆写）。
+`is_default_smoke` **判定维度未变**（`_nosyn` 是格式常量、不入判定），并新增与
+`smoke_fingerprint` 的**维度对齐守卫**（若今后有人往指纹加维度却漏了判定，
+守卫立即报错，而不是静默覆盖默认冒烟产物）。`train.py` 的保存逻辑零改动。
+
+**本轮实测冒烟产物**（真实执行；产物名与 SHA256）：
+
+| 命令 | 产物（`checkpoints/n3d_shape/_verify/`） | 字节 | SHA256 |
+| --- | --- | --- | --- |
+| `train.py --smoke-test` | `smoke_nosyn.pt`（默认路径；原历史名 `smoke.pt`） | 193,551 | `a1f4772f797487eadf37ce777ad367fbda02af22d5540bd41286c6c83eaeb6fc` |
+| `train.py --smoke-test --fc-dim -1` | `smoke_shapesphere_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_bs32_fc-1_nosyn_s42.pt` | 256,437 | `a68c638ff415a90122e7f2a02c913324e08e19bbfe9328e010e0f0a2117506c0` |
+
+两次运行均 **16/16 PASS / 0 FAIL、退出码 0**（日志 `_verify/nosyn_probe/smoke_default.log`、
+`smoke_fc-1.log`）。**同名复跑字节稳定**：默认冒烟产物**3 次**运行均为同一 SHA256
+（`a1f4772f…`），16/16 PASS、退出码 0 —— 该产物确由**最终源码**产出且可复现。
+
+**[!] 产物 SHA256 的适用范围（本轮实测，重要披露）**：产物字节**不只是配置的函数**。
+本副本 `torch 2.14` 的 `torch.save` 把 zip 条目名写成**产物基名前缀**（实测：
+
+```text
+smoke_nosyn.pt -> ['smoke_nosyn/data.pkl', 'smoke_nosyn/.format_version', 'smoke_nosyn/.storage_alignment', …] 共 26 条
+```
+
+），**故改名必然改 SHA256**。同进程 A/B 实验（`probe_bytes.py`，`_verify/nosyn_probe/bytes_sim/`）
+直接坐实：同配置、同进程、仅输出文件名不同（`name_a.pt` / `name_b.pt`）→ 两份产物
+**全部张量与全部浮点值逐位相同**（逐键 `torch.equal` / `==` 全等、`loss` 同为
+`0x1.1327ac0000000p+1`），但 SHA256 不同（`e1fb2fb0…` vs `39d6977f…`）；而**同名复跑**
+（`name_a.pt` 前后两次）字节逐位相同。因此：
+
+* 本模块"改名"这一动作**必然**改变产物 SHA256 与**字节数**（历史名 `smoke.pt` 的旧记录为
+  `e9c83f615399eb28fe1a0e749a5ddb12ff4cdfc6475f6237b39a3468623e6918`，192,755 B —— 该文件
+  已随改名删除，**该 SHA / 字节数仅作历史留档**；新名 `smoke_nosyn.pt` 实测 **193,551 B**）。
+  **[!] 修订留档（离朱 R23 发现 D1）**：本节初版误把上表的字节列沿用为历史名 `smoke.pt` 的
+  192,755 B，与同一行的 SHA256（对应 `smoke_nosyn.pt`）自相矛盾；已按现场实测更正为 193,551 B
+  （`os.path.getsize` 与资源管理器双口径一致，3 次复跑字节与 SHA 均稳定）；
+* **跨名字 / 跨 torch 版本不得用文件 SHA256 判等价**（仓库 D1 口径）：等价判据一律回到
+  **张量级 `torch.equal`**（§19.1 的逐位比对即按此口径做了 5 个配置）。
+
+日志新增一行产物格式说明：
+`[产物格式] nosyn：8 个突触类张量（…）为 persistent=False、不进入 state_dict；edge_dist 与全部索引拓扑量仍持久化（n3d_viz 契约）`。
+
+### 19.3 变更点 3：硬约束第 1 条改写（`n3d_sphere` 由「零改动」改为「同批同步改造」）
+
+**原表述（已失效）**：`n3d_sphere` / `n3d_proto` 源码与既有产物**零改动**。
+
+**改写后（现行）**：
+
+1. `n3d_proto`（**一期**）源码与产物**零改动**；
+2. `n3d_sphere`（**二期**）**与本模块同批同步改造** —— 改造范围**仅**两项：
+   突触类 buffer 持久性（同样 8 个键、同样 `persistent=False`）与产物名 `_nosyn` 段；
+3. 该同步改造**不改任何数值**：二期**张量数值与 `forward` 结果仍逐位不变**，
+   本模块 S12（sphere 分支 vs 二期，27 个张量 `torch.equal`）**仍成立**
+   （本轮实测通过，见 §19.4）；二期既有产物的**字节**亦不被改写。
+
+**修订理由（必须写明，不得留自相矛盾表述）**：本轮产物的"不再落盘突触信息"是**跨模块的格式口径**，
+只有二期与本模块**同批同步**才能保证"两个模块的产物格式一致、可互相复算"；
+若只改本模块，则二期产物仍带这 8 键，两模块的 nosyn 口径与产物名规则将不一致。
+故原"上游零改动"硬约束的第 1 条**按事实修订**，而**不是**被"放宽"——
+它被替换为一条**更强且可验证**的口径（一期零改动 + 二期同批同步且数值逐位不变）。
+
+**受此影响的既有表述（本轮已全部同步）**：§0 读者须知"上游零改动"行、§8.4 上游回归表、
+§9 与二期关系、§13.0 门槛表、§14.3/§15.4 历史轮次记录（加注"该历史轮次实测记录"）。
+
+### 19.4 本轮验证执行清单（全部真实执行；不可执行项如实声明）
+
+| # | 命令 | 实测结果 |
+| --- | --- | --- |
+| 1 | `python -m compileall -q n3d_shape` | 退出码 **0** |
+| 2 | `python n3d_shape/train.py --smoke-test` | **16/16 PASS / 0 FAIL**、退出码 **0**（§19.2） |
+| 3 | `python n3d_shape/train.py --smoke-test --fc-dim -1` | **16/16 PASS / 0 FAIL**、退出码 **0**（§19.2） |
+| 4 | 针对性探针 `probe_snapshot.py after`（4a/4b/4c/4d） | **PASS**、退出码 0（§19.1 逐位取证表） |
+| 4e | 针对性探针 `probe_roundtrip.py`（新产物 save→load 往返） | **PASS**、退出码 0：`smoke_nosyn.pt` 20 键 / fc-1 26 键，`strict=True` 加载 **missing=[] unexpected=[]**，往返后**全部持久化张量逐位相同** |
+| 5 | `python -m n3d_viz -c <模拟新格式产物>`（既有 FC 产物删去这 8 键后另存到临时路径） | 退出码 **0**；FC 分支被识别（`fc_dim=-1 H=256`、四个 FC 键齐全）；三件套正常产出（HTML 160,615 B / PLY 256 顶点 / OBJ 736 行）；**原产物与 `checkpoints/n3d_viz/` 既有三件套 SHA256 逐位不变**（前后快照 `Compare-Object` 仅新增、0 变更） |
+| 6 | `python n3d_shape/verify_shape.py --quick` | **78/78 PASS / 0 FAIL**、退出码 **0** |
+| 6b | `python n3d_shape/verify_shape.py`（全量） | **145/145 PASS / 0 FAIL**、退出码 **0**（含 S12 与二期 27 张量 `torch.equal` 全等、S15/S16） |
+| 7 | 针对性探针 `probe_names.py`（三处指纹 + 默认冒烟名口径） | **PASS**、退出码 0（§5.1 / §19.2） |
+| 8 | 针对性探针 `probe_size.py`（产物体积收益实测） | 退出码 0（§19.1 体积表） |
+| 9 | 针对性探针 `probe_bytes.py`（产物 SHA256 与文件名的关系） | 退出码 0（§19.2 的 SHA 可比性披露） |
+| 10 | 负例复核 `--smoke-test --shape cube --cyl-aspect 1.5` / `--shape cylinder --cyl-aspect 5.0` | 退出码 **2** / **2**（与历史口径一致） |
+
+**兼容性边界的实测（`probe_roundtrip.py`，只读既有旧产物）**：把**改动前生成的既有产物**
+（仍含这 8 键）交给**新代码**构造的模型加载：
+
+```text
+Error(s) in loading state_dict for ThreeDNeuronSpace:
+    Unexpected key(s) in state_dict: "input_syn_pos", "output_syn_pos", "syn_dist",
+    "representative_syn_out", "representative_syn_input", "neuron_conn_mask",
+    "input_isolated_mask", "output_isolated_mask".
+```
+
+即 `strict=True` **必报**（PyTorch 实际报文为 `Unexpected key(s) in state_dict:`，
+非计划文本中的小写 `unexpected key(s) in state_dict` —— 此处按**实测报文**记录）；
+改用 `strict=False` 时返回 `missing=[]`、`unexpected=` 上述 8 键，即**可显式复用**。
+**既有旧产物未被改写或删除**（全程只 `torch.load` 读取）。
+
+**不可复现项（如实声明，不得伪造通过）**：本工作副本的 `checkpoints/n3d_shape/_verify/`
+下**不存在**此前各轮落盘的台账与冻结快照（该目录被 `.gitignore` 忽略），因此：
+
+| 脚本 | 实测结果 | 原因 |
+| --- | --- | --- |
+| `verify_full_runs.py` | 退码 **1**：`[FAIL] 账本不存在：…\_verify\full_runs_shape.json` | 台账缺失，11 组记录的独立复算与 5 条冻结 SHA256 承重断言**无法复现** |
+| `verify_ladder.py` | 退码 **1**：`[FAIL] 台账不存在：…\_verify\ladder_runs.json` | 同上（N 阶梯台账缺失） |
+| `verify_fc_alignment.py` | 退码 **1**：`[FAIL] 台账不存在：…\_verify\fc_alignment_runs.json` | 同上（FC 同参台账与改动前快照 `fc_pre_change_snapshot.json` 缺失） |
+
+上述三项**不是本轮代码缺陷**，而是取证文件在本副本中不存在；本轮的替代证据是
+`probe_snapshot.py`（对**本轮改动前后**的现场逐位比对，§19.1）与 `probe_roundtrip.py`
+（对既有 FC 产物与既有冒烟产物的只读校验，§19.4）。**亦未复跑**一期 `n3d_proto` 与二期
+`n3d_sphere` 的冒烟（其产物与台账不在本副本；且二期源码由**同批的二期任务**改动，
+本任务不写上游文件）。
+
+**环境差异的如实留档**：本副本 `torch 2.14.0+cpu` / Python 3.13.15；`verify_shape.py` 全量实测
+S15 最紧余量 `ratio = 0.582`（`N=3072/cube/λ=1.0`），而 README §15.6 / spec 登记的历史值为 `0.578` ——
+差异来自 `torch.cdist` float32 **距离域累加伪影**随 torch 构建不同（该伪影本身即为 §15.6 讨论的对象），
+`dev` 与 `tol` 均在原口径内、判据全部通过（`ratio < 1`）。
+
+### 19.5 披露汇总（本轮新增/修订的结论性披露）
+
+1. **突触类 buffer 现为 `persistent=False`、不进入 `state_dict()`** —— 产物**不再自证突触几何**；
+   凡需突触级几何（`input_syn_pos` / `output_syn_pos` / `syn_dist` / 代表突触对 / 孤立掩码 /
+   `neuron_conn_mask`）的复核，**必须回到 `config + seed` 重算**，不能用产物里的张量反查。
+2. **兼容性边界**：改用新代码后，**既有旧产物**（仍含这 8 键）以 `strict=True` 加载会报
+   `Unexpected key(s) in state_dict`；如需复用旧产物须显式 `strict=False`（§19.4 实测报文）。
+3. **名字类记录**：§7.1、§16.2、§17.1、§18.1、§18.4 等处的旧格式产物名**已随本轮改名**
+   （新增 `_nosyn` 段），**既有实测数字一律保留**，并在各处就地标注。
+4. **`edge_dist` 与全部索引拓扑量保持持久化** —— `n3d_viz` 的 schema 契约（`REQUIRED_KEYS`）
+   与三件套渲染**未受影响**（§19.4 第 5 项实测退出码 0）。
+5. **`_nosyn` 与 `_fc{n}` 的相对位置三处一致**：`_nosyn` 紧随 `_fc{n}` 之后、`_s{seed}` 之前；
+   `fc_dim == 0` 时仍不加 `_fc` 段（§5.1）。

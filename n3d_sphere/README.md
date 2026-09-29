@@ -227,6 +227,20 @@ a_up[B] = ReLU( Σ_{A→B} w_{A→B} · ( a_up[A] + a_in[A] ) + b_B )
 > `verify_device_regression.py` 用 `meta` 设备做搬运实验（注册的 buffer 会搬走、
 > 普通 Python list 里的张量搬不走）+ 两条守卫负例（设备不一致 / 未注册均必须抛错）；
 > 若在有 GPU 的机器上运行，该脚本会自动追加真实 `.cuda()` 前向与 CPU 结果比对。
+>
+> **F16 契约的适用范围（本轮明确，与 8.0 节的瘦身改动不冲突）**：F16 要求"**被 `forward`
+> 当作索引张量使用**的一切拓扑量必须是 `register_buffer` / `nn.Parameter`"，以便
+> (a) 跟随 `.to(device)` 搬运、(b) 进入 `state_dict()` 持久化。**本轮把 8 个"突触类几何量"
+> 改为 `persistent=False`**（不进入 `state_dict()`、但**仍注册、仍随 `.to(device)` 搬运**），
+> 它们**都不在** `_assert_index_device` 的必需清单里、也不被 `forward` 读作索引，
+> 故**不构成 F16 回归**。仍未改动持久化的对象（`persistent=True`）逐条为：
+> `neuron_pos` / `edge_src` / `edge_dst` / `edge_dist` / `topo_index` / `edge_offset` /
+> `edge_perm` / `edge_perm_in` / `neuron_in_edge_reach` / `edge_dst_in` /
+> `level_edge_reach` / `level_node_reach` / `in_scope_mask` / `out_scope_mask` /
+> `in_degree` / `out_degree`（共 16 个 buffer）+ 全部 `nn.Parameter`。
+> 改动前后 `named_buffers()` 的键集合**逐字相同**，只有 `state_dict()` 少 8 个键
+> （详见 8.0 节；该键集差异已由针对性脚本**实跑取证**：改前 28 键 → 改后 20 键，
+> 少 8 个、多 0 个，见 8.0.1）。
 
 ### 3.3 判据开关与读出
 
@@ -377,28 +391,34 @@ CLI 一览（几何相关部分）：
 
 | `input_scope` | `readout_scope` | `S_in` | `S_out` | loss（原始值） | 产物文件 | 退出码 |
 |---|---|---|---|---|---|---|
-| `any_isolated` | `any_isolated` | 55 | 53 | `2.1496479511260986` | `smoke.pt` | 0 |
-| `any_isolated` | `all_isolated` | 55 | 16 | `2.236379623413086` | `smoke_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsall_bs32_s42.pt` | 0 |
-| `all_isolated` | `any_isolated` | 11 | 53 | `2.2899417877197266` | `smoke_N64_y4x4_H0.15_D0.15_plfcc_axz_isall_rsany_bs32_s42.pt` | 0 |
-| `all_isolated` | `all_isolated` | 11 | 16 | `2.337554454803467` | `smoke_N64_y4x4_H0.15_D0.15_plfcc_axz_isall_rsall_bs32_s42.pt` | 0 |
+| `any_isolated` | `any_isolated` | 55 | 53 | `2.1496479511260986` | `smoke_nosyn.pt` | 0 |
+| `any_isolated` | `all_isolated` | 55 | 16 | `2.236379623413086` | `smoke_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsall_bs32_nosyn_s42.pt` | 0 |
+| `all_isolated` | `any_isolated` | 11 | 53 | `2.2899417877197266` | `smoke_N64_y4x4_H0.15_D0.15_plfcc_axz_isall_rsany_bs32_nosyn_s42.pt` | 0 |
+| `all_isolated` | `all_isolated` | 11 | 16 | `2.337554454803467` | `smoke_N64_y4x4_H0.15_D0.15_plfcc_axz_isall_rsall_bs32_nosyn_s42.pt` | 0 |
+
+> **名字类标注（本轮改名）**：上表四个产物的名字**本轮起加 `_nosyn` 格式段**
+> （插在 `_s{seed}` 之前）。表中 loss 与规模数字取自产生它们的那一轮（当时文件名没有
+> `_nosyn` 段），**数字不动、只改名**；同理，`S_in`/`S_out` 与 loss 的实现语义**未变**
+> （本轮只改 buffer 持久性与产物名，前向计算与参数集零改动）。详见第 8 节与 8.0 节。
 
 四种组合均 **15/15 PASS、退出码 0**，且 **loss 互不相同** —— 这直接证明
 `input_scope` 与 `readout_scope` 两个开关都真正生效（`S_out` 不同 → 严格 readout 下
 `h` 不同 → logits/loss 不同）。
 
-默认组合（`neuron3d` + `flow_axis=z` + 两个 `any_isolated`）写入历史文件名
-`checkpoints/n3d_sphere/_verify/smoke.pt`；**其它任何组合**（含 `arch=mlp`、`flow_axis=x`、
-任一 scope 取 `all_isolated`）写入 `smoke[_ar{arch}]_{完整指纹}.pt`。
+默认组合（`neuron3d` + `flow_axis=z` + 两个 `any_isolated`）写入
+`checkpoints/n3d_sphere/_verify/smoke_nosyn.pt`（本轮起加 `_nosyn` 格式段；原名为
+`smoke.pt`，`is_default_smoke` 的判定维度**未变**）；**其它任何组合**（含 `arch=mlp`、
+`flow_axis=x`、任一 scope 取 `all_isolated`）写入 `smoke[_ar{arch}]_{完整指纹}.pt`。
 
-> **默认路径必须是 `smoke.pt`**（历史缺陷：曾无条件传入指纹，使默认路径**永远不再写**
+> **默认路径必须是 `smoke_nosyn.pt`**（历史缺陷：曾无条件传入指纹，使默认路径**永远不再写**
 > `smoke.pt`，而文档与验证脚本仍指向它 —— 于是读到上一版代码留下的陈旧产物）。
-> 现在 `run_smoke_test` 只在"默认组合"时退化为 `smoke.pt`，并在每次运行时**刷新**它。
+> 现在 `run_smoke_test` 只在"默认组合"时退化为 `smoke_nosyn.pt`，并在每次运行时**刷新**它。
 
-默认产物 `smoke.pt` 的实测值（可由下方复核命令直接验证）：
+默认产物 `smoke_nosyn.pt` 的实测值（可由下方复核命令直接验证）：
 
 ```
 python n3d_sphere/train.py --smoke-test          -> 退出码 0，15/15 PASS
-loss = 2.1496479511260986（可 torch.load 复核 checkpoints/n3d_sphere/_verify/smoke.pt）
+loss = 2.1496479511260986（可 torch.load 复核 checkpoints/n3d_sphere/_verify/smoke_nosyn.pt）
 单 batch 前向+反向耗时 = 3.41s（随机器负载波动，不作契约）；可学习参数 = 43930
 四个可学习参数的梯度范数（L2，**全精度、与产物逐位相等**）：
   W_in         1.5796021223068237
@@ -408,10 +428,13 @@ loss = 2.1496479511260986（可 torch.load 复核 checkpoints/n3d_sphere/_verify
 E=106，平均出度 1.6562，最大出度 4，层数 7，S_in=55，S_out=53，双副本神经元 44
 最近邻距 0.299999952（= 2H），R=0.663198 ∈ [R_min=0.663198, R_max=1.326395]
 config 中不含已删除字段（无迭代轮数维度）
+产物内 `model_state_dict` **不含** 8 个突触类 buffer（本轮变更，见 8.0 节）；
+上述 loss / 梯度范数由**前向-反向计算**决定，与"是否落盘这些 buffer"无关
 ```
 
-> 复核命令：`python -c "import torch; c=torch.load('checkpoints/n3d_sphere/_verify/smoke.pt',map_location='cpu',weights_only=False); print(c['loss'], c['grad_norms'])"`
-> —— 该命令对应当前代码，输出必须与上表逐位一致。
+> 复核命令：`python -c "import torch; c=torch.load('checkpoints/n3d_sphere/_verify/smoke_nosyn.pt',map_location='cpu',weights_only=False); print(c['loss'], c['grad_norms'])"`
+> —— 该命令对应当前代码，输出必须与上表逐位一致（上表数字来自 `D≤H` 改造那一轮的
+> 实测产物，本轮**只改产物名与 buffer 持久性**，故 loss 与梯度范数应逐位不变）。
 >
 > **数值随配置口径变化的说明（D≤H 改造）**：本轮把三个预设改为 `D = H` 后，SMALL 冒烟的
 > 拓扑与 loss 全部改变（`E 181→106`、`|S_in| 13→55`、`|S_out| 17→53`、参数 `11077→43930`、
@@ -708,6 +731,24 @@ python n3d_proto/train.py --smoke-test   -> 9/9 PASS、退出码 0、loss = 2.41
 
 ## 8. 产物纪律与命名
 
+> **本轮（`_nosyn` 格式段 + 突触类 buffer 不落盘）带来的产物名变更与历史记录标注**
+>
+> 本轮起，checkpoint **不再落盘突触类 buffer**（`state_dict` 瘦身，见 8.0 节），
+> 故所有产物名新增**格式段 `_nosyn`**（插在 `_s{seed}` 之前），默认产物名同步变为
+> `model_nosyn.pt`（原 `model.pt`）与 `_verify/smoke_nosyn.pt`（原 `_verify/smoke.pt`）。
+> **这是刻意为之**：新版瘦身产物与旧版产物必须分开留痕，旧产物上的冻结 SHA256 断言
+> 依赖"字节不变"，不能被同名覆盖。
+>
+> **如实标注（名字类记录）**：本文档第 7.2 节（K1 正式全量训练）与第 9 节（验证脚本与
+> 取证清单）中出现的旧产物名 —— `checkpoints/n3d_sphere/model.pt`、`model.pt.bak`、
+> `full_N256_…_s42.pt(.bak)`、`full_N384_…_s42.pt(.bak)`、`_verify/smoke.pt` ——
+> **均已随本轮改名**：同一份实测数字与 SHA256 记录对应的**现行文件名**分别多了 `_nosyn`
+> 段（`model_nosyn.pt(.bak)`、`full_N256_…_s42_nosyn.pt(.bak)`、
+> `full_N384_…_s42_nosyn.pt(.bak)`、`_verify/smoke_nosyn.pt`）。这些产物**在本工作副本中
+> 不存在**（`checkpoints/` 被 `.gitignore` 忽略、未随仓库分发），故其数字按**当初产生它们的
+> 那一轮**原样保留、不做改动。其余仍属"当前实现行为"的名字（如 `--checkpoint` 的默认路径、
+> "产物保护"日志文案）已同步改名。
+
 * 正式产物目录：`checkpoints/n3d_sphere/`；验证类运行（`--smoke-test` / `--max-batches > 0`）
   一律写入 `checkpoints/n3d_sphere/_verify/`，**绝不覆盖正式产物**；
 * **历史口径存档 `checkpoints/n3d_sphere/_verify/legacy/`**：仅存放**改造前 `D > H` 口径**的
@@ -721,22 +762,220 @@ python n3d_proto/train.py --smoke-test   -> 9/9 PASS、退出码 0、loss = 2.41
   1:1 吻合，**无边界模糊项**；唯一不带 `D` 标识的 `.pt` 是 `smoke.pt`，其内嵌 `config` 为
   `H=0.15 / D=0.15`（`D = H`），故判定为**当前口径**并保留在根目录；
 * 冒烟产物命名：**完全默认组合**（neuron3d + SMALL_CONFIG 的 N/y/H/D/seed/batch_size +
-  `flow_axis=z` + 两个 `any_isolated` + `space_radius=0`）退化为 `smoke.pt`；
+  `flow_axis=z` + 两个 `any_isolated` + `space_radius=0`）退化为 **`smoke_nosyn.pt`**
+  （本轮起加 `_nosyn` 格式段；`is_default_smoke` 的**判定维度未变**）；
   其它任何组合为 `smoke[_ar{arch}]_{指纹}.pt`，指纹为
-  `N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{axis}_is{scope}_rs{scope}_bs{batch_size}[_R{space_radius}]_s{seed}`
+  `N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{axis}_is{scope}_rs{scope}_bs{batch_size}[_R{space_radius}]_nosyn_s{seed}`
   —— **指纹维度必须与默认判定维度严格对齐**（历史缺陷：默认判定含 `batch_size` /
   `space_radius` 而指纹不含，导致 `--batch-size 64` 与 `--space-radius 0.9`
   落回同名文件、互相覆盖取证产物；`arch` 缺维度亦曾导致 `--arch mlp` 与主模型互覆）；
+  `_nosyn` 为**格式段**（非配置维度），位置固定在 `_s{seed}` 之前；
 * 限批产物命名：
-  `verify_<bpe>_N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{axis}_is{scope}_rs{scope}_s{seed}[_tag].pt`；
-* 全量产物的默认路径：与 `DEFAULT_CONFIG` 完全同配置时用 `model.pt`，其它配置使用
-  `full_N{N}_y{..}_H{..}_D{..}_pl{..}_ax{..}_is{..}_rs{..}_s{seed}[_tag].pt`；
+  `verify_<bpe>_N{N}_y{y_in}x{y_out}_H{H}_D{D}_pl{placement}_ax{axis}_is{scope}_rs{scope}_nosyn_s{seed}[_tag].pt`；
+* 全量产物的默认路径：与 `DEFAULT_CONFIG` 完全同配置时用 **`model_nosyn.pt`**，其它配置使用
+  `full_N{N}_y{..}_H{..}_D{..}_pl{..}_ax{..}_is{..}_rs{..}_nosyn_s{seed}[_tag].pt`
+  （`_nosyn` 同样插在 `_s{seed}` 之前、用户 `--tag` 之前）；
 * **指纹维度**：`flow_axis` / `input_scope` / `readout_scope` / `placement` / `seed` /
   `H` / `D` / `N` / `y_in` / `y_out`（冒烟另含 `arch` / `batch_size` / `space_radius`；
   架构中无迭代轮数，故指纹不含该维度）—— 任一维度不同即不同
   文件名，互不覆盖（历史纠正：同名互覆曾导致筛选记录丢失）。注意 `seed` 影响突触采样，
   **不同 seed 即不同边集**，故必须进指纹；
 * 覆盖已有 checkpoint 前默认生成 `<path>.bak` 备份（`--no-backup` 关闭）。
+
+### 8.0 突触类 buffer 不落盘（`state_dict` 瘦身）与 `_nosyn` 格式段
+
+**契约**：下列 8 个**突触类** buffer 以 `register_buffer(..., persistent=False)` 注册，
+**不进入 `state_dict()`**，因此**不再随 checkpoint 落盘**：
+
+| 非持久化 buffer | 形状（DEFAULT：N=256 / y=8×8） | 由谁重算 |
+|---|---|---|
+| `syn_dist` | `[N*y_out, N*y_in]` = `[2048, 2048]` | `config + seed` 下 `torch.cdist(output_syn_pos, input_syn_pos)` |
+| `input_syn_pos` | `[N*y_in, 3]` = `[2048, 3]` | 半球采样（`-axis` 负半球） |
+| `output_syn_pos` | `[N*y_out, 3]` = `[2048, 3]` | 半球采样（`+axis` 正半球） |
+| `representative_syn_out` | `[E]`（int64，seed=42 时 `E=736`） | 神经元级连接的最近代表对 |
+| `representative_syn_input` | `[E]`（int64） | 同上 |
+| `input_isolated_mask` | `[N*y_in]` = `[2048]` | 合法突触对的 `amin` 与 `D` 比较 |
+| `output_isolated_mask` | `[N*y_out]` = `[2048]` | 同上（按行） |
+| `neuron_conn_mask` | `[N, N]` = `[256, 256]` | 配对最近距 `<= D` ⊙ 上行约束 |
+
+* **只改持久性**：不删除、不改名、不改形状、不改 dtype。因此 `named_buffers()` 的键集合
+  **与改动前逐字相同**（8 个张量仍在、仍随 `.to(device)` 搬运、仍可被 `forward` 之外的自检
+  接口读取），仅 `state_dict()` **少这 8 个键**。
+* **体量口径（本副本已实测，见 8.0.1）**：本轮实测（临时脚本 `_tmp_nosyn_size.py`，
+  DEFAULT/seed42 与 SMALL/seed42 各构造"改前持久性"与"改后持久性"两个模型后
+  `torch.save` 同一结构负载）：
+  **DEFAULT/seed42**：`model_state_dict` 张量净字节 **18,063,208 B（17.226 MiB）→ 668,008 B（0.637 MiB）
+  = −96.3%**；磁盘 `.pt` **18,072,761 B → 675,305 B = −96.3%**；
+  被移除的 8 个张量合计 **17,395,200 B（16.589 MiB）**，其中 `syn_dist` 一张
+  `2048×2048×4 = 16,777,216 B` 即占 **96.4%**。
+  **SMALL/seed42**（冒烟规模）：净字节 **491,432 B → 184,584 B = −62.4%**。
+  上游正式提交报出的 `17.44 MB → 约 0.854 MB（−95.1%）` 与本处实测同量级、均为 −96% 左右，
+  但**统计口径不同**（源/目标字节的界定与产物结构），两组数字**不互相替代**，引用时须注明口径。
+* **为什么可以不落盘**：这 8 个张量全部由 `config + seed` 在 `__init__` 期**确定性重算**
+  （同一 config 两次独立构造的对应张量 `torch.equal` 逐位全等），且 `forward` **不读取**它们
+  （运行时设备守卫 `_assert_index_device` 的必需清单中也没有它们）；`n3d_viz` 只读取
+  `syn_dist` 的**字节数**（`_syn_dist_bytes`）而从不读入其内容（HTML 自包含断言明确禁止嵌入）。
+* **`edge_dist` 必须保持持久化**：它是 `n3d_viz` 的 `REQUIRED_KEYS` 之一，去掉会使可视化
+  **退码 3**。本轮的 8 个张量**不含** `edge_dist`。
+* **与 F16 设备契约的关系（逐条对齐）**：F16 的适用范围是"**被 `forward` 当作索引张量**的
+  拓扑量"，本轮的 8 个张量**不在**该清单内，故两者**不冲突**。下列对象**全部保持
+  `persistent=True`**（既跟随 `.to(device)` 搬运、又进入 `state_dict()`，F16 回归不受影响）：
+  `neuron_pos` / `edge_src` / `edge_dst` / `edge_dist` / `topo_index` / `edge_offset` /
+  `edge_perm` / `edge_perm_in` / `neuron_in_edge_reach` / `edge_dst_in` /
+  `level_edge_reach` / `level_node_reach` / `in_scope_mask` / `out_scope_mask` /
+  `in_degree` / `out_degree`。
+* **计算与断言零改动**：这 8 个张量在 `__init__` 中的**计算、契约断言与校验一律保留** ——
+  含 `_build_neuron_edges` 的 3 处契约断言（代表间距 `== pair_min`、不得出现反向边等）、
+  "最近邻距 `== 2H`"断言、连通性下限校验（`E >= N`、层数 `K >= 2`、`|S_in| >= 1`、
+  `|S_out| >= 1`）—— 不得因"不落盘"而删减任何计算或断言。
+* **复核口径（重要）**：产物**不再自证突触几何**。要复核这 8 个张量，必须**回到 `config + seed`
+  重算构造模型**：用 `torch.load` 读出产物内嵌的 `config` → `Config(**config_dict)` →
+  `ThreeDNeuronSpace(cfg)` → 与"当初存储值"比对（本轮的针对性验证即按此路径取证）。
+* **`n3d_viz` 的可观测差异（离朱独立测试实测，属预期行为）**：对新产物实跑
+  `python -m n3d_viz -c checkpoints/n3d_sphere/_verify/smoke_nosyn.pt` → **退出码 0**，
+  HTML / PLY / OBJ 三件套正常生成（HTML 自包含、无 `http://`、无 `syn_dist`），
+  但日志打印 **`[数据] syn_dist 体积 = 0 字节`** —— 因为产物里已没有 `syn_dist` 这张张量，
+  该"体积展示量"由原来的字节数降为 0。`n3d_viz` 的 `_syn_dist_bytes` 用
+  `sd.get("syn_dist")` 取值，**缺键不报错**；该量只是**信息展示**，不参与渲染，
+  故**不影响可视化正确性**。此处明写以免后续被误读为"可视化读取失败"。
+* **产物 SHA256 的可比性（离朱独立测试实测披露）**：`torch.save` 的 zip 条目名**带产物基名**
+  （实测为新产物内的 `smoke_nosyn/data.pkl`），因此**改名本身必然改变文件 SHA256**；
+  同名复跑才逐位相同。故**跨名字 / 跨 torch 版本不得用文件 SHA256 判等价** ——
+  判"数值相同"一律回到**张量级 `torch.equal`**（即第 8.2 节的既有口径）。
+  同理：本轮**未触碰任何旧产物文件**，旧产物上的冻结 SHA256 断言**仍然有效**；
+  新版产物写入的是**新文件名**（`model_nosyn.pt` / `smoke_nosyn.pt` / `…_nosyn_s{seed}.pt`），
+  与旧名产物**不存在互相覆盖**。
+* **默认规模体量与验证（见 8.0.1 的实测）**：本副本已真跑并记录 —— `model_state_dict`
+  在 DEFAULT/seed42 下由 **18,063,208 B（17.226 MiB）** 降到 **668,008 B（0.637 MiB）**
+  （**−96.3%**），与上游提交的 `17.44 MB → 约 0.854 MB（−95.1%）`同量级
+  （两者统计口径不同，见上一条）。
+
+#### 8.0.1 本工作副本的真实验证结果（已执行）
+
+> **环境更正（必须先说明）**：本节初稿曾据"`python` 不在 PATH 上"判定"本副本无 Python 运行时"。
+> 该判定**已被推翻**：解释器未在 PATH 上，但**实际存在于本机**
+> `C:\Users\wb3094\AppData\Local\Programs\Python\Python313\python.exe`
+> （`Python 3.13.15`、`torch 2.14.0+cpu`、`torch.cuda.is_available() == False`）。
+> 本节以下内容均为**用该解释器真跑**取得的原始输出（命令同时设置 `PYTHONIOENCODING=utf-8`）。
+
+**1）`compileall`**
+
+```
+> & <Python313>\python.exe -m compileall -q n3d_sphere
+EXITCODE=0
+```
+
+**2）冒烟测试（15 条判据）**
+
+```
+> & <Python313>\python.exe n3d_sphere/train.py --smoke-test
+[N3D][INFO ] 阶段 A 结果：loss=2.149648，处理 batch 数=1，耗时=3.98s
+[N3D][INFO ]   [OK ] W_in                         grad_norm=1.579602e+00
+[N3D][INFO ]   [OK ] edge_weight                  grad_norm=2.537662e-01
+[N3D][INFO ]   [OK ] neuron_bias                  grad_norm=1.892900e-01
+[N3D][INFO ]   [OK ] W_out                        grad_norm=4.945818e-01
+[N3D][INFO ]   [PASS] [1] .. [15]（逐条 PASS，无 FAIL）
+[N3D][INFO ]   [PASS] [12] 不存在 [N*y_out, N*y_in] 形状的权重张量 —— 命中 0 个
+[N3D][INFO ] [产物保护] 冒烟测试 checkpoint 写入独立路径（不覆盖正式产物）：
+              D:\git\neuron3d\checkpoints\n3d_sphere\_verify\smoke_nosyn.pt
+[N3D][INFO ] [产物保护] 正式 checkpoint 默认路径未被写入：
+              D:\git\neuron3d\checkpoints\n3d_sphere\model_nosyn.pt（该路径仅在正式全量训练时写入）
+[N3D][INFO ] 阶段 A 冒烟测试结论：全部通过
+EXITCODE=0
+```
+
+**实测要点**：**15/15 PASS、退出码 0**；产物名 = `_verify/smoke_nosyn.pt`（新格式段生效，
+**未**触碰旧名 `smoke.pt`）；`loss=2.1496481895446777` 与第 4 节登记的
+`2.1496479511260986` **逐位一致**（日志按 6 位小数打印）；四个梯度范数与第 4 节登记值逐位一致；
+`E=106`、`|S_in|=55`、`|S_out|=53`、层数 7、可学习参数 43930、单 batch 3.98s（< 120s 阈值）。
+
+**3）冒烟产物指纹**
+
+| 量 | 实测值 |
+|---|---|
+| 路径 | `checkpoints/n3d_sphere/_verify/smoke_nosyn.pt` |
+| 字节数 | **192,719 B** |
+| SHA256 | **`175ff12c94f540888d54a96e12211294892d7e858a61ce2d8e491f31821794cc`** |
+| `model_state_dict` 键数 | **20**（旧口径为 28） |
+| `model_state_dict` 净字节 | **184,584 B** |
+| `loss`（`torch.load` 复核） | `2.1496481895446777` |
+| 8 个突触类键是否在产物内 | **否**（`sorted(set(SYN) & set(state_dict)) == []`） |
+
+**4）针对性验证脚本（临时 `_tmp_nosyn_verify.py`，不入库）：44 项全部 PASS、退出码 0**
+
+改动前持久性的参照由**改动前的 `model.py` 副本**（`module_agent_backup` 于本计划开始时
+生成的备份）**逐字取出 21 条原 `register_buffer` 语句执行**得到，故 (a)(c)(d) 三条
+"与改动前逐位相同"的对比**有真实参照物**，不是自证：
+
+| 判据 | DEFAULT/seed42（E=736） | SMALL/seed42（E=106） |
+|---|---|---|
+| (a) `state_dict()` 恰好少这 8 个键、不多不少 | **PASS**（少 8：`syn_dist` / `input_syn_pos` / `output_syn_pos` / `representative_syn_out` / `representative_syn_input` / `input_isolated_mask` / `output_isolated_mask` / `neuron_conn_mask`；多 **0** 个；改前 **28** 键 → 改后 **20** 键） | 同（28 → 20 键） |
+| (b) `named_buffers()` 键集合含全部 8 个非持久化张量 | **PASS**（24 项 buffer + 4 项参数） | 同 |
+| (b0) 同 seed 参数初始化未受扰动 | **PASS**（漂移键数 = 0） | 同 |
+| (c) 同一 batch 前向输出改前/改后 `torch.equal` | **PASS=True**（input 逐位相同；logits sha 改后 = 改前 = `1f00cd089aaaf9cf…`） | **PASS=True**（sha `9252413e79d92d97…`） |
+| (d) 重算 8 个张量与改动前存储值逐位相同 | **PASS × 8**（`syn_dist (2048,2048) float32 sha 9a79c2a2…`、`input_syn_pos (2048,3) 16daaa62…`、`output_syn_pos (2048,3) 84cf0693…`、`representative_syn_out (736,) int64 86b2d24f…`、`representative_syn_input (736,) 58c6d34c…`、`input_isolated_mask (2048,) 0e6f1d87…`、`output_isolated_mask (2048,) ef1a75f8…`、`neuron_conn_mask (256,256) af2e6ec1…`） | **PASS × 8**（`(256,256)` / `(256,3)` / `(256,3)` / `(106,)` / `(106,)` / `(256,)` / `(256,)` / `(64,64)`，sha 见原始输出） |
+| (e) 改后 `state_dict` `load_state_dict(strict=True)` | **PASS**（missing=[] / unexpected=[]） | **PASS** |
+| (e2) 载入后前向与改后逐位相同 | **PASS** | **PASS** |
+| (e3) 阴性对照：删 `neuron_bias` 后 `strict=True` 必须报错 | **PASS**（报 `Missing key(s)`，判据非恒真） | **PASS** |
+| (f)(g) 产物命名 | **PASS**：默认冒烟 `smoke_nosyn.pt`；`full_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_nosyn_s42.pt`；限批 `verify_200_N256_…_nosyn_s42.pt`；带 tag 时 `…_nosyn_s42_tagX.pt`；`--checkpoint` 默认 `model_nosyn.pt` | 指纹 `N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_bs32_nosyn_s42` |
+| (h)(h2) 断言/校验保留 | **PASS**：`D=0.03`→`D=0.16` 等非法/退化配置仍抛 `ValueError`（消息含 `D` / `H` / 约束说明） | 同 |
+
+**5）体量实测**（同一负载结构，改前/改后两次 `torch.save`）
+
+| 配置 | 磁盘 `.pt` | `model_state_dict` 净字节 | 降幅 | 8 个张量合计 |
+|---|---|---|---|---|
+| DEFAULT（N=256/y=8×8，seed=42） | 18,072,761 B → **675,305 B** | 18,063,208 B（17.226 MiB）→ **668,008 B（0.637 MiB）** | **−96.3%** | 17,395,200 B（`syn_dist` 占 96.4%） |
+| SMALL（N=64/y=4×4，seed=42） | 500,631 B → **191,567 B** | 491,432 B → **184,584 B** | **−62.4%** | 306,848 B |
+
+**7）离朱独立测试（70/70 PASS，结论"全部通过、未发现功能缺陷"）**
+
+离朱用**独立于力牧的来源**建立"改动前"参照物（`git show HEAD:n3d_sphere/model.py`、
+`train.py`，HEAD = `05bb849`，落地为参照包动态加载），并独立重跑了全部命令：
+
+| 项 | 实测 |
+|---|---|
+| 独立单元/契约测试（`.lizhu_env/lizhu_nosyn_test.py`） | **70/70 PASS、退出码 0** |
+| 编译（`compileall -q n3d_sphere n3d_proto n3d_viz n3d_shape`） | 4 模块、**退出码 0** |
+| n3d_sphere 冒烟（重新真跑） | **15/15 PASS、退出码 0**；产物 `_verify/smoke_nosyn.pt` = **192,719 B**、SHA256 **`175ff12c…94cc`**，与力牧登记值**完全一致**（→ 产物生成逐字节可复现） |
+| 一期回归（`n3d_proto/train.py --smoke-test`） | **9/9 PASS、退出码 0、`loss=2.419689`**（见下条第 2 点的口径更正） |
+| 持久性/数值/往返 | 8 键"少 8 多 0"、`named_buffers()` 对称差 `[]`、16 个持久化量 16/16 在册、8 张量形状/dtype 一致、前向 `torch.equal`（`max\|Δ\|=0.000e+00`）、重算逐位相同、`strict=True` 往返无 missing/unexpected |
+| 阴性对照（判据非恒真） | 删 `neuron_bias` → `Missing key(s)`；多 `bogus_key` → `Unexpected key(s)`；**旧格式 28 键产物用新类 `strict=True` 装载被拒**（`Unexpected key(s): syn_dist, …`）→ 反证 `_nosyn` 分段留痕确有必要 |
+| 断言保留 | `D=0.16>H=0.15` 抛 `ValueError`；`E=0` 与 `E=1 < N=512` 两分支均抛 `ValueError [连通性下限校验失败]`；**9/9 契约断言文本保留**；对 HEAD 的全量 diff 显示 `model.py` 的改动**仅有** docstring / 注释 / 8 条 `register_buffer` 语句 |
+| 命名 | 10/10 通过（含 `_nosyn` 在 `_s{seed}` 之前、带 tag 时在 tag 之前、限批重定位语义未变、非默认配置不污染默认名、`is_default_smoke` 维度**未增未减**） |
+| `n3d_viz` 对新产物（**离朱补做了本副本未做的实跑**） | `python -m n3d_viz -c …/smoke_nosyn.pt` → **退出码 0**，HTML 35,453 B / PLY 1,245 B / OBJ 106 行；日志 `[数据] syn_dist 体积 = 0 字节`（**预期行为**，见 8.0 节说明） |
+
+离朱首轮曾报 3 条 FAIL，经其复核**全部为测试脚本自身缺陷**（把基线源码的局部变量名当 buffer 名、
+异常消息关键字与实际命中分支不符、6 位小数常量用 `1e-9` 容差比对），修正判据后重跑通过 ——
+该留痕说明其判据**非恒真**。
+
+**8）本副本仍无法复现的部分（如实声明，离朱亦同口径）**
+
+* `checkpoints/n3d_sphere/_verify/` 下的既有脚本与台账（`verify_all.py`、`doc_numbers.json`
+  的 252 项数字防线、`artifacts/` 冻结快照、`full_runs.json`、历史 `log_*.txt`）
+  **在本工作副本中不存在**（`checkpoints/` 被 `.gitignore` 忽略、未随仓库分发），
+  故这些验收**本轮无法执行、无法比对**，本轮**不声称其通过**。
+  其中与本改动直接相关、**需要具备该目录的一侧补做**的项：`verify_sphere_dag.py` 的 R7（读默认冒烟
+  产物）、`verify_scope_and_fingerprint.py` 的 S4-S5（按当前命名规则预测冒烟产物名）、
+  `run_smoke_matrix.py`（11 组合的落盘名比对与"默认产物未被污染"断言，其默认产物名现为
+  `smoke_nosyn.pt`）、`verify_all.py`（命令集 + 文档数字防线 + 计数自检）。
+* 本轮**未修改** `n3d_proto`（一期）与 `n3d_viz` 的任何文件（`git diff --stat` 对 HEAD 二者均为空），
+  也**未由力牧**运行一期冒烟；**但离朱的独立测试已真跑** `python n3d_proto/train.py --smoke-test`
+  → **9/9 PASS、退出码 0、`loss=2.419689`**（与既有登记一致），且 `n3d_viz` 对新产物的实跑
+  亦由离朱补做并**退出码 0**（见上表）。**本项的口径更正**：本节初稿曾把一期回归列为"未复跑"，
+  该表述在离朱回报后**已失效**，此处按实测改写。
+
+#### 8.0.2 后续需要补做的验证（本轮未执行部分）
+
+1. 在**具备 `checkpoints/n3d_sphere/_verify/` 的副本**上重跑：`verify_sphere_dag.py`（R7 默认冒烟
+   产物名）、`verify_scope_and_fingerprint.py`（S4-S5）、`run_smoke_matrix.py`（11 组合，
+   其产物名预测与"默认产物未被污染"断言须与 `smoke_nosyn.pt` 对齐）、`verify_all.py`
+   （含 `doc_numbers.json` 现跑比对与计数自检）—— 这些脚本中的**冒烟产物名**若仍按旧名
+   `smoke.pt` 预测，需要先同步为 `smoke_nosyn.pt`。
+2. ~~一期回归复跑~~ → **已由离朱独立测试真跑通过**（`n3d_proto/train.py --smoke-test`
+   **9/9 PASS、退出码 0、`loss=2.419689`**），本条已完成。
+3. ~~`n3d_viz` 对**新产物**的实跑~~ → **已由离朱补做通过**：`python -m n3d_viz -c …/smoke_nosyn.pt`
+   **退出码 0**，三件套正常生成，日志 `syn_dist 体积 = 0 字节` 属预期（见 8.0 节）。本条已完成。
+
 
 ### 8.1 checkpoint 元数据
 
@@ -746,10 +985,20 @@ python n3d_proto/train.py --smoke-test   -> 9/9 PASS、退出码 0、loss = 2.41
 | `connection_stats` | 神经元级连接统计（`num_edges` / 度分布 / `num_layers` / `num_in_scope` / `num_out_scope` / 孤立突触数） |
 | `topology_stats` | 几何指纹（`placement` / `flow_axis` / `space_radius` / `placement_radius` / `lattice_constant` / `nearest_neighbour_dist` / 神经元流向轴高度分布 / 判据编码 / `edge_dist_*` / `dual_copy_count`） |
 | `dag_selfcheck` | `dag_acyclic` / `all_edges_uphill` / `topo_covers_all` / `topo_matches_axis_order` |
-| `model_state_dict` 中的拓扑 buffer | `topo_index` / `edge_offset` / `edge_perm` / `edge_perm_in` / `neuron_in_edge_reach` / `edge_dst_in` / **`level_edge_reach` / `level_node_reach`** / `in_scope_mask` / `out_scope_mask` / 度分布 —— **全部 `register_buffer`**，故 `.to(device)` 与 `state_dict()` 都能搬运/持久化（F16 设备契约） |
+| `model_state_dict` 中的**持久化**拓扑 buffer（16 项） | `neuron_pos` / `edge_src` / `edge_dst` / `edge_dist` / `topo_index` / `edge_offset` / `edge_perm` / `edge_perm_in` / `neuron_in_edge_reach` / `edge_dst_in` / **`level_edge_reach` / `level_node_reach`** / `in_scope_mask` / `out_scope_mask` / `in_degree` / `out_degree` —— **全部 `register_buffer(..., persistent=True)`**，故 `.to(device)` 与 `state_dict()` 都能搬运/持久化（**F16 设备契约的适用范围 = 被 `forward` 当索引张量使用的拓扑量**） |
+| `model_state_dict` 中**不存在**的突触类 buffer（8 项，本轮变更） | `syn_dist` / `input_syn_pos` / `output_syn_pos` / `representative_syn_out` / `representative_syn_input` / `input_isolated_mask` / `output_isolated_mask` / `neuron_conn_mask` —— `persistent=False`：**仍注册**（`named_buffers()` 可见、随 `.to(device)` 搬运）但**不进入 `state_dict()`**、**不再落盘**；复核须回到 `config + seed` 重算（详见 8.0 节） |
 | 顶层 | `placement` / `flow_axis` / `space_radius` / `effective_space_radius` / `min_space_radius` / `max_space_radius` / `input_scope` / `readout_scope` / 训练超参 |
 
 ### 8.2 字节确定性：SHA256 作为等价判据的前提（离朱第 11 轮 D1）
+
+> **本轮改名后的口径（必读）**：本节以下所有 `smoke.pt` 的实测 SHA256 均为**产生它们的那一轮**
+> 记录（名字本轮起已改为 `smoke_nosyn.pt`，见第 8 节改名标注）。**本轮新产物的实测值**：
+> `_verify/smoke_nosyn.pt` = **192,719 B**、SHA256 **`175ff12c94f540888d54a96e12211294892d7e858a61ce2d8e491f31821794cc`**
+> （`--smoke-test` 裸跑，Python 3.13.15 + torch 2.14.0+cpu）。
+> 该 SHA 与本节的旧值**不可跨轮比较**（产物 schema 已变：`model_state_dict` 28 键 → 20 键），
+> 但**同代码路径下的等价判据不变**：同一语义配置的多次写入仍必须逐位一致
+> （本轮未重跑 `run_smoke_matrix.py` 的 11 组合，故"同路径多次写入逐位一致"这一条
+> **本轮未复验**，见 8.0.2）。
 
 **`torch.save` 产物的字节并不只由数值决定，还取决于 pickle 的记忆化（memo），而 memo
 依赖对象的身份（`id`）而非取值。** 因此"SHA256 相等"只有在**同一语义配置走同一代码路径**
@@ -788,6 +1037,27 @@ python n3d_proto/train.py --smoke-test   -> 9/9 PASS、退出码 0、loss = 2.41
 
 ## 9. 验证脚本
 
+> **本节的真实现状声明（必读，本轮）**
+>
+> 1. 下表所列脚本与取证文件**位于 `checkpoints/n3d_sphere/_verify/`**，而该目录
+>    （连同整个 `checkpoints/`）被 `.gitignore` 忽略、**未随仓库分发** —— 故
+>    **在本工作副本中它们并不存在**：`verify_all.py`、`doc_numbers.json`（252 项数字防线）、
+>    冻结快照 `artifacts/`、`full_runs.json`、各类 `log_*.txt` 与产物 `.pt`
+>    一律无法读取、无法运行、无法复现。**不得声称其通过。**
+> 2. 本工作副本的 Python 解释器**不在 PATH 上但实际存在**
+>    （`C:\Users\wb3094\AppData\Local\Programs\Python\Python313\python.exe`，
+>    `Python 3.13.15` + `torch 2.14.0+cpu`）：本轮已用它真跑 `compileall`（退出码 0）与
+>    `n3d_sphere/train.py --smoke-test`（15/15 PASS、退出码 0），并用临时脚本完成
+>    44 项针对性验证（见第 8.0.1 节）；**离朱的独立测试（70/70 PASS）另复跑了**一期
+>    `n3d_proto/train.py --smoke-test`（9/9 PASS、`loss=2.419689`）与 `n3d_viz` 对新产物的
+>    实跑（退出码 0）。**但**下表所列"`verify_all` / R1-R7b / S1-S5 等
+>    整链验收"本轮**仍未执行**（它们依赖的 `_verify/` 目录不在本副本）。
+> 3. 表中所有**实测数字、SHA256 与日志计数**都是**产生它们的那一轮**（f21 / g5 / h3 / j3 /
+>    k1 / k1fix / k1fix2 / counts）的真实记录，本轮**未重跑、未刷新**，故与本轮代码可能
+>    存在"名字类"差异：产物名已随本轮加 `_nosyn` 格式段（见第 8 节的改名标注），
+>    其余数字（loss / 梯度范数 / E / params / test_acc 等）本轮**未改动任何计算语义**，
+>    按原样保留。
+
 | 脚本 | 覆盖内容 |
 | --- | --- |
 | `_verify/verify_sphere_dag.py` | R1 几何（球内/半球/体积均匀）、R2 FCC（晶格常数、最近邻距=2H、seed 无关性）、R3 DAG（无环/严格上行/拓扑序）、R4 去重（神经元对数==E、代表连接为块内最近）、R5 双副本（零化 `a_in` 改变 `a_up`、`d(a_up)/d(a_in)` 非零）、**R5b 逐边数值正确性**（独立重建阶段 2 累加，核对每条边必须读到自己起点的激活；并含"错误槽位映射"反例以证明判据敏感）、R6 判据（包含关系/独立性/互斥）、R7 产物可 `torch.load` |
@@ -796,9 +1066,9 @@ python n3d_proto/train.py --smoke-test   -> 9/9 PASS、退出码 0、loss = 2.41
 | `_verify/verify_config_contracts.py` | C1 半径公式、C2-C3 窗口校验与 FCC 容纳性、C4-C5 字段清理与取值域、C6 零残留断言 |
 | `_verify/verify_topology_snapshot.py` | 固定实验点 × 10 seed 的拓扑量快照（落盘 JSON，供报告引用时标注 seed；6 个测点均为 `D = H`） |
 | `_verify/verify_device_regression.py` | **D1-D7 设备契约（F16 回归取证）**：层拓扑量的类型/注册状态、`vars(model)` 通用扫描（不得存在搬不动的张量容器）、层切分等价性、`.to('meta')` 搬运实验 + 普通 Python list 搬不动的机制复现、两条守卫负例（必须抛 RuntimeError）、CUDA 实测（无 GPU 时自动 skip 并标注"静态取证"）、`state_dict` 往返逐位一致 |
-| `_verify/run_smoke_matrix.py` | 以当前代码重跑 **11 种冒烟配置组合**，从日志解析**实际落盘路径**并与独立预测的产物名比对、回读 config 与期望逐字段比对、断言 `smoke.pt` 未被非默认组合污染且**同一路径多次写入逐位一致**；刷新 `smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt`，并由四条 scope 记录重建 `smoke_scope_matrix.json` |
+| `_verify/run_smoke_matrix.py` | 以当前代码重跑 **11 种冒烟配置组合**，从日志解析**实际落盘路径**并与独立预测的产物名比对、回读 config 与期望逐字段比对、断言**默认冒烟产物（本轮起为 `smoke_nosyn.pt`）**未被非默认组合污染且**同一路径多次写入逐位一致**；刷新 `smoke_matrix_f9.json` / `log_smoke_matrix_f9.txt`，并由四条 scope 记录重建 `smoke_scope_matrix.json`。**注意**：该脚本与 `verify_sphere_dag.py` 的 R7、`verify_scope_and_fingerprint.py` 的 S4-S5 均按**当前**命名规则预测产物名，故本轮加 `_nosyn` 段后**必须重跑一次**才能与实现对齐（本副本的 `_verify/` 目录不存在，**未重跑**；见第 8.0.1/8.0.2 节） |
 | `_verify/run_round.py` | **正式全量训练取证 runner**（K1）：以 Python 侧写盘统一日志为 **UTF-8**（规避 Windows PowerShell 重定向写 UTF-16LE 使日志不可解析），把子进程 stdout+stderr **流式**写入 `_verify/<log>` 并在末尾追加真实 `EXITCODE=<n>` |
-| `_verify/verify_full_runs.py` | **F-L1~F-R1 正式全量训练取证判据**（K1）：F-L1 台账结构自检；F-L2/F-L3 逐轮**三方一致**（台账 vs 真实终端日志 vs 可 `torch.load` 的产物，含逐 epoch 轨迹、参数量、退出码与达标判定）；F-L4 正式产物 `model.pt` 与台账来源轮次一致性；F-R1 **逐位可复现重放**（`--max-batches` 限批，产物写入 `_verify/`，绝不覆盖正式产物）。`ledger` 模式秒级（已纳入 `verify_all`），`bounded` 模式分钟级（单独执行） |
+| `_verify/verify_full_runs.py` | **F-L1~F-R1 正式全量训练取证判据**（K1）：F-L1 台账结构自检；F-L2/F-L3 逐轮**三方一致**（台账 vs 真实终端日志 vs 可 `torch.load` 的产物，含逐 epoch 轨迹、参数量、退出码与达标判定）；F-L4 正式产物 `model_nosyn.pt`（原 `model.pt`，本轮改名）与台账来源轮次一致性；F-R1 **逐位可复现重放**（`--max-batches` 限批，产物写入 `_verify/`，绝不覆盖正式产物）。`ledger` 模式秒级（已纳入 `verify_all`），`bounded` 模式分钟级（单独执行） |
 | `_verify/build_full_runs_ledger.py` | 轮次台账构建脚本（K1，**不是判据**）：从各轮真实日志解析实测值、按每轮显式声明的 `snapshot_source`（`artifact` / `backup`）**冻结产物快照**到 `_verify/artifacts/<轮次>.pt`，并在冻结时强制校验『来源→快照 SHA256 一致』与『快照 config/test_acc 与本轮终端日志一致』（不一致即中止，杜绝"登记别轮 SHA / 登记不存在的路径"）、执行限批重放取"前 N batch 的 CE 和"，写出 `full_runs.json` |
 | `_verify/register_full_runs_doc_numbers.py` | 把各轮登记项写入 `doc_numbers.json` 的第五类 `full_run_checks`（K1，**不是判据**），并写入两次限批筛参的 `text_checks`：登记项的值全部现场取数（产物字段以**冻结快照**为读回对象），不手填、可重复运行 |
 | `_verify/verify_snapshots_k1fix.py` | **K1 修复轮的 5 轮快照 × 配置复核脚本**（只读）：打印每轮快照路径 / 字节数 / SHA256 / `snapshot_source` / 现算 `artifact_available`，并用 `torch.load` 复核 `(epochs, batch_size, lr, readout_bias, lr_schedule, grad_clip, test_acc, E)` 与轮次期望逐项一致；输出落 `_verify/log_snapshots_k1fix.txt` |
@@ -890,8 +1160,17 @@ python n3d_proto/train.py --smoke-test                                          
    由 `stage2_recurrence` 每次前向的 `_assert_index_device` 强制。
 7. **`--seed 0` 按 CLI 约定表示"不覆盖"**（见 `--seed` 帮助与 `validate_overrides`），
    `--preset default` 在冒烟路径下的基线即 `SMALL_CONFIG` —— 故这两种命令行写法在冒烟
-   矩阵中都与默认组合等价（产物同为 `smoke.pt` 且逐位相同）。矩阵记录逐条注明，
+   矩阵中都与默认组合等价（产物同为默认冒烟产物 `smoke_nosyn.pt` 且逐位相同，
+   本轮起加 `_nosyn` 格式段）。矩阵记录逐条注明，
    真正的额外 seed 覆盖由 `--seed 7` / `--seed 2024` 承担（见 `smoke_matrix_f9.json`）。
+8. **本工作副本的 Python 解释器不在 PATH 上，但实际存在**：
+   `C:\Users\wb3094\AppData\Local\Programs\Python\Python313\python.exe`
+   （`Python 3.13.15` + `torch 2.14.0+cpu`）。本轮全部实测（`compileall` 退出码 0、
+   冒烟 15/15 PASS、针对性脚本 44/44 PASS、体量测量）**均用该解释器真跑取得**，原始输出见第 8.0.1 节。
+   但 `checkpoints/n3d_sphere/` 整个目录**仍不存在**（`checkpoints/` 被 `.gitignore` 忽略、
+   未随仓库分发），故 `_verify/verify_all.py`、`doc_numbers.json`（252 项数字防线）、
+   冻结快照与历史 `log_*.txt` **在本副本仍无法复现**，本轮**不声称其通过**；
+   需补做的项见第 8.0.2 节。
 
 ### 10.1 第一/二轮修复的缺陷
 
