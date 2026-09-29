@@ -11,7 +11,15 @@
     },
     {
       "path": ".gitignore",
-      "description": "仓库根级 .gitignore（Python 3.12 项目忽略清单，分节组织，由 framework 模块维护）。覆盖：Python 字节码与包构建产物（__pycache__/、*.py[cod]、*.egg-info/、build/、dist/）、虚拟环境（.venv/、venv/、.venv-win/ 等）、测试与静态检查缓存（.pytest_cache/、.mypy_cache/、.ruff_cache/、.coverage*、htmlcov/、.tox/）、IDE 与 OS 文件（.idea/、.vscode/、*.swp、.DS_Store、Thumbs.db 等）、运行产物目录（/outputs/、/runs/、/checkpoints/、/logs/、/exp/runs/、/exp/outputs/、*.log，其中 /checkpoints/ 忽略使 checkpoint 工件不进入版本控制）、.lizhu_env/ 本地测试环境，以及「数据集原始文件（运行时复制，不入库）」分节下的 data/mnist/MNIST/——该目录是 data.py 首次运行把工程内已跟踪的 data/mnist/ 原始 IDX 文件复制到 torchvision 期望布局（MNIST/raw/，4 文件约 11 MB）所产生的运行时副作用产物，忽略粒度收窄到该级以不影响 data/mnist/ 下已跟踪文件。"
+      "description": "仓库根级 .gitignore（Python 3.12 项目忽略清单，分节组织，由 framework 模块维护）。覆盖：Python 字节码与包构建产物（__pycache__/、*.py[cod]、*.egg-info/、build/、dist/）、虚拟环境（.venv/、venv/、.venv-win/ 等）、测试与静态检查缓存（.pytest_cache/、.mypy_cache/、.ruff_cache/、.coverage*、htmlcov/、.tox/）、「Node / 前端依赖（Playwright 测试依赖，不入库）」分节下的 node_modules/（覆盖 n3d_viz/tests/node_modules/ 的 Playwright 1.63.0 依赖，183 文件约 17.7 MB，防 git add -A 误提交）、IDE 与 OS 文件（.idea/、.vscode/、*.swp、.DS_Store、Thumbs.db 等）、运行产物目录（/outputs/、/runs/、/checkpoints/、/logs/、/exp/runs/、/exp/outputs/、*.log，其中 /checkpoints/ 忽略使 checkpoint 工件不进入版本控制）、.lizhu_env/ 本地测试环境，以及「数据集原始文件（运行时复制，不入库）」分节下的 data/mnist/MNIST/——该目录是 data.py 首次运行把工程内已跟踪的 data/mnist/ 原始 IDX 文件复制到 torchvision 期望布局（MNIST/raw/，4 文件约 11 MB）所产生的运行时副作用产物，忽略粒度收窄到该级以不影响 data/mnist/ 下已跟踪文件。"
+    },
+    {
+      "path": "test_reports/lizhu_n3d_sphere_W1_report.md",
+      "description": "离朱对 n3d_sphere W1 轮的独立测试报告，含一期产物 n3d_model_highacc.pt / n3d_model_capacity.pt 的 SHA256 零回归证据表（§6.6）。该证据表下方新增「重建轮标注」：说明这两个产物已于 n3d_shape 重建轮删除、表中 SHA256 为该轮当时的历史证据值、已无法在磁盘上复核；原表结构（3 列 4 行）与全部 SHA256 字符逐字符未改动，标注为纯新增行。"
+    },
+    {
+      "path": "test_reports/lizhu_n3d_sphere_dh_constraint_r14_report.md",
+      "description": "离朱对 n3d_sphere H/D 约束轮（R14）的独立测试报告，含一期三产物（full/highacc/capacity）指纹断言证据（§8「三产物指纹」行）。该行行尾新增「重建轮标注」：说明 n3d_model_highacc.pt / n3d_model_capacity.pt 已于重建轮删除（n3d_model_full.pt 保留）、后两者指纹仅作历史记录；全部指纹字符串与其余历史数字逐字符未改动，标注为纯后缀追加。"
     }
   ]
 }

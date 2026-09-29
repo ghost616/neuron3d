@@ -26,6 +26,11 @@ env/
 htmlcov/
 .tox/
 
+# ---- Node / 前端依赖（Playwright 测试依赖，不入库）----
+# n3d_viz/tests/ 下由 npm 安装的 Playwright 测试依赖（183 文件、约 17.7 MB）属可
+# 再生产物，不入版本控制；本规则防止 git add -A / git add . 误提交依赖目录。
+node_modules/
+
 # ---- IDE / 编辑器 / OS ----
 .idea/
 .vscode/

@@ -52,6 +52,30 @@
     {
       "description": "fc_dim 同参对齐的现跑复核脚本（新增文件，非训练路径，只读产物与台账）。A 段：fc_dim 语义与关闭路径零回归（-1 → 宽度==N、>0 → 该值、0 → 关闭、<-1 报错；fc_dim=0 时模型逐张量 + 前向中间量 + 参数量与**改动前源码现场生成的快照** _verify/fc_pre_change_snapshot.json 逐位一致、且不创建任何 FC 参数/buffer；产物命名不变式：fc_dim=0 不含 _fc 段、fc_dim!=0 含 _fc{n} 段且互不同名；解析式参数量公式 == count_parameters；count_dense_weight_tensors() == 0；报告输入侧结构性零梯度投影行计数）。B 段：台账逐条复核（产物存在、磁盘 SHA256 == 台账、字段齐全含 exit_code、产物名 == 规范名、产物 config 与固定口径逐字段一致且非限批、用**现场重建模型**独立复算 params/E/K/|S_in|/|S_out| 并与台账逐项比对、**同参偏差 ≤ 0.5% 硬断言**）。C 段：搜索块复核（chosen_N 必须等于其 17 行实测表的 argmin |params − target|，且覆盖 815..831，并**现场重建该 N** 核对 params 一致）。D 段：33 个既有产物（10 个三期 + 22 个 N 阶梯 + 1 个一期 MLP）SHA256 的**代码内冻结常量**承重断言。另校验产物名两两唯一且与既有产物零冲突、汇总块与逐条记录一致。固定口径与冻结常量由本脚本独立复述、**不 import** run_fc_alignment.py（避免与被测实现同源）。退出码 0（全部通过）/1（存在不一致）。",
       "path": "n3d_shape/verify_fc_alignment.py"
+    },
+    {
+      "description": "重建轮取证脚本：枚举并硬断言待删 45 个训练产物的清单（路径/字节/SHA256）与按目录分布，输出 regen_cleanup_manifest.json（含 anchor_sha256_pre/post）。位于 checkpoints/ 下，被 .gitignore 忽略，仅差本地取证用",
+      "path": "checkpoints/n3d_shape/_verify/regen_cleanup_a1.py"
+    },
+    {
+      "description": "重建轮 A1 删除脚本：先记录后删除 45 个产物并做删后断言（待删集残留 0、保留集逐一 isfile）；A1b 误写目录段当前仅记录不删除（待补显式删除与删后断言）",
+      "path": "checkpoints/n3d_shape/_verify/regen_cleanup_a1_delete.py"
+    },
+    {
+      "description": "重建轮 A3 产物核查脚本：torch.load 复核新 FC 产物的名称/字节/SHA256/test_acc/FC 键形状/无突触张量；其 anchors_unchanged_known 断言当前为永真死断言且含伪造字面量（待修）",
+      "path": "checkpoints/n3d_shape/_verify/regen_a3_verify.py"
+    },
+    {
+      "description": "重建轮台账构建脚本：生成 regen_ledger_<日期>.json（8 个 section）；其中 plan_start_baseline_measured 字段当前为硬编码字面量（待改为现场取数）",
+      "path": "checkpoints/n3d_shape/_verify/regen_build_ledger.py"
+    },
+    {
+      "description": "重建轮台账校验脚本：对 regen_ledger_<日期>.json 做 33 条结构/数值断言",
+      "path": "checkpoints/n3d_shape/_verify/regen_validate.py"
+    },
+    {
+      "description": "重建轮「本轮重建台账」：记录 45 个删除产物的路径/字节/SHA256、误目录、保留集校验、旧 fc 台账作废、新 FC 产物记录与失效基线清单",
+      "path": "checkpoints/n3d_shape/_verify/regen_ledger_20260929.json"
     }
   ]
 }

@@ -181,6 +181,7 @@ cube SMALL / cube DEFAULT / sphere z / sphere x 四组几何断言全 PASS
 | `checkpoints/n3d_model_full.pt` | `888556B0913C9F46419A674117FD13A99F2C71BA6692367A839DB873A58D8924` | 同 | 未变化 |
 | `checkpoints/n3d_model_highacc.pt` | `9F21AC34C91977FE60F623138F3DEE24428E44B473BD86DE60A8B577F11BE3F8` | 同 | 未变化 |
 | `checkpoints/n3d_model_capacity.pt` | `0F7CF500C256BFE41408E3DC68CED9316C21EE4EE94527790F861C76E6C35011` | 同 | 未变化 |
+> **重建轮标注**：表中 `n3d_model_highacc.pt` / `n3d_model_capacity.pt` 已于重建轮删除，上述 SHA256 为该轮当时的历史证据值，已无法在磁盘上复核。
 
 ### 6.7 附加：官方 W1 专项回归脚本
 

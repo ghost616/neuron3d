@@ -1461,6 +1461,12 @@ x [B,784]
 （`test_acc` / `params` / `E` / `K` / `|S_in|` / `|S_out|` / `SHA256` 现场取数自产物与台账
 `_verify/fc_alignment_runs.json`，可逐条复核）。`Δ = N3D+FC − MLP`（pp）：
 
+**注（2026 年重建轮连带失效，只增标注、不改任何历史数字）**：上句引用的台账
+`_verify/fc_alignment_runs.json` 已于重建轮**作废归档**至 `_verify/_void/fc_alignment_runs.json`
+（原名保留、内容未改，SHA256 `3bf087933870740b…`）；同轮清理使该台账 18 条记录中 **17 条**
+所引用的 fc_align 产物被删除（仅 `N825 fc-1` 锚点产物保留），故本节表格的逐条现场复核
+（`verify_fc_alignment.py` 的 B/C 段与 D 段 33 个冻结常量）**在当前产物状态下已不可再运行**。
+
 | `seed` | `N` | `params` | 偏差 | `E` | `K` | `|S_in|` | `|S_out|` | 结构性零梯度行 | `test_acc` | 同 seed MLP | Δ(pp) | 单轮耗时 | 产物 SHA256（前 16） |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | 827 | 1,627,648 | -0.0321% | 2,583 | 15 | 577 | 591 | 16 / 577 | 98.73% | 98.63% | **+0.10** | 547.7 s | `e5fe7b9718097583` |
@@ -1778,6 +1784,11 @@ Error(s) in loading state_dict for ThreeDNeuronSpace:
 | `verify_full_runs.py` | 退码 **1**：`[FAIL] 账本不存在：…\_verify\full_runs_shape.json` | 台账缺失，11 组记录的独立复算与 5 条冻结 SHA256 承重断言**无法复现** |
 | `verify_ladder.py` | 退码 **1**：`[FAIL] 台账不存在：…\_verify\ladder_runs.json` | 同上（N 阶梯台账缺失） |
 | `verify_fc_alignment.py` | 退码 **1**：`[FAIL] 台账不存在：…\_verify\fc_alignment_runs.json` | 同上（FC 同参台账与改动前快照 `fc_pre_change_snapshot.json` 缺失） |
+
+**注（2026 年重建轮更新，只增标注、不改原表数字）**：上表第三行的 FC 同参台账在本副本中
+**已存在但被作废归档**至 `_verify/_void/fc_alignment_runs.json`（SHA256 `3bf087933870740b…`）；
+`verify_fc_alignment.py` 若按原路径运行仍报同一个 `[FAIL] 台账不存在`，且其 18 条记录中 17 条
+的被测产物已随重建轮删除 —— 该脚本在当前产物状态下**不可复现**，与原表"无法复现"的结论一致。
 
 上述三项**不是本轮代码缺陷**，而是取证文件在本副本中不存在；本轮的替代证据是
 `probe_snapshot.py`（对**本轮改动前后**的现场逐位比对，§19.1）与 `probe_roundtrip.py`

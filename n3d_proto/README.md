@@ -78,6 +78,7 @@ python n3d_proto/train.py --no-backup                    # 覆盖前不生成 <p
 ```bash
 # 预设：small / default / highacc（缺省 default，保持既有默认行为不变）
 python n3d_proto/train.py --preset highacc --checkpoint checkpoints/n3d_model_highacc.pt
+# 注：上一行示例的 checkpoint 产物已于 2026 年重建轮删除、当前不存在，该行仅作历史用法记录。
 
 # 线程：0（默认）= 不干预，保持 torch 默认线程数；正数则显式设置
 python n3d_proto/train.py --threads 4
@@ -88,6 +89,11 @@ python n3d_proto/train.py --preset highacc --n 384 --t 6 --batch-size 128 --lr 2
     --weight-decay 1e-4 --dropout 0.1 --readout-bias --epochs 8 --max-batches 150
 python n3d_proto/train.py --preset highacc --no-readout-bias
 ```
+
+> **产物状态注记（2026 年重建轮）**：本文档中引用的一期 checkpoint 产物——`checkpoints/n3d_model_highacc.pt`、
+> `checkpoints/n3d_model_capacity.pt`、`checkpoints/_seedscan/seed_*.pt`——均已于 2026 年重建轮**删除，当前不存在**；
+> 所有引用这些路径的行（含本节命令行示例）一律仅为历史实验记录，其中的数字、参数量、耗时与 SHA256
+> **逐字符保持原样、未做任何改动**。`checkpoints/n3d_model_full.pt` **未在删除之列**，仍是现存交付工件。
 
 **线程实测对比**（同一限批配置 `--preset default --epochs 1 --max-batches 100`，CPU 8 核，
 两次运行结果完全一致：`loss=0.5784 / test_acc=87.92%`）：
@@ -319,7 +325,7 @@ checkpoints/_verify/verify_<bpe>_N{N}_y{y_in}x{y_out}_H{H}_D{D}_T{T}_s{seed}[_<t
 
 ### 全量冲刺实测（两轮，均为 60000 样本全量）
 
-**第 1 轮**：`--preset highacc --epochs 12 --checkpoint checkpoints/n3d_model_highacc.pt --threads 4`
+**第 1 轮**：`--preset highacc --epochs 12 --checkpoint checkpoints/n3d_model_highacc.pt --threads 4`　〔已删产物：已于 2026 年重建轮删除，当前不存在〕
 （AdamW lr=2e-3 / wd=1e-4 / dropout=0.1 / cosine T_max=12 / clip=1.0）
 
 ```
@@ -339,7 +345,7 @@ checkpoints/_verify/verify_<bpe>_N{N}_y{y_in}x{y_out}_H{H}_D{D}_T{T}_s{seed}[_<t
 ```
 
 **第 2 轮（阶段 4 兜底，按"过拟合"方向加正则）**：
-`--preset highacc --epochs 10 --lr 3e-3 --weight-decay 2e-4 --dropout 0.15 --checkpoint checkpoints/n3d_model_highacc.pt`
+`--preset highacc --epochs 10 --lr 3e-3 --weight-decay 2e-4 --dropout 0.15 --checkpoint checkpoints/n3d_model_highacc.pt`　〔已删产物：已于 2026 年重建轮删除，当前不存在〕
 
 ```
 [epoch  1/10] 95.09% | [epoch  2/10] 95.69% | [epoch  3/10] 95.98% | [epoch  4/10] 96.52%
@@ -358,6 +364,7 @@ checkpoints/_verify/verify_<bpe>_N{N}_y{y_in}x{y_out}_H{H}_D{D}_T{T}_s{seed}[_<t
 
 ```
 python n3d_proto/train.py --preset highacc --epochs 16 --checkpoint checkpoints/n3d_model_capacity.pt --threads 0
+# 注：上一行示例的 checkpoint 产物已于 2026 年重建轮删除、当前不存在，该行仅作历史用法记录。
 ```
 （AdamW lr=2e-3 / wd=1e-4 / dropout=0.1 / readout_bias=True / cosine T_max=16 / clip=1.0）
 
@@ -381,7 +388,7 @@ python n3d_proto/train.py --preset highacc --epochs 16 --checkpoint checkpoints/
 总耗时 2112.2s ≈ 35.2 min
 最终统计：可学习参数 1691730；连接稀疏度(密度) 0.014604；zero_ratio 0.985396；
          边数 E=61255；平均出度 29.910；tau 0.348827；最终 test_acc 97.70%
-产物：checkpoints/n3d_model_capacity.pt
+产物：checkpoints/n3d_model_capacity.pt　〔已删产物：已于 2026 年重建轮删除，当前不存在〕
 SHA256：0f7cf500c256bfe41408e3dc68ced9316c21ee4ee94527790f861c76e6c35011
 ```
 
@@ -396,17 +403,17 @@ SHA256：0f7cf500c256bfe41408e3dc68ced9316c21ee4ee94527790f861c76e6c35011
 
 配置完全固定为 HIGHACC：`--preset highacc --epochs 12 --threads 0`（T=4 / bs=128 / AdamW lr=2e-3 /
 wd=1e-4 / dropout=0.1 / readout_bias=True / cosine / clip=1.0，全量 60000 样本），**只改 `--seed`**。
-产物写入 `checkpoints/_seedscan/seed_<seed>.pt`（每个种子独立命名，不互相覆盖）。
+产物写入 `checkpoints/_seedscan/seed_<seed>.pt`（每个种子独立命名，不互相覆盖）。　〔已删产物：已于 2026 年重建轮删除，当前不存在；下表四行产物（含 seed 42 的历史基线）均同此，表中数字为历史实验记录〕
 
 | seed | 实际 E 边数 | 可学习参数 | 单 epoch 耗时 | 总耗时 | test_acc | 产物（`checkpoints/_seedscan/`） |
 |------|------------|-----------|---------------|--------|----------|----------------------------------|
-| **42**（历史基线，未重跑） | 61255 | 1691730 | 131.9s | 1570.9s | **97.84%** | `../n3d_model_highacc.pt` |
+| **42**（历史基线，未重跑） | 61255 | 1691730 | 131.9s | 1570.9s | **97.84%** | `../n3d_model_highacc.pt`〔已删产物：已于 2026 年重建轮删除，当前不存在〕 |
 | 7 | 60167 | 1690642 | 131.8s | 1581.9s | 97.55% | `seed_7.pt` |
 | **2024** | 62024 | 1692499 | 134.9s | 1618.6s | **97.90%** | `seed_2024.pt` |
 | 123 | 60326 | 1690801 | 122.5s | 1470.0s | 97.68% | `seed_123.pt` |
 
 （`epochs=12`、`batches_per_epoch=469`、SHA256 分别：seed_7 `afbf2221a919feab…`、
-seed_2024 `6b1d2657d4847fe5…`、seed_123 `d40b5ebb3418f385…`；表中每个数字均可用 `torch.load` 从对应产物复核。）
+seed_2024 `6b1d2657d4847fe5…`、seed_123 `d40b5ebb3418f385…`；表中每个数字均可用 `torch.load` 从对应产物复核。**该"可复核"说法仅适用于产物删除之前——上表四行产物已于 2026 年重建轮删除、当前不存在，上列 SHA256 等数字为历史记录原文、未做任何改动。**）
 
 **判读**
 * 四个种子极差 = 97.90% − 97.55% = **0.35pp**，均值 97.74%、标准差约 0.13pp；
@@ -442,7 +449,7 @@ dropout=0.1 / cosine / grad_clip=1.0 / seed=42 / 全量 60000 / 无增强无标�
 
 | 组 | 架构 | test_acc | 可学习参数 | 单 epoch | 总耗时 | 产物（`torch.load` 可复核） |
 |----|------|----------|-----------|----------|--------|------------------------------|
-| **A**（已有，未重跑） | 四步闭环 `neuron3d` | 97.84% | 1691730 | 131.9s | 1570.9s | `checkpoints/n3d_model_highacc.pt` |
+| **A**（已有，未重跑） | 四步闭环 `neuron3d` | 97.84% | 1691730 | 131.9s | 1570.9s | `checkpoints/n3d_model_highacc.pt`〔已删产物：已于 2026 年重建轮删除，当前不存在〕 |
 | **B**（本轮必跑） | **普通 MLP 784→2048→10** | **98.64%** | **1628170** | **19.6s** | **234.9s** | `checkpoints/_control/mlp_highacc_ep12_seed42.pt`（SHA256 `f261716e7f3c3cba…`） |
 | C（条件触发） | 未跑（触发条件为"B 异常偏低 < 97.5%"，实测 B=98.64% **不满足**） | — | — | — | — | — |
 
@@ -455,7 +462,7 @@ dropout=0.1 / cosine / grad_clip=1.0 / seed=42 / 全量 60000 / 无增强无标�
 旁证：MLP 单 epoch 仅 **19.6s**（主模型 131.9s，快 **6.7 倍**），且 MLP 在 **epoch 7** 就已达 98.41%，
 而主模型全程封顶 ~97.8% —— 主模型不仅**慢 6.7 倍**，泛化上限也**更低 0.80pp**。
 
-> 注：A 组产物 `n3d_model_highacc.pt` 是第 4 轮产出，其 checkpoint 元数据中无 `arch` 字段
+> 注：A 组产物 `n3d_model_highacc.pt` 是第 4 轮产出，其 checkpoint 元数据中无 `arch` 字段　〔已删产物：已于 2026 年重建轮删除，当前不存在〕
 > （当时尚未引入 `--arch`）；B 组元数据 `arch="mlp"`。两者的训练控制变量已逐项比对一致（bs/lr/wd/dropout/cosine/clip/seed）。
 
 **架构侧后续方向**（按预期收益排序）
@@ -476,21 +483,21 @@ dropout=0.1 / cosine / grad_clip=1.0 / seed=42 / 全量 60000 / 无增强无标�
 | 配置 | 最终 test_acc | 耗时 | 产物 |
 |------|---------------|------|------|
 | `DEFAULT_CONFIG`（T=3, bs=64, Adam 1e-3, 10ep） | 97.53% / 97.20%（两次运行） | 22~33 min | `checkpoints/n3d_model_full.pt` |
-| `HIGHACC_CONFIG`（T=4, bs=128, AdamW 2e-3, 12ep） | **97.84%**（历史最佳） | 26.2 min | `checkpoints/n3d_model_highacc.pt` |
+| `HIGHACC_CONFIG`（T=4, bs=128, AdamW 2e-3, 12ep） | **97.84%**（历史最佳） | 26.2 min | `checkpoints/n3d_model_highacc.pt`〔已删产物：已于 2026 年重建轮删除，当前不存在〕 |
 | HIGHACC + 更强正则（wd=2e-4, dropout=0.15, 10ep） | 97.71% | 21.6 min | 第 2 轮产物**未保留**（见下） |
-| **HIGHACC 16ep（第 5 轮容量扫描后）** | **97.70%** | 35.2 min | `checkpoints/n3d_model_capacity.pt` |
+| **HIGHACC 16ep（第 5 轮容量扫描后）** | **97.70%** | 35.2 min | `checkpoints/n3d_model_capacity.pt`〔已删产物：已于 2026 年重建轮删除，当前不存在〕 |
 
 **四轮全量运行的结果全部落在 97.70% ~ 97.84% 的 0.14pp 带内**（差异远小于架构层面的噪声），
 即该架构在当前约束下的泛化上限约 **97.8%**。
 
 **产物标签更正**：`checkpoints/_verify/highacc_r1.pt` 经 `torch.load` 复核为
 **第 1 轮（12 epoch）的产物**——其 `test_acc=0.9784`、`epochs=12`、
-SHA256 与 `n3d_model_highacc.pt` **完全相同**（`9f21ac34c91977fe…`），二者内容一致。
+SHA256 与 `n3d_model_highacc.pt` **完全相同**（`9f21ac34c91977fe…`），二者内容一致。　〔已删产物：已于 2026 年重建轮删除，当前不存在；上列 SHA256 为历史记录原文，未做任何改动〕
 第 2 轮（97.71%，10 epoch）的产物**未被保留**（当时该轮结束时直接覆盖写入了正式路径，
 随后为保留最佳结果又用第 1 轮产物恢复覆盖）；因此第 2 轮的 97.71% **没有工件可直接复核**，
 仅作为过程记录保留在下方日志中。
 
-两轮均**未达 > 99%**，最好成绩 **97.84%**。当前 `checkpoints/n3d_model_highacc.pt` 保存的是
+两轮均**未达 > 99%**，最好成绩 **97.84%**。删除前 `checkpoints/n3d_model_highacc.pt` 保存的是　〔已删产物：已于 2026 年重建轮删除，当前不存在；上列数字为历史记录原文，未做任何改动〕
 第 1 轮（97.84%）的产物，其 SHA256 为 `9f21ac34c91977fe…`。
 
 ### 主因分析（为什么卡在 ~97.8%）

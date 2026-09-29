@@ -293,7 +293,7 @@ seed |   E |  avgOut | maxOut |  avgIn | maxIn | K | S_in | S_out | dual | isoIn
 |---|---|---|
 | 源码零改动 | `git status --porcelain -- n3d_proto` | 输出为**空** |
 | 一期冒烟 | `python n3d_proto/train.py --smoke-test` | `exit=0`、**9/9 PASS**、`FAIL=0`、输出 `loss=2.419689` |
-| 三产物指纹 | SHA256 | `n3d_model_full.pt = 888556B0…8924`、`n3d_model_highacc.pt = 9F21AC34…E3F8`、`n3d_model_capacity.pt = 0F7CF500…5011`，与登记值**逐字符一致** |
+| 三产物指纹 | SHA256 | `n3d_model_full.pt = 888556B0…8924`、`n3d_model_highacc.pt = 9F21AC34…E3F8`、`n3d_model_capacity.pt = 0F7CF500…5011`，与登记值**逐字符一致**。**重建轮标注**：其中 `n3d_model_highacc.pt` / `n3d_model_capacity.pt` 已于重建轮删除（`n3d_model_full.pt` 保留），后两者指纹仅作历史记录 |
 | 产物隔离 | `checkpoints/n3d_sphere/model.pt` | 不存在（冒烟只写 `_verify/`） |
 
 ### 8.5 测试前后被测试版本未漂移

@@ -10,6 +10,7 @@
   `data/mnist/MNIST/` 忽略项的作用：`n3d_proto/data.py` 与 `n3d_sphere/data.py` 优先复用工程内 `data/mnist/` 的 4 个原始 IDX 文件（已被版本控制跟踪），首次运行时会把它们复制到 torchvision 期望的布局 `data/mnist/MNIST/raw/`（4 个文件、约 11 MB）。该目录是运行时副作用产物，故整体忽略；忽略粒度收窄到 `data/mnist/MNIST/` 这一级，**不影响 `data/mnist/` 下已跟踪的原始 IDX 文件**。
 
 已移除：`pyproject.toml`（原 H-STDN 构建与依赖权威声明，包名 hstdn）随 H-STDN 代码一并删除；`n3d_proto/requirements.txt` 已上移为仓库根文件。`n3d_proto/README.md` 为 `n3d_proto` 模块自有文档（一期详细技术文档），不再与仓库根 `README.md` 同源。
+  `node_modules/` 忽略项的作用：`n3d_viz/tests/` 下由 npm 安装的 Playwright 测试依赖（`playwright` 1.63.0，183 文件、约 17.7 MB）属可再生产物，位于新增的「Node / 前端依赖（Playwright 测试依赖，不入库）」分节（`.gitignore` 第 29–32 行，规则本体在第 32 行）。该规则生效前 `git check-ignore -v n3d_viz/tests/node_modules/playwright/package.json` 退出码为 1（未命中任何规则），依赖仅因未被 `git add` 才未入库；生效后退出码为 0 且命中 `.gitignore:32:node_modules/`，`git status --porcelain -uall` 中 183 条 `n3d_viz/tests/node_modules/` 未跟踪条目归零，从而消除 `git add -A` / `git add .` 误提交依赖（约 17.7 MB）的风险。规则写作不带前导斜杠的 `node_modules/`，以匹配任意层级的依赖目录；经 `git ls-files | git check-ignore --stdin` 全量校验，被跟踪文件中被忽略者数量为 0，无路径误伤。
 ## G0 断言公共工具
 
 **（已废弃）** 本节所述 G0 断言公共工具随 H-STDN 代码一并移除，当前不再存在：
