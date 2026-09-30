@@ -56,11 +56,39 @@ from torch.utils.data import DataLoader
 # 兼容"以脚本方式运行"（python n3d_shape/train.py）与"作为包导入"两种情形
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
+def _reconfigure_stdio() -> None:
+    """把 stdout / stderr 重配为 UTF-8（errors='replace'），消除 GBK 控制台崩溃（离朱 DEF-1）。
+
+    背景：Windows 默认 stdout 编码常为 **gbk**，而本模块的日志/判据文本含大量中文与数学记号。
+    一旦某个字符不在 GBK 码表内，`print` / `log_info` 会抛 `UnicodeEncodeError`
+    （实测历史：`=>` U+21D2、`d` U+2202、`^2` U+00B2、`[!]` U+26A0、`-` U+2212），
+    使**验收命令在默认控制台下退码 2 / 1** —— 这是**输出层**缺陷，不是业务逻辑缺陷。
+
+    处置为**两道防线**（对外部调用者最稳）：
+    1. 本函数在**入口**处把 stdout / stderr 重配为 UTF-8 且 `errors='replace'`
+       （Python 3.7+ 才有 `reconfigure`，缺失时静默跳过）；
+    2. 源码中**全部非 GBK 字符已替换为 ASCII 等价记号**（`=>` / `dL/dalpha` / `^2` / `[!]` …），
+       故即使 1 未生效（例如把本模块当库导入且未调用入口），也不会再有输出层崩溃。
+
+    参数：无。返回：None。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            # 非文本流 / 老版本解释器：静默跳过（ASCII 替换已提供第二道防线）
+            pass
+
+
+_reconfigure_stdio()
+
 try:
     from .config import (
         Config,
         DEFAULT_CONFIG,
         FLOW_AXIS_CHOICES,
+        GEO_FIELD_CHOICES,
         HIGHACC_CONFIG,
         PLACEMENT_CHOICES,
         SCOPE_CHOICES,
@@ -83,6 +111,7 @@ except ImportError:  # pragma: no cover
         Config,
         DEFAULT_CONFIG,
         FLOW_AXIS_CHOICES,
+        GEO_FIELD_CHOICES,
         HIGHACC_CONFIG,
         PLACEMENT_CHOICES,
         SCOPE_CHOICES,
@@ -194,6 +223,27 @@ def smoke_fingerprint(config: Config) -> str:
     #     （`fc_dim == 0` 时紧随 scope 段之后）、位于 `_s{seed}` 之前。同一口径已同步
     #     `config_fingerprint` / `full_checkpoint_name` 与 README §19。
     nosyn_part = "_nosyn"
+    # ---- 几何权重场（第 5 轮新增）：`geo_field` 族 ----
+    # [!] 命名段 `_geo{mode}`（**仅 `geo_field != "none"` 时插入**）：否则同 N/seed/scope
+    #     的"关闭"与"开启"两种产物会写同一个文件名而互相覆盖（历史纠正 #1 的同类缺陷）。
+    #     口径（三处指纹**必须逐字一致**）：
+    #       位置 = 紧随 `_fc{n}` 段之后（`fc_dim == 0` 时紧随 scope 段之后）、
+    #              **`_nosyn` 段之前**、`_s{seed}` 之前；
+    #       `geo_field == "none"` **不加段** -> 既有产物名逐字不变。
+    #     段值含 RBF 阶数 `k`：`_geoadditive_k12`（同档不同 k 是两套不同几何场，必须可区分）。
+    geo_part = (
+        (
+            f"_geo{config.geo_field}_k{int(config.geo_rbf_k)}"
+            + ("_sd" if bool(config.geo_signed_delta) else "")
+            # [!] `_a{alpha_init:g}`：离朱 DEF-7 —— `geo_alpha_init` 原先**未进指纹**，
+            #     使 `--geo-alpha-init 0.4` 与默认 `1.0` 生成**同名产物**并**静默互覆**
+            #     （实测 SHA `01e56cb7…` -> `7b89b4ef…`）。口径：**仅非默认值（!= 1.0）
+            #     时插入**，故默认组合的产物名逐字不变（既有产物名与 README 口径不受影响）。
+            + (f"_a{float(config.geo_alpha_init):g}"
+               if float(config.geo_alpha_init) != 1.0 else "")
+        )
+        if str(config.geo_field) != "none" else ""
+    )
     return (
         f"{config.shape_tag()}_"
         f"N{config.N}_y{config.y_in}x{config.y_out}"
@@ -204,6 +254,7 @@ def smoke_fingerprint(config: Config) -> str:
         f"_rs{scope_abbrev(config.readout_scope)}"
         f"_bs{config.batch_size}"
         f"{fc_part}"
+        f"{geo_part}"
         f"{nosyn_part}"
         f"{radius_part}"
         f"_s{config.seed}"
@@ -468,6 +519,45 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "N3D 核心（不变） -> h = a_up[S_out]（索引收集） -> "
             "Linear(|S_out|->H)+b+ReLU -> Linear(H->10)+b -> logits。"
             "启用时不再创建 W_in / W_out / W_out_bias。仅 --arch neuron3d 生效。"
+        ),
+    )
+    parser.add_argument(
+        "--geo-field",
+        dest="geo_field",
+        type=str,
+        default="",
+        choices=["", *GEO_FIELD_CHOICES],
+        help=(
+            "几何权重场开关（缺省 = 沿用预设 none；形状 = 生长度量 + 几何权重场）。"
+            "none = 关闭（默认）：**连几何特征都不构造**，buffer 不注册、参数不创建，"
+            "代码路径与改动前逐位一致；"
+            "additive = RBF 加性档（本批实现的唯一档）：w_e = w_free[e] + "
+            "alpha*(sum_k c_k*phi_k(feat_e) + c_0)，c 零初始化（故初始前向与关闭路径"
+            "逐位相同）、alpha 初值 = --geo-alpha-init 且可学习；"
+            "class_tied / mlp = **枚举已接受但本批未实现** —— 构造期显式报错（不静默降级）。"
+            "几何场只改**权重取值**，不改连接判据、不改突触半球切分、不引入随机放置、"
+            "不改训练循环与数据管线。仅 --arch neuron3d 生效。"
+        ),
+    )
+    parser.add_argument(
+        "--geo-rbf-k",
+        dest="geo_rbf_k",
+        type=int,
+        default=0,
+        help=(
+            "RBF 基函数个数 k（> 0；0 = 不覆盖、沿用预设 12）。基中心 = 逐维分位点、"
+            "宽度 = 逐维相邻中心间距均值（下限 5e-2），全部由确定性算法算出、无额外随机数"
+            "消耗；详见 README 的「几何权重场（geo_field）」节"
+        ),
+    )
+    parser.add_argument(
+        "--geo-alpha-init",
+        dest="geo_alpha_init",
+        type=float,
+        default=-1.0,
+        help=(
+            "几何场增益 alpha 的初值（>= 0；哨兵 -1 = 不覆盖、沿用预设 1.0）。"
+            "注意 c 零初始化，故该值不影响开关开启时的初始前向"
         ),
     )
     parser.add_argument(
@@ -834,6 +924,28 @@ def validate_override_args(args: argparse.Namespace) -> None:
             f"--fc-dim={args.fc_dim}（非 0）。请移除 --fc-dim 或改用 --arch neuron3d"
             f"（拒绝静默无效参数）。"
         )
+    # ---- geo_field 族校验（第 5 轮新增）----
+    # [!] `--arch mlp` 搭配 `geo_field != none` 在 **CLI 层直接拒绝**（沿用 `--fc-dim`
+    #     的既有先例）：几何权重场只作用于 N3D 主模型的稀疏边集，MLP 基线不读取该字段，
+    #     静默接受会让用户误以为"MLP 也开了几何场"。
+    if args.geo_field and args.geo_field != "none" and args.arch == "mlp":
+        raise ValueError(
+            f"--geo-field 仅在 --arch neuron3d 时生效：当前 --arch=mlp 但 "
+            f"--geo-field={args.geo_field}（非 none）。请移除 --geo-field 或改用 "
+            f"--arch neuron3d（拒绝静默无效参数）。"
+        )
+    # `--geo-rbf-k` 哨兵 0 = 不覆盖；显式给出时必须 > 0（负数由下面的通用规则拦下）
+    if args.geo_rbf_k < 0:
+        raise ValueError(
+            f"--geo-rbf-k 不能为负（0 表示不覆盖/沿用预设 12），"
+            f"当前 --geo-rbf-k={args.geo_rbf_k}"
+        )
+    # `--geo-alpha-init` 哨兵 -1.0 = 不覆盖；显式给出时必须 >= 0
+    if args.geo_alpha_init < -1.0:
+        raise ValueError(
+            f"--geo-alpha-init 必须 >= 0（-1 表示不覆盖、沿用预设 1.0），"
+            f"当前 --geo-alpha-init={args.geo_alpha_init}"
+        )
     # ---- 形状参数校验（本模块新增）----
     # `--cyl-aspect` 哨兵 -1.0 = 未提供；显式给出时必须 > 0，且形状必须是 cylinder。
     # [!] 这里做"非 cylinder + 显式 λ"的前置拒绝：Config 只能看到"非默认值"，看不到
@@ -933,6 +1045,16 @@ def apply_overrides(
     if args.fc_dim is not None:
         overrides["fc_dim"] = int(args.fc_dim)
         changed = True
+    # ---- 几何权重场覆盖（第 5 轮新增；空串 = 未提供，`none` 是**合法覆盖值**）----
+    if args.geo_field:
+        overrides["geo_field"] = args.geo_field
+        changed = True
+    if args.geo_rbf_k > 0:
+        overrides["geo_rbf_k"] = int(args.geo_rbf_k)
+        changed = True
+    if args.geo_alpha_init >= 0.0:
+        overrides["geo_alpha_init"] = float(args.geo_alpha_init)
+        changed = True
     if args.seed_override > 0:
         log_info(f"seed 覆盖：{overrides['seed']} -> {args.seed_override}")
         overrides["seed"] = args.seed_override
@@ -1018,6 +1140,10 @@ def build_smoke_config(args: argparse.Namespace) -> Config:
         or args.cyl_aspect != -1.0
         # fc_dim（第 3 轮新增）：必须计入 explicit，否则 --fc-dim 会被静默丢弃
         or args.fc_dim is not None
+        # geo_field 族（第 5 轮新增）：必须计入 explicit，否则 --geo-field 会被静默丢弃
+        or bool(args.geo_field)
+        or args.geo_rbf_k > 0
+        or args.geo_alpha_init >= 0.0
     )
     if not explicit:
         return SMALL_CONFIG
@@ -1027,7 +1153,7 @@ def build_smoke_config(args: argparse.Namespace) -> Config:
         warn_message=(
             "冒烟测试配置已被显式覆盖（--preset/--n/--y-in/--y-out/--h/--d/--seed/--lr/"
             "--flow-axis/--space-radius/--input-scope/--readout-scope/--placement/"
-            "--shape/--cyl-aspect/--fc-dim 之一）："
+            "--shape/--cyl-aspect/--fc-dim/--geo-field 之一）："
             f"预设={args.preset}；阶段 A 的默认基线仅在默认组合下成立"
         ),
     )
@@ -1104,8 +1230,16 @@ def run_smoke_test(
     log_info("各可学习参数梯度范数（L2）：")
     if not grad_norms:
         log_error("未能收集到任何梯度，反向传播可能未执行")
+    # [!] 离朱 DEF-5：结构性零梯度参数（`geo_alpha`，场系数零初始化 => dL/dalpha == 0）
+    #     原先把标记打成 `[BAD]`，与随后判据 `[3]` 的 PASS 结论并列出现，会误导人工复核。
+    #     现按 `model._geo_zero_grad_params` 显式标为 `[EXPECTED-ZERO]`（豁免标签），
+    #     仅**非豁免**参数才可能落到 `[BAD]`。
+    expected_zero = set(getattr(model, "_geo_zero_grad_params", ()) or ())
     for name, gnorm in grad_norms.items():
-        flag = "OK " if gnorm > GRAD_NORM_MIN else "BAD"
+        if name in expected_zero:
+            flag = "EXPECTED-ZERO"
+        else:
+            flag = "OK " if gnorm > GRAD_NORM_MIN else "BAD"
         log_info(f"  [{flag}] {name:<28s} grad_norm={gnorm:.6e}")
     log_info(f"可学习参数总数：{param_total}")
     log_info(
@@ -1218,6 +1352,16 @@ def run_smoke_test(
     other_gnorms = {
         n: v for n, v in grad_norms.items() if n not in set(out_layer_names)
     }
+    # [!] 几何权重场（第 5 轮新增）的**结构性零梯度**参数：`geo_alpha` 的梯度是
+    #     `dL/dα = Σ_e Δ_e · 场(φ_e)`，而场系数 `c`（`geo_rbf_theta`）**零初始化**，
+    #     初始时 `场(φ_e) == 0` => `dL/dα` **恒为 0**（后续步骤经 `c` 回传即非零）。
+    #     这与"W_out 的非 S_out 列结构性零梯度"同源，属**设计预期**而非缺陷，
+    #     故从"其余参数必须 > 0"的判据中**显式豁免**，并在判据文本中逐条列出。
+    geo_zero_struct = [
+        n for n in getattr(model, "_geo_zero_grad_params", ()) if n in other_gnorms
+    ]
+    for n in geo_zero_struct:
+        other_gnorms.pop(n, None)
     zero_others = [n for n, v in other_gnorms.items() if not (v > GRAD_NORM_MIN)]
     out_layer_ok = any(v > GRAD_NORM_MIN for v in out_layer_gnorms)
     # neuron3d 额外核对"非零梯度列数落在 [1, |S_out|]"（严格 readout 的结构性下界/上界）
@@ -1246,6 +1390,16 @@ def run_smoke_test(
                     else ""
                 )
                 + f"其余参数梯度范数={'全部 > 0' if not zero_others else zero_others}"
+                + (
+                    "；结构性零梯度（设计预期，已豁免）："
+                    + ", ".join(
+                        f"{n}={float(grad_norms.get(n, float('nan'))):.3e}"
+                        for n in geo_zero_struct
+                    )
+                    + "（几何场系数零初始化 => dL/dalpha == 0，梯度经 c 回传后为非零）"
+                    if geo_zero_struct
+                    else ""
+                )
             ),
         )
     )
@@ -1457,6 +1611,12 @@ def run_smoke_test(
         # fc_dim（第 3 轮新增）**必须纳入默认判定**：否则 `--smoke-test --fc-dim -1`
         # 会静默覆盖默认产物（用"两端全连接包裹"的结果冒充默认产物）。
         and int(config.fc_dim) == int(small.fc_dim)
+        # geo_field（第 5 轮新增）**必须纳入默认判定**：否则
+        # `--smoke-test --geo-field additive` 会静默覆盖默认产物（用"开了几何权重场"的
+        # 结果冒充默认产物）。`geo_field == "none"` 时指纹不加 `_geo` 段，故此处比对
+        # 与"段口径"天然自洽；几何场档位不同即判定为"非默认"。
+        and str(config.geo_field) == str(small.geo_field)
+        and bool(config.geo_signed_delta) == bool(small.geo_signed_delta)
         # batch_size 进指纹粒度之外，但它直接影响探针 batch 的规模，故一并比对，
         # 避免"几何相同但批大小不同"的配置覆盖默认产物
         and int(config.batch_size) == int(small.batch_size)
@@ -1520,6 +1680,14 @@ def run_smoke_test(
             "placement_within_circum": bool(getattr(model, "placement_within_circum", False)),
             "placement_within_circum_ratio": float(
                 getattr(model, "placement_within_circum_ratio", float("nan"))
+            ),
+            # ---- 几何权重场（第 5 轮新增；冒烟产物自带可复核取证信息）----
+            "geo_field": config.geo_field,
+            "geo_rbf_k": int(config.geo_rbf_k),
+            "geo_alpha_init": float(config.geo_alpha_init),
+            "geo_signed_delta": bool(config.geo_signed_delta),
+            "geo_edge_feature_names": (
+                list(model._geo_feature_names) if getattr(model, "geo_enabled", False) else []
             ),
         },
         smoke_path,
@@ -1612,6 +1780,22 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
     # `_nosyn`（第 4 轮新增）恒定插入，紧随 `_fc{n}` 段之后、`_s{seed}` 之前
     # （产物不再落盘 8 个突触类张量，格式段必须进名字以与旧格式产物区分）。
     nosyn_part = "_nosyn"
+    # `_geo{mode}_k{k}`（第 5 轮新增）：**仅 `geo_field != "none"` 时插入**，
+    # 位置 = 紧随 `_fc{n}` 段之后、`_nosyn` 段之前（与 `smoke_fingerprint` /
+    # `full_checkpoint_name` 三处**逐字同一口径**）。
+    geo_part = (
+        (
+            f"_geo{config.geo_field}_k{int(config.geo_rbf_k)}"
+            + ("_sd" if bool(config.geo_signed_delta) else "")
+            # [!] `_a{alpha_init:g}`：离朱 DEF-7 —— `geo_alpha_init` 原先**未进指纹**，
+            #     使 `--geo-alpha-init 0.4` 与默认 `1.0` 生成**同名产物**并**静默互覆**
+            #     （实测 SHA `01e56cb7…` -> `7b89b4ef…`）。口径：**仅非默认值（!= 1.0）
+            #     时插入**，故默认组合的产物名逐字不变（既有产物名与 README 口径不受影响）。
+            + (f"_a{float(config.geo_alpha_init):g}"
+               if float(config.geo_alpha_init) != 1.0 else "")
+        )
+        if str(config.geo_field) != "none" else ""
+    )
     name = (
         f"verify_{max_batches}"
         f"_{config.shape_tag()}"
@@ -1624,6 +1808,7 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
         f"_is{scope_abbrev(config.input_scope)}"
         f"_rs{scope_abbrev(config.readout_scope)}"
         f"{fc_part}"
+        f"{geo_part}"
         f"{nosyn_part}"
         f"_s{config.seed}"
     )
@@ -1665,6 +1850,21 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
     # `_nosyn`（第 4 轮新增）恒定插入，紧随 `_fc{n}` 段之后、`_s{seed}` 之前
     # （产物不再落盘 8 个突触类张量，格式段必须进名字以与旧格式产物区分）。
     nosyn_part = "_nosyn"
+    # `_geo{mode}_k{k}`（第 5 轮新增）：**仅 `geo_field != "none"` 时插入**，
+    # 位置 = 紧随 `_fc{n}` 段之后、`_nosyn` 段之前（三处指纹逐字同一口径）。
+    geo_part = (
+        (
+            f"_geo{config.geo_field}_k{int(config.geo_rbf_k)}"
+            + ("_sd" if bool(config.geo_signed_delta) else "")
+            # [!] `_a{alpha_init:g}`：离朱 DEF-7 —— `geo_alpha_init` 原先**未进指纹**，
+            #     使 `--geo-alpha-init 0.4` 与默认 `1.0` 生成**同名产物**并**静默互覆**
+            #     （实测 SHA `01e56cb7…` -> `7b89b4ef…`）。口径：**仅非默认值（!= 1.0）
+            #     时插入**，故默认组合的产物名逐字不变（既有产物名与 README 口径不受影响）。
+            + (f"_a{float(config.geo_alpha_init):g}"
+               if float(config.geo_alpha_init) != 1.0 else "")
+        )
+        if str(config.geo_field) != "none" else ""
+    )
     name = (
         f"full_{config.shape_tag()}"
         f"_N{config.N}"
@@ -1676,6 +1876,7 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
         f"_is{scope_abbrev(config.input_scope)}"
         f"_rs{scope_abbrev(config.readout_scope)}"
         f"{fc_part}"
+        f"{geo_part}"
         f"{nosyn_part}"
         f"_s{config.seed}"
     )
@@ -1944,6 +2145,80 @@ def run_full_training(
     )
 
 
+def build_param_groups(
+    model: torch.nn.Module, config: Config
+) -> List[Dict[str, object]]:
+    """构造优化器的 **param groups**（几何权重场参数排除 weight decay）。
+
+    职责
+    ----
+    把"几何场参数 `geo_rbf_theta` / `geo_alpha` 排除 `weight_decay`"这一口径**集中到一个
+    可被外部调用的函数**里（皋陶 F1 修复的配套改动）。理由：该逻辑原先内联在
+    `_run_training_with_config` 中，导致验证脚本只能**重新实现一遍**（同源自洽、
+    无法守护真实代码路径 —— 实测把 F1 缺陷注入 `train.py` 后，重实现的判据**抓不到**）。
+
+    口径
+    ----
+    * `geo_field == "none"`（无几何参数）：**单一 param group**，且**必须显式携带**
+      `"weight_decay": float(config.weight_decay)`；
+    * `geo_field != "none"`：两个 group —— 第 0 组为其余参数（携带 `config.weight_decay`），
+      第 1 组为几何参数（恒 `0.0`）。
+
+    [!] 为什么"必须显式携带"（皋陶 F1，error）：本模块的调用点以
+    `AdamW(param_groups, lr=..., weight_decay=0.0)` 构造，构造器参数会**覆盖** group 的
+    默认值；若 group 字典里**没有** `weight_decay` 键，该组的 wd 就取构造器给的 `0.0` ——
+    即把关闭路径的 weight decay **静默关成 0**（改动前是
+    `AdamW(model.parameters(), lr, weight_decay=config.weight_decay)`），属关闭路径行为回归。
+
+    参数
+    ----
+    model : torch.nn.Module
+        已构造的模型（`named_parameters()` 的顺序即 group 内参数顺序）。
+    config : Config
+        本次生效的配置（读取 `weight_decay`）。
+
+    返回
+    ----
+    List[Dict[str, object]]
+        可直接传给 `torch.optim.Adam` / `AdamW` 的 param groups 列表。
+    """
+    geo_param_names = ("geo_rbf_theta", "geo_alpha")
+    geo_params = [p for n, p in model.named_parameters() if n in geo_param_names]
+    other_params = [p for n, p in model.named_parameters() if n not in geo_param_names]
+    if geo_params:
+        return [
+            {"params": other_params, "weight_decay": float(config.weight_decay)},
+            {"params": geo_params, "weight_decay": 0.0},
+        ]
+    # 关闭路径：单一 group，**必须显式携带 weight_decay**（见上方 F1 说明）
+    return [{"params": other_params, "weight_decay": float(config.weight_decay)}]
+
+
+def build_optimizer(
+    model: torch.nn.Module, config: Config
+) -> torch.optim.Optimizer:
+    """按配置构造优化器（`weight_decay > 0` -> AdamW，否则 Adam）。
+
+    参数
+    ----
+    model : torch.nn.Module
+        已构造的模型。
+    config : Config
+        本次生效的配置。
+
+    返回
+    ----
+    torch.optim.Optimizer
+        优化器实例；其 `param_groups` 的**生效** `weight_decay` 由
+        `build_param_groups` 保证（`AdamW` 构造器传 `weight_decay=0.0`，
+        真实值一律由各 param group 携带）。
+    """
+    groups = build_param_groups(model, config)
+    if float(config.weight_decay) > 0.0:
+        return torch.optim.AdamW(groups, lr=config.lr, weight_decay=0.0)
+    return torch.optim.Adam(groups, lr=config.lr)
+
+
 def _run_training_with_config(
     config: Config,
     preset: str,
@@ -1989,14 +2264,51 @@ def _run_training_with_config(
     model, train_loader, test_loader = build_model_and_data(
         config, device, max_batches, arch
     )
-    if config.weight_decay > 0.0:
-        optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-            model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+    # ---- 参数分组（第 5 轮新增）：几何场参数**排除 weight decay** ----
+    # 归因纯度要求：几何场参数 `geo_rbf_theta`（零初始化）与 `geo_alpha` 若被 `weight_decay`
+    # 拉向 0，等价于对几何场施加**隐式正则**，使"场是否有效"的归因被污染。故按
+    # **参数分组**把这两者放进 `weight_decay = 0` 的独立 group；其余参数照旧。
+    # `clip_grad_norm_` 仍覆盖**全参数**（它接收 `model.parameters()`，与分组无关）。
+    # [!] 分组与优化器构造已抽成 `build_param_groups` / `build_optimizer`（皋陶 F1 配套改动）：
+    #     这样**验证脚本与变异驱动器可以直接调用真实代码路径**，而不是"重新实现一遍"
+    #     （后者是同源自洽、抓不到注入了 F1 缺陷的 train.py —— 实测验证过）。
+    geo_param_names = ("geo_rbf_theta", "geo_alpha")
+    geo_params = [p for n, p in model.named_parameters() if n in geo_param_names]
+    param_groups = build_param_groups(model, config)
+    if geo_params:
+        log_info(
+            "几何权重场参数分组：geo_rbf_theta / geo_alpha 排除 weight_decay"
+            f"（共 {sum(p.numel() for p in geo_params)} 个参数）；"
+            f"其余 {sum(p.numel() for p in model.parameters()) - sum(p.numel() for p in geo_params)}"
+            f" 个参数按 weight_decay={float(config.weight_decay)}"
         )
-        log_info(f"优化器：AdamW(lr={config.lr}, weight_decay={config.weight_decay})")
+    optimizer: torch.optim.Optimizer = build_optimizer(model, config)
+    if config.weight_decay > 0.0:
+        # [!] 皋陶审查 F1 第 2 点：日志必须按**生效值**打印（原先把 `config.weight_decay`
+        #     直接打进日志，在修复前会打印 `weight_decay=1e-4` 而实际为 0，属**误导性日志**）。
+        effective_wds = sorted(
+            {float(g.get("weight_decay", 0.0)) for g in optimizer.param_groups}
+        )
+        log_info(
+            f"优化器：AdamW(lr={config.lr}, 生效 weight_decay="
+            f"{'|'.join(f'{w:g}' for w in effective_wds)}"
+            f"{'，几何场参数组 weight_decay=0' if geo_params else ''})"
+        )
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
         log_info(f"优化器：Adam(lr={config.lr})")
+    # ---- 契约断言（F1 常驻防线）：生效 wd 必须与 config 逐组一致 ----
+    # 关闭路径（单组）必须恰好等于 `config.weight_decay`；开启路径第 0 组同值、几何组恒 0。
+    _expr = [float(g.get("weight_decay", 0.0)) for g in optimizer.param_groups]
+    if geo_params:
+        assert len(_expr) == 2 and _expr[0] == float(config.weight_decay) and _expr[1] == 0.0, (
+            "[契约失败] 几何场参数分组的生效 weight_decay 与配置不符："
+            f"实测 {_expr}，期望 [{float(config.weight_decay)}, 0.0]"
+        )
+    else:
+        assert len(_expr) == 1 and _expr[0] == float(config.weight_decay), (
+            "[契约失败] 关闭路径的生效 weight_decay 与配置不符（F1 回归！）："
+            f"实测 {_expr}，期望 [{float(config.weight_decay)}]"
+        )
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None
     if config.lr_schedule == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -2060,6 +2372,25 @@ def _run_training_with_config(
             # ---- fc_dim（第 3 轮新增；产物自带开关与有效宽度取证）----
             "fc_dim": int(config.fc_dim),
             "fc_width": int(config.fc_width),
+            # ---- 几何权重场（第 5 轮新增；产物自带开关 / 基 / 特征列取证）----
+            # [!] `edge_geo_feat` 等特征张量为 `persistent=False`（与突触类 buffer 同口径），
+            #     故复核须回到 `config + seed` 重算；此处只落盘**标量取证字段**。
+            "geo_field": config.geo_field,
+            "geo_rbf_k": int(config.geo_rbf_k),
+            "geo_hidden": int(config.geo_hidden),
+            "geo_alpha_init": float(config.geo_alpha_init),
+            "geo_signed_delta": bool(config.geo_signed_delta),
+            "geo_edge_feature_names": (
+                list(model._geo_feature_names) if getattr(model, "geo_enabled", False) else []
+            ),
+            "geo_alpha_final": (
+                float(model.geo_alpha.detach().item())
+                if getattr(model, "geo_enabled", False) else 0.0
+            ),
+            "geo_theta_norm_final": (
+                float(model.geo_rbf_theta.detach().norm().item())
+                if getattr(model, "geo_enabled", False) else 0.0
+            ),
             "circum_coef": config.circum_coef,
             "shape_circum_radius": config.shape_circum_radius,
             "selection_metric": float(getattr(model, "selection_metric", float("nan"))),
@@ -2139,6 +2470,11 @@ def _run_training_with_config(
     log_info(f"  优化器               ：{'AdamW' if config.weight_decay > 0 else 'Adam'}")
     log_info(f"  lr_schedule          ：{config.lr_schedule}")
     log_info(f"  readout_bias         ：{config.readout_bias}")
+    log_info(
+        f"  geo_field            ：{config.geo_field}"
+        f"（k={config.geo_rbf_k}, alpha_init={config.geo_alpha_init}, "
+        f"signed_delta={int(bool(config.geo_signed_delta))}）"
+    )
     log_info(f"  grad_clip            ：{config.grad_clip}")
     log_info(f"  checkpoint           ：{os.path.abspath(save_path)}")
     log_info("-" * 78)

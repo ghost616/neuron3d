@@ -185,6 +185,15 @@
 - CLI：`--shape {sphere,cube,cylinder}`、`--cyl-aspect R`；**两者都必须纳入 `explicit` 判定与 `apply_overrides`**，否则会被静默丢弃。
 - `to_dict()` / `describe()` / 预设同步。
 - **交叉引用（`fc_dim` 族，细则见「两端全连接包裹（fc_dim）」节）**：`--fc-dim` 是形状无关的第三个 CLI 覆盖项，两条易错约束须在此索引节点明：① 通用规则「负数一律报错」对 `--fc-dim` **单独豁免** —— **`-1` 合法**（表示"跟随 `N`"，即两端有效宽度 `H = N`），仅 `< -1` 报错；② **`--arch mlp` 搭配非 0 `--fc-dim` 在 CLI 层直接拒绝**（拒绝静默无效参数）。另：`--fc-dim` 的 `default=None`（`None` 与 `0` 必须区分），且必须纳入 `explicit` 判定与 `apply_overrides`，`to_dict()` / `describe()` 必须含该字段。
+**第 20 轮新增（几何权重场族）**：`geo_field: str = "none"`（取值 `none` | `additive` |
+`class_tied` | `mlp`；本批**实现** `none` 与 `additive`，后两者**枚举已接受但构造期显式报错"未实现"**）、
+`geo_rbf_k: int = 12`、`geo_hidden: int = 32`、`geo_alpha_init: float = 1.0`、
+`geo_signed_delta: bool = False`（**可选扩展开关，默认关闭**：追加 signed `dx/H`、`dy/H` 两列）。
+CLI：`--geo-field`、`--geo-rbf-k`（哨兵 `0`）、`--geo-alpha-init`（哨兵 `-1.0`）——三者
+**均纳入 `explicit` 判定与 `apply_overrides`**，并同步 `to_dict()` / `describe()` / 预设 / 便捷属性
+（`geo_enabled`）。**两条 CLI 层拒绝**：① `--arch mlp` 搭配 `geo_field != none` 在 CLI 层直接拒绝
+（退出码 2，沿用 `--fc-dim` 先例）；② 未实现档（`class_tied` / `mlp`）在 `Config.__post_init__`
+显式报错，**不静默降级为 `none`**。详见「几何权重场（geo_field）」节。
 ## 产物指纹（防撞名硬要求）
 
 指纹**必须新增形状维度**（`cylinder` 还须含长径比），否则 N/H/D/seed/scope 相同的三种形状会**互相覆盖**（历史纠正记录中的 `verify_<bpe>.pt` 同名互覆同类缺陷）。须附"同配置不同形状产物名互不相同"的可区分性断言。
@@ -195,11 +204,52 @@
   - `_nosyn` 是**格式常量**（与 config 无关），故**不进入** `is_default_smoke` 判定（判定维度不变）；判定另加与 `smoke_fingerprint` 的**维度对齐守卫**（指纹是 config 的纯函数；若今后往指纹加维度却漏了判定，守卫立即报错而**不会静默覆盖默认冒烟产物**）。
   - **产物 SHA256 的可比性**：`torch.save` 的 zip 条目名带**产物基名**（实测 `smoke_nosyn/data.pkl`），故**改名必然改 SHA256**；**跨名字 / 跨 torch 版本不得用文件 SHA256 判等价**，等价判据回到**张量级 `torch.equal`**（细则见「产物持久性（nosyn 口径）」节）。
   - **实测（`_verify/nosyn_probe/probe_names.log`，退出码 0）**：`sphere/fc0` -> `full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isall_rsall_nosyn_s42.pt`；`sphere/fc-1` -> `…_isall_rsall_fc-1_nosyn_s42.pt`；`cube/fc8`（SMALL）-> `full_shapecube_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_fc8_nosyn_s42.pt`；默认冒烟 -> `_verify/smoke_nosyn.pt`。
+**第 20 轮新增 `_geo{mode}_k{k}[_sd]` 名段（四处同步，缺失会硬报错）**：三处指纹
+（`smoke_fingerprint` / `config_fingerprint` / `full_checkpoint_name`）与 `is_default_smoke` 判定
+**必须同步**（`is_default_smoke` 与 `smoke_fingerprint` 之间有维度对齐守卫，只改一处会直接抛错）。
+口径：**仅 `geo_field != "none"` 时插入**（`geo_field == "none"` **不加段** ⇒ 既有产物名**逐字不变**）；
+**段位**（三处逐字一致，实测位置下标钉住 `geo@63 < nosyn@79 < s42@85`）= 完整段序
+`..._rs{scope}` → `[_fc{n}]` → `[_geo{mode}_k{k}[_sd]]` → `_nosyn` → `_s{seed}`；
+`_sd` 后缀仅在 `geo_signed_delta=True` 时出现。`is_default_smoke` 纳入 `geo_field` 与
+`geo_signed_delta`；`geo_rbf_k` / `geo_alpha_init` / `geo_hidden` 在 `geo_field == "none"` 时是
+**无效果字段**，故**不入指纹、不入判定** —— 这是**有界且已声明**的缺口（与 `fc_dim == 0` 时
+`--fc-dim 0` 覆盖值的情形同源）。命名不变式由 **S17-6a/6b/6c/6d** 实测钉住
+（`none` 无段 / 非 `none` 含段 / 段位口径 / 形状×geo 档 10 名两两唯一 / 与磁盘 16 个既有文件零冲突）。
 ## 冒烟判据
 
 把二期 15 条冒烟判据同构为形状感知版本，退出码语义保持 0 / 1 / 2。三形状冒烟全绿，且 `sphere` 分支与二期数值一致。
 
 **产物名（第 19 轮修订）**：默认组合（`SMALL_CONFIG` 规模 + sphere + `flow_axis=z` + 两个 `any_isolated`）的冒烟产物名由历史名 `_verify/smoke.pt` 改为 **`_verify/smoke_nosyn.pt`**（加 `_nosyn` 格式段，使新版瘦身产物与旧版同名产物分开留痕）；其余组合写 `_verify/smoke[_ar{arch}]_{shape_tag}_..._{_fc{n}}_nosyn_s{seed}.pt`。`is_default_smoke` 的**判定维度不变**（`_nosyn` 是格式常量、不入判定），其职责仍是**防止非默认配置静默覆盖默认冒烟产物**，并新增与 `smoke_fingerprint` 的**维度对齐守卫**（指纹是 config 的纯函数；若今后往指纹加维度却漏了判定，守卫立即报错而不会静默覆盖）。**第 19 轮实测**：默认组合与 `--fc-dim -1` 两条命令均 **16/16 PASS、退出码 0**；同名复跑字节稳定（`smoke_nosyn.pt` 3 次同 SHA256 `a1f4772f797487eadf37ce777ad367fbda02af22d5540bd41286c6c83eaeb6fc`）。
+**第 20 轮（几何权重场）实测**：`--smoke-test` **16/16 PASS、退出码 0**（产物 `_verify/smoke_nosyn.pt`，
+**193,871 B**，SHA256 `1e2cca361c3793141d29d0189eb85e82277bfc9390ccdea94dbac1fb73aa6cd7`；
+字节/SHA 变化仅因载荷新增 5 个 `geo_*` 标量取证字段，`state_dict` 20=20 键逐位全等、载荷旧键逐值不变）；
+`--smoke-test --fc-dim -1` **16/16 PASS、退出码 0**（256,757 B，SHA256
+`8d572df3ce9981db672db404bb94a90be05efec42cfdec65f4fc85e60d97ce5d`，`state_dict` 26=26 键逐位全等）；
+`--smoke-test --geo-field additive` **16/16 PASS、退出码 0**（写新名
+`_verify/smoke_shapesphere_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_bs32_geoadditive_k12_nosyn_s42.pt`，
+199,987 B，`params = 43930 + 14 = 43944`，**不覆盖任何既有产物**）。
+判据 `[3]`「其余参数梯度范数 > 0」对几何参数 `geo_alpha` 的**首步结构性零梯度**（场系数零初始化
+⇒ `∂L/∂alpha ≡ 0`）**显式豁免并逐条列出参数名与原因**（`model._geo_zero_grad_params`），
+`theta` 与其余全部参数照旧硬断言 —— 豁免已知结构性质，**不是**放宽判据。
+详见「几何权重场（geo_field）」节。
+
+**[!] F1 生效 `weight_decay` 的终端留档（皋陶复审 F11 补）**：真实训练路径
+`python n3d_shape/train.py --max-batches 1 --epochs 1 --weight-decay 1e-4 --no-backup --tag f11_wd_log`
+（退出码 0）实测输出包含 `[N3D][INFO ] 优化器：AdamW(lr=0.001, 生效 weight_decay=0.0001)`，
+与生效值 `[0.0001]` 一致（修复前该行会打印配置值 `1e-4` 而实际为 0，属误导性日志）。
+**留档文件**：`checkpoints/n3d_shape/_verify/_geo_probe/f11_wd_log.txt`（UTF-8 无损捕获，
+含命令行与退出码）；另有 `f11_wd_log_full.txt`（pwsh 原始重定向留档，UTF-16LE）。
+该命令属**限批验证类**，产物写 `checkpoints/n3d_shape/_verify/verify_1_..._f11_wd_log.pt`（**新文件**），
+**未覆盖任何既有产物**。
+
+**[!] F14（info，皋陶复审）：`--weight-decay` 在 `--smoke-test` 路径中不生效（如实记录，本轮不改代码）**：
+冒烟路径以 `torch.optim.Adam(model.parameters(), lr=config.lr)` 直接构造优化器，**未走**
+`build_optimizer`，故 `--smoke-test --weight-decay>0` 的 weight decay 会被**静默忽略**，
+也不会触发 F1 新增的生效值契约断言。**默认冒烟 `weight_decay=0`，故本批产物与判据不受影响**
+（四组冒烟均 16/16、产物字节与 SHA256 与基线一致）。
+**列入后续批次决策项**：是否把冒烟路径切换为 `build_optimizer` 以统一口径。
+若切换，须以 `torch.equal` 复核默认组合产物**张量级不变**，并以字节/SHA256 复核
+`smoke_nosyn.pt` 等既有取证产物（**改名/改字节必须显式登记**，依仓库 D1 口径跨版本不比文件 SHA）。
 ## 验收
 
 形状变体的验收（全部实测，命令与结果一一对应；含离朱 R6/R8 后的加固与第 19 轮的 nosyn 改造）：
@@ -275,6 +325,81 @@
   一期与二期冒烟均退出码 0、既有 5 组 any/any 产物 SHA256 逐位不变（只追加，不重写）"
   **属改动前各轮的历史实测记录**，本工作副本无这些上游产物与台账，**本轮未复跑**（见上方不可复现声明）；
   上游产物一律**不改写**。
+**第 20 轮（几何权重场 `geo_field`）验收实测**：
+
+* 编译：`python -m compileall -q n3d_shape` → 退出码 **0**；
+* 冒烟：默认 **16/16 PASS / 退出码 0**、`--fc-dim -1` **16/16 / 0**、`--geo-field additive`
+  **16/16 / 0**（判据 `[3]` 对 `geo_alpha` 的首步结构性零梯度显式豁免并逐条列出，见「冒烟判据」节）；
+* 形状验证：`python n3d_shape/verify_shape.py` → **S1–S17 共 169 条断言，169 通过 / 0 失败，
+  退出码 0**；`--quick` → **102/102 通过，退出码 0**（S17 组 23 条在**两种模式都跑**）。
+  本副本实测 S15 最紧余量 `ratio = 0.582`（`N=3072/cube/λ=1.0`，判据 `ratio < 1` 通过）；
+* **S17 组（几何权重场）23 条**：`none` 档不构造特征 + 与二期 **27 张量 `torch.equal`**；
+  on + 零初始化前向 `torch.equal`（最大绝对差 `0.000e+00`）；on/off 基座参数与 28 个公共 buffer
+  **逐位一致**（RNG 隔离）；`theta` 1 步后梯度非零（`2.356403e-01`）、`alpha` 首步恒 0（设计预期，
+  已显式断言）、全参数 2 步后非零（`∂L/∂alpha`(step2) `1.328e-03`）；特征取值域与
+  `dhat`/`zeta`/`rho`/`mult` **逐边独立复算**（偏差全 `0.000e+00`）；命名不变式与产物零冲突；
+  CLI 拒绝 `mlp + geo`。**变异测试 8/8 全部被捕获、0 逃逸**
+  （`_verify/_geo_mutation_proof.py`，日志 `_geo_mutation_proof.log`；基线副本 12/12 全通过）；
+* **P0 诊断**（`probe_geo_field.py`，仪表化、非门槛）：读既有 free 权重产物，
+  几何 R² `0.003114` **低于**零假设基线 `mean 0.012018`（落在随机初始化噪声带内），
+  等价类内方差占比 `0.999981`；判定规则：**纯诊断，只报数，不下结论**，
+  **不得**据此关闭或宣称假说成立；
+* **既有产物零回归**：改动前后快照比对，`checkpoints/` 下 11 个 `.pt` 中**仅 2 个冒烟产物变化**
+  （即本轮按计划真实重跑的两个），且已逐位取证「`state_dict` 20=20 / 26=26 键**逐张量 `torch.equal`
+  全等、0 处不一致**，全部载荷旧键逐值不变，仅新增 `geo_*` 标量字段」；**其余 9 个 `.pt`
+  SHA256 逐位不变、0 变化、0 缺失**；产物仍写 `checkpoints/n3d_shape/` 与其 `_verify/` 子目录，
+  **未新建目录**；依仓库 D1 口径交叉版本**不比文件 SHA**，等价判据回到张量级 `torch.equal`；
+* 上游（`n3d_proto` / `n3d_sphere`）源码与产物**本轮零改动**；`requirements.txt` 零新增依赖
+  （`probe_geo_field.py` 只用 `torch` + 标准库）。
+**第 20 轮修复子轮（离朱第 1 轮 6 项缺陷全部修复后）实测**：`compileall` 退码 0；
+**原生 GBK 控制台（未设 `PYTHONUTF8`/`PYTHONIOENCODING`）**下：默认冒烟 **16/16 退码 0**、
+`--fc-dim -1` **16/16 退码 0**、`--geo-field additive` **16/16 退码 0**、
+`--geo-field additive --geo-alpha-init 0.4` **16/16 退码 0**（DEF-3 修复）、
+`verify_shape.py --quick` **106/106 退码 0**、全量 **173/173 退码 0**（S17 组 28 条，
+含 S17-8 四条 DEF-1/DEF-2/DEF-3 回归防线；DEF-1 修复）、变异测试 **8/8 全捕获 0 逃逸**、
+P0 诊断退码 0 且**权重来自产物**（自检 `torch.equal` = True、26 个公共张量 0 不一致，DEF-2 修复）。
+新增/修订的 geo 数值（DEF-2 修复后，**旧值作废**）：几何 R² `0.005063`（低于零假设基线
+`mean 0.012018`）、仅 `in_degree` `0.000169`、合并 `0.005186`、偏效应 `0.005016`、
+等价类内方差占比 `0.999963`。产物零回归不变（11 个既有 `.pt`：9 个 SHA256 逐位不变，
+2 个按计划重跑的冒烟产物已逐位取证）。
+**DEF-7 修复后（离朱第 2 轮复测收口）实测**：`compileall` 退码 0；**原生 GBK 控制台**下
+默认冒烟 **16/16 退码 0**、`--fc-dim -1` **16/16 退码 0**、`--geo-field additive` **16/16 退码 0**、
+`--geo-field additive --geo-alpha-init 0.4` **16/16 退码 0**（并写**新名**
+`smoke_..._geoadditive_k12_a0.4_nosyn_s42.pt`、canonical 产物 SHA 前后逐位不变）；
+`verify_shape.py --quick` **109/109 退码 0**、全量 **176/176 退码 0**（S17 组 **31** 条，
+新增 S17-9 三条 DEF-7 回归防线）；变异测试 **9/9 全捕获 0 逃逸**；P0 诊断退码 0 且权重来自产物。
+产物零回归不变（11 个既有 `.pt`：9 个 SHA256 逐位不变，2 个按计划重跑的冒烟产物已逐位取证；
+正式产物 `b622ed99…` 冻结未变）。
+**皋陶审查修复轮（F1–F9 全部处置后）验收实测 —— 本节为 `geo_field` 相关的当前权威值（含对上方历史段的更正）**：
+
+* 编译：`python -m compileall -q n3d_shape` → 退出码 **0**；
+* 形状验证：`python n3d_shape/verify_shape.py` → **全量 180/180 通过 / 0 失败，退出码 0**；
+  `--quick` → **113/113 通过，退出码 0**（**S17 组 35 条**在两种模式都跑）。
+  本副本实测 S15 最紧余量 `ratio = 0.582`（`N=3072/cube/lambda=1.0`，判据 `ratio < 1` 通过）；
+* **S17 组 35 条**：24 条（S17-1..7）+ 4 条 S17-8（DEF-1/2/3 回归）+ 3 条 S17-9（DEF-7 回归）
+  + **4 条 S17-10（皋陶 F1/F2 回归）**；
+* 变异测试：**11 个变异全部被捕获、0 逃逸**，**基线判据 15/15**（含新增 **M9** = F1
+  「关闭路径 param group 不带 `weight_decay`」与 **M10** = F2「none 档仍执行 `mult` 归约」）；
+* **F1 专项实测**：`geo_field=none` + `weight_decay=1e-4` 生效值 `[0.0001]`（= 配置值）；
+  `additive` + `wd=1e-4` 生效 `[0.0001, 0.0]`；`none+wd=1e-2` → `[0.01]`；`none+wd=0` → `[0.0]`；
+  关闭路径一步更新与改动前口径**逐位一致**（全参数最大差 `0`）；日志改按**生效值**打印；
+* **F2 专项实测**：`geo_field=none` 构造期 `bisect_left`（`mult` 归约定位函数）调用 **0 次**；
+  `N=1024/y=8x8/D=0.065` 构造耗时 `0.849s -> 0.627s`（与"跳过时"`0.625s` 同量级）；
+  开档仍执行（`27296` 次）；开/关档公共 `state_dict` 张量**逐位一致**、`E` 不变；
+* **F3 专项实测**：`probe_geo_field.py --shape sphere`（与产物一致）退码 0；
+  `--shape cube`（不一致）**退码 1 且原因可读**；`--shape cube --cyl-aspect 2.0` 由**脚本自身的 shape 断言**拒绝（**归因更正（离朱文档修复轮 X1）**：原写「由 `Config` 拒绝」，该归因不成立 —— F3 采「断言」口径后**不回写 `cfg_dict`**，`cfg_dict.shape` 仍是产物自身的 `sphere`，故 `Config` 层的「非 cylinder + 非默认 λ 报错」防线在该脚本内**不会被触发**）；
+  `--signed-delta` 退码 0（特征列 18 -> 20）；
+* **F8 专项实测**：标准化自由权重的偏效应由死赋值改为真算，实测 **`0.004894`**；
+* 产物零回归：`checkpoints/` 下 11 个既有 `.pt` 中**仅 2 个冒烟产物变化**（按计划真实重跑，
+  已逐位取证「张量全等、仅新增标量字段、0 处旧键改值」）、**其余 9 个 SHA256 逐位不变、0 缺失**；
+  正式产物 `b622ed9945b29620007e17e5cd97ec1846768514111e99c2b9c138226b6890be` **冻结未变**；
+  上游 `n3d_proto` / `n3d_sphere` / `n3d_viz` **git 干净**；`requirements.txt` **零新增依赖**。
+
+**[!] 历史留档与口径澄清（防误读）**：本节上方各"第 20 轮 / 修复子轮"段落中的部分数字
+**已被后续修复轮取代**，仅作历史留档，**不得作为当前口径引用** ——
+`169 条 / --quick 102`、`S17 组 23 条`、`173/173`、`173 条`、`S17 组 28 条`、`106/106`、
+P0 几何 R² `0.003114` 与类内方差占比 `0.999981`（DEF-2 修复后为 `0.005063` / `0.999963`）、
+变异 `8/8` 与基线 `12/12`（现为 `11/11` / `15/15`）。**当前权威值一律以本节所列为准。**
 ## 历次独立审查发现并已修复的问题（累计）
 
 | 轮次 | 发现方 | 问题 | 处置 |
@@ -350,6 +475,21 @@
 4. 不得覆盖既有正式产物（`model.pt`、`full_N*`、`_verify/` 下既有取证文件）
 5. **报告中不得出现无产物支撑的实测数字**；前置探针数字必须显式标注为"探针、非实测"
 6. 涉及多组对比须标注共享 seed 前提
+**第 20 轮补充（几何权重场 `geo_field`，逐条自检）**：
+
+* 硬约束第 1 条（本轮口径延伸）：`geo_field=none`（默认）**连几何特征都不执行** —— buffer 不注册、
+  参数不创建、**参数创建顺序与名称、`forward` 数值逐位一致**（S17-1a/1b/1c + 载荷逐位取证）；
+  `shape=sphere` 与二期张量级 `torch.equal` 仍成立（S17-1b **27/27**，S12 **27/27**）；
+* 硬约束第 3 条：**未改**连接判据、突触半球切分、随机放置、训练循环与数据管线 —— 唯一动到训练
+  循环的是「几何参数排除 weight decay」的**参数分组**，且 `geo_field=none` 时等价于改动前的单一
+  param group（迭代顺序与取值完全相同）；
+* 硬约束第 4 条：**未覆盖既有正式产物**（`model.pt` 未被写入；正式产物
+  `full_shapesphere_N256_..._fc-1_s42.pt` SHA256 逐位不变）；产物仍写 `checkpoints/n3d_shape/`
+  与其 `_verify/` 子目录，**未新建目录**；本轮**按计划**真实重跑了两个冒烟产物（默认与 `--fc-dim -1`），
+  其 SHA/字节变化**唯一来源**是载荷新增的 `geo_*` 标量字段，已逐位取证「张量全等、旧键值不变」；
+* `neuron_pos` / `edge_dist` **只读**、语义不变；`edge_dist` 仍是 `n3d_viz` 必填键（保持 `persistent=True`）；
+* 几何特征 buffer 一律 `persistent=False`（不落盘、复核回到 `config + seed` 重算）；
+  仅 RBF 基常量（`geo_rbf_centers` / `geo_rbf_width`）持久化，以保证有效权重可复算。
 ## 训练对照实验
 
 
@@ -663,3 +803,351 @@ SHA256 **逐位不变**（前后快照比对仅新增、0 变更）。
 
 1. **产物不再自证突触几何**：8 个突触类 buffer 不进入 `state_dict()`，凡需突触级几何（`input_syn_pos` / `output_syn_pos` / `syn_dist` / 代表突触对 / 孤立掩码 / `neuron_conn_mask`）的复核，**必须回到 `config + seed` 重算**，不能用产物里的张量反查。
 2. **兼容性边界**：改用新代码后，**既有旧产物**（仍含这 8 键）以 `strict=True` 加载会报 `Unexpected key(s) in state_dict`；如需复用旧产物须显式 `strict=False`。
+## 几何权重场（geo_field）
+
+### 职责与范围（本批**只做开关 + `additive`（RBF）档**）
+
+把「形状 = 生长度量」升级为「**形状 = 生长度量 + 几何权重场**」—— 让学习权重成为神经元
+3D 坐标的函数，而不仅是决定「谁连谁」。本批交付**开关 + `additive`（RBF）档**，为后续
+`class_tied` / `mlp` 档与 9-seed 配对实验打地基。
+**不在本批范围**：`class_tied` / `mlp` 档实现、9-seed 配对训练实验、跨形状迁移实验、边 dropout 鲁棒曲线。
+
+### 配置与 CLI
+
+| 字段 | 取值 | 语义 |
+| --- | --- | --- |
+| `geo_field` | `none`（默认）/ `additive` / `class_tied` / `mlp` | `none` = **关闭**（连几何特征都不构造）；`additive` = 本批实现；后两者**枚举已接受但构造期显式报错"未实现"**（禁止静默降级为 `none`） |
+| `geo_rbf_k` | 默认 `12` | RBF 基函数个数 `k`（`>= 1`） |
+| `geo_hidden` | 默认 `32` | 预留（后续档位宽度）；本批不消费但**必须**进 `to_dict()`（否则 `apply_overrides` 经 `Config(**base.to_dict())` 往返静默丢字段） |
+| `geo_alpha_init` | 默认 `1.0` | 场增益 `alpha` 初值（`>= 0`，可学习） |
+| `geo_signed_delta` | 默认 `False` | **可选扩展开关**：追加 signed `dx/H`、`dy/H` 两列特征（`F: 5 -> 7`） |
+
+CLI：`--geo-field {none,additive,class_tied,mlp}`、`--geo-rbf-k`（哨兵 `0` = 不覆盖）、
+`--geo-alpha-init`（哨兵 `-1.0` = 不覆盖）。三者**均纳入 `explicit` 判定、`apply_overrides`、
+`to_dict()` 与 `describe()`**（否则会被静默丢弃）。
+**两条 CLI 层拒绝**：① `--arch mlp` + `geo_field != none` → `ValueError`（退出码 2，沿用
+`--fc-dim` 先例）；② 未实现档 → `Config` 构造期 `ValueError`（**不静默降级**）。
+
+**[!] `geo_signed_delta` / `geo_hidden` 无 CLI 入口（皋陶 F9，如实注明）**：`train.py` CLI 只暴露
+上列三项（本批计划所要求）；这两个字段**只能由脚本内构造 `Config` 触发**，属**有意**而非遗漏。
+本模块内唯一暴露 signed 档的 CLI 是诊断脚本 `probe_geo_field.py --signed-delta`（仅供诊断）。
+后续批次若在 `train.py` 暴露，**必须同步四处**：`explicit` / `apply_overrides` / `describe()`
+（与 `to_dict()` 一并）/ 指纹与 `is_default_smoke` 维度对齐守卫。
+
+### 形式与注入点
+
+```text
+w_e = w_free[e] + alpha * ( sum_k c_k * phi_k(phi_e) + c_0 )
+```
+
+* `w_free` = 既有 `edge_weight`；`c` = `geo_rbf_theta [K+1]`（**末位为偏置 `c_0`**）**零初始化**；
+  `alpha` = `geo_alpha`（标量，初值 `geo_alpha_init`，可学习）；
+* 注入实现：`stage2_recurrence` 中 `w_all = edge_weight[edge_perm_in] + 场系数` ——
+  场系数在**全部边**上只算一次（`[E, 1]`），随后与 `w_all` 一起按层区间切片，**不新增逐层重算**；
+* **`c = 0` => `w_e == w_free[e]`** => 开启开关 + 零初始化时前向与基线**逐位一致**
+  （S17-2 实测最大绝对差 `0.000e+00`）。
+
+**[!] RNG 隔离的真实承担者（皋陶 F5，表述已修正）**：`c` / `alpha` 的 RNG 隔离由
+**结构性创建顺序**与 **S17-3a 判据**承担，**不是**由构造期断言承担：
+
+* **结构性创建顺序**：几何参数严格在 `_init_parameters()` **之后**创建，且
+  `_init_geo_parameters` 使用**自己的** `torch.Generator(seed + 2)`；基座参数的随机流与之无关。
+  实测 **S17-3a：on/off 下 28 个公共张量逐位一致**。
+* **S17-3a 判据**：`none` 与 `additive` 两次构造的全部公共参数/buffer 逐位比对，任一被平移即 FAIL。
+* **构造期断言的**真实能力（如实披露）**：`model.py` 中 `assert gen.initial_seed() == seed + 2`
+  是**同语句自洽断言** —— 只能捕获"把该字面量改成 `seed + 1`"这一类编辑（变异 M2 属此类），
+  **不能**捕获"把 `_init_geo_parameters` 整体换成使用 `seed+1` 的自洽实现"（皋陶实测该替换后
+  构造成功、零报错）。**故它不构成独立的 RNG 隔离守卫。**
+* 原文"一旦有人改成共用 generator 便立即报错"属**表述过强**，已更正（README §20.2 同步）。
+* 另注：原文"若与 `_init_parameters` 的 `gen` 共用会导致基座随机流平移"在当前**代码顺序下
+  并不成立**（两者各用局部 generator），该风险只存在于"几何参数被提前到 `_init_parameters`
+  之前并共享其 generator"这种**结构性改动**下。
+
+### 边级几何特征 `phi_e`（全部无量纲；`dp = p_B - p_A`）
+
+| 列 | 名称 | 定义 | 契约取值域 |
+| --- | --- | --- | --- |
+| 0 | `zeta` | `dp[axis] / H`（流向轴分量；构图强制严格上行 => 恒正） | `> 0` |
+| 1 | `rho` | `||dp[xy]||2 / H` | `>= 0` |
+| 2 | `dhat` | `edge_dist / D` | `(0, 1]` |
+| 3 | `slack` | `(D - edge_dist) / D` | `[0, 1]` |
+| 4 | `mult` | `log1p(该神经元对在 D 内的可行握手对数)` | `>= log 2 > 0` |
+
+* `rho` **不用** `sqrt(||dp||^2 - dp_axis^2)`（近乎平行流向轴时灾难性抵消），而由逐分量坐标差直接算；
+* `mult` **复用** `_build_neuron_edges` 已有的 `syn_dist` 视图，随同一次 `order` 与 `edge_src` 对齐；
+  **大规模按 `B` 分块**计数，峰值内存由 `N^2*y_out*y_in` 降到 `N*y_out*chunk*y_in`
+  （`N≈2976` 时布尔中间量约 0.5G 元素；实测 `N=2976` 构造含特征构造共 **6.4 s**）；
+* **[!] 皋陶 F2（warning，已修复）**：该 `mult` 归约**原先无条件执行**（结果只在
+  `if self.geo_enabled` 分支被消费），使关闭路径白付开销（实测 `N=1024/y=8x8/D=0.065`
+  构造 `0.625s -> 0.849s`，**+0.224s 约 +26%**；`bisect_left` 在 none 档被调用 **96 次**），
+  与"关闭时连几何特征构造都不执行"的字面口径冲突。现用 `if self.geo_enabled:` 包住该块
+  （含正常返回路径的 `order` 重排分支），none 档返回 0 长占位张量。**修复后实测**：
+  none 档 `bisect_left` 调用 **0 次**、构造耗时回落到 `0.627s`；开档仍执行（`27296` 次调用）；
+  开/关档公共 `state_dict` 张量**逐位一致**（S17-10d）。
+* `geo_field = "none"` 时**不执行本步**（一个特征张量都不构造）。
+
+**张量契约**（`geo_field != none` 时才存在）：
+
+| 名称 | 形状 | 类型 |
+| --- | --- | --- |
+| `edge_geo_feat_raw` / `edge_geo_feat` | `[E, F]` | buffer，**`persistent=False`**（归一化前后） |
+| `edge_geo_feat_min` / `edge_geo_feat_max` | `[F]` | buffer，**`persistent=False`** |
+| `geo_rbf_centers` | `[F, k]` | buffer，`persistent=True`（基常量，随产物落盘） |
+| `geo_rbf_width` | `[F]` | buffer，`persistent=True`（逐维宽度，随产物落盘） |
+| `geo_rbf_theta` | `[k+1]` | Parameter（零初始化，末位为 `c_0`） |
+| `geo_alpha` | `[]` | Parameter（初值 `geo_alpha_init`） |
+
+**口径**：特征类 buffer 一律**不落盘**（与突触类 buffer 同纪律，复核回到 `config + seed` 重算）；
+**RBF 基常量落盘**（基函数定义的一部分，否则有效权重无法复算）。
+
+### RBF 基（确定性算法，无随机数消耗）
+
+* **归一化**：`edge_geo_feat = (raw - raw.min) / (raw.max - raw.min)`（构造期实测、detach、buffer 固定）；
+* **中心**：每维取 `k` 个分位点 `q_i = i/(k+1)`（`i = 1..k`，`torch.quantile` 线性插值口径）；
+* **宽度（逐维）**：`width[j] = max(mean_k(centers[j,k+1] - centers[j,k]), 5e-2)`。
+  逐维而非全局常数：FCC 规则晶格上 `zeta`/`rho` **只取 2~7 个离散值**（实测
+  `zeta = rho = 1.414214`，`nuniq = 3~7`），共用全局下界会让退化维基函数全部饱和到 1
+  （等价常数项、梯度恒 0）；`5e-2` = 每维至少约 20 个有效分辨率单元；
+* **基函数**：`phi_k(x) = exp( -sum_j (x[j] - center[j,k])^2 / (2*width[j]^2) )`；
+* 实测（DEFAULT / `N=1024` / `N=2976`，`_verify/_geo_probe/geo_scale_probe.log`）：归一化特征全域
+  `[0.0, 1.0]`；基激活 `mean≈0.003~0.012`、`std≈0.03~0.07`（非退化）。
+
+### 优化器：几何参数排除 weight decay（皋陶 F1 修复）
+
+**实现已抽成两个可被外部调用的函数**（`train.build_param_groups(model, config)` /
+`train.build_optimizer(model, config)`）：
+
+* `geo_field != "none"`：两个 group —— 第 0 组为其余参数（携带 `config.weight_decay`），
+  第 1 组为 `geo_rbf_theta` / `geo_alpha`（恒 `0.0`）。理由：**归因纯度** —— 零初始化的几何场
+  若被 `weight_decay` 拉向 0，等于对几何场施加**隐式正则**，污染「场是否有效」的归因。
+* `geo_field == "none"`：**单一 group**，且**必须显式携带**
+  `"weight_decay": float(config.weight_decay)`。
+* `AdamW` 构造传 `weight_decay=0.0`，真实值一律由各 param group 携带（不依赖 `torch.optim` 默认值）；
+  `clip_grad_norm_` 仍覆盖**全参数**。
+
+**[!] 皋陶 F1（error，阻断项，已修复）**：关闭路径原先写作
+`param_groups = [{"params": other_params}]` —— **未携带 `weight_decay` 键**，而调用点以
+`AdamW(param_groups, lr=..., weight_decay=0.0)` 构造，于是唯一 group 取到默认 **0.0**，
+把 `geo_field=none` 的 weight decay **静默关成 0**（改动前为
+`AdamW(model.parameters(), lr, weight_decay=config.weight_decay)`）。这是**关闭路径行为回归**：
+`--preset highacc`（wd=1e-4）与经 subprocess 调用该函数的 `run_ladder.py` /
+`run_fc_alignment.py` / `verify_fc_alignment.py` 全部受影响，使 wd>0 的既有台账**不可复现**。
+**修复后实测**：`none+wd=1e-4` 生效 `[0.0001]`、`additive+wd=1e-4` 生效 `[0.0001, 0.0]`；
+关闭路径一步更新与改动前口径**逐位一致**（全参数最大差 `0`）。
+
+**[!] F1 的第 2 点：日志须按生效值打印**。原先把 `config.weight_decay` 直接打进日志，
+修复前会打印 `weight_decay=1e-4` 而实际为 `0`，属**误导性日志**；现改为输出各 group 的
+**生效** `weight_decay` 集合，并在 `_run_training_with_config` 内加**契约断言**
+（关闭路径单组的生效值必须等于 `config.weight_decay`）。
+
+**[!] F1 的配套工程约束（重要，防"同源自洽"）**：分组与构造逻辑**必须**是可调用的真实函数，
+否则验证脚本只能"重新实现一遍"，注入 F1 缺陷后**抓不到**（本轮实测：变异 M9 在"重写版判据"
+下**逃逸**）。故 `verify_shape.py` 的 S17-10a 与变异驱动器均**直接调用**
+`train.build_optimizer`（不是复制表达式）。
+
+### 优化器/冒烟的结构性零梯度（必须按此读，不可写反）
+
+`c`（`theta`）零初始化时 `dL/dalpha = sum_e Delta_e * 场(phi_e) == 0`（场本身恒为 0）。故：
+
+* **`theta` 1 步后梯度非零**（实测 `2.356403e-01`），**`alpha` 首步梯度恒为 0**
+  （实测 `0.000000e+00`，S17-4b **显式断言为设计预期**）；
+* **全参数 2 步后非零**（实测 `dL/dalpha`(step2) `= 1.328e-03`）；
+* 冒烟判据 `[3]` 对 `geo_alpha` **显式豁免**并逐条列出参数名与原因
+  （`model._geo_zero_grad_params`），`theta` 与其余全部参数照旧硬断言 ——
+  **豁免已知结构性质**，不是放宽判据；日志中该参数标 `[EXPECTED-ZERO]`（离朱 DEF-5 修复）。
+
+### 命名段 `_geo{mode}_k{k}[_sd][_a{alpha_init}]`
+
+* **仅 `geo_field != "none"` 时插入**；`geo_field == "none"` **不加段** => 既有产物名**逐字不变**；
+* **段位口径**（`smoke_fingerprint` / `config_fingerprint` / `full_checkpoint_name` 三处**逐字一致**）：
+  完整段序 `..._rs{scope}` -> `[_fc{n}]` -> `[_geo{mode}_k{k}[_sd][_a{alpha_init}]]` -> `_nosyn` -> `_s{seed}`。
+  实测位置下标 `geo@63 < nosyn@79 < s42@85`（S17-6b）；
+* `_sd` 仅在 `geo_signed_delta=True` 时出现；`_a{值}` 仅在 `geo_alpha_init != 1.0` 时出现
+  （离朱 DEF-7 修复：否则不同初值会生成同名产物而**静默互覆**）；
+* `is_default_smoke` 纳入 `geo_field` / `geo_signed_delta`，并与 `smoke_fingerprint` 维持
+  **维度对齐守卫**（`geo_rbf_k` / `geo_alpha_init` / `geo_hidden` 在 `geo_field == "none"` 时是
+  **无效果字段**，故不入指纹、不入判定 —— 这是**有界且已声明的缺口**）。
+
+**参数量公式（更新）**：`geo_field != none` 时在既有公式上加 **`k + 2`** 个参数（`[k+1]` + `[1]`）。
+实测（SMALL `k=12`）：`--smoke-test` `params = 43930`（未变）；`--smoke-test --geo-field additive`
+`params = 43944`。
+
+### 断言清单（S17 组，`verify_shape.py`；`--quick` 与全量**都跑**，**共 35 条**）
+
+**本清单为唯一权威版本**（皋陶 F4：此前 spec 中另有一份"共 24 条"的陈旧副本，已删除）。
+
+| 编号 | 判据 | 本轮实测 |
+| --- | --- | --- |
+| S17-1a | `none` 档不注册任何几何 buffer / 参数 | PASS（命中 = `[]`，`hasattr(edge_geo_feat)=False`） |
+| S17-1b | `none` 档与二期 `n3d_sphere` **27 张量 `torch.equal`** | PASS（`E=106/106`、`params=43930/43930`） |
+| S17-1c | `none` 档构造确定；**特征类 buffer 全部非持久**（4 个），基常量 2 个持久 | PASS |
+| S17-2 | on + 零初始化时前向与基线 `torch.equal` | PASS（最大绝对差 `0.000e+00`） |
+| S17-3a | on/off 下**基座参数与全部公共 buffer 逐位一致**（28 个） | PASS（不一致 = 无；新增仅 8 个几何张量） |
+| S17-3b | `theta` 全零（`[13]`）、`alpha == geo_alpha_init` | PASS |
+| S17-4a/b/c | `theta` 1 步后非零 / `alpha` 首步恒 0（设计预期）/ 全参数 2 步后非零 | PASS |
+| S17-4d | 1 步后有效权重与 free 权重出现可测差异 | PASS（`max|dw| = 2.057549e-03`） |
+| S17-5a | 特征取值域（`slack`/`zeta`/`mult`/`dhat`/`rho`） | PASS |
+| S17-5b | `dhat`/`zeta`/`rho` 由 `edge_dist`/`neuron_pos` **逐边独立复算** | PASS（偏差 `0.000e+00`） |
+| S17-5c | `mult` 对 `syn_dist` **逐边独立复算（向量化）** | PASS（偏差 `0.000e+00`；皋陶 F6 已改为成对 `gather` 向量化，删去 Python 遍历与 `if True else 0` 死分支） |
+| S17-5d/e | RBF 中心/宽度合法；additive 档构造确定性（36 张量逐位一致） | PASS |
+| S17-5f/g | 可选扩展开关默认关闭（5 列）/ 打开时 7 列 | PASS |
+| S17-6a/b | `none` 无 `_geo` 段 / 非 `none` 含段；段位口径 | PASS |
+| S17-6c/d | 形状 x geo 档 10 名两两唯一；与磁盘既有产物**零冲突** | PASS |
+| S17-7a/b/c | CLI 拒绝 `mlp + geo`；接受 `--geo-field none`；未实现档构造期显式报错 | PASS |
+| S17-8a | 非 float32 可表示的 `geo_alpha_init` 必须可构造（DEF-3 回归） | PASS（6/6） |
+| S17-8b | 改动文件**无任何非 GBK 可编码字符**（DEF-1 回归） | PASS（0 处） |
+| S17-8c | 两入口已 `def` 且已调用 stdout/stderr UTF-8 重配（DEF-1 回归） | PASS |
+| S17-8d | P0 脚本载入产物权重且自证逐位相同（DEF-2 回归） | PASS |
+| S17-9a/b/c | 不同 `geo_alpha_init` 的三处指纹名互不相同 / 默认名不含 `_a` / 非默认含 `_a{值}`（DEF-7 回归） | PASS（5x3=15 名两两唯一） |
+| S17-10a | **F1 回归**：生效 `weight_decay` 逐组等于配置（**直接调用 `train.build_optimizer`**） | PASS（5 组） |
+| S17-10b | **F1 回归**：关闭路径一步更新与改动前口径逐位一致（wd=1e-3） | PASS（全参数最大差 `0`） |
+| S17-10c | **F2 回归**：none 档 `bisect_left` 调用 `0` 次、开档 `> 0`（探针有区分力） | PASS（none `0` / additive `27296`） |
+| S17-10d | **F2 回归**：开/关档公共 `state_dict` 张量逐位一致 | PASS（不一致 = 无） |
+
+条数对账（唯一口径）：改动前全量 `145` / `--quick` `78` → 第 20 轮 `+24`（S17-1..7）
+⇒ `169/102` → 第 1 修复子轮 `+4`（S17-8）⇒ `173/106` → 第 2 修复子轮 `+3`（S17-9）⇒ `176/109`
+→ **皋陶修复轮 `+4`（S17-10）⇒ 全量 180 / `--quick` 113**（机读报告 `checks` 计数实测一致）。
+
+### 变异测试（拒绝证明，**11 个变异全部被捕获、0 逃逸**）
+
+驱动：`python checkpoints/n3d_shape/_verify/_geo_mutation_proof.py`
+（按字节复制 `n3d_shape/` 到临时目录后在子进程里变异并跑 S17 核心判据，**全程不改动工作区源码**；
+日志 `_verify/_geo_mutation_proof.log`）。**基线判据 15/15** 全通过 => 前置条件成立（**口径更正（皋陶复审 F10）：** 此处原写 `13/13`，那是**注入 M9/M10 两条判据之前**的旧口径；皋陶实跑 `_geo_mutation_proof.py`（退码 0）确认真值为 **15/15**，本行已更正）。
+
+| 变异 | 内容 | 期望被抓 | 实测 |
+| --- | --- | --- | --- |
+| M1 | 非零初始化（`theta.zero_()` -> `fill_(0.05)`） | S17-2 / S17-3b | **捕获** |
+| M2 | 去掉 RNG 隔离（改用 `seed+1` 并消耗随机数） | S17-3a | **捕获** |
+| M3 | 特征错标（`dhat = edge_dist`） | S17-5b | **捕获** |
+| M4 / M4b | 名段缺失（smoke / full 指纹不加 `_geo` 段） | S17-6a | **捕获**（并连带 S17-9a） |
+| M5 | `none` 档也构造几何特征 | S17-1a | **捕获** |
+| M6 | 未实现档静默放行 | S17-7c | **捕获** |
+| M7 | 场不注入 `forward` | S17-4d | **捕获**（S17-4a/4c/4d） |
+| M8 | `geo_alpha_init` 不进指纹（DEF-7） | S17-9a | **捕获** |
+| **M9** | **关闭路径 param group 不携带 `weight_decay`（皋陶 F1）** | S17-10a | **捕获** |
+| **M10** | **`none` 档仍无条件执行 `mult` 归约（皋陶 F2）** | S17-10c | **捕获** |
+
+**[!] M9 的方法学留档**：M9 在"判据**重写一遍** `build_param_groups` 表达式"的版本下
+**逃逸**（重写版不受 `train.py` 变异影响）—— 这正是皋陶 F1 暴露的"同源自洽"陷阱。
+改为**直接调用 `train.build_optimizer`** 后 M9 被捕获。（`build_param_groups` /
+`build_optimizer` 因此被提取为模块级公开函数。）
+
+### P0 诊断脚本（`probe_geo_field.py`，**仪表化、非门槛**）
+
+读**既有 free 权重产物**（默认 `full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isall_rsall_fc-1_s42.pt`），
+回归 `edge_weight ~ phi_e`，报告 R²、**等价类内方差**、**以 `in_degree` 为协变量的偏效应**、
+以及**初始化权重的 R² 作零假设基线**。
+
+**权重来源（离朱 DEF-2 修复）**：`load_state_dict(strict=False)` + 两处**预期差异显式登记**
+（`missing` = 现场重建模型打开 `geo_field` 带来的 4 个几何张量；`unexpected` = nosyn 口径下
+产物不含的 8 个突触类 buffer）+ 任何**非预期**差异即 `RuntimeError` + **自检判据
+`torch.equal(载入权重, 产物权重)` = True** + 全部 **26** 个公共持久化张量逐位比对（0 处不一致）。
+
+**本轮实测**（单 `seed=42`、`E=736`；`geo_field_p0_probe.json`）：
+
+| 口径 | R² |
+| --- | --- |
+| 几何特征（含 RBF 基） | `0.005063` |
+| 仅 `in_degree`（协变量） | `0.000169` |
+| 几何 + `in_degree` | `0.005186` |
+| **偏效应**（控制 `in_degree` 后几何额外解释） | `0.005016` |
+| 标准化自由权重的几何 R² | `0.005063` |
+| 标准化自由权重：仅 `in_degree` 的 R² | `0.000169` |
+| 标准化自由权重：**偏效应**（皋陶 F8 修复后真算） | `0.004894` |
+| **零假设基线**（`U(-b,b)` 重抽 50 次） | `mean 0.012018` / `std 0.004945` / `min 0.002376` / `max 0.020823` |
+
+等价类（按 `(zeta, rho)` 归并）：类数 `2`，**类内方差占比 `0.999963`**，类标签 R² `0.000037`。
+
+**[!] 皋陶 F3（warning，已修复）—— `--shape` / `--cyl-aspect` 的静默无效参数**：
+这两项原先被 argparse 接受并传入 `run_probe` 却**全程未使用**（`--shape cube` 会静默沿用
+产物内形状）。**处置选择：实现为"产物配置断言"**（既不是皋陶建议的"直接写回 `cfg_dict`"，
+也不是"删除这两个 CLI 项"）。**选择理由由实测给出**：写回 shape 会让现场重建模型与产物
+**拓扑不一致**（`sphere` `E=736` vs `cube` `E=713`），`load_state_dict` 立即报
+`size mismatch for edge_dist/edge_weight/...` —— 因为**产物的权重形状由其自身形状唯一决定**，
+不可能"跨形状重算同名权重"，故"写回"会引入一个**新的必然失败路径**；而"删除"会削弱工具。
+现口径：显式给出时**必须与产物内 config 逐值一致**，否则抛可读错误；空串 / 哨兵 `-1` = 不校验。
+实测：`--shape sphere`（匹配）退码 0；`--shape cube`（不匹配）**退码 1 并给可读原因**；
+`--shape cube --cyl-aspect 2.0` 由**脚本自身的 shape 断言**拒绝（**归因更正（离朱文档修复轮 X1）**：原写「由 `Config` 第二道防线拒绝」，该归因不成立 —— 见上文 F3 的「断言」口径说明；两处更正后 spec 与 README §20.12(F13) 及两个 SUMMARY 口径一致）。
+
+**[!] 皋陶 F8（info，已修复）**：原先偏效应写成 `partial_z = r2_geo_z - 0.0`（**无意义死赋值**），
+且同处算出的 `r2_cov_z` 从未进入结果字典 / 报告。现按 `r2_geo_z - r2_cov_z` **真算**
+（实测 `0.004894`），并把三个量全部写入返回字典与渲染报告。
+
+**[!] 新增 CLI（F9 关联）**：`probe_geo_field.py --signed-delta` 是本模块内**唯一**暴露
+`geo_signed_delta` 的命令行入口（仅供诊断；该开关只改变特征列数 `F`，不影响拓扑/权重形状，
+故可安全写回）。实测：开启后特征列由 18 -> 20（`feat:dx` / `feat:dy` 两列）。
+
+**判定规则（事先固定）**：**纯诊断，只报数，不下结论**；实测几何 R²（`0.005063`）**低于**
+零假设基线均值（`0.012018`），即未训练的自由权重与几何特征的相关性**落在随机初始化噪声带内**
+—— 与"权重完全随机、与几何无关"一致，但**不构成对假说的否证**；R² 为**单 seed 单点**，
+高不代表因果、低不否证假说；**不得**据此关闭或宣称几何权重场假说成立。
+
+### 本轮实测（默认路径零回归 + 修复轮复跑）
+
+* **默认冒烟**（`geo_field=none`）：**16/16 PASS、退出码 0**，产物名逐字不变
+  `_verify/smoke_nosyn.pt`（**193,871 B**，SHA256 `1e2cca361c3793141d29d0189eb85e82277bfc9390ccdea94dbac1fb73aa6cd7`）；
+  字节/SHA 变化的**唯一来源**是载荷新增 5 个标量取证字段与 `config`/`topology_stats` 新增 `geo_*` 键；
+  **逐位取证**（`_smoke_payload_cmp.py`，退出码 0）：`model_state_dict` **20 = 20 键、逐张量全等、
+  0 处不一致**，`connection_stats`/`dag_selfcheck`/`grad_norms`/`loss`/`test_acc`/`topology_stats`
+  的**全部旧键逐值不变**。依仓库 D1 口径：**跨版本不比文件 SHA**，等价判据回到张量级 `torch.equal`。
+* **`--fc-dim -1` 冒烟**：16/16 PASS、退出码 0；产物名逐字不变（256,757 B，SHA256
+  `8d572df3ce9981db672db404bb94a90be05efec42cfdec65f4fc85e60d97ce5d`）；`state_dict` **26 = 26 键、
+  逐位全等、0 处不一致**（`_smoke_fc_payload_cmp.py`，退出码 0）。
+* **`--geo-field additive` 冒烟**：16/16 PASS、退出码 0；写**新名**
+  `_verify/smoke_shapesphere_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_bs32_geoadditive_k12_nosyn_s42.pt`
+  （199,987 B），**不覆盖任何既有产物**。
+* **`verify_shape.py`**：全量 **180/180**、`--quick` **113/113**，均退码 0（S17 组 **35** 条）。
+* **既有产物零回归**：改动前对 `checkpoints/` 下全部 11 个 `.pt` 取 SHA256 快照
+  （`_verify/_geo_pre_change_sha256.txt`），改动后**仅 2 个冒烟产物变化**——即按计划真实重跑的
+  两个冒烟产物（已逐位取证「张量全等、仅新增标量字段」）；**其余 9 个 `.pt` SHA256 逐位不变、
+  0 变化、0 缺失**（含正式产物 `full_shapesphere_N256_..._fc-1_s42.pt`、`nosyn_probe/*`、
+  `_verify/verify_2_*.pt`、`n3d_sphere/` 与一期 `checkpoints/_verify/smoke.pt`）。
+  产物仍写 `checkpoints/n3d_shape/` 与其 `_verify/` 子目录，**未新建目录**
+  （`_verify/_geo_probe/` 为本批取证子目录，位于既有 `_verify/` 之下）。
+
+### 历次独立审查对本章节的缺陷与处置（累计）
+
+**[!] 本轮自检修正的"判据本身错误"（如实留档）**：`_assert_geo_feature_domain` 的几何自洽判据
+先后写成 ①`rho*H <= dhat*D`（**不成立**：`rho` 是中心横向位移、`edge_dist` 是最近突触对间距，
+后者垂向分量可抵消横向位移，实测 `max(rho*H - dhat*D) ≈ 6H`）、②`zeta*H >= 2H`（**不成立**：
+FCC 最近邻距虽为 2H，但**沿流向轴**相邻格点间距是 `sqrt(2)*H`，实测 `min = 0.212132`）、
+③量纲笔误（恒等式右侧多除一次 `H^2`）。三者均为**判据实现错误而非实现错误**，已改为两条
+**可证**判据（`zeta^2+rho^2 == ||dp||^2/H^2` 恒等式 + `||dp|| <= dhat*D + 2H` 上界）并就地留档。
+
+#### 离朱第 1 轮（6 项，全部已修复）
+
+| 编号 | 级别 | 缺陷 | 处置与实测 |
+| --- | --- | --- | --- |
+| DEF-1 | **高** | **默认 GBK 控制台下崩溃**（新增文本含 `⇒`/`∂` 等非 GBK 字符），additive 冒烟**退码 2**、`verify_shape.py` **退码 1**；崩溃发生在写报告之前，磁盘残留陈旧报告 | 两道防线：① 两入口 `sys.stdout/stderr.reconfigure(utf-8, errors="replace")`；② 五个改动文件**全部非 GBK 字符 ASCII 化**。实测（原生 GBK 控制台）全部命令退码 0 |
+| DEF-2 | **高** | `probe_geo_field.py` **未调用 `load_state_dict`**，R² 算在随机初始化权重上 | 载入产物权重 + 预期差异登记 + 自检 `torch.equal` + 26 公共张量逐位比对；数值重出、**旧值作废** |
+| DEF-3 | 中 | `geo_alpha_init` 构造期断言用精确 `==`（float32 vs float64），`0.4`/`0.1` 必然 `AssertionError` | 改容差断言 `<= 1e-6 * max(1, |want|)` |
+| DEF-4 | 低 | 文档把"顶层 5 个字段"与"`config` 内 geo 键"混写 | 落点口径分列（本条又被皋陶 F7 进一步更正计数） |
+| DEF-5 | 低 | 日志把结构性零梯度参数打 `[BAD]` | 改标 `[EXPECTED-ZERO]` |
+| DEF-6 | 低 | 冻结的正式产物不含 geo 字段，与"新增字段"表述冲突 | 加**适用范围**声明（属预期） |
+
+#### 离朱第 2 轮（修复验证）：DEF-1..6 全部生效 + 新发现 DEF-7（已修复）
+
+| 编号 | 级别 | 缺陷 | 处置与实测 |
+| --- | --- | --- | --- |
+| DEF-7 | 中高 | **`geo_alpha_init` 未进产物名指纹 ⇒ 同名产物静默互覆**（`{1.0, 0.4, 0.0}` 在三处指纹生成同名；实测 `01e56cb7…` 被覆盖为 `7b89b4ef…`） | 三处指纹追加 **`_a{alpha_init:g}`**（仅非默认值时插入）；实测 `alpha=0.4` 写**新文件**、canonical 产物 SHA **逐位不变** |
+
+#### 皋陶审查（本轮，9 项：1 error + 4 warning + 4 info，全部已处置）
+
+| 编号 | 级别 | 问题 | 处置与实测 |
+| --- | --- | --- | --- |
+| F1 | **error（阻断）** | 关闭路径 param group 未携带 `weight_decay` ⇒ `AdamW(..., weight_decay=0.0)` 把 wd **静默关成 0**；日志按配置值打印属误导 | 单 group **显式携带** `weight_decay`；分组/构造抽成 `build_param_groups` / `build_optimizer`；日志按**生效值**打印；加契约断言 + S17-10a/10b + 变异 M9。实测：`none+wd=1e-4` 生效 `[0.0001]`，一步更新与改动前口径逐位一致 |
+| F2 | warning | `geo_field=none` 仍**无条件执行** `mult` 归约（关闭路径白付开销，`N=1024` +26% 耗时） | `if self.geo_enabled:` 包住该块（含返回路径 `order` 分支）；S17-10c/10d + 变异 M10。实测 none 档 `bisect_left` **0 次**、耗时 `0.849s -> 0.627s` |
+| F3 | warning | `probe_geo_field.py` 的 `--shape` / `--cyl-aspect` 是**静默无效参数** | 实现为**产物配置断言**（含选择理由与实测依据：写回会导致 `E` 不一致 ⇒ `load_state_dict` size mismatch）。实测 `--shape sphere` 退码 0、`--shape cube` 退码 1 且原因可读 |
+| F4 | warning | `current_spec.md` 结构性重复（两处 `### 配置与 CLI`）+ 陈旧断言清单（24 条）与孤立表头 + 过期条数（169/102、28、173/106）与"当前刷新值"事实错误 | 本节**整章重写**：单一 `### 配置与 CLI`、单一权威断言清单（35 条）、删除全部陈旧块与孤立表头、"当前刷新值"更正为 **180 / 113** |
+| F5 | warning | README / spec 对"构造期 generator 守卫"**表述过强** | 改写为"RNG 隔离由**结构性创建顺序**与 **S17-3a** 承担；构造期断言仅校验 `seed+2` 字面量自洽"，并如实披露其**不能**捕获"整体替换为等价实现"（两处同步） |
+| F6 | info | S17-5c 用 Python 列表推导遍历 E 条边 + `if True else 0` 死分支，违反向量化规范 | 改为**成对 `gather` 向量化**（并留档：`index_select(2, ...)` 会得到笛卡尔积而非配对，实测形状报错） |
+| F7 | info | README 称"顶层新增 5 个标量字段"不精确（正式载荷实为 6+2） | 分列为「冒烟 5 个（**实测**）/ 正式 6+2 个（**代码推导，非实测**，本批未跑正式训练）」 |
+| F8 | info | `probe_geo_field.py` 的 `partial_z = r2_geo_z - 0.0` 死赋值，`r2_cov_z` 未入结果 | 改为真算 `r2_geo_z - r2_cov_z`（实测 `0.004894`），写入返回字典与渲染报告 |
+| F9 | info | `geo_signed_delta` / `geo_hidden` 无 CLI 入口 | 不构成计划偏离，但**显式注明**"仅编程接口可用、`train.py` CLI 暂不暴露"，并写明后续暴露须同步的**四处**（`explicit` / `apply_overrides` / `describe()` / 指纹与 `is_default_smoke` 守卫） |
+
+**[!] 复核纪律（历次审查共识）**：崩溃类缺陷（如 DEF-1）发生在 `write_report` 之前，故
+「磁盘上的报告文件」**不能单独作为通过判据** —— 必须同时看**命令退出码**与报告内 `checks`
+条目数（当前刷新值：`verify_shape_report.json` = **180**、`verify_shape_report_quick.json` = **113**）。
+**基线判据数口径（唯一权威）**：**15/15**（皋陶修复轮后；此前为 13/13 —— 因紧凑判据脚本新增
+`S17-10a`（F1：生效 weight_decay 逐组等于配置）与 `S17-10c`（F2：none 档 bisect_left 调用 0 次）
+两条，故从 13 增至 15）。**变异数 11、逃逸 0。**

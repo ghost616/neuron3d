@@ -7,15 +7,14 @@
     {
       "name": "n3d_proto",
       "created_at": "2026-09-22T10:37:45.212Z"
+    },
+    {
+      "name": "test",
+      "created_at": "2026-09-29T09:22:38.072Z"
     }
   ],
   "bindings": {
-    "session-4f4ea9ba-da28-4eac-80ee-888062acb4f6": "neuron3d",
-    "session-0e40f23a-f94e-4774-813e-bb1a3139a36a": "neuron3d",
-    "session-b621cbb4-c477-42a0-ade8-0d178c6f45bb": "neuron3d",
-    "session-abe38eb5-a63b-4ab1-8a50-4a5711fcb0c3": "neuron3d",
-    "session-3f6ed93c-ad76-40b1-879b-ecfe9fe787a8": "neuron3d",
-    "session-45d19084-0f10-444b-83c2-27df794fb010": "neuron3d",
-    "session-3cbc1f9d-dc19-4842-a64f-8a85f4bfbef4": "neuron3d"
+    "session-328e7512-146b-4b99-99d5-2367dd28d1e9": "test",
+    "session-e6afdabd-efcc-4af3-ab5f-96a130316c13": "test"
   }
 }

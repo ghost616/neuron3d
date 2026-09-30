@@ -85,6 +85,9 @@ DEFAULT 口径下实测 `placement_radius / R_max` 为：`sphere` **0.5137**（�
 * `cyl_aspect > 0`，且**仅 `shape == "cylinder"` 时允许显式传入**（其余形状显式传入报错，
   避免静默无效参数）；
 * `flow_axis ∈ {"x", "y", "z"}`；
+* `geo_field ∈ {"none", "additive", "class_tied", "mlp"}`（本批**实现** `none` 与 `additive`；
+  `class_tied` / `mlp` 仅接受枚举并在构造期**显式报错"未实现"**，避免静默降级）；
+* `geo_rbf_k >= 1`、`geo_hidden >= 1`、`geo_alpha_init >= 0`；
 * `input_scope ∈ {"any_isolated", "all_isolated"}`、`readout_scope` 同理；
 * `space_radius == 0.0`（默认，表示取该形状的 `R_min`）或 `space_radius ∈ [R_min, R_max]`；
 * 可学习参数的**连通性下限**（`E >= N`、层数 `K >= 2`、`|S_in| >= 1`、`|S_out| >= 1`）
@@ -95,6 +98,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import Tuple
 
 __all__ = [
     "Config",
@@ -106,12 +110,15 @@ __all__ = [
     "SCOPE_CHOICES",
     "PLACEMENT_CHOICES",
     "SHAPE_CHOICES",
+    "GEO_FIELD_CHOICES",
+    "GEO_IMPLEMENTED_CHOICES",
     "CYLINDER_ASPECT_SENTINEL",
     "PACKING_PHI",
     "shape_spec",
     "min_space_radius",
     "max_space_radius",
     "SHAPE_VARIANT_NOTE",
+    "GEO_FIELD_NOTE",
 ]
 
 # 全局流向轴：输入突触取负半球（-axis）、输出突触取正半球（+axis）
@@ -139,6 +146,20 @@ PACKING_PHI: float = 0.7405
 
 # 本模块为**形状变体**（球体 / 立方体 / 圆柱体）；保留此常量便于验证脚本做"形状维度已落地"断言
 SHAPE_VARIANT_NOTE: str = "neuron_shape_variant:sphere|cube|cylinder"
+
+# ---- 几何权重场（geo_field，本模块第 5 轮新增维度：形状 = 生长度量 + 几何权重场）----
+# `none`       = **关闭**（默认）：**连几何特征都不构造**，buffer 不注册、参数不创建，
+#                代码路径与改动前逐位一致（`shape=sphere` 仍与二期张量级 `torch.equal` 一致）；
+# `additive`   = 本批**已实现**档：`w_e = w_free[e] + alpha · (Σ_k c_k · φ_k(φ_e) + c_0)`，
+#                `c` 零初始化、`alpha` 初值 = `geo_alpha_init`（可学习）；
+# `class_tied` = **枚举已接受但本批未实现**（构造期显式报错，不静默降级为 none）；
+# `mlp`        = **枚举已接受但本批未实现**（构造期显式报错，不静默降级为 none）。
+GEO_FIELD_CHOICES: Tuple[str, ...] = ("none", "additive", "class_tied", "mlp")
+# 本批**真正实现**的子集（其余取值必须显式报错，而不是被静默忽略）
+GEO_IMPLEMENTED_CHOICES: Tuple[str, ...] = ("none", "additive")
+
+# 保留此常量便于验证脚本做"几何权重场维度已落地"断言
+GEO_FIELD_NOTE: str = "neuron_geo_weight_field:none|additive"
 
 
 @dataclass(frozen=True)
@@ -195,7 +216,7 @@ def shape_spec(shape: str, cyl_aspect: float = 1.0) -> ShapeSpec:
         return ShapeSpec(name="sphere", cyl_aspect=1.0, circum_coef=1.0)
     if shape == "cube":
         # 立方体：特征尺度 s 为半边长，外接半径 = 体对角线之半 = √3·s → ρ/R = √3。
-        # ⚠️ 历史缺陷（离朱实测 D1，已修复）：此处曾误写为"所有非 cylinder 形状都返回 1.0"，
+        # [!] 历史缺陷（离朱实测 D1，已修复）：此处曾误写为"所有非 cylinder 形状都返回 1.0"，
         #    导致 `max_space_radius` 少除一个 √3 —— cube 的 `R_max` 与校验窗口被放大 √3 倍
         #    （实测 `N=256,H=D=0.1`：代码 `1.403681` vs 文档 `0.810415`，比值恰为 1.732051），
         #    于 `Config(shape="cube", space_radius=1.0/1.2/1.403681)` 这类**越界配置被静默接受**。
@@ -406,6 +427,33 @@ class Config:
         `→ h = a_up[S_out] → Linear(|S_out|→H)+b+ReLU → Linear(H→10)+b → logits`。
         **启用时不再创建 `W_in` / `W_out` / `W_out_bias`**（它们被上面两组全连接层取代），
         输入侧偏置复用 `neuron_bias[in_scope_mask]`。`< -1` 在构造期报错。默认 0。
+    geo_field : str
+        **几何权重场开关**（本模块第 5 轮新增的"形状 = 生长度量 + 几何权重场"维度）：
+        `"none"`（默认）= **关闭** —— **连几何特征都不构造**（不注册 `edge_geo_feat` 等
+        buffer、不创建几何参数），代码路径与改动前**逐位一致**；
+        `"additive"` = RBF 加性档（本批实现的唯一档）：每条边的有效权重为
+        `w_e = w_free[e] + alpha · (Σ_k c_k · φ_k(φ_e) + c_0)`，`c` 零初始化、`alpha`
+        初值 = `geo_alpha_init`（可学习）；
+        `"class_tied"` / `"mlp"` = **枚举已接受但本批未实现** —— 构造期显式报错
+        （拒绝把未实现档静默降级成 `none`）。
+        几何场只改**权重取值**，不改连接判据、不改突触半球切分、不引入随机放置、
+        不改训练循环与数据管线；`neuron_pos` / `edge_dist` 只读、语义不变。
+    geo_rbf_k : int
+        RBF 基函数个数 `k`（`additive` 档；必须 >= 1）。基中心与宽度由 **model 侧**从
+        边级特征按**确定性分位点 / 逐维间距**算出（无额外随机数消耗），详见 README 的
+        「几何权重场（geo_field）」节。
+    geo_hidden : int
+        预留字段（后续 `class_tied` / `mlp` 档的隐藏宽度；必须 >= 1）。本批不消费该
+        字段，但必须保留在 `to_dict()` 中，否则 `train.apply_overrides` 经
+        `Config(**base.to_dict())` 往返会**静默丢字段**。
+    geo_alpha_init : float
+        `additive` 档场增益 `alpha` 的初值（> = 0，可学习）。默认 1.0。
+        注意：`c`（RBF 系数）**零初始化**，故 `alpha` 的初值只决定"零初始化不影响前向"
+        之后的起点尺度，不影响开关开启时的初始前向逐位等于基线这一性质。
+    geo_signed_delta : bool
+        **可选扩展开关**（默认 `False`）：为边级几何特征追加 signed `dx/H`、`dy/H` 两列
+        （可区分横向位移的左右方向）。**默认关闭时特征列集合与文档表格逐字一致**（5 列）。
+        非 `additive` 档时该字段无效果（不报错 —— 它是纯扩展位，不改变任何语义）。
     batch_size : int
         批大小。默认 64。
     lr : float
@@ -470,6 +518,29 @@ class Config:
     hidden_dim: int = 2048  # 仅 `--arch mlp` 对照基线使用（主模型不使用该字段）
     # 两端全连接包裹开关：0 = 关闭（默认，逐位不变）/ -1 = 跟随 N / > 0 = 显式宽度
     fc_dim: int = 0
+
+    # ---- 几何权重场（本模块第 5 轮新增维度："形状 = 生长度量 + 几何权重场"）----
+    # `none` = 关闭（默认，逐位不变）；`additive` = RBF 加性档（本批实现）；
+    # `class_tied` / `mlp` = 枚举已接受但本批未实现（构造期显式报错）。
+    geo_field: str = "none"
+    # RBF 基函数个数 k（中心与宽度由 model 侧按**确定性分位点**从边级特征算出，写入 README）。
+    geo_rbf_k: int = 12
+    # 预留：后续 `class_tied` / `mlp` 档的隐藏宽度（本批不消费该字段，但必须保留以便
+    # `to_dict()` 往返不丢字段——`train.apply_overrides` 经 `Config(**base.to_dict())` 往返）。
+    # [!] **无 train.py CLI 入口**（皋陶 F9，如实注明）：只能由脚本内构造 `Config` 触发。
+    geo_hidden: int = 32
+    # `alpha` 的初值（可学习；`additive` 档的场增益）。默认 1.0。
+    geo_alpha_init: float = 1.0
+    # 可选扩展开关（**默认关闭**）：为边级几何特征追加 signed `dx/H`、`dy/H` 两列。
+    # 默认关闭时特征列集合与文档表格逐字一致（5 列）。
+    # [!] **无 train.py CLI 入口**（皋陶 F9，如实注明）：该字段改变特征列数 `F`（5 -> 7），
+    #     并影响 `_sd` 名段与 `is_default_smoke` 判定，但本批**只能由脚本内构造 `Config`**
+    #     或诊断脚本 `probe_geo_field.py --signed-delta` 触发（`train.py` 只暴露
+    #     `--geo-field` / `--geo-rbf-k` / `--geo-alpha-init`，即本批计划所要求的三项）。
+    #     后续若在 `train.py` 暴露，**必须同步四处**：`explicit` 判定 / `apply_overrides` /
+    #     `describe()`（与 `to_dict()` 一并）/ 指纹与 `is_default_smoke` 的维度对齐守卫
+    #     —— 否则会重演"静默丢弃"或"静默覆盖默认冒烟产物"两类历史缺陷。
+    geo_signed_delta: bool = False
 
     # ---- 训练 ----
     batch_size: int = 64
@@ -540,6 +611,36 @@ class Config:
             raise ValueError(
                 f"Config.fc_dim 只允许 -1（跟随 N）或 >= 0（0 表示关闭），"
                 f"当前 fc_dim={self.fc_dim}"
+            )
+        # ---- geo_field 校验（本模块第 5 轮新增：几何权重场）----
+        # [!] 两条纪律：
+        #   (a) 非法取值在**构造期**报错（不留给下游按陌生字符串去查表）；
+        #   (b) `class_tied` / `mlp` 在 `GEO_FIELD_CHOICES` 里**但本批未实现** ——
+        #       必须**显式报错"未实现"**，绝不允许静默降级成 `none` 后照常训练
+        #       （那会产出"看起来开了几何场、实际什么都没改"的取证产物）。
+        if self.geo_field not in GEO_FIELD_CHOICES:
+            raise ValueError(
+                f"Config.geo_field 仅允许 {GEO_FIELD_CHOICES}，当前 geo_field={self.geo_field!r}"
+            )
+        if self.geo_field not in GEO_IMPLEMENTED_CHOICES:
+            raise ValueError(
+                f"Config.geo_field={self.geo_field!r} 本批**未实现**"
+                f"（已实现档：{GEO_IMPLEMENTED_CHOICES}）。"
+                f"`class_tied` / `mlp` 档待批次 1 验证通过后按单独计划实现；"
+                f"当前不接受该取值（拒绝把未实现档静默降级成 'none'）。"
+            )
+        if int(self.geo_rbf_k) < 1:
+            raise ValueError(
+                f"Config.geo_rbf_k 必须 >= 1（RBF 基函数个数），当前 geo_rbf_k={self.geo_rbf_k}"
+            )
+        if int(self.geo_hidden) < 1:
+            raise ValueError(
+                f"Config.geo_hidden 必须 >= 1（预留的隐藏宽度），当前 geo_hidden={self.geo_hidden}"
+            )
+        if not (float(self.geo_alpha_init) >= 0.0):
+            raise ValueError(
+                f"Config.geo_alpha_init 必须 >= 0（几何场增益初值），"
+                f"当前 geo_alpha_init={self.geo_alpha_init}"
             )
 
         # ---- 几何字段校验 ----
@@ -657,6 +758,15 @@ class Config:
         return int(self.fc_dim) != 0
 
     @property
+    def geo_enabled(self) -> bool:
+        """几何权重场是否启用（`geo_field != "none"`）。
+
+        关闭（`none`）时**连几何特征都不构造**：`edge_geo_feat` 等 buffer 不注册、
+        几何参数不创建，代码路径与改动前逐位一致（硬约束第 1 条）。
+        """
+        return self.geo_field != "none"
+
+    @property
     def fc_width(self) -> int:
         """两端全连接的**有效宽度** `H`：`0`=关闭 -> 0；`-1`=跟随 N -> N；`>0` -> 该值。"""
         return int(self._derived["fc_width"])
@@ -749,6 +859,14 @@ class Config:
             "output_dim": self.output_dim,
             "hidden_dim": self.hidden_dim,
             "fc_dim": self.fc_dim,
+            # geo_field 族（第 5 轮新增）：**必须全部进 to_dict()**，否则
+            # `train.apply_overrides` 经 `Config(**base.to_dict())` 往返会静默丢字段，
+            # `--geo-field additive` 就会失效（与 `--shape` / `--fc-dim` 的历史陷阱同源）。
+            "geo_field": self.geo_field,
+            "geo_rbf_k": self.geo_rbf_k,
+            "geo_hidden": self.geo_hidden,
+            "geo_alpha_init": self.geo_alpha_init,
+            "geo_signed_delta": self.geo_signed_delta,
             "batch_size": self.batch_size,
             "lr": self.lr,
             "epochs": self.epochs,
@@ -797,6 +915,9 @@ class Config:
             f"device={self.device}",
             f"weight_decay={self.weight_decay}",
             f"fc_dim={self.fc_dim}",
+            f"geo_field={self.geo_field}",
+            f"geo_rbf_k={self.geo_rbf_k}",
+            f"geo_alpha_init={self.geo_alpha_init}",
             f"readout_bias={self.readout_bias}",
             f"lr_schedule={self.lr_schedule}",
             f"grad_clip={self.grad_clip}",

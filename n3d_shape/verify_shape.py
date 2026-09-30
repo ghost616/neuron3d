@@ -13,7 +13,7 @@
  S2  最近邻距恰为 2H（FCC 规则堆积契约，三形状均须成立）
  S3  形状专项：shape / lambda / circum_coef 与**脚本内联的独立公式**一致
       （不用 `config.shape_spec` 作期望值 —— 那属"自洽性"而非"正确性"检查）
- S3b 尺寸窗口：`R_min` 由**体积不等式 V(R) >= N·(4/3)πH³/φ 就地反解**得到并与实现比对
+ S3b 尺寸窗口：`R_min` 由**体积不等式 V(R) >= N·(4/3)πH^3/φ 就地反解**得到并与实现比对
       （**不复制实现的表达式形式**，避免"代码 == 抄写下来的同一公式"）；`R_max`/`ρ` 亦然
  S3c 越界拒绝：给定正确 `R_max` 时，超出它的 `space_radius` 必须被拒
       （**注意**：探针取 `R_max` 相对倍数，故它**不是** D1/E1 类缺陷的独立防线，那是 S3b 的职责）
@@ -37,6 +37,15 @@
       并报告实测偏差/容差的最紧余量（防止第二道常数项被改小而无人发现）
  S14 `neuron_pos` 排序口径**如实取证**（索引顺序非严格轴升序 + 拓扑序/严格上行仍成立）
       —— 继承二期的缩放整数 key，单方面修会破坏"默认分支与二期逐位一致"，故如实披露
+ S17 **几何权重场（`geo_field`）**（第 5 轮新增；`--quick` 与全量**都跑**，均在 SMALL 规模）：
+      S17-1 `none` 档连几何特征都不构造 + 与二期 27 张量 `torch.equal`；
+      S17-2 开关 on + 零初始化时前向与基线 `torch.equal`；
+      S17-3 on/off 基座参数与公共 buffer 逐位一致（RNG 隔离），几何参数零初始化；
+      S17-4 `theta` 1 步后梯度非零、全参数 2 步后非零（`alpha` 首步恒 0 属设计预期）；
+      S17-5 特征取值域与**逐边独立复算**（`dhat`/`zeta`/`rho`/`mult`）+ 构造确定性 +
+            可选扩展开关默认关闭；
+      S17-6 命名不变式（`none` 无 `_geo` 段 / 非 none 含段 / 段位口径 / 与既有产物零冲突）；
+      S17-7 CLI 拒绝 `--arch mlp` + `geo_field != none`；未实现档构造期显式报错
 
 [!] S3d 曾作为"窗口比值自洽性"判据被加入，实测其推导不成立（`R_min` 亦含形状相关体积
     系数），在**正确代码**上也会失败，属**断言本身错误**，已删除（详见 S3d 处注释）。
@@ -59,6 +68,28 @@ import traceback
 from typing import Any, Dict, List, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def _reconfigure_stdio() -> None:
+    """把 stdout / stderr 重配为 UTF-8（errors='replace'），消除 GBK 控制台崩溃（离朱 DEF-1）。
+
+    背景：Windows 默认 stdout 编码常为 **gbk**；本脚本的逐条断言文本含中文与数学记号，
+    一旦某字符不在 GBK 码表内，`print` 会抛 `UnicodeEncodeError` ——
+    且崩溃发生在**写报告之前**，于是磁盘上会残留**上一轮的陈旧报告**（旧断言数），
+    退出码却是 1，极易被误读为"本轮已通过"。故两道防线：
+    1. 入口处 `reconfigure(encoding='utf-8', errors='replace')`；
+    2. 源码中全部非 GBK 字符已替换为 ASCII 等价记号。
+
+    参数：无。返回：None。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_reconfigure_stdio()
 
 import torch  # noqa: E402
 
@@ -233,7 +264,7 @@ def run_shape_matrix(rep: Report, size_tag: str, size_kw: Dict[str, Any]) -> Non
         )
 
         # ---- S3 shape/lambda/circum_coef 与配置一致 ----
-        # ⚠️ 历史缺陷（离朱实测 D1，本判据当初**没能抓住**该缺陷）：这里曾写成
+        # [!] 历史缺陷（离朱实测 D1，本判据当初**没能抓住**该缺陷）：这里曾写成
         #    `model.circum_coef == spec.circum_coef`，而 `spec` 与 `model` 同源于
         #    `config.shape_spec` —— 属**自洽性**检查，不是**正确性**检查。
         #    于是当 `shape_spec` 把 cube 的 `circum_coef` 误写成 1.0（应为 √3）时，
@@ -262,25 +293,25 @@ def run_shape_matrix(rep: Report, size_tag: str, size_kw: Dict[str, Any]) -> Non
         h_scale = (float(cfg.N) / phi) ** (1.0 / 3.0)
         # ------------------------------------------------------------------
         # [!] W1 修复要点（皋陶审查）：**不复制实现的表达式形式**，而是由
-        #     "该形状的体积 >= N·(4/3)πH³/φ" 这一**不等式就地反解**出特征尺度。
+        #     "该形状的体积 >= N·(4/3)πH^3/φ" 这一**不等式就地反解**出特征尺度。
         #     实现写法是 `H*(2N/(3λφ))^(1/3)`；本判据写法是
-        #     `((N*(4/3)πH³/φ) / (形状体积系数))^(1/3)`，两者形式不同、可互相证伪。
-        #     `shape_volume_coef(R)` 返回"形状体积 / R³"（R = 特征尺度），
+        #     `((N*(4/3)πH^3/φ) / (形状体积系数))^(1/3)`，两者形式不同、可互相证伪。
+        #     `shape_volume_coef(R)` 返回"形状体积 / R^3"（R = 特征尺度），
         #     定义完全来自几何（球 (4/3)π、立方体 8、圆柱 2πλ），不引用实现。
         # ------------------------------------------------------------------
         def shape_volume_coef(_shape: str, _lam: float) -> float:
-            """返回形状体积 `V = coef · R³` 中的系数（R = 特征尺度）。"""
+            """返回形状体积 `V = coef · R^3` 中的系数（R = 特征尺度）。"""
             if _shape == "sphere":
-                return (4.0 / 3.0) * math.pi          # V = (4/3)πR³
+                return (4.0 / 3.0) * math.pi          # V = (4/3)πR^3
             if _shape == "cube":
-                return 8.0                            # V = (2s)³ = 8s³
-            return 2.0 * math.pi * _lam               # V = πr²·(2λr) = 2πλr³
+                return 8.0                            # V = (2s)^3 = 8s^3
+            return 2.0 * math.pi * _lam               # V = πr^2·(2λr) = 2πλr^3
 
-        # 由体积不等式反解：coef·R³ >= N·(4/3)πH³/φ  =>  R >= (N·(4/3)πH³/(φ·coef))^(1/3)
+        # 由体积不等式反解：coef·R^3 >= N·(4/3)πH^3/φ  =>  R >= (N·(4/3)πH^3/(φ·coef))^(1/3)
         vol_coef = shape_volume_coef(shape, lam)
         need_vol = float(cfg.N) * (4.0 / 3.0) * math.pi * float(cfg.H) ** 3 / phi
         exp_min = (need_vol / vol_coef) ** (1.0 / 3.0)
-        # R_max 由"外接半径系数"折算（同样由几何定义：球 1 / 立方体 √3 / 圆柱 √(1+λ²)）
+        # R_max 由"外接半径系数"折算（同样由几何定义：球 1 / 立方体 √3 / 圆柱 √(1+λ^2)）
         exp_max = (float(cfg.H) + float(cfg.D)) * h_scale / expect_coef
         s3b_ok = (
             abs(cfg.min_space_radius - exp_min) <= 1e-12
@@ -403,7 +434,7 @@ def run_shape_matrix(rep: Report, size_tag: str, size_kw: Dict[str, Any]) -> Non
         # `最小非零轴坐标差 × (N+1) > N-1`；FCC 晶格最小轴差为 `a/2 = √2·H`，实测不成立
         # （SMALL：0.212132×65 = 13.79 < 63），故**索引顺序并非轴坐标升序**，
         # 即"`neuron_pos` == 真字典序"这一表述**不成立**。
-        # ⚠️ 但该行为**继承自二期**：若在本模块单方面改成真字典序，`shape="sphere"` 将与二期
+        # [!] 但该行为**继承自二期**：若在本模块单方面改成真字典序，`shape="sphere"` 将与二期
         #    不再逐位一致，直接违反硬约束"默认分支必须与二期张量级逐位一致"。
         #    故本项**不改实现**，只把事实做成可复核判据：
         #      (a) 索引顺序**不**保证轴坐标升序（记录逆序位置数，不判失败）；
@@ -745,10 +776,18 @@ def check_phase2_equality(rep: Report) -> None:
             #     使 S12 整段异常（X1 捕获）而**失去逐张量比对**。
             #     第 3 轮新增 `fc_dim`（仅三期字段）时实际发生了该回归，已在此修好 ——
             #     该过滤是"跨模块字段差异"的唯一登记点，故刻意保持集中、可审计。
+            #     第 5 轮新增 `geo_field` / `geo_rbf_k` / `geo_hidden` / `geo_alpha_init` /
+            #     `geo_signed_delta` 五个仅三期字段（同一回归由本轮 `verify_shape.py`
+            #     `--quick` 首次运行再次实测捕获：`TypeError: unexpected keyword argument
+            #     'geo_field'`），已一并登记。
             mine_dict = make_config(size_kw, shape, lam).to_dict()
             phase2_kw = {
                 k: v for k, v in mine_dict.items()
-                if k not in ("shape", "cyl_aspect", "fc_dim")
+                if k not in (
+                    "shape", "cyl_aspect", "fc_dim",
+                    "geo_field", "geo_rbf_k", "geo_hidden", "geo_alpha_init",
+                    "geo_signed_delta",
+                )
             }
             other = Phase2Model(Phase2Config(**phase2_kw))
             bad = [n for n in tensors + params
@@ -766,6 +805,690 @@ def check_phase2_equality(rep: Report) -> None:
                 "params": [mine.count_parameters(), other.count_parameters()],
                 "note": "依仓库 D1 口径：跨代码路径不比文件 SHA256，而是 torch.load 后逐张量比对",
             })
+
+
+def _geo_config(
+    size_kw: Dict[str, Any],
+    geo_field: str,
+    *,
+    shape: str = "sphere",
+    lam: float = 1.0,
+    geo_rbf_k: int = 12,
+    geo_alpha_init: float = 1.0,
+    geo_signed_delta: bool = False,
+) -> Config:
+    """构造几何权重场参试配置（S17 专用；其余口径与 `make_config` 一致）。"""
+    return Config(
+        **size_kw,
+        shape=shape,
+        cyl_aspect=lam,
+        flow_axis="z",
+        input_scope="any_isolated",
+        readout_scope="any_isolated",
+        input_dim=784,
+        output_dim=10,
+        lr=1e-3,
+        epochs=1,
+        seed=42,
+        device="cpu",
+        geo_field=geo_field,
+        geo_rbf_k=geo_rbf_k,
+        geo_alpha_init=geo_alpha_init,
+        geo_signed_delta=geo_signed_delta,
+    )
+
+
+def _geo_tensor_snapshot(model: ThreeDNeuronSpace) -> Dict[str, Any]:
+    """收集模型的全部参数与 buffer（detach 克隆），用于逐位比对与 RNG 隔离取证。"""
+    snap: Dict[str, Any] = {}
+    for name, p in model.named_parameters():
+        snap[f"param:{name}"] = p.detach().clone()
+    for name, b in model.named_buffers():
+        snap[f"buffer:{name}"] = b.detach().clone()
+    return snap
+
+
+def check_geo_field(rep: Report) -> None:
+    """S17：几何权重场（`geo_field`）开关与 `additive` 档的硬断言组。
+
+    子判据
+    ------
+    * S17-1 `geo_field=none`（默认）**连几何特征都不构造**（无任何 `geo*` 命名张量），
+      且与二期 `n3d_sphere` 在**全部 27 个张量**上 `torch.equal` 逐位相等；
+    * S17-2 开关打开 + 零初始化时，前向与基线 `torch.equal`；
+    * S17-3 on/off 下**基座参数与全部公共 buffer 逐位一致**（RNG 隔离守卫）；
+    * S17-4 梯度：末层系数 `theta` **1 步后非零**、全部参数 **2 步后非零**
+      （注意：`theta` 零初始化时隐藏层 `alpha` 首步梯度**恒为 0**，这是设计预期，
+      不可写成"1 步后 dL/dalpha > 0"）；
+    * S17-5 特征取值域（`slack ∈ [0,1]`、`zeta > 0`、`mult >= 1`、`dhat ∈ (0,1]`）
+      与**逐边对齐**（`edge_dist` / `mult` 由 `syn_dist` 独立复算）；
+    * S17-6 命名不变式：`none` 无 `_geo` 段；非 `none` 含段且与既有产物零冲突；
+    * S17-7 `--arch mlp` + `geo_field != none` 被 CLI 拒绝（退码 2）。
+    """
+    print("\n===== S17 几何权重场（geo_field）=====", flush=True)
+    size_kw = SIZE_CASES[1][1]          # SMALL 规模（--quick 与全量都跑）
+    none_cfg = _geo_config(size_kw, "none")
+    add_cfg = _geo_config(size_kw, "additive")
+
+    # ---------------- S17-1：none 档"连几何特征都不构造" ----------------
+    m_none = ThreeDNeuronSpace(none_cfg)
+    geo_named = [
+        n for n in list(m_none.state_dict()) if n.startswith("geo")
+    ] + [
+        n for n, _ in m_none.named_buffers() if n.startswith("geo") or "geo_feat" in n
+    ]
+    rep.check(
+        "S17-1a", "geo_field=none 时不注册任何几何 buffer / 参数",
+        not geo_named and not hasattr(m_none, "edge_geo_feat"),
+        f"命中几何命名张量={geo_named}；hasattr(edge_geo_feat)="
+        f"{hasattr(m_none, 'edge_geo_feat')}",
+    )
+    try:
+        from n3d_sphere.config import Config as Phase2Config  # noqa: WPS433
+        from n3d_sphere.model import ThreeDNeuronSpace as Phase2Model  # noqa: WPS433
+        mine_dict = none_cfg.to_dict()
+        phase2_kw = {
+            k: v for k, v in mine_dict.items()
+            if k not in (
+                "shape", "cyl_aspect", "fc_dim",
+                "geo_field", "geo_rbf_k", "geo_hidden", "geo_alpha_init",
+                "geo_signed_delta",
+            )
+        }
+        p2 = Phase2Model(Phase2Config(**phase2_kw))
+        names = [
+            "neuron_pos", "input_syn_pos", "output_syn_pos", "syn_dist",
+            "edge_src", "edge_dst", "edge_dist", "representative_syn_out",
+            "representative_syn_input", "topo_index", "edge_perm", "edge_perm_in",
+            "neuron_in_edge_reach", "edge_dst_in", "level_edge_reach",
+            "level_node_reach", "in_scope_mask", "out_scope_mask", "in_degree",
+            "out_degree", "input_isolated_mask", "output_isolated_mask",
+            "neuron_conn_mask", "edge_weight", "neuron_bias", "W_in", "W_out",
+        ]
+        bad = [n for n in names if not torch.equal(getattr(m_none, n), getattr(p2, n))]
+        rep.check(
+            "S17-1b", "geo_field=none 与二期 n3d_sphere 全部张量 torch.equal",
+            not bad,
+            f"比对 {len(names)} 个张量，不一致={bad if bad else '无'}；"
+            f"E={m_none.num_edges}/{p2.num_edges}，"
+            f"params={m_none.count_parameters()}/{p2.count_parameters()}",
+        )
+    except Exception as exc:  # pragma: no cover
+        rep.check("S17-1b", "geo_field=none 与二期 n3d_sphere 全部张量 torch.equal",
+                  False, f"{type(exc).__name__}: {exc}")
+
+    # ---------------- S17-2 / S17-3：前向逐位一致 + RNG 隔离 ----------------
+    m_add = ThreeDNeuronSpace(add_cfg)
+    snap_none = _geo_tensor_snapshot(m_none)
+    snap_add = _geo_tensor_snapshot(m_add)
+    geo_only = sorted(set(snap_add) - set(snap_none))
+    common = sorted(set(snap_none))
+    mism = [k for k in common if not torch.equal(snap_none[k], snap_add[k])]
+    rep.check(
+        "S17-3a", "on/off 下基座参数与全部公共 buffer 逐位一致（RNG 隔离守卫生效）",
+        not mism,
+        f"公共张量 {len(common)} 个，不一致={mism if mism else '无'}；"
+        f"新增（仅 additive 档）={geo_only}",
+    )
+    # 关闭路径自身确定性 + 特征 buffer 均为非持久（不落盘 -> 不改变 state_dict 口径）
+    m_none2 = ThreeDNeuronSpace(none_cfg)
+    snap_none2 = _geo_tensor_snapshot(m_none2)
+    det_none_bad = [
+        k for k in snap_none if not torch.equal(snap_none[k], snap_none2[k])
+    ]
+    persistent_geo = [
+        k for k in geo_only
+        if k.startswith("buffer:") and k.split(":", 1)[1] in m_add.state_dict()
+    ]
+    # 口径：**特征类** buffer（`edge_geo_feat*`）一律 non-persistent（不落盘、复核回
+    # 到 config+seed 重算）；**RBF 基常量**（`geo_rbf_centers` / `geo_rbf_width`）
+    # persistent=True —— 它们是基函数定义的一部分，必须随产物落盘才能复算有效权重。
+    feature_buffers = [
+        k for k in geo_only if "geo_feat" in k
+    ]
+    persisting_features = [k for k in feature_buffers if k in persistent_geo]
+    basis_buffers = sorted(
+        k for k in geo_only if "geo_rbf_centers" in k or "geo_rbf_width" in k
+    )
+    rep.check(
+        "S17-1c", "none 档构造确定 + 特征类几何 buffer 均非持久（不进 state_dict）",
+        not det_none_bad and not persisting_features and len(basis_buffers) == 2,
+        f"none 档不一致={det_none_bad if det_none_bad else '无'}；"
+        f"落盘的特征类 buffer={persisting_features if persisting_features else '无'}"
+        f"（特征类共 {len(feature_buffers)} 个，全部 non-persistent）；"
+        f"落盘的基常量 buffer={basis_buffers}（persistent=True，保证基函数可复现）",
+    )
+    theta_key = "param:geo_rbf_theta"
+    alpha_key = "param:geo_alpha"
+    rep.check(
+        "S17-3b", "几何参数零初始化 / alpha 初值 == geo_alpha_init",
+        theta_key in snap_add
+        and alpha_key in snap_add
+        and bool((snap_add[theta_key] == 0).all())
+        and float(snap_add[alpha_key].item()) == float(add_cfg.geo_alpha_init),
+        f"theta 全零={bool((snap_add[theta_key] == 0).all())}（形状 "
+        f"{tuple(snap_add[theta_key].shape)}）；alpha={float(snap_add[alpha_key].item())}",
+    )
+
+    torch.manual_seed(0)
+    x = torch.randn(8, int(none_cfg.input_dim))
+    m_none.eval()
+    m_add.eval()
+    with torch.no_grad():
+        logits_none = m_none(x)
+        logits_add = m_add(x)
+    eq = bool(torch.equal(logits_none, logits_add))
+    rep.check(
+        "S17-2", "开关打开 + 零初始化时前向与基线 torch.equal",
+        eq,
+        f"逐位相等={eq}，最大绝对差={float((logits_none - logits_add).abs().max()):.3e}，"
+        f"logits.shape={tuple(logits_add.shape)}",
+    )
+
+    # ---------------- S17-4：梯度（1 步 / 2 步） ----------------
+    y = torch.randint(0, int(add_cfg.output_dim), (8,))
+    ce = torch.nn.CrossEntropyLoss()
+
+    def _grads(mdl) -> Dict[str, float]:
+        mdl.zero_grad(set_to_none=True)
+        ce(mdl(x), y).backward()
+        return {
+            n: (-1.0 if p.grad is None else float(p.grad.detach().norm().item()))
+            for n, p in mdl.named_parameters()
+        }
+
+    g1 = _grads(m_add)
+    opt = torch.optim.Adam(m_add.parameters(), lr=1e-3)
+    opt.step()
+    g2 = _grads(m_add)
+    rep.check(
+        "S17-4a", "零初始化末层：theta 1 步后梯度非零",
+        g1.get("geo_rbf_theta", 0.0) > 0.0,
+        f"‖dL/dtheta‖={g1.get('geo_rbf_theta'):.6e}；"
+        f"‖dL/dalpha‖={g1.get('geo_alpha'):.6e}（**恒为 0 属设计预期**："
+        f"场系数零初始化 => dL/dalpha = Σ_e Δ_e·场(φ_e) == 0）",
+    )
+    rep.check(
+        "S17-4b", "零初始化末层：alpha 首步梯度恒为 0（设计预期，非缺陷）",
+        abs(g1.get("geo_alpha", 1.0)) <= 1e-12,
+        f"‖dL/dalpha‖(step1)={g1.get('geo_alpha'):.6e}",
+    )
+    zero_params = [n for n, v in g2.items() if not (v > 0.0)]
+    rep.check(
+        "S17-4c", "零初始化末层：全参数 2 步后梯度非零",
+        not zero_params,
+        f"2 步后零/缺梯度参数={zero_params if zero_params else '无'}；"
+        f"‖dL/dtheta‖(step2)={g2.get('geo_rbf_theta'):.6e}，"
+        f"‖dL/dalpha‖(step2)={g2.get('geo_alpha'):.6e}",
+    )
+    # 场真正生效的可复核证据：训练 1 步后有效权重 != free 权重
+    eff_delta = float(
+        (m_add._effective_edge_weight().detach() - m_add.edge_weight.detach())
+        .abs().max().item()
+    )
+    rep.check(
+        "S17-4d", "1 步后有效权重与 free 权重出现可测差异（场确实注入 forward）",
+        eff_delta > 0.0,
+        f"max|w_eff - w_free|={eff_delta:.6e}",
+    )
+
+    # ---------------- S17-5：特征取值域 + 逐边对齐（独立复算） ----------------
+    raw = m_add.edge_geo_feat_raw.detach()
+    names = list(m_add._geo_feature_names)
+    zeta = raw[:, names.index("zeta")]
+    rho = raw[:, names.index("rho")]
+    dhat = raw[:, names.index("dhat")]
+    slack = raw[:, names.index("slack")]
+    mult_val = torch.expm1(raw[:, names.index("mult")])
+    H, D = float(add_cfg.H), float(add_cfg.D)
+    tol = 1e-5
+    domain_ok = (
+        bool((slack >= -tol).all()) and bool((slack <= 1.0 + tol).all())
+        and bool((zeta > 0.0).all())
+        and bool((mult_val >= 1.0 - tol).all())
+        and bool((dhat > 0.0).all()) and bool((dhat <= 1.0 + tol).all())
+        and bool((rho >= 0.0).all())
+    )
+    rep.check(
+        "S17-5a", "特征取值域：slack∈[0,1]、zeta>0、mult>=1、dhat∈(0,1]、rho>=0",
+        domain_ok,
+        f"slack∈[{float(slack.min()):.6g},{float(slack.max()):.6g}]，"
+        f"zeta∈[{float(zeta.min()):.6g},{float(zeta.max()):.6g}]，"
+        f"mult∈[{float(mult_val.min()):.6g},{float(mult_val.max()):.6g}]，"
+        f"dhat∈[{float(dhat.min()):.6g},{float(dhat.max()):.6g}]，"
+        f"rho∈[{float(rho.min()):.6g},{float(rho.max()):.6g}]",
+    )
+    # 逐边独立复算：dhat 必须等于 edge_dist/D；zeta/rho 必须由 neuron_pos 复算得到
+    dhat_err = float((dhat - m_add.edge_dist.detach() / D).abs().max().item())
+    pos_src = m_add.neuron_pos.index_select(0, m_add.edge_src.to(torch.long))
+    pos_dst = m_add.neuron_pos.index_select(0, m_add.edge_dst.to(torch.long))
+    delta = pos_dst - pos_src
+    axis = add_cfg.flow_axis_index
+    xy = [i for i in range(3) if i != axis]
+    zeta_ref = delta[:, axis] / H
+    rho_ref = (delta[:, xy[0]] ** 2 + delta[:, xy[1]] ** 2).sqrt() / H
+    zeta_err = float((zeta - zeta_ref).abs().max().item())
+    rho_err = float((rho - rho_ref).abs().max().item())
+    rep.check(
+        "S17-5b", "特征逐边独立复算一致（dhat=edge_dist/D；zeta/rho 由 neuron_pos 复算）",
+        dhat_err <= 1e-6 and zeta_err <= 1e-5 and rho_err <= 1e-5,
+        f"dhat 最大偏差={dhat_err:.3e}，zeta 最大偏差={zeta_err:.3e}，"
+        f"rho 最大偏差={rho_err:.3e}（E={m_add.num_edges}）",
+    )
+    # mult 独立复算：**向量化**（皋陶 F6：原先用 Python 列表推导逐条遍历 E 条边 + 含
+    # `if True else 0` 死分支，违反仓库规范「禁止用 Python for 循环遍历神经元或突触」）。
+    # 口径：对每条边取**成对**的 `blocks[a_i, :, b_i, :]`，在 (o, j) 两维上数 `<= D` 的握手对数。
+    # [!] 必须用 `gather` 做**成对**索引：`index_select(2, b_idx)` 会得到 [E, y_out, E, y_in]
+    #     的**笛卡尔积**而非配对（本轮实测该写法会让形状校验直接报错，已改对）。
+    syn_dist = m_add.syn_dist.detach()
+    y_in, y_out = int(add_cfg.y_in), int(add_cfg.y_out)
+    blocks = syn_dist.reshape(m_add.N, y_out, m_add.N, y_in)
+    a_idx = m_add.edge_src.detach().to(torch.long)
+    b_idx = m_add.edge_dst.detach().to(torch.long)
+    e_cnt = int(a_idx.numel())
+    sel = blocks.index_select(0, a_idx).reshape(e_cnt, y_out, m_add.N * y_in)
+    col = (b_idx.view(e_cnt, 1, 1) * y_in
+           + torch.arange(y_in).view(1, 1, y_in))
+    pair = torch.gather(sel, 2, col.expand(-1, y_out, -1))       # [E, y_out, y_in]
+    mult_ref = (pair <= D).sum(dim=(1, 2)).to(torch.float32)
+    mult_err = float((mult_val - mult_ref).abs().max().item())
+    rep.check(
+        "S17-5c", "mult 逐边独立复算一致（对 syn_dist 分块数 <= D 的握手对数，向量化）",
+        mult_err <= 1e-6,
+        f"mult 最大偏差={mult_err:.3e}；实测 mult∈[{float(mult_ref.min()):.6g},"
+        f"{float(mult_ref.max()):.6g}]，E={m_add.num_edges}",
+    )
+    # RBF 基 / 宽度的结构性判据（确定性、无随机数消耗）
+    centers = m_add.geo_rbf_centers.detach()
+    width = m_add.geo_rbf_width.detach()
+    rep.check(
+        "S17-5d", "RBF 中心/宽度形状与取值域合法（中心∈[0,1]、宽度>0 且有限）",
+        tuple(centers.shape) == (len(names), int(add_cfg.geo_rbf_k))
+        and bool((centers >= -1e-6).all()) and bool((centers <= 1.0 + 1e-6).all())
+        and tuple(width.shape) == (len(names),)
+        and bool((width > 0.0).all()) and bool(torch.isfinite(width).all()),
+        f"centers.shape={tuple(centers.shape)}（期望 ({len(names)},"
+        f"{int(add_cfg.geo_rbf_k)})），width={[round(v, 6) for v in width.tolist()]}",
+    )
+    # 构造确定性：同配置两次构造的全部张量逐位一致（几何特征不走随机路径）
+    m_add2 = ThreeDNeuronSpace(add_cfg)
+    snap_add2 = _geo_tensor_snapshot(m_add2)
+    det_bad = [k for k in snap_add if not torch.equal(snap_add[k], snap_add2[k])]
+    rep.check(
+        "S17-5e", "additive 档构造确定性（同配置两次构造全部张量逐位一致）",
+        not det_bad,
+        f"比对 {len(snap_add)} 个张量，不一致={det_bad if det_bad else '无'}",
+    )
+    # 可选扩展开关：默认关闭时特征列集合与文档表格逐字一致
+    rep.check(
+        "S17-5f", "可选扩展开关默认关闭（特征列 == 5 列基准集合）",
+        list(names) == ["zeta", "rho", "dhat", "slack", "mult"]
+        and tuple(raw.shape) == (m_add.num_edges, 5),
+        f"列名={names}，形状={tuple(raw.shape)}",
+    )
+    m_signed = ThreeDNeuronSpace(_geo_config(size_kw, "additive", geo_signed_delta=True))
+    rep.check(
+        "S17-5g", "可选扩展打开时追加 signed dx/dy 两列（默认关闭路径不受影响）",
+        list(m_signed._geo_feature_names)
+        == ["zeta", "rho", "dhat", "slack", "mult", "dx", "dy"]
+        and tuple(m_signed.edge_geo_feat_raw.shape) == (m_signed.num_edges, 7),
+        f"列名={list(m_signed._geo_feature_names)}，"
+        f"形状={tuple(m_signed.edge_geo_feat_raw.shape)}",
+    )
+
+    # ---------------- S17-6：命名不变式 ----------------
+    names_none = {
+        "verify": train_mod.config_fingerprint(none_cfg, 2),
+        "full": train_mod.full_checkpoint_name(none_cfg),
+        "smoke": train_mod.smoke_fingerprint(none_cfg),
+    }
+    names_add = {
+        "verify": train_mod.config_fingerprint(add_cfg, 2),
+        "full": train_mod.full_checkpoint_name(add_cfg),
+        "smoke": train_mod.smoke_fingerprint(add_cfg),
+    }
+    no_seg = all("_geo" not in v for v in names_none.values())
+    has_seg = all("_geo" in v for v in names_add.values())
+    rep.check(
+        "S17-6a", "命名不变式：geo_field=none 无 `_geo` 段；非 none 含段",
+        no_seg and has_seg,
+        f"none -> {names_none}; additive -> {names_add}",
+    )
+    # 段位口径：`_geo` 必须紧随 `_fc{n}` 之后、`_nosyn` 之前（三处指纹一致）
+    order_ok = True
+    detail_order = []
+    for kind, nm in names_add.items():
+        i_geo = nm.find("_geoadditive")
+        i_nosyn = nm.find("_nosyn")
+        i_seed = nm.find("_s42")
+        ok = 0 <= i_geo < i_nosyn < i_seed
+        order_ok &= ok
+        detail_order.append(f"{kind}: geo@{i_geo} nosyn@{i_nosyn} s42@{i_seed} ok={ok}")
+    fc_cfg = _geo_config(size_kw, "additive")
+    fc_cfg2 = Config(**{**fc_cfg.to_dict(), "fc_dim": -1})
+    nm_fc = train_mod.full_checkpoint_name(fc_cfg2)
+    fc_order_ok = nm_fc.find("_fc-1") < nm_fc.find("_geoadditive") < nm_fc.find("_nosyn")
+    rep.check(
+        "S17-6b", "段位口径：`_geo` 紧随 `_fc{n}` 之后、`_nosyn` 之前、`_s{seed}` 之前",
+        order_ok and fc_order_ok,
+        "; ".join(detail_order) + f"；with_fc: {nm_fc}（fc<geo<nosyn={fc_order_ok}）",
+    )
+    # 同 N/H/D/seed/scope 下 geo 档位与形状维度组合两两唯一，且与既有产物零冲突
+    combos = []
+    for shape, lam in SHAPE_CASES:
+        for mode in ("none", "additive"):
+            cfg = _geo_config(size_kw, mode, shape=shape, lam=lam)
+            combos.append(train_mod.full_checkpoint_name(cfg))
+    rep.check(
+        "S17-6c", "形状 x geo 档 组合的产物名两两唯一（防撞名）",
+        len(set(combos)) == len(combos),
+        f"共 {len(combos)} 个名字，去重后 {len(set(combos))} 个",
+    )
+    existing = set()
+    if os.path.isdir(VERIFY_DIR):
+        for nm in os.listdir(VERIFY_DIR):
+            existing.add(nm)
+    parent_dir = os.path.join(PROJECT_ROOT, "checkpoints", "n3d_shape")
+    if os.path.isdir(parent_dir):
+        for nm in os.listdir(parent_dir):
+            existing.add(nm)
+    clash = [n for n in names_add.values() if os.path.basename(n) in existing]
+    clash += [n for n in names_none.values() if os.path.basename(n) in existing]
+    rep.check(
+        "S17-6d", "本轮参试产物名与磁盘既有产物零冲突（不覆盖任何既有取证文件）",
+        not clash,
+        f"磁盘既有文件 {len(existing)} 个；冲突={clash if clash else '无'}",
+    )
+    rep.record("S17_names", {"none": names_none, "additive": names_add})
+
+    # ---------------- S17-7：CLI 层拒绝 mlp + geo_field ----------------
+    try:
+        cli_args = train_mod.parse_args(
+            ["--smoke-test", "--arch", "mlp", "--geo-field", "additive"]
+        )
+        train_mod.validate_override_args(cli_args)
+        rejected, msg = False, "未报错"
+    except ValueError as exc:
+        rejected, msg = True, str(exc)
+    rep.check(
+        "S17-7a", "CLI 拒绝 --arch mlp + geo_field != none（退码 2 路径）",
+        rejected, msg[:220],
+    )
+    # `--geo-field none` 必须被接受（它是**合法覆盖值**，不是"未提供"）
+    try:
+        cli_none = train_mod.parse_args(["--smoke-test", "--geo-field", "none"])
+        train_mod.validate_override_args(cli_none)
+        accepted = bool(cli_none.geo_field == "none")
+        msg2 = f"geo_field={cli_none.geo_field!r}"
+    except ValueError as exc:  # pragma: no cover
+        accepted, msg2 = False, str(exc)
+    rep.check(
+        "S17-7b", "CLI 接受 --geo-field none（合法覆盖值，与『未提供』可区分）",
+        accepted, msg2,
+    )
+    # 未实现档（class_tied / mlp）必须在 Config 构造期显式报错，不得静默降级
+    unimplemented = []
+    for mode in ("class_tied", "mlp"):
+        try:
+            ThreeDNeuronSpace(_geo_config(size_kw, mode))
+            unimplemented.append(f"{mode}: 未报错")
+        except ValueError as exc:
+            if "未实现" not in str(exc):
+                unimplemented.append(f"{mode}: 报错信息未含'未实现' -> {exc}")
+        except Exception as exc:  # pragma: no cover
+            unimplemented.append(f"{mode}: {type(exc).__name__} {exc}")
+    rep.check(
+        "S17-7c", "未实现档 class_tied / mlp 在构造期显式报错（不静默降级为 none）",
+        not unimplemented,
+        f"问题={unimplemented if unimplemented else '无（两档均按未实现拒绝）'}",
+    )
+
+    # ---------------- S17-8：离朱第 1 轮 DEF-1/DEF-2/DEF-3 的回归防线 ----------------
+    # DEF-3：构造期 `geo_alpha_init` 断言必须用**容差**比较；非 float32 可表示的初值
+    # （如 0.4 / 0.1）不得让合法配置无法构造。
+    alpha_cases = [0.4, 0.1, 0.7, 0.3, 0.0, 1.0]
+    alpha_bad = []
+    for a in alpha_cases:
+        try:
+            m = ThreeDNeuronSpace(_geo_config(size_kw, "additive", geo_alpha_init=a))
+            got = float(m.geo_alpha.detach().item())
+            if abs(got - a) > 1e-6 * max(1.0, abs(a)):
+                alpha_bad.append(f"{a}: 实测 {got!r}")
+        except Exception as exc:
+            alpha_bad.append(f"{a}: {type(exc).__name__} {exc}")
+    rep.check(
+        "S17-8a", "DEF-3 回归：非 float32 可表示的 geo_alpha_init 必须可构造（容差断言）",
+        not alpha_bad,
+        f"参试 {alpha_cases}，问题={alpha_bad if alpha_bad else '无'}",
+    )
+    # DEF-1：源码中不得残留非 GBK 可编码字符（本机默认 stdout 为 gbk；两道防线之一）
+    gbk_bad = []
+    here = os.path.dirname(os.path.abspath(__file__))
+    for rel in ("config.py", "model.py", "train.py", "verify_shape.py",
+                "probe_geo_field.py"):
+        with open(os.path.join(here, rel), encoding="utf-8") as fh:
+            for ln, line in enumerate(fh, 1):
+                for col, ch in enumerate(line, 1):
+                    try:
+                        ch.encode("gbk")
+                    except UnicodeEncodeError:
+                        gbk_bad.append(f"{rel}:{ln}:{col}:{hex(ord(ch))}")
+    rep.check(
+        "S17-8b", "DEF-1 回归：本轮改动文件无任何非 GBK 可编码字符（ASCII 化防线）",
+        not gbk_bad,
+        f"命中 {len(gbk_bad)} 处"
+        + (f"：{gbk_bad[:6]}" if gbk_bad else "（默认 GBK 控制台不会再有输出层崩溃）"),
+    )
+    # DEF-1 第二道防线：两个入口模块必须提供 stdout/stderr 重配函数并已调用
+    entry_ok = True
+    entry_detail = []
+    for rel in ("train.py", "verify_shape.py"):
+        src = open(os.path.join(here, rel), encoding="utf-8").read()
+        called = "_reconfigure_stdio()" in src
+        defined = "def _reconfigure_stdio()" in src
+        entry_ok &= bool(called and defined)
+        entry_detail.append(f"{rel}: def={defined} called={called}")
+    rep.check(
+        "S17-8c", "DEF-1 回归：两个入口模块已调用 stdout/stderr UTF-8 重配", entry_ok,
+        "; ".join(entry_detail),
+    )
+    # DEF-2 回归：P0 诊断脚本必须**载入产物权重**（而非按 seed 重建的随机权重）并自证
+    probe_src = open(os.path.join(here, "probe_geo_field.py"), encoding="utf-8").read()
+    probe_json = os.path.join(VERIFY_DIR, "geo_field_p0_probe.json")
+    has_load = "load_state_dict" in probe_src
+    probe_ok = has_load and os.path.isfile(probe_json)
+    probe_detail = f"源码含 load_state_dict={has_load}；报告存在={os.path.isfile(probe_json)}"
+    if probe_ok:
+        try:
+            import json as _json
+            with open(probe_json, encoding="utf-8") as fh:
+                pj = _json.load(fh)
+            probe_ok = bool(
+                pj.get("weight_loaded_from_artifact") is True
+                and pj.get("weight_bitwise_equal_to_artifact") is True
+                and pj.get("weight_source") == "artifact"
+                and not pj.get("common_tensors_mismatch")
+            )
+            probe_detail += (
+                f"；报告自证：source={pj.get('weight_source')}, "
+                f"bitwise_equal={pj.get('weight_bitwise_equal_to_artifact')}, "
+                f"公共张量比对={pj.get('common_tensors_compared')} 个、"
+                f"不一致={len(pj.get('common_tensors_mismatch') or [])} 个"
+            )
+        except Exception as exc:  # pragma: no cover
+            probe_ok = False
+            probe_detail += f"；读取失败：{type(exc).__name__}: {exc}"
+    else:
+        probe_detail += "（缺报告 -> 请先运行 probe_geo_field.py）"
+    rep.check(
+        "S17-8d", "DEF-2 回归：P0 诊断脚本载入产物权重且自证逐位相同", bool(probe_ok),
+        probe_detail,
+    )
+
+    # ---------------- S17-9：离朱第 2 轮 DEF-7（`geo_alpha_init` 未进指纹 -> 静默互覆） ----------------
+    # 复现口径：`geo_alpha_init ∈ {1.0, 0.4, 0.0}` 若生成**同一名字**，则
+    # `--smoke-test --geo-field additive --geo-alpha-init 0.4` 会**静默覆盖** canonical 产物。
+    # 修复口径：三处指纹在 `geo_field != "none"` 时追加 `_a{alpha_init:g}`，
+    # **仅当 `geo_alpha_init != 1.0`** 才插入（默认组合的产物名逐字不变）。
+    alpha_vals = [1.0, 0.4, 0.0, 0.5, 2.0]
+    fp_names = {}
+    for a in alpha_vals:
+        c = _geo_config(size_kw, "additive", geo_alpha_init=a)
+        fp_names[a] = (
+            train_mod.full_checkpoint_name(c),
+            train_mod.smoke_fingerprint(c),
+            train_mod.config_fingerprint(c, 2),
+        )
+    all_names = [n for v in fp_names.values() for n in v]
+    rep.check(
+        "S17-9a", "DEF-7 回归：不同 geo_alpha_init 的三处指纹名互不相同（防静默互覆）",
+        len(set(all_names)) == len(all_names),
+        f"参试 {alpha_vals} x 3 处指纹 = {len(all_names)} 个名字，去重后 {len(set(all_names))} 个；"
+        + "; ".join(f"a={a} -> {v[0]}" for a, v in fp_names.items()),
+    )
+    # 默认值（1.0）必须**逐字不含** `_a` 段（既有产物名口径不受影响）
+    default_clean = all("_a" not in v[0].split("_geoadditive")[1] for v in [fp_names[1.0]])
+    rep.check(
+        "S17-9b", "DEF-7 回归：默认 geo_alpha_init=1.0 的产物名不含 `_a` 段（既有名逐字不变）",
+        default_clean,
+        f"a=1.0 -> {fp_names[1.0][0]}",
+    )
+    # 非默认值必须**含** `_a{值}` 段，且与该值对应
+    non_default_ok = all(
+        f"_a{float(a):g}_" in fp_names[a][0] or fp_names[a][0].find(f"_a{float(a):g}") > 0
+        for a in (0.4, 0.0, 0.5, 2.0)
+    )
+    rep.check(
+        "S17-9c", "DEF-7 回归：非默认 geo_alpha_init 的产物名含对应 `_a{值}` 段",
+        non_default_ok,
+        "; ".join(f"a={a} -> {fp_names[a][0]}" for a in (0.4, 0.0, 0.5, 2.0)),
+    )
+
+    # ---------------- S17-10：皋陶审查 F1 / F2 的常驻回归防线 ----------------
+    # F1（error，阻断项）：关闭路径的单 param group **必须携带** `weight_decay` ——
+    # 否则 `AdamW(param_groups, weight_decay=0.0)` 会把 wd 静默关成 0（关闭路径行为回归）。
+    # [!] **直接调用 train.build_param_groups / build_optimizer 的真实实现**，不在此重写一遍：
+    #     重写属"同源自洽"，注入 F1 缺陷后**抓不到**（本轮实测：变异 M9 在重写版判据下逃逸）。
+    f1_cases = [
+        ("none", 1e-4), ("none", 0.0), ("none", 1e-2),
+        ("additive", 1e-4), ("additive", 0.0),
+    ]
+    f1_bad = []
+    for mode, wd in f1_cases:
+        cfg = _geo_config(size_kw, mode)
+        cfg = Config(**{**cfg.to_dict(), "weight_decay": wd})
+        mdl = ThreeDNeuronSpace(cfg)
+        opt = train_mod.build_optimizer(mdl, cfg)
+        eff = [float(g.get("weight_decay", 0.0)) for g in opt.param_groups]
+        want = [wd, 0.0] if mode != "none" else [wd]
+        if eff != want:
+            f1_bad.append(f"{mode}/wd={wd:g}: 实测 {eff} 期望 {want}")
+    rep.check(
+        "S17-10a", "F1 回归：生效 weight_decay 逐组等于配置（关闭路径不再是 0）",
+        not f1_bad,
+        f"参试 {len(f1_cases)} 组（直接调用 train.build_param_groups），"
+        f"问题={f1_bad if f1_bad else '无'}",
+    )
+    # F1 数值对照：关闭路径「当前实现口径」必须与「改动前口径」一步更新**逐位一致**
+    kw_wd = dict(size_kw)
+    cfg_wd = Config(**{**kw_wd, "geo_field": "none", "weight_decay": 1e-3,
+                       "shape": "sphere", "cyl_aspect": 1.0, "flow_axis": "z",
+                       "input_scope": "any_isolated", "readout_scope": "any_isolated",
+                       "input_dim": 784, "output_dim": 10, "lr": 1e-3, "epochs": 1,
+                       "seed": 42, "device": "cpu"})
+    m_old = ThreeDNeuronSpace(cfg_wd)
+    m_new = ThreeDNeuronSpace(cfg_wd)
+    opt_old = torch.optim.AdamW(
+        m_old.parameters(), lr=cfg_wd.lr, weight_decay=cfg_wd.weight_decay
+    )
+    opt_new = train_mod.build_optimizer(m_new, cfg_wd)
+    torch.manual_seed(7)
+    for (_, pa) in m_old.named_parameters():
+        if pa.requires_grad:
+            pa.grad = torch.randn_like(pa) * 1e-3
+    for (_, pb), (_, pa) in zip(m_new.named_parameters(), m_old.named_parameters()):
+        if pb.requires_grad:
+            pb.grad = pa.grad.detach().clone()
+    opt_old.step()
+    opt_new.step()
+    f1_diffs = [
+        float((pa.detach() - pb.detach()).abs().max())
+        for (_, pa), (_, pb) in zip(m_old.named_parameters(), m_new.named_parameters())
+    ]
+    f1_same = max(f1_diffs) == 0.0
+    rep.check(
+        "S17-10b", "F1 回归：关闭路径一步更新与改动前口径逐位一致（wd=1e-3）",
+        f1_same,
+        f"全参数最大差={max(f1_diffs):.6g}（0 表示逐位一致）",
+    )
+
+    # F2（warning）：`geo_field=none` 时**不得执行** mult 归约 —— 用 `bisect_left` 调用计数作探针
+    # （该函数全模块仅用于 mult 分块定位；关闭路径调用次数必须为 0）。
+    # [!] 必须按 `ThreeDNeuronSpace.__module__` 解析模块对象：本脚本以**脚本方式**运行时
+    #     走的是 `except ImportError` 分支（`from model import ...`），模块名是 `model`；
+    #     若直接 `import n3d_shape.model` 会拿到**另一个模块对象**，patch 不到真身
+    #     （本轮实测该写法使探针恒为 0，属**探针自身缺陷**，已修正并留档）。
+    _model_mod = sys.modules[ThreeDNeuronSpace.__module__]
+    f2_calls = {"n": 0}
+    _orig_bisect = _model_mod.bisect_left
+
+    def _counting_bisect(a, b, _o=_orig_bisect):
+        f2_calls["n"] += 1
+        return _o(a, b)
+
+    f2_detail = []
+    f2_ok = True
+    try:
+        _model_mod.bisect_left = _counting_bisect
+        for tag, kw in (
+            ("SMALL/N=64", dict(size_kw)),
+            ("N=1024/D=0.065", dict(N=1024, y_in=8, y_out=8, H=0.1, D=0.065,
+                                    batch_size=64)),
+        ):
+            f2_calls["n"] = 0
+            _ = ThreeDNeuronSpace(
+                Config(**{**kw, "geo_field": "none", "shape": "sphere",
+                          "cyl_aspect": 1.0, "flow_axis": "z",
+                          "input_scope": "any_isolated", "readout_scope": "any_isolated",
+                          "input_dim": 784, "output_dim": 10, "lr": 1e-3, "epochs": 1,
+                          "seed": 42, "device": "cpu"})
+            )
+            f2_detail.append(f"{tag}: none 档 bisect_left={f2_calls['n']}")
+            f2_ok &= f2_calls["n"] == 0
+        # 开启档必须**大于 0**（证明探针有区分力，不是恒 0 的空转判据）
+        f2_calls["n"] = 0
+        _ = ThreeDNeuronSpace(
+            Config(**{**dict(N=1024, y_in=8, y_out=8, H=0.1, D=0.065, batch_size=64),
+                      "geo_field": "additive", "shape": "sphere", "cyl_aspect": 1.0,
+                      "flow_axis": "z", "input_scope": "any_isolated",
+                      "readout_scope": "any_isolated", "input_dim": 784, "output_dim": 10,
+                      "lr": 1e-3, "epochs": 1, "seed": 42, "device": "cpu"})
+        )
+        f2_detail.append(f"N=1024: additive 档 bisect_left={f2_calls['n']}（须 > 0）")
+        f2_ok &= f2_calls["n"] > 0
+    finally:
+        _model_mod.bisect_left = _orig_bisect
+    rep.check(
+        "S17-10c", "F2 回归：none 档不执行 mult 归约（bisect_left 调用 0），开档仍执行",
+        bool(f2_ok), "; ".join(f2_detail),
+    )
+    # F2 数值不受影响：开/关档公共 state_dict 张量逐位一致
+    f2b_bad = []
+    for kw in (dict(size_kw), dict(N=256, y_in=8, y_out=8, H=0.1, D=0.1, batch_size=64)):
+        common_kw = {**kw, "shape": "sphere", "cyl_aspect": 1.0, "flow_axis": "z",
+                     "input_scope": "any_isolated", "readout_scope": "any_isolated",
+                     "input_dim": 784, "output_dim": 10, "lr": 1e-3, "epochs": 1,
+                     "seed": 42, "device": "cpu"}
+        ma = ThreeDNeuronSpace(Config(**{**common_kw, "geo_field": "none"}))
+        mb = ThreeDNeuronSpace(Config(**{**common_kw, "geo_field": "additive"}))
+        sd_a, sd_b = ma.state_dict(), mb.state_dict()
+        bad = [k for k in sd_a if k in sd_b and not torch.equal(sd_a[k], sd_b[k])]
+        f2b_bad += bad
+    rep.check(
+        "S17-10d", "F2 回归：开/关档公共 state_dict 张量逐位一致（条件化未改变数值）",
+        not f2b_bad,
+        f"不一致={f2b_bad if f2b_bad else '无'}",
+    )
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -789,6 +1512,9 @@ def main(argv: List[str] | None = None) -> int:
         check_negatives(rep)
         check_fingerprint(rep)
         check_phase2_equality(rep)
+        # S17：几何权重场（`geo_field`）开关与 `additive` 档（第 5 轮新增）。
+        # `--quick` 与全量**都跑**（S17 全部子判据都在 SMALL 规模上，实测耗时 < 5s）。
+        check_geo_field(rep)
         check_large_n_tolerance(rep, full=not args.quick)
         check_boundary_anchors(rep, full=not args.quick)
     except Exception:
@@ -796,7 +1522,7 @@ def main(argv: List[str] | None = None) -> int:
 
     title = "n3d_shape 形状变体验证报告"
     if args.quick:
-        # ⚠️ 离朱信息项 I1（已修复）：`--quick` 原先与全量写**同一份**报告文件，
+        # [!] 离朱信息项 I1（已修复）：`--quick` 原先与全量写**同一份**报告文件，
         #    跑一次快速验证会把全量报告（103 条）覆盖成快速版（73 条），
         #    使"报告落盘的断言条数"与最近一次运行模式绑定，复核时容易误读。
         #    现按模式分名落盘，两份报告互不覆盖。

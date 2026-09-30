@@ -4,5 +4,7 @@
   "n3d_shape/train.py": "cbe0a7ee76d14fdedada972f9142233e",
   "n3d_shape/__init__.py": "71230c2fc9e836826c2b0d1636763eb7",
   "n3d_shape/verify_full_runs.py": "7f6ce345798dce8896a935d7f4b40a11",
-  "n3d_shape/README.md": "261f1ea896549c7152fdfc01905a4320"
+  "n3d_shape/README.md": "261f1ea896549c7152fdfc01905a4320",
+  "n3d_shape/verify_shape.py": "5d85bc92c1e1c92a1653f4d24bca7014",
+  ".module_agent/n3d_shape/current_spec.md": "72781b940fc9ebe6297012de62b20d8b"
 }

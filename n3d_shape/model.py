@@ -78,6 +78,45 @@
 * `readout_activations()` 的 `[B, N]` 掩码契约**保持不变**（两条路径共用，供冒烟判据 [13] 与
   既有调用方使用）；fc 路径的 (4)(5)(6) 由 `fc_readout_logits()` 承担、由 `forward()` 分派。
 
+**几何权重场（`geo_field`，第 5 轮新增，默认关闭）**
+----------------------------------------------------
+把"形状 = 生长度量"升级为"形状 = 生长度量 **+ 几何权重场**"：让学习权重成为神经元 3D
+坐标的函数，而不仅是决定"谁连谁"。本批只实现**开关 + `additive`（RBF）档**。
+
+* `geo_field == "none"`（默认）时**连几何特征都不构造**：`edge_geo_feat` 等 buffer 不注册、
+  `geo_rbf_theta` / `geo_alpha` 参数不创建，参数创建顺序与名称、`forward` 数值与改动前
+  **逐位一致**（`shape=sphere` 仍与二期 `torch.equal` 一致）；
+* `geo_field == "additive"` 时，每条边的**有效权重**（作用在阶段 2 的两份副本上）为
+
+      w_e = w_free[e] + alpha · ( Σ_{k=1..K} c_k · φ_k(φ_e) + c_0 )
+
+  其中 `w_free` 即既有的 `edge_weight` 参数，`φ_e ∈ R^F` 是**边级无量纲几何特征**
+  （见下），`φ_k` 是 RBF 基（中心 = **逐维分位点**、宽度 = **逐维相邻中心间距均值**
+  （下限 `1e-3`），全部由确定性算法在 `__init__` 算出并 `register_buffer`，写入 README），
+  `c`（= `geo_rbf_theta`，形状 `[K+1]`，末位为偏置 `c_0`）**零初始化**、
+  `alpha`（= `geo_alpha`）初值 `geo_alpha_init`（默认 1.0）且**可学习**。
+  `c = 0` 时 `w_e == w_free[e]` —— 这是"开启开关 + 零初始化 => 前向与基线 `torch.equal`"
+  这条不变式的依据。
+* **RNG 隔离（硬要求）**：`c` 与 `alpha` 用**独立 generator**（`seed + 2`）初始化。
+  若与 `_init_parameters` 的 `gen`（`seed + 1`）共用，基座参数 `W_in` / `edge_weight` /
+  `neuron_bias` 的随机流会被平移，导致"开关 on/off 下基座参数初始化逐位一致"这条
+  RNG 隔离守卫失败。且末层（`c`）零初始化本身不消耗随机数 —— 它用 `zero_()`。
+
+边级特征 `φ_e`（全部**无量纲**；`Δp = p_B - p_A`，`H` / `D` 为配置的半径与连接阈值）
+------------------------------------------------------------------------------------
+| 序号 | 名称   | 定义                              | 取值域（契约）        |
+|------|--------|-----------------------------------|-----------------------|
+| 0    | `zeta` | `Δz / H`（流向轴分量；恒正）      | `> 0`                 |
+| 1    | `rho`  | `‖Δp_xy‖2 / H`（横向分量模）      | `>= 0`                |
+| 2    | `dhat` | `edge_dist / D`                   | `∈ (0, 1]`            |
+| 3    | `slack`| `(D - edge_dist) / D`             | `∈ [0, 1)`            |
+| 4    | `mult` | 该神经元对在 `D` 内的**可行握手对数** | `>= 1`（整数）        |
+
+`mult` 复用 `_build_neuron_edges` 中已有的 `pair_blocks` 归约（`(pair_blocks <= D)`
+在 `(o, j)` 两维上求和），索引方式与 `valid_linear` / `order` 一致。
+可选扩展开关（**默认关闭**）`enable_signed_delta` 追加 signed `Δx/H` 与 `Δy/H` 两列。
+**`geo_field == "none"` 时不构造任何特征张量、不执行本步。**
+
 参数集合
 --------
 `W_in [input_dim, |S_in|]`、`edge_weight [E_neuron]`（每条神经元级连接一个）、
@@ -115,6 +154,11 @@
 | head_weight               | [output_dim, H]       | Parameter（仅 fc_dim!=0） |
 | head_bias                 | [output_dim]          | Parameter（仅 fc_dim!=0） |
 | out_scope_index           | [|S_out|]             | buffer (int64)（仅 fc_dim!=0） |
+| edge_geo_feat             | [E_neuron, F]         | buffer（**persistent=False**，仅 geo_field!=none） |
+| edge_geo_feat_raw         | [E_neuron, F]         | buffer（**persistent=False**，仅 geo_field!=none） |
+| geo_rbf_centers           | [K]                   | buffer（仅 geo_field!=none） |
+| geo_rbf_theta             | [K+1]                 | Parameter（仅 geo_field!=none，末位为偏置） |
+| geo_alpha                 | []                    | Parameter（仅 geo_field!=none） |
 
 产物持久性（`nosyn` 口径）
 --------------------------
@@ -151,6 +195,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import math
+from bisect import bisect_left
 from typing import Dict, List, Tuple
 
 import torch
@@ -183,6 +228,23 @@ __all__ = ["ThreeDNeuronSpace", "MLPBaseline", "NEURON_BIAS_INIT"]
 # 神经元偏置初始值（正偏置）：保证阶段 1/2 的 ReLU 在训练初期不会被完全抑制，
 # 从而 `W_in` / `edge_weight` / `neuron_bias` 都能拿到非零梯度。
 NEURON_BIAS_INIT: float = 0.1
+
+# ---- 几何权重场（geo_field）的边级特征列定义（本模块第 5 轮新增）----
+# 顺序即 `edge_geo_feat` 的列序；全部**无量纲**（`H` = 神经元半径、`D` = 连接阈值）。
+GEO_EDGE_FEATURE_NAMES: Tuple[str, ...] = ("zeta", "rho", "dhat", "slack", "mult")
+# 可选扩展开关打开时追加的两列（signed 横向位移，默认**关闭**）
+GEO_EDGE_FEATURE_NAMES_SIGNED: Tuple[str, ...] = ("dx", "dy")
+# `mult` 的压缩变换：`log1p(mult)`（`mult` 可达数十至数百，与其余特征不同量级；
+# 采用 `log1p` 而非线性缩放，是为了让"握手对数"的**倍数关系**进入特征而不过度挤压小值）
+GEO_MULT_TRANSFORM: str = "log1p"
+# RBF 宽度的下界（逐维）：`width[j] >= GEO_RBF_WIDTH_FLOOR_FRAC`。
+# 理由：归一化特征恒落在 `[0, 1]`，故 1.0 即全域跨度。取 `5e-2` 即"每维至少铺设约
+# 20 个有效分辨率单元"，既保证**每个基函数在其中心附近的梯度非零**（不会出现
+# `exp(-huge) == 0` 的死基），也保证分位点重合的**退化维**（FCC 规则晶格上 `zeta`/`rho`
+# 只取 2~7 个离散值）不会把中心挤成一堆 δ 尖峰。
+GEO_RBF_WIDTH_FLOOR_FRAC: float = 5e-2
+# `mult` 计数分块的 pair 元素数上限（防止大规模下布尔中间量一次性占满内存）
+GEO_MULT_CHUNK_PAIRS: int = 1 << 22
 
 
 class ThreeDNeuronSpace(nn.Module):
@@ -242,6 +304,21 @@ class ThreeDNeuronSpace(nn.Module):
         self.n_in_syn: int = int(config.n_input_syn)    # N * y_in
         self.n_out_syn: int = int(config.n_output_syn)  # N * y_out
 
+        # ---- 几何权重场（geo_field，第 5 轮新增）----
+        # [!] `geo_field == "none"`（默认）时**一个几何特征 buffer / 一个几何参数都不创建**，
+        #     且下方**不执行几何特征构造**（与 fc_dim 关闭时的"一个 FC 参数都不创建"同源纪律）。
+        self.geo_field: str = str(config.geo_field)
+        self.geo_enabled: bool = bool(config.geo_enabled)
+        self.geo_rbf_k: int = int(config.geo_rbf_k)
+        # 可选扩展开关（**默认关闭**）：追加 signed `dx/H` 与 `dy/H` 两列特征。
+        # 默认关闭 => 特征列集合与文档表格逐字一致；打开时由 `Config.geo_signed_delta` 控制。
+        self.geo_signed_delta: bool = bool(config.geo_signed_delta)
+        self._geo_feature_names: Tuple[str, ...] = (
+            GEO_EDGE_FEATURE_NAMES
+            if not self.geo_signed_delta
+            else GEO_EDGE_FEATURE_NAMES + GEO_EDGE_FEATURE_NAMES_SIGNED
+        )
+
         # 用 config.seed 派生的局部生成器采样固定坐标，保证模块级可复现且不扰动全局随机状态
         gen = torch.Generator(device="cpu").manual_seed(int(config.seed))
 
@@ -256,7 +333,7 @@ class ThreeDNeuronSpace(nn.Module):
         #     `placement_radius / R_max`）：`sphere` 0.5137（**满足**）、`cube` **1.2090**、
         #     `cylinder(λ=1)` 0.8308、`λ=0.5` 0.6944、`λ=2` **1.7157**；SMALL 口径 `sphere` 0.5057、
         #     `cube` 1.2993、`cylinder(λ=2)` 1.5993。原因是 `R_max = B·(N/φ)^(1/3)/circum_coef`
-        #     随 `circum_coef` 变大而**变小**，而立方体/细高圆柱的放置半径按 `‖p‖∞`/`max(‖p_xy‖₂,·)`
+        #     随 `circum_coef` 变大而**变小**，而立方体/细高圆柱的放置半径按 `‖p‖∞`/`max(‖p_xy‖2,·)`
         #     生长时外接半径本就更大 —— 两者尺度不同源。
         #     故：**`shape=sphere` 分支保留二期的 `placement_radius <= R_max` 硬断言**
         #     （球体口径下恒成立，且实测不破坏"默认分支与二期逐位一致"硬约束）；
@@ -285,7 +362,7 @@ class ThreeDNeuronSpace(nn.Module):
         #     即**实际放置已略微超出公式下界**。硬断言会让默认分支无法构造，
         #     与"默认分支必须与二期张量级逐位一致"直接冲突。
         #     故此处**如实记录**该事实，并把"窗口是否真的容纳了放置/选取"作为**可复核诊断量**。
-        #     ⚠️ 这些诊断量**已接入** `get_topology_stats()`、训练日志与产物元数据（皋陶 I1）。
+        #     [!] 这些诊断量**已接入** `get_topology_stats()`、训练日志与产物元数据（皋陶 I1）。
         self.selection_metric: float = float(selection_metric)
         self.selection_metric_within_space: bool = bool(
             self.selection_metric <= self.space_radius + 1e-9
@@ -331,6 +408,7 @@ class ThreeDNeuronSpace(nn.Module):
             input_isolated_mask,
             output_isolated_mask,
             neuron_conn_mask,
+            geo_mult_before_order,
         ) = self._build_neuron_edges(neuron_pos, syn_dist)
         self.num_edges: int = int(edge_src.numel())
         if self.num_edges <= 0:
@@ -350,6 +428,39 @@ class ThreeDNeuronSpace(nn.Module):
         self.register_buffer("neuron_conn_mask", neuron_conn_mask, persistent=False)
         self.register_buffer("input_isolated_mask", input_isolated_mask, persistent=False)
         self.register_buffer("output_isolated_mask", output_isolated_mask, persistent=False)
+
+        # ---------------- 几何权重场的边级特征（**仅开关打开时构造**） ----------------
+        # [!] 硬约束（计划第 1 条）：`geo_field == "none"` 时**连几何特征构造都不执行**
+        #     —— 本分支整段跳过，不注册任何 buffer、不创建任何参数，代码路径与改动前一致。
+        #     本步**不消耗任何新随机数**（全部是已有张量上的确定性算术）。
+        if self.geo_enabled:
+            edge_geo_feat_raw = self._build_geo_edge_features(
+                neuron_pos=neuron_pos,
+                edge_src=edge_src,
+                edge_dst=edge_dst,
+                edge_dist=edge_dist,
+                mult=geo_mult_before_order,
+            )
+            # 归一化用 min/max（**构造期实测、detach**，作为 buffer 固定下来）：
+            # 归一化后特征恒落在 [0, 1]，使 RBF 中心 / 宽度与特征量纲解耦。
+            feat_min = edge_geo_feat_raw.amin(dim=0)
+            feat_max = edge_geo_feat_raw.amax(dim=0)
+            # 归一化特征（`forward` 直接读取该 buffer，不在前向里重算 min/max）
+            edge_geo_feat = (edge_geo_feat_raw - feat_min) / (
+                feat_max - feat_min
+            ).clamp_min(1e-12)
+            self.register_buffer("edge_geo_feat_raw", edge_geo_feat_raw, persistent=False)
+            self.register_buffer("edge_geo_feat_min", feat_min, persistent=False)
+            self.register_buffer("edge_geo_feat_max", feat_max, persistent=False)
+            self.register_buffer("edge_geo_feat", edge_geo_feat, persistent=False)
+            # RBF 中心与宽度：由**确定性分位点**给出（无随机数消耗），写入 README。
+            centers, width = self._build_geo_rbf_basis(
+                self.edge_geo_feat, self.geo_rbf_k
+            )
+            self.register_buffer("geo_rbf_centers", centers, persistent=True)
+            self.register_buffer("geo_rbf_width", width, persistent=True)
+            # 特征取值域契约断言（S17-5 的构造期内建防线；与验证脚本的独立复算互为对照）
+            self._assert_geo_feature_domain()
 
         # ---------------- 拓扑序与 CSR 风格分组（按源神经元分组的连续切片） ----------------
         topo_index = self._build_topo_order()
@@ -453,6 +564,56 @@ class ThreeDNeuronSpace(nn.Module):
             )
             self.head_bias = nn.Parameter(torch.zeros(int(config.output_dim)))
         self._init_parameters()
+
+        # ---- 几何权重场参数（**仅开关打开时创建**）----
+        # [!] 放在 `_init_parameters()` **之后**：这样即使将来在参数创建顺序上有改动，
+        #     也不会影响"关闭路径逐位不变"这条硬约束（关闭时本段整段跳过）。
+        if self.geo_enabled:
+            self.geo_rbf_theta = nn.Parameter(torch.zeros(self.geo_rbf_k + 1))
+            self.geo_alpha = nn.Parameter(
+                torch.tensor(float(config.geo_alpha_init), dtype=torch.float32)
+            )
+            self._init_geo_parameters()
+            # **generator 隔离守卫**（**同语句自洽断言 —— 能力有界，如实披露**，皋陶 F5）：
+            # 本断言只能捕获"把 `seed + 2` 字面量改成别的值"这一类编辑；**不能**捕获
+            # "把 `_init_geo_parameters` 整体替换成使用 `seed+1` 且自洽断言的等价实现"
+            # （实测该替换后构造成功、零报错）。真正的 RNG 隔离承担者是：
+            #   ① **结构性创建顺序** —— 几何参数严格在 `_init_parameters()`（其自身使用局部
+            #      generator）**之后**创建，且本方法使用**自己的** generator；
+            #   ② **S17-3a 判据** —— `geo_field=none` 与 `additive` 两次构造的全部公共
+            #      参数/buffer 逐位比对（实测 28 个公共张量逐位一致）。
+            _iso = torch.Generator(device="cpu").manual_seed(int(config.seed) + 2)
+            assert tuple(self.geo_rbf_theta.shape) == (self.geo_rbf_k + 1,), (
+                "[契约失败] geo_rbf_theta 形状必须为 [k+1]（末位为偏置 c_0）"
+            )
+            assert int(_iso.initial_seed()) == int(config.seed) + 2, (
+                "[契约失败] 几何场参数的初始化 generator 必须为 seed+2（独立于基座参数）"
+            )
+            # [!] **必须用容差比较，不可用精确 `==`**（离朱 DEF-3 实测）：
+            #     左侧是 float32 张量取出的值、右侧是 Python float64，
+            #     非 float32 可表示的初值（如 `geo_alpha_init=0.4`）在精确比较下必然失败
+            #     （实测 `0.4000000059604645 != 0.4` -> 构造期 AssertionError，退码 1），
+            #     而 `1.0` / `0.0` 恰好可精确表示，于是默认路径**掩盖**了该缺陷。
+            _alpha_got = float(self.geo_alpha.detach().item())
+            _alpha_want = float(config.geo_alpha_init)
+            assert abs(_alpha_got - _alpha_want) <= 1e-6 * max(1.0, abs(_alpha_want)), (
+                "[契约失败] geo_alpha 初值必须等于 geo_alpha_init="
+                f"{_alpha_want}（float32 容差 1e-6），实测 {_alpha_got!r}"
+            )
+            # 零初始化不变式（结构前提）：`theta == 0` => `w_e == w_free[e]` => 前向与基线逐位一致
+            assert bool((self.geo_rbf_theta == 0).all()), (
+                "[契约失败] geo_field != none 时 RBF 系数必须**零初始化**"
+                "（否则'开启开关 + 零初始化 => 前向与基线 torch.equal'这条不变式不成立）"
+            )
+            self.geo_theta_init_zeros: bool = True
+            # 结构性零梯度参数名单（冒烟判据 [3] 的**显式豁免清单**）：
+            # `dL/dalpha = Σ_e Δ_e · 场(φ_e)`，而场系数 `c` 零初始化 => 初始 `场 == 0`
+            # => `dL/dalpha == 0`（后续步骤经 `c` 回传即非零）。这是与"W_out 的非 S_out 列
+            # 结构性零梯度"同源的设计预期，故在判据中豁免而不是放宽判据本身。
+            self._geo_zero_grad_params: Tuple[str, ...] = ("geo_alpha",)
+        else:
+            # 关闭路径：空清单（判据行为与改动前逐字一致）
+            self._geo_zero_grad_params = ()
 
     # ==================================================================
     # 几何：FCC 规则堆积 + 突触半球采样
@@ -652,7 +813,7 @@ class ThreeDNeuronSpace(nn.Module):
         #   [!] 为什么需要那个**常数项**（离朱 R6 实测发现的同类假阳性）：
         #       被断言的量是 `torch.cdist` 在 **float32** 下算出的**距离**，其误差包含两部分：
         #       ① 坐标域舍入 ≈ `6e-8·L`（随量级线性放大，即尺度项）；
-        #       ② 距离域累加舍入 `a·a − 2ab + b·b` —— **与 `max|coord|` 不同步增长**。
+        #       ② 距离域累加舍入 `a·a - 2ab + b·b` —— **与 `max|coord|` 不同步增长**。
         #       实测（多形状 × N=512…4096）：**距离域项在 N=3072/4096 达到饱和 ≈ 2.471e-6**；
         #       同一批坐标若改用 **float64 算距离**，偏差落在**离散量化下限 `[3.29e-8, 5.40e-8]`**
         #       （实测 35 组：33 组 `5.40e-8`，仅 `N=512` 的 sphere / cylinder λ=2 为 `3.29e-8`；
@@ -756,6 +917,7 @@ class ThreeDNeuronSpace(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
         """按神经元级规则构图，**同一神经元对只保留一条代表连接**（间距最近的一对）。
 
@@ -779,12 +941,18 @@ class ThreeDNeuronSpace(nn.Module):
         ----
         Tuple[torch.Tensor, ...]
             (edge_src, edge_dst, edge_dist, rep_syn_out, rep_syn_input,
-             input_isolated_mask, output_isolated_mask, neuron_conn_mask)：
+             input_isolated_mask, output_isolated_mask, neuron_conn_mask, mult):
             * edge_src / edge_dst / edge_dist：[E_neuron] 的起点神经元 / 终点神经元 / 代表连接间距；
             * rep_syn_out / rep_syn_input：[E_neuron] 代表连接的（输出突触, 输入突触）全局索引；
             * input_isolated_mask：[N*y_in] 0/1，第 j 个输入突触是否孤立；
             * output_isolated_mask：[N*y_out] 0/1，第 o 个输出突触是否孤立；
-            * neuron_conn_mask：[N, N] 0/1 神经元级连接掩码（行 = 起点 A，列 = 终点 B）。
+            * neuron_conn_mask：[N, N] 0/1 神经元级连接掩码（行 = 起点 A，列 = 终点 B）；
+            * mult：[E_neuron] **该神经元对在 D 内的可行握手对数**（本模块第 5 轮新增，
+              供几何权重场的 `mult` 特征使用）。它复用本函数已有的 `pair_blocks`
+              归约，索引方式与 `valid_linear` / `order` **完全一致**，逐边与
+              `edge_src` / `edge_dst` 对齐（**已在 `order` 重排后同步**）。
+              `mult >= 1` 恒成立（该边存在即意味着至少有一对突触间距 `<= D`）。
+              [E=0] 的退化分支返回空张量。
         """
         H = float(self.config.H)
         D = float(self.config.D)
@@ -836,6 +1004,63 @@ class ThreeDNeuronSpace(nn.Module):
         valid_linear = torch.nonzero(
             neuron_conn_mask.reshape(-1) > 0, as_tuple=False
         ).reshape(-1)
+
+        # ---- 几何权重场的 `mult` 特征（本模块第 5 轮新增）----
+        # [!] **仅 `geo_field != "none"` 时执行**（皋陶审查 F2，已修复）：本块原先**无条件**
+        #     执行，而结果只在 `if self.geo_enabled` 分支（`_build_geo_edge_features`）被消费 ——
+        #     关闭路径白付开销（实测 N=1024/y=8x8/D=0.065 构造 0.625s -> 0.849s，**+0.224s 约 +26%**；
+        #     `bisect_left` 在 none 档构造期被调用 96 次），与硬约束「关闭时连几何特征构造都不执行」
+        #     的字面口径冲突。本块**纯确定性算术、不消耗随机数**，故条件化不影响基座参数逐位一致。
+        # ---- 以下为口径说明（仅开关打开时生效）----
+        # `mult[A, B]` = 该神经元对在 D 内的**可行握手对数** = |{(o, j) : d(o,j) <= D}|。
+        # 复用 `syn_dist` 的 [N_A, y_out, N_B, y_in] 视图，**逐 B 分块**在突触两维上求和：
+        # 分块口径与 `pair_blocks.reshape(N*N, y_out, y_in)` 的**块内线性序一致**
+        # （同一视图、同一 (o, j) 排布），故逐元素与整体归约等价，但峰值内存
+        # 由 `N^2·y_out·y_in` 降到 `N·y_out·chunk·y_in`（N≈2976 时布尔中间量约 0.5G 元素，
+        # 一次性 materialize 会直接撑爆内存/显存）。
+        # 与 `pair_min` / `neuron_conn_mask` 同一次归约口径，**不新增随机数、不改连接判据**。
+        # [!] `valid_linear` 已按 (A, B) 升序（`nonzero` 的行优先序），故逐个 A 段内的
+        #     B 下标单调递增 —— 用双指针把每个 A 段与 B 分块线性配对，避免任何
+        #     `N x N` 布尔矩阵运算。逐段只把少量下标搬到 Python 侧（列表切片，非逐元素循环）。
+        if self.geo_enabled:
+            mult_pairs = torch.zeros(
+                valid_linear.numel(), dtype=torch.float32, device=syn_dist.device
+            )
+            if valid_linear.numel() > 0:
+                blocks_view = syn_dist.reshape(self.N, y_out, self.N, y_in)
+                b_chunk = max(
+                    1, int(GEO_MULT_CHUNK_PAIRS) // max(1, self.N * y_out * y_in)
+                )
+                valid_list: List[int] = valid_linear.tolist()
+                ptr = 0
+                for a in range(self.N):
+                    hi_a = ptr
+                    while hi_a < len(valid_list) and valid_list[hi_a] // self.N == a:
+                        hi_a += 1
+                    if hi_a == ptr:
+                        continue
+                    b_list = [v - a * self.N for v in valid_list[ptr:hi_a]]
+                    for b0 in range(0, self.N, b_chunk):
+                        b1 = min(b0 + b_chunk, self.N)
+                        lo = bisect_left(b_list, b0)
+                        hi = bisect_left(b_list, b1)
+                        if hi <= lo:
+                            continue
+                        pair_chunk = blocks_view[a, :, b0:b1, :].reshape(
+                            y_out, b1 - b0, y_in
+                        )
+                        hit = (pair_chunk <= D).sum(dim=0).sum(dim=-1).to(torch.float32)
+                        cols = torch.tensor(
+                            [b - b0 for b in b_list[lo:hi]],
+                            dtype=torch.long,
+                            device=syn_dist.device,
+                        )
+                        mult_pairs[ptr + lo:ptr + hi] = hit.index_select(0, cols)
+                    ptr = hi_a
+        else:
+            # 关闭路径：**不执行 mult 归约**，返回 0 长占位张量（调用方只在 geo_enabled 时消费）
+            mult_pairs = torch.zeros(0, dtype=torch.float32, device=syn_dist.device)
+
         if valid_linear.numel() == 0:
             empty = torch.zeros(0, dtype=torch.long)
             empty_f = torch.zeros(0, dtype=syn_dist.dtype)
@@ -848,6 +1073,7 @@ class ThreeDNeuronSpace(nn.Module):
                 input_isolated_mask,
                 output_isolated_mask,
                 neuron_conn_mask,
+                mult_pairs,
             )
         edge_src = torch.div(valid_linear, self.N, rounding_mode="floor").to(torch.long)
         edge_dst = (valid_linear - edge_src * self.N).to(torch.long)
@@ -877,6 +1103,12 @@ class ThreeDNeuronSpace(nn.Module):
         ), "[契约失败] 构图出现 z_A >= z_B 的反向边"
         # 按 (起点, 终点) 排序，保证确定性
         order = torch.argsort(edge_src * self.N + edge_dst, stable=True)
+        if self.geo_enabled:
+            # `mult` 与 `edge_src` 等**同一次 `order` 重排**，保证逐边对齐
+            mult_ordered = mult_pairs.index_select(0, order).contiguous()
+        else:
+            # 关闭路径：`mult` 归约未执行（F2），返回 0 长占位张量（调用方不消费）
+            mult_ordered = mult_pairs
         return (
             edge_src.index_select(0, order).contiguous(),
             edge_dst.index_select(0, order).contiguous(),
@@ -886,6 +1118,7 @@ class ThreeDNeuronSpace(nn.Module):
             input_isolated_mask,
             output_isolated_mask,
             neuron_conn_mask,
+            mult_ordered,
         )
 
     # ==================================================================
@@ -919,7 +1152,7 @@ class ThreeDNeuronSpace(nn.Module):
         两侧同源，故该比值为 **1 属构造性结果**（恒真），**不构成独立验证**。
         真正有效的是本函数内的两条断言：**(a)** Kahn 遍历覆盖全部 N 个节点（无环）、
         **(b)** Kahn 结果与 `axis_order` 逐位相同（轴升序确为合法拓扑序）；
-        返回的拓扑序之所以合法，依据是**构图已强制 `A→B ⟹ z_A < z_B`**，
+        返回的拓扑序之所以合法，依据是**构图已强制 `A→B => z_A < z_B`**，
         与 `neuron_pos` 的索引顺序无关。
 
         [!] **已知遗留口径**：`neuron_pos` 的索引顺序**并非**严格的轴坐标升序
@@ -933,7 +1166,7 @@ class ThreeDNeuronSpace(nn.Module):
         """
         axis_coord = self.neuron_pos[:, self.flow_axis_index].to(torch.float64)
         # 期望序：按轴坐标升序（`argsort(stable=True)` 使同坐标者保持原索引次序）。
-        # ⚠️ 该序**独立于** `neuron_pos` 的索引顺序计算 —— `neuron_pos` 的索引顺序并非严格
+        # [!] 该序**独立于** `neuron_pos` 的索引顺序计算 —— `neuron_pos` 的索引顺序并非严格
         #    轴升序（见 `_build_fcc_positions` 的 D2 披露），本函数因此不依赖它。
         axis_order = torch.argsort(axis_coord, stable=True)
         # 显式 Kahn（就绪集按 (轴坐标, 索引) 取最小）
@@ -1151,6 +1384,329 @@ class ThreeDNeuronSpace(nn.Module):
         )
 
     # ==================================================================
+    # 几何权重场（geo_field）：边级特征 / RBF 基 / 场注入（第 5 轮新增）
+    # ==================================================================
+    @torch.no_grad()
+    def _build_geo_edge_features(
+        self,
+        neuron_pos: torch.Tensor,
+        edge_src: torch.Tensor,
+        edge_dst: torch.Tensor,
+        edge_dist: torch.Tensor,
+        mult: torch.Tensor,
+    ) -> torch.Tensor:
+        """构造**边级无量纲几何特征** `edge_geo_feat_raw [E, F]`（仅 `geo_field != none`）。
+
+        特征定义（`Δp = p_B - p_A`，`H` = 神经元半径，`D` = 连接阈值）
+        ---------------------------------------------------------
+        | 列 | 名称   | 定义                                | 契约取值域   |
+        |----|--------|-------------------------------------|--------------|
+        | 0  | `zeta` | `Δz / H`（流向轴分量；构图强制上行）| `> 0`        |
+        | 1  | `rho`  | `‖Δp_xy‖2 / H`（流向轴之外两分量）  | `>= 0`       |
+        | 2  | `dhat` | `edge_dist / D`                      | `∈ (0, 1]`   |
+        | 3  | `slack`| `(D - edge_dist) / D`                | `∈ [0, 1)`   |
+        | 4  | `mult` | `log1p(可行握手对数)`                | `>= log 2 > 0` |
+
+        可选扩展开关 `geo_signed_delta`（**默认关闭**）在末尾追加 signed `Δx/H`、`Δy/H`。
+
+        实现口径
+        --------
+        * `rho` **不用** `sqrt(‖Δp‖^2 - Δz^2)`（该分解在 `Δp` 几乎平行于流向轴时会发生
+          灾难性抵消），而是由**逐分量坐标差**直接算 `Δx^2 + Δy^2`（与配置的流向轴一致地
+          取"另外两个分量"）；
+        * `mult` 由 `_build_neuron_edges` 逐边给出（已随 `order` 与 `edge_src` 对齐）；
+        * **不消耗任何随机数**（纯确定性算术），故不扰动 `_init_parameters` 的随机流。
+
+        参数
+        ----
+        neuron_pos : torch.Tensor
+            形状 [N, 3] 的神经元坐标。
+        edge_src / edge_dst : torch.Tensor
+            形状 [E] 的边端点（int64）。
+        edge_dist : torch.Tensor
+            形状 [E] 的代表连接间距。
+        mult : torch.Tensor
+            形状 [E] 的可行握手对数（`>= 1`）。
+
+        返回
+        ----
+        torch.Tensor
+            形状 `[E, F]`（`F = 5`，或开启 `geo_signed_delta` 时 `F = 7`）的 float32 特征。
+
+        异常
+        ------
+        ValueError
+            各输入长度不一致时抛出。
+        """
+        e = int(edge_src.numel())
+        for name, tensor, expect in (
+            ("edge_dst", edge_dst, e),
+            ("edge_dist", edge_dist, e),
+            ("mult", mult, e),
+        ):
+            if int(tensor.numel()) != expect:
+                raise ValueError(
+                    f"几何特征构造要求 {name} 长度为 E={expect}，当前 {int(tensor.numel())}"
+                )
+        axis = self.flow_axis_index
+        xy_idx = [i for i in range(3) if i != axis]
+        pos_src = neuron_pos.index_select(0, edge_src.to(torch.long))
+        pos_dst = neuron_pos.index_select(0, edge_dst.to(torch.long))
+        delta = pos_dst - pos_src                                   # [E, 3]
+        H = float(self.config.H)
+        D = float(self.config.D)
+        if not (H > 0.0 and D > 0.0):
+            raise ValueError(f"几何特征要求 H > 0 且 D > 0，当前 H={H}, D={D}")
+        dz = delta[:, axis] / H
+        dxy = torch.sqrt(
+            (delta[:, xy_idx[0]] ** 2 + delta[:, xy_idx[1]] ** 2).clamp_min(0.0)
+        ) / H
+        dhat = edge_dist / D
+        slack = (D - edge_dist) / D
+        mult_feat = torch.log1p(mult)                                # log1p 压缩
+        cols = [dz, dxy, dhat, slack, mult_feat]
+        if self.geo_signed_delta:
+            # 可选扩展开关（默认关闭）：signed 横向位移（可区分左右方向）
+            cols.append(delta[:, xy_idx[0]] / H)
+            cols.append(delta[:, xy_idx[1]] / H)
+        feat = torch.stack(cols, dim=1).to(torch.float32).contiguous()
+        assert feat.shape[1] == len(self._geo_feature_names), (
+            f"[契约失败] 几何特征列数 {feat.shape[1]} != 声明列数 "
+            f"{len(self._geo_feature_names)}（{self._geo_feature_names}）"
+        )
+        return feat
+
+    @torch.no_grad()
+    def _assert_geo_feature_domain(self) -> None:
+        """构造期特征取值域契约断言（`geo_field != none` 时执行）。
+
+        判据（逐条硬断言；与 `verify_shape.py` 的 S17-5 **独立复算**互为对照）
+        ----
+        * `slack ∈ [0, 1]`；
+        * `zeta > 0`（构图强制 `z_A < z_B`，故流向轴分量严格为正 —— 见 `_build_neuron_edges`）；
+        * `mult >= 1`（该边存在即至少一对握手 `<= D`）；
+        * `dhat ∈ (0, 1]`；
+        * `rho >= 0`；
+        * **几何自洽**：`zeta·H = Δp[axis]`、`rho·H = ‖Δp[xy]‖` 两列由**同一批坐标差**
+          独立复算必须满足恒等式 `zeta^2 + rho^2 == ‖Δp‖^2/H^2`（防"特征串列"）；并由代表连接
+          的那对突触分居两个半径 H 的球内，得**上界** `‖Δp‖ <= dhat·D + 2H`。
+
+        异常
+        ------
+        AssertionError
+            任一取值域或一致性判据不成立时抛出。
+        """
+        raw = self.edge_geo_feat_raw
+        names = list(self._geo_feature_names)
+        zeta = raw[:, names.index("zeta")]
+        rho = raw[:, names.index("rho")]
+        dhat = raw[:, names.index("dhat")]
+        slack = raw[:, names.index("slack")]
+        mult_feat = raw[:, names.index("mult")]
+        # 还原 `mult` 原值做整数域判据（log1p 单调，故 expm1 后比较）
+        mult_val = torch.expm1(mult_feat)
+        tol = 1e-5
+        assert bool((slack >= -tol).all()) and bool((slack <= 1.0 + tol).all()), (
+            f"[契约失败] 几何特征 slack 必须落在 [0,1]，实测 "
+            f"[{float(slack.min()):.6g}, {float(slack.max()):.6g}]"
+        )
+        assert bool((zeta > 0.0).all()), (
+            f"[契约失败] 几何特征 zeta = Δz/H 必须 > 0（构图强制严格上行），实测 "
+            f"min={float(zeta.min()):.6g}"
+        )
+        assert bool((mult_val >= 1.0 - tol).all()), (
+            f"[契约失败] 几何特征 mult 必须 >= 1（该边存在即至少一对握手 <= D），实测 "
+            f"min={float(mult_val.min()):.6g}"
+        )
+        assert bool((dhat > 0.0).all()) and bool((dhat <= 1.0 + tol).all()), (
+            f"[契约失败] 几何特征 dhat = edge_dist/D 必须落在 (0,1]，实测 "
+            f"[{float(dhat.min()):.6g}, {float(dhat.max()):.6g}]"
+        )
+        assert bool((rho >= 0.0).all()), (
+            f"[契约失败] 几何特征 rho 必须 >= 0，实测 min={float(rho.min()):.6g}"
+        )
+        h = float(self.config.H)
+        d = float(self.config.D)
+        # ---- 几何自洽（两条**可证**判据，而非"看起来合理"的猜测）----
+        # 记 `Δp = p_B - p_A`（神经元**中心**之差）。由本方法的定义直接有
+        #   `zeta·H = Δp[axis]`、`rho·H = ‖Δp[xy]‖`
+        # 故**恒等式** `zeta^2 + rho^2 == ‖Δp‖^2/H^2` 必须成立（浮点容差内）。
+        # 另由代表连接的那对突触分居两个半径 H 的球内，得 `edge_dist >= ‖Δp‖ - 2H`，
+        # 于是 `dhat·D >= ‖Δp‖ - 2H` => `zeta^2 + rho^2 <= (dhat·D + 2H)^2/H^2`。
+        # [!] 历史留档（本轮自检修正，三处**断言/判据本身错误**已剔除）：
+        #   (a) 初版判据写成 `rho·H <= dhat·D` —— **不成立**：`rho` 是**中心**横向位移，
+        #       而 `edge_dist` 是**最近突触对**间距，后者的垂向分量可以抵消横向位移
+        #       （实测 SMALL 规模下 `max(rho·H - dhat·D) ≈ 6H`）。
+        #   (b) 二版判据写成 `zeta·H >= 2H` —— **不成立**：FCC 最近邻距虽为 2H，但**沿
+        #       流向轴**的相邻格点间距是 `√2·H`（面心位移同时含横向分量），实测
+        #       `min(zeta·H) = 0.212132 = √2·0.15`（SMALL，H=0.15）。
+        #   (c) 三版恒等式右侧曾多除一次 `H^2`（`span_sq` 已含 `1/H^2` 量纲）—— 判据实现
+        #       笔误，已在下方标注。
+        # `centre_dist` = `‖Δp‖/H`（与 `zeta`/`rho` 同量纲，均为"除以 H 后的长度"）
+        centre_dist_sq = (zeta * h) ** 2 + (rho * h) ** 2        # = ‖Δp‖^2
+        centre_dist_sq_norm = centre_dist_sq / (h * h)           # = ‖Δp‖^2/H^2
+        # [!] 量纲必须一致：左侧是 `‖Δp‖^2/H^2`（`zeta`/`rho` 已除 H），故右侧上界
+        #     也必须除以 `H^2`（首次写入时漏除，实测把合法的 3.0H 中心间距误判为越界）。
+        bound_norm_sq = ((dhat * d + 2.0 * h) ** 2) / (h * h)
+        assert bool((centre_dist_sq_norm <= bound_norm_sq * (1.0 + 1e-4) + 1e-9).all()), (
+            "[契约失败] 几何特征中心距离上界不成立：‖Δp‖ 超过 dhat*D + 2H（实测最大超出 "
+            f"{float((centre_dist_sq.clamp_min(0)).sqrt().max() - ((dhat * d + 2.0 * h)).max()):.6g}）"
+        )
+        # 恒等式：`zeta^2 + rho^2 == ‖Δp‖^2/H^2`（由同一批坐标差独立复算，防"特征串列"）
+        # [!] 注意量纲：左右两侧**都**是 `‖Δp‖^2/H^2`（`zeta`/`rho` 本身已除过 H）。
+        pos_src = self.neuron_pos.index_select(0, self.edge_src.to(torch.long))
+        pos_dst = self.neuron_pos.index_select(0, self.edge_dst.to(torch.long))
+        dir_sq_norm = ((pos_dst - pos_src) ** 2).sum(dim=1) / (h * h)
+        ident_err = (centre_dist_sq_norm - dir_sq_norm).abs()
+        assert bool((ident_err <= 1e-4 * dir_sq_norm.clamp_min(1.0) + 1e-6).all()), (
+            "[契约失败] 几何特征 zeta/rho 与中心位移不满足恒等式 zeta^2+rho^2 == ‖Δp‖^2/H^2"
+            f"（实测最大偏差 {float(ident_err.max()):.6g}）"
+        )
+        # 特征有限性（NaN / Inf 一律视为契约失败 —— 场注入会把它们带进损失）
+        assert bool(torch.isfinite(raw).all()), (
+            "[契约失败] 几何特征出现非有限值（NaN/Inf）"
+        )
+
+    @torch.no_grad()
+    def _build_geo_rbf_basis(
+        self, feat01: torch.Tensor, k: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """由**确定性分位点**构造 RBF 基的中心与宽度（无随机数消耗）。
+
+        口径（写入 README 的「几何权重场（geo_field）」节）
+        -------------------------------------------------
+        * 输入 `feat01` 为已归一化到 `[0, 1]` 的特征（`edge_geo_feat`）；
+        * 每个特征维度 `j` 上取 `k` 个**分位点**作为中心：
+          `q_i = i / (k + 1)`，`i = 1..k`，`centers[j, i-1] = quantile(feat01[:, j], q_i)`
+          （`torch.quantile` 的线性插值口径 —— 纯确定性，与 seed 无关）；
+        * 宽度取**逐维**的相邻中心间距均值
+          `width[j] = max(mean_k(centers[j, k+1] - centers[j, k]), GEO_RBF_WIDTH_FLOOR_FRAC)`。
+          逐维而非全局常数的理由：不同维度的分位点间距可以差若干数量级（例如
+          SMALL/DEFAULT 规模下 `zeta` / `rho` 在 FCC 规则晶格上**恒为常数**
+          —— 实测 `zeta = rho = √2 = 1.414214`，分位点全部重合），若把全局下界当成
+          唯一宽度，退化维度上的基函数会全部饱和到 1（等价于一个常数项、梯度恒为 0）。
+          逐维下界保证**每维至少铺设约 `1/FLOOR` 个有效分辨率单元**。
+        * 基函数：`φ_k(φ_e) = exp( -Σ_j (φ_e[j] - center[j,k])^2 / (2·width[j]^2) )`。
+
+        参数
+        ----
+        feat01 : torch.Tensor
+            形状 `[E, F]` 的归一化特征（取值应落在 `[0, 1]`）。
+        k : int
+            中心个数（>= 1）。
+
+        返回
+        ----
+        Tuple[torch.Tensor, torch.Tensor]
+            `(centers [F, k] float32, width [F] float32)`。
+
+        异常
+        ------
+        ValueError
+            `k < 1` 或 `feat01` 不是 2D 时抛出。
+        """
+        if k < 1:
+            raise ValueError(f"geo_rbf_k 必须 >= 1，当前 {k}")
+        if feat01.dim() != 2:
+            raise ValueError(
+                f"RBF 基构造要求 [E, F] 特征，当前 shape={tuple(feat01.shape)}"
+            )
+        f_dim = int(feat01.shape[1])
+        qs = torch.arange(1, k + 1, dtype=torch.float64) / float(k + 1)
+        centers = torch.quantile(
+            feat01.to(torch.float64), qs, dim=0
+        ).transpose(0, 1).to(torch.float32).contiguous()             # [F, k]
+        floor = float(GEO_RBF_WIDTH_FLOOR_FRAC)
+        if k >= 2:
+            gaps = (centers[:, 1:] - centers[:, :-1]).mean(dim=1)    # [F]
+            width = gaps.clamp_min(floor)
+        else:
+            # `k == 1`：只有单中心，无"相邻间距"可言 —— 一律取下界（全域分辨率的保守值）
+            width = torch.full((f_dim,), floor, dtype=torch.float32)
+        assert bool(torch.isfinite(width).all()) and bool((width > 0.0).all()), (
+            f"[契约失败] RBF 宽度必须为逐维正有限值，实测 {width.tolist()}"
+        )
+        return centers, width.contiguous()
+
+    def _geo_basis(self, feat: torch.Tensor) -> torch.Tensor:
+        """计算 RBF 基激活 `φ_k(φ_e)`，形状 `[E, k]`（`forward` 中唯一新增的逐边算子）。
+
+        `φ_k(x) = exp( -Σ_j (x[j] - center[j,k])^2 / (2·width[j]^2) )`，`centers` / `width`
+        均为 `__init__` 预计算并 `register_buffer` 的常量（`forward` 中**不重算**）。
+
+        参数
+        ----
+        feat : torch.Tensor
+            形状 `[E, F]` 的归一化边级特征（来自 `edge_geo_feat` 或其在入边重排下的切片）。
+
+        返回
+        ----
+        torch.Tensor
+            形状 `[E, k]` 的基激活（float32，与 `feat` 同设备）。
+        """
+        centers = self.geo_rbf_centers                                  # [F, k]
+        width = self.geo_rbf_width                                      # [F]
+        diff = feat.unsqueeze(2) - centers.unsqueeze(0)                 # [E, F, k]
+        sq = (diff * diff / (width * width).unsqueeze(1)).sum(dim=1)    # [E, k]
+        return torch.exp(-0.5 * sq)
+
+    def _geo_edge_coeff(self, edge_index: torch.Tensor) -> torch.Tensor:
+        """返回指定边子集上的**几何权重场增量** `Δw_e = alpha · (Σ_k c_k φ_k + c_0)`。
+
+        形状 `[len(edge_index), 1]`，可直接与 `[E_chunk, 1]` 的权重广播相加。
+        `c`（= `geo_rbf_theta`，末位为偏置 `c_0`）**零初始化**，故初始时该增量恒为 0，
+        与关闭路径逐位一致。
+
+        参数
+        ----
+        edge_index : torch.Tensor
+            形状 `[M]` 的边下标（阶段 2 传入 `edge_perm_in` 或其在层区间上的切片）。
+
+        返回
+        ----
+        torch.Tensor
+            形状 `[M, 1]` 的权重增量。
+        """
+        feat = self.edge_geo_feat.index_select(0, edge_index)          # [M, F]
+        basis = self._geo_basis(feat)                                  # [M, k]
+        theta = self.geo_rbf_theta
+        field = basis @ theta[: self.geo_rbf_k] + theta[self.geo_rbf_k]  # [M]
+        return (self.geo_alpha * field).unsqueeze(1)
+
+    def _init_geo_parameters(self) -> None:
+        """初始化几何权重场参数（**独立 generator：`seed + 2`**）。
+
+        [!] **RNG 隔离的真实承担者（皋陶 F5，表述已修正）**：隔离由**结构性创建顺序**承担 ——
+        本方法被调用时 `_init_parameters()`（其自身使用局部 `Generator(seed+1)`）**已经执行完毕**，
+        且本方法使用**自己的** `Generator(seed+2)`，故两者随机流互不影响；
+        并由 **S17-3a**（on/off 全部公共参数/buffer 逐位比对）作为**判据层**守卫。
+
+        本方法内那条 `assert gen.initial_seed() == seed + 2` 是**同语句自洽断言** ——
+        它**只能**捕获"把该字面量改成 `seed + 1`"这一类编辑，**不能**捕获
+        "把本方法整体替换为使用 `seed+1` 的自洽实现"。**它不构成独立的 RNG 隔离守卫**
+        （原文"一旦有人改成共用 generator 便立即报错"属表述过强，已更正）。
+
+        另：原文"若与 `_init_parameters` 的 `gen` 共用会导致基座随机流平移"在当前**代码顺序下
+        并不成立**（两者各用局部 generator），该风险只存在于"几何参数被提前到
+        `_init_parameters` 之前并共享其 generator"这种**结构性改动**下。
+
+        实现口径：`geo_rbf_theta` 初值恒为**零**（`zero_()`，不消耗随机数）、
+        `geo_alpha` 初值取自配置常量 `geo_alpha_init` —— 故本方法**实际不消耗任何随机数**，
+        独立 generator 是**防御性隔离**（今后若给几何参数加随机初值，隔离已就位）。
+        """
+        gen = torch.Generator(device="cpu").manual_seed(int(self.config.seed) + 2)
+        with torch.no_grad():
+            # 末层（RBF 系数 + 偏置）**零初始化** —— 结构前提，不消耗随机数
+            self.geo_rbf_theta.zero_()
+            # `alpha` 取配置初值（可学习）。`gen` 当前**不取样**，仅作隔离记录：
+            # 一旦今后给几何参数加随机初值，必须**继续用本 generator**（`seed + 2`）。
+            assert int(gen.initial_seed()) == int(self.config.seed) + 2, (
+                "[契约失败] 几何参数的初始化 generator 字面量必须为 seed+2"
+                "（注：本断言仅校验字面量自洽，不构成独立的 RNG 隔离守卫 —— "
+                "隔离由创建顺序与 S17-3a 承担，见 docstring）"
+            )
+
+    # ==================================================================
     # 连通性下限校验（G3）
     # ==================================================================
     @torch.no_grad()
@@ -1333,6 +1889,12 @@ class ThreeDNeuronSpace(nn.Module):
         因 `A → B` 必有 `z_A < z_B`，故处理 `B` 时其**全部上游 A 均已算完**
         （`topo_index` 即流向轴升序，模块内以断言守护），一次前向递推即可。
 
+        **[第 5 轮] 几何权重场注入**：`geo_field != "none"` 时上式中的 `w_{A→B}` 换成
+        **有效权重** `w_e = w_free[e] + alpha · (Σ_k c_k φ_k(φ_e) + c_0)`（见 `_geo_edge_coeff`）——
+        即"权重成为神经元 3D 坐标的函数"。该增量在**全部边**上只算一次（`[E, 1]`），
+        随后与既有 `edge_weight` 一起按层区间切片，**不新增逐层重算**；
+        `c` 零初始化时增量恒为 0，前向与关闭路径逐位一致。
+
         **有效感受野覆盖全部层**：递推沿 DAG 逐层展开，`B` 的上游版本已经聚合了
         其所有祖先的信息，故即使没有任何循环/多轮中继，感受野也从第一层贯通到
         最后一层（DEFAULT 规模 9 层，验证脚本 R5c 给出覆盖层数的证据）。
@@ -1384,6 +1946,11 @@ class ThreeDNeuronSpace(nn.Module):
         perm_in = self.edge_perm_in
         slot_src = self.edge_src.index_select(0, perm_in)      # 每条入边的源神经元
         w_all = self.edge_weight.index_select(0, perm_in).unsqueeze(1)
+        if self.geo_enabled:
+            # ---- 几何权重场（第 5 轮）：把"权重是坐标的函数"注入有效权重 ----
+            # 字段在所有边上**只算一次**（`[E, 1]`），随后与 `w_all` 一起按层区间切片，
+            # **不新增逐层重算**（与既有的"每条边一个权重"结构完全同构）。
+            w_all = w_all + self._geo_edge_coeff(perm_in)
         # 输入层副本的贡献：与上游版本共享同一套边权（与层无关的常量项）
         rel = a_in_driven.index_select(0, slot_src) * w_all
         # ---- 向量化逐层递推（层内整体并行）----
@@ -1409,6 +1976,23 @@ class ThreeDNeuronSpace(nn.Module):
             ).unsqueeze(1)
             a_up = a_up.index_copy(0, nodes, F.relu(pre))
         return a_up
+
+    def _effective_edge_weight(self) -> torch.Tensor:
+        """返回**全部 E 条边**上的有效权重 `w_e = w_free[e] + alpha·场(φ_e)`。
+
+        仅用于诊断（几何权重场开启时的可复核取证量）；`forward` 内部走
+        `stage2_recurrence` 的入边重排路径，不经过本方法。
+
+        返回
+        ----
+        torch.Tensor
+            形状 `[E]` 的有效权重（`geo_field == "none"` 时即 `edge_weight` 本身）。
+        """
+        if not self.geo_enabled:
+            return self.edge_weight
+        return self.edge_weight + self._geo_edge_coeff(
+            torch.arange(self.num_edges, device=self.edge_weight.device)
+        ).reshape(-1)
 
     def _iter_levels(self):
         """按层迭代 (lo, hi, nodes)：层边区间与层节点集合（`__init__` 预计算）。
@@ -1472,6 +2056,16 @@ class ThreeDNeuronSpace(nn.Module):
         # fc_dim 路径的 (4) 索引收集下标：同为 buffer，必须随 .to(device) 一起搬运
         if self.fc_enabled:
             required.append("out_scope_index")
+        # 几何权重场（第 5 轮）：前向会 index_select 特征、并读取 RBF 中心/宽度与两个参数，
+        # 三者都必须能随 .to(device) 搬运（否则 CUDA 上会在前向中途抛 device mismatch）
+        if self.geo_enabled:
+            required += [
+                "edge_geo_feat",
+                "geo_rbf_centers",
+                "geo_rbf_width",
+                "geo_rbf_theta",
+                "geo_alpha",
+            ]
         for name in required:
             if name not in movable:
                 raise RuntimeError(
@@ -1806,6 +2400,25 @@ class ThreeDNeuronSpace(nn.Module):
             "num_out_scope": float(self.num_out_scope),
             "fc_dim": float(self.fc_dim),
             "fc_width": float(self.fc_width),
+            # ---- 几何权重场（第 5 轮新增）：仅开关打开时有非零实测值 ----
+            # `geo_field_kind`：0 = none / 1 = additive（编码位，便于产物内取证）
+            # `geo_rbf_k` / `geo_alpha` / `geo_field_bias`（= c_0）：几何场的规模量
+            # `geo_theta_norm`：RBF 系数向量的 L2 范数（零初始化时为 0）
+            "geo_field_kind": (
+                0.0 if self.geo_field == "none" else 1.0
+            ),
+            "geo_rbf_k": float(self.geo_rbf_k) if self.geo_enabled else 0.0,
+            "geo_alpha": (
+                float(self.geo_alpha.detach().item()) if self.geo_enabled else 0.0
+            ),
+            "geo_field_bias": (
+                float(self.geo_rbf_theta.detach()[-1].item())
+                if self.geo_enabled else 0.0
+            ),
+            "geo_theta_norm": (
+                float(self.geo_rbf_theta.detach().norm().item())
+                if self.geo_enabled else 0.0
+            ),
             "num_edges": float(self.num_edges),
             "edge_dist_mean": float(edge_dist.mean().item()),
             "edge_dist_min": float(edge_dist.min().item()),
