@@ -40,6 +40,8 @@ pip install -r requirements.txt
 
 依赖清单位于仓库根目录，包含 PyTorch（CPU 即可运行，有 CUDA 时自动选择 GPU）、torchvision 与 numpy。
 
+数据集不入库：`data/` 目录已被 `.gitignore` 整体忽略，克隆仓库后本地并不存在该目录。训练前需自备 `data/mnist/` 下的 4 个 MNIST IDX 文件（`train-images-idx3-ubyte.gz`、`train-labels-idx1-ubyte.gz`、`t10k-images-idx3-ubyte.gz`、`t10k-labels-idx1-ubyte.gz`，合计约 11 MB），放到 `data/mnist/` 即可；也可以调用各代 `data.py` 提供的 `ensure_mnist_files(<root>, allow_download=True)` 联网获取（该参数默认为 `False`，此时严格复用本地数据、不联网）。数据缺失且不允许下载时会抛出 `FileNotFoundError`，并给出已检查的目录与候选目录，便于按提示排查。
+
 装好后可以直接运行各模块。下面每一条都是对应模块的最简入口或最简自检命令：
 
 ```bash
