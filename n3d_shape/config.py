@@ -98,7 +98,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Dict, Optional, Tuple
+
+try:  # 兼容包导入与脚本直跑
+    from .data import DATASET_CHOICES, DATASET_SPECS, dataset_spec
+except ImportError:  # pragma: no cover
+    from data import DATASET_CHOICES, DATASET_SPECS, dataset_spec  # type: ignore
 
 __all__ = [
     "Config",
@@ -119,6 +124,11 @@ __all__ = [
     "max_space_radius",
     "SHAPE_VARIANT_NOTE",
     "GEO_FIELD_NOTE",
+    "DATASET_CHOICES",
+    "DATASET_SPECS",
+    "DATASET_LAYER_NOTE",
+    "dataset_spec",
+    "resolve_dataset_dims",
 ]
 
 # 全局流向轴：输入突触取负半球（-axis）、输出突触取正半球（+axis）
@@ -161,6 +171,47 @@ GEO_IMPLEMENTED_CHOICES: Tuple[str, ...] = ("none", "additive")
 # 保留此常量便于验证脚本做"几何权重场维度已落地"断言
 GEO_FIELD_NOTE: str = "neuron_geo_weight_field:none|additive"
 
+# ---- 数据集通用层（本模块第 6 轮新增：数据集可插拔）----
+# 注册表本体在 `data.DATASET_SPECS`（**唯一注册表**），此处只做 re-export，
+# 避免"两张表"这种必然漂移的重复定义。
+# 保留此常量便于验证脚本做"数据集维度已落地"断言。
+DATASET_LAYER_NOTE: str = "dataset_plugin_layer:mnist|synthetic|npz|csv|json"
+
+
+def resolve_dataset_dims(
+    dataset: str, input_dim: Optional[int], output_dim: Optional[int]
+) -> Tuple[int, int, str]:
+    """**数据集规格的单一解析点**（`Config.__post_init__` 的唯一调用点）。
+
+    语义见 `data.resolve_dims`：显式值优先、缺省取注册表、两者冲突立即报错。
+    本函数只是把解析入口放在 config 层（便于验证脚本与 `train.py` 复用同一入口），
+    **实现完全委派** `data.resolve_dims`，不复制任何判定逻辑。
+
+    参数
+    ----
+    dataset : str
+        数据集名（`DATASET_CHOICES` 之一）。
+    input_dim : Optional[int]
+        显式输入维数（`None` = 未提供，取规格）。
+    output_dim : Optional[int]
+        显式类别数（`None` = 未提供，取规格）。
+
+    返回
+    ----
+    Tuple[int, int, str]
+        `(input_dim, output_dim, 来源说明)`。
+
+    异常
+    ------
+    ValueError
+        数据集未注册 / 显式值非正 / 显式值与规格冲突 / 规格为占位值但未显式给出时抛出。
+    """
+    try:  # 兼容包导入与脚本直跑
+        from .data import resolve_dims as _resolve_dims
+    except ImportError:  # pragma: no cover
+        from data import resolve_dims as _resolve_dims  # type: ignore
+
+    return _resolve_dims(dataset, input_dim, output_dim)
 
 @dataclass(frozen=True)
 class ShapeSpec:
@@ -513,8 +564,13 @@ class Config:
     readout_scope: str = "any_isolated"
 
     # ---- 网络 ----
-    input_dim: int = 784
-    output_dim: int = 10
+    # [!] `input_dim` / `output_dim` 的**生效值由数据集规格单一解析点决定**
+    #     （仿 `_resolve_fc_width` 的做法，见 `__post_init__` 的调用与 `to_dict` 的取舍）：
+    #     `None` = 未显式给出 -> 取 `DATASET_SPECS[dataset]` 的 `input_dim` / `num_classes`；
+    #     显式给出 -> 优先，但与规格声明值冲突时报错（拒绝静默不一致）。
+    #     两个字段的**有效类型是 int**（`__post_init__` 保证），此处 `None` 只是"未给出"哨兵。
+    input_dim: Optional[int] = None
+    output_dim: Optional[int] = None
     hidden_dim: int = 2048  # 仅 `--arch mlp` 对照基线使用（主模型不使用该字段）
     # 两端全连接包裹开关：0 = 关闭（默认，逐位不变）/ -1 = 跟随 N / > 0 = 显式宽度
     fc_dim: int = 0
@@ -553,6 +609,15 @@ class Config:
     data_root: str = "data/mnist"
     num_workers: int = 0
     log_interval: int = 100
+    # ---- 数据集通用层（第 6 轮新增）----
+    # [!] 这五个字段**必须全部进 `to_dict()`**，否则 `train.apply_overrides` 经
+    #     `Config(**base.to_dict())` 往返会**静默丢字段**（与 `--shape` / `--fc-dim` /
+    #     `--geo-field` 的历史陷阱同源）。
+    dataset: str = "mnist"
+    dataset_path: str = ""
+    num_samples: int = 0
+    norm_mean: Optional[float] = None
+    norm_std: Optional[float] = None
 
     # ---- 可选训练增强 ----
     weight_decay: float = 0.0
@@ -642,6 +707,49 @@ class Config:
                 f"Config.geo_alpha_init 必须 >= 0（几何场增益初值），"
                 f"当前 geo_alpha_init={self.geo_alpha_init}"
             )
+
+        # ---- 数据集通用层校验 + 维度解析（第 6 轮新增）----
+        # [!] 纪律与 `fc_dim` / `geo_field` 一致：
+        #   (a) 未注册的数据集名在**构造期**报错（不留给下游按陌生字符串去查表）；
+        #   (b) `input_dim` / `output_dim` 的生效值由**单一解析点**决定
+        #       （`resolve_dataset_dims` -> `data.resolve_dims`），显式值优先、缺省取规格、
+        #       与规格冲突立即报错 —— 拒绝"配置说 784、数据只有 64 列"这类静默不一致；
+        #   (c) `input_dim == 0` 这类**非法显式值**必须在此拦下（计划验收第 6 条）。
+        if str(self.dataset) not in DATASET_SPECS:
+            raise ValueError(
+                f"Config.dataset 仅允许 {DATASET_CHOICES}，当前 dataset={self.dataset!r}"
+            )
+        if int(self.num_samples) < 0:
+            raise ValueError(
+                f"Config.num_samples 必须 >= 0（0 表示取该数据集的缺省样本数），"
+                f"当前 num_samples={self.num_samples}"
+            )
+        if (self.norm_mean is None) != (self.norm_std is None):
+            raise ValueError(
+                f"Config.norm_mean 与 Config.norm_std 必须同时给出或同时留空，"
+                f"当前 norm_mean={self.norm_mean}, norm_std={self.norm_std}"
+            )
+        if self.norm_std is not None and not (float(self.norm_std) > 0.0):
+            raise ValueError(
+                f"Config.norm_std 必须 > 0，当前 norm_std={self.norm_std}"
+            )
+        # [!] **遗留维度不在本层静默清除**（重要纪律，见 `train.apply_overrides` 的说明）：
+        #     "换数据集时上一份配置遗留的 `input_dim=784 / output_dim=10`"必须在
+        #     **确实发生了数据集切换的那个入口**（CLI 覆盖链）里清除 —— 因为
+        #     "用户显式给出的 784"与"上一步继承来的 784"在构造期**不可区分**。
+        #     若在本层按"值等于 mnist 规格"就静默清成 `None`，会同时把
+        #     "显式给出 784（与新数据集冲突，本应报错）"这一情况**静默放过**，
+        #     违反"拒绝静默不一致"的纪律。故本层只做解析与校验。
+        effective_input_dim, effective_output_dim, dims_source = resolve_dataset_dims(
+            str(self.dataset), self.input_dim, self.output_dim
+        )
+        # 显式覆盖与规格缺省是否不同 -> 只影响**产物名指纹**是否插入 `_d{D}x{C}` 段
+        # （供 `train.is_default_smoke` / 指纹与"数据集规范值"比对，口径见 README 的
+        #  「数据集通用层」节）。这里只记录事实，不做任何校验决策。
+        explicit_dims_unconventional = (
+            int(effective_input_dim) != int(dataset_spec(str(self.dataset)).input_dim)
+            or int(effective_output_dim) != int(dataset_spec(str(self.dataset)).num_classes)
+        )
 
         # ---- 几何字段校验 ----
         if self.flow_axis not in FLOW_AXIS_CHOICES:
@@ -747,15 +855,85 @@ class Config:
             "shape_circum_radius": float(circum_radius),
             # fc_dim 的**有效宽度**：0 -> 0（关闭）；-1 -> N；> 0 -> 该值。
             "fc_width": self._resolve_fc_width(),
+            # ---- 数据集通用层（第 6 轮新增）----
+            # `input_dim` / `output_dim` 的**生效值**（由规格单一解析点给出，见上文）；
+            # `dims_source` 是解析来源说明（写入运行日志，便于复核是哪一侧生效）。
+            "input_dim": int(effective_input_dim),
+            "output_dim": int(effective_output_dim),
+            "dims_source": str(dims_source),
+            "explicit_dims_unconventional": bool(explicit_dims_unconventional),
         }
 
     # ------------------------------------------------------------------
     # 便捷属性
     # ------------------------------------------------------------------
+    # [!] `input_dim` / `output_dim` 的**读取语义**（第 6 轮新增）：字段本身是
+    #     "显式给出 / 未给出"的哨兵（`None` = 未给出），**生效值**由数据集规格的
+    #     单一解析点给出。为了让全部既有调用点（`model.py` / `train.py` / 验证脚本）
+    #     一行不改地读到**生效值**，这里在**读取时**把这两个名字解析为 `_derived` 里的
+    #     生效值 —— 于是"配置改了但模型没读到"这类错位在结构上不可能发生。
+    #     已实测的不变量：`cfg.input_dim == int(cfg.input_dim)`（含 `Config()` 缺省构造）。
+    def __getattribute__(self, name: str) -> object:
+        """读取 `input_dim` / `output_dim` 时返回**生效值**（规格解析结果）。
+
+        实现要点
+        --------
+        * 只在**名字命中**且 `_derived` 已含该键时改写；`__post_init__` 执行期间
+          （`_derived` 尚未写入）与"显式给出了 int 但解析尚未发生"时一律原样返回，
+          因此**不会**在构造过程中把哨兵值吃掉；
+        * 其余名字零开销直达（一次 `dict.get`），不改任何既有语义。
+
+        参数
+        ----
+        name : str
+            属性名。
+
+        返回
+        ----
+        object
+            `input_dim` / `output_dim` 返回生效 int；其余属性原样返回。
+        """
+        if name == "input_dim" or name == "output_dim":
+            derived = object.__getattribute__(self, "_derived")
+            if name in derived:
+                return derived[name]
+        return object.__getattribute__(self, name)
+
     @property
     def fc_enabled(self) -> bool:
         """两端全连接包裹是否启用（`fc_dim != 0`）。"""
         return int(self.fc_dim) != 0
+
+    @property
+    def dataset_spec(self) -> "DatasetSpec":
+        """该配置对应的数据集规格（`DatasetSpec`；注册表 `DATASET_SPECS` 的唯一查表结果）。"""
+        return dataset_spec(str(self.dataset))
+
+    @property
+    def dims_source(self) -> str:
+        """`input_dim` / `output_dim` 生效值的**解析来源说明**（写入运行日志）。"""
+        return str(self._derived["dims_source"])
+
+    @property
+    def explicit_dims_unconventional(self) -> bool:
+        """显式维度是否**偏离该数据集规格的缺省值**（只影响产物名是否插 `_d{D}x{C}` 段）。
+
+        缺省构造（未显式给出 `input_dim` / `output_dim`）恒为 `False`；
+        显式给出的值与规格声明值一致时也是 `False`（此时产物名与"未给出"逐字相同，
+        与 `apply_overrides` 的"值等价即复用基线对象"纪律一致）。
+        """
+        return bool(self._derived["explicit_dims_unconventional"])
+
+    @property
+    def effective_input_dim(self) -> int:
+        """输入维度生效值（= `self.input_dim`，此处显式命名以便阅读）。"""
+        return int(self._derived["input_dim"])
+
+    @property
+    def effective_output_dim(self) -> int:
+        """类别数生效值（= `self.output_dim`）。"""
+        return int(self._derived["output_dim"])
+
 
     @property
     def geo_enabled(self) -> bool:
@@ -855,8 +1033,14 @@ class Config:
             "cyl_aspect": self.cyl_aspect,
             "input_scope": self.input_scope,
             "readout_scope": self.readout_scope,
-            "input_dim": self.input_dim,
-            "output_dim": self.output_dim,
+            # [!] `input_dim` / `output_dim` 写出的是**原始字段值**（"显式给出 / 未给出"哨兵，
+            #     `None` = 未给出），不是解析后的生效值 —— 这是**刻意**的：
+            #     往返 `Config(**base.to_dict())` 必须保持"未给出"这一事实，
+            #     否则 `--dataset` 换来源后维度会被上一份配置的解析结果**粘住**。
+            #     生效值请读 `self.input_dim` / `self.output_dim`（读取时解析）或
+            #     `effective_input_dim` / `effective_output_dim`。
+            "input_dim": self.__dict__["input_dim"],
+            "output_dim": self.__dict__["output_dim"],
             "hidden_dim": self.hidden_dim,
             "fc_dim": self.fc_dim,
             # geo_field 族（第 5 轮新增）：**必须全部进 to_dict()**，否则
@@ -875,6 +1059,12 @@ class Config:
             "data_root": self.data_root,
             "num_workers": self.num_workers,
             "log_interval": self.log_interval,
+            # ---- 数据集通用层（第 6 轮新增）：**必须全部进 to_dict()** ----
+            "dataset": self.dataset,
+            "dataset_path": self.dataset_path,
+            "num_samples": self.num_samples,
+            "norm_mean": self.norm_mean,
+            "norm_std": self.norm_std,
             "weight_decay": self.weight_decay,
             "readout_bias": self.readout_bias,
             "lr_schedule": self.lr_schedule,
@@ -906,8 +1096,13 @@ class Config:
             f"placement={self.placement}",
             f"input_scope={self.input_scope}",
             f"readout_scope={self.readout_scope}",
-            f"input_dim={self.input_dim}",
-            f"output_dim={self.output_dim}",
+            f"input_dim={self.effective_input_dim}",
+            f"output_dim={self.effective_output_dim}",
+            # ---- 数据集通用层（第 6 轮新增）：来源与归一化口径进摘要，便于事后复核 ----
+            f"dataset={self.dataset}",
+            f"dataset_path={self.dataset_path or '(未提供)'}",
+            f"num_samples={self.num_samples}",
+            f"norm=({'given' if self.norm_mean is not None else 'computed'})",
             f"batch_size={self.batch_size}",
             f"lr={self.lr}",
             f"epochs={self.epochs}",

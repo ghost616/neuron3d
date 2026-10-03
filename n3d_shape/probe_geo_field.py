@@ -54,7 +54,14 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir
 
 DEFAULT_CHECKPOINT = os.path.join(
     PROJECT_ROOT, "checkpoints", "n3d_shape",
-    "full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isall_rsall_fc-1_s42.pt",
+    # [!] 第 21 轮修复（**预存失效默认值**，非本轮引入）：本行原先写的是
+    #     `..._fc-1_s42.pt`（**第 19 轮 `_nosyn` 改名之前**的名字）。第 19 轮把
+    #     `_nosyn` 格式段恒定插入三处指纹后，该文件就不再存在，于是本脚本的**默认**
+    #     调用会直接退码 1（`[FAIL] checkpoint 不存在：...`），进而使
+    #     `verify_shape.py` 的 **S17-8d**（"P0 诊断脚本载入产物权重且自证逐位相同"）
+    #     因"缺报告"而 FAIL。本轮按**当前口径**更正为带 `_nosyn` 段的真实产物名
+    #     （该文件在磁盘上存在且为 isall/rsall 口径，见 `bench_shape_modes.py` 的 120 条标定集）。
+    "full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isall_rsall_fc-1_nosyn_s42.pt",
 )
 
 

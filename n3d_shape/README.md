@@ -2294,3 +2294,247 @@ DEF-3 的 6 档初值全部可构造且容差断言经变异证明非空转；DE
 | **F12** | info | 变异表归因过期：M5 归因为「S17-1a FAIL」（实际是**构造期 `ValueError`**，因 F2 修复后 `none` 档 `mult` 为 0 长占位）；M2 仍写「generator 隔离守卫先命中」，与 F5 新口径不一致 | M5 归因改为「构造期 `ValueError`：`几何特征构造要求 mult 长度为 E=106，当前 0`」，并注明 S17-1a 仍是该**不变量**的常驻判据；M2 改为「构造期 `seed+2` **字面量自洽断言**先命中」并回指 §20.2。**结论「被捕获」不变**（11/11、0 逃逸） |
 | **F13** | info | SUMMARY §3 称 `--shape cube --cyl-aspect 2.0`「由 `Config` 第二道防线拒绝」，实为**脚本自身的 shape 断言**即退码 1（F3 采取断言口径后**不回写** `cfg_dict`，故 `--cyl-aspect` 的 Config 防线在该脚本内不会被触发） | 更正归因，**删去不成立的「Config 第二道防线」表述**；结论（退码 1、报错可读、无静默无效参数）不变 |
 | **F14** | info | 冒烟路径仍直接 `torch.optim.Adam(model.parameters(), ...)`，未走 `build_optimizer`，故 `--smoke-test --weight-decay>0` **被静默忽略**且不触发 F1 断言（**非本轮引入**，F1 范围之外） | **本轮只做文档记录**（README §8.2 与 spec 的「冒烟判据」节均已写明），并把「是否将冒烟切换到 `build_optimizer` 以统一口径」列入**后续批次决策项**（切换须以 `torch.equal` 复核默认组合产物张量级不变 + 字节/SHA256 复核既有取证产物）。**本轮未改动该行为** |
+
+## 21 数据集通用层：把 n3d_shape 从「MNIST 硬编码」改造为「数据集可插拔」（第 21 轮）
+
+### 21.0 目标与硬约束
+
+把数据来源从**硬编码的 MNIST** 变成**可插拔注册表**：支持 `mnist` / `synthetic` / `npz` /
+`csv` / `json`（含 `.jsonl`）五种来源，同时**严格保证 MNIST 路径零回归** ——
+产物名逐字不变、`get_mnist_loaders` 签名/行为/加载顺序/归一化逐字不变。
+
+**不在本轮范围**：多数据集联合训练、在线下载其他数据集、数据增强、类别重映射（`y` 的重标号）。
+
+### 21.1 注册表 `DATASET_SPECS`（`data.py`，**唯一注册表**）
+
+| `name` | `input_dim` | `num_classes` | `kind` | `norm_mean` / `norm_std` | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `mnist` | 784 | 10 | `mnist` | `0.1307` / `0.3081`（**固定记录**，与 `RawIdxMNIST` 内联常量同源） | 委派 `get_mnist_loaders`，**零回归锚点** |
+| `synthetic` | 64 | 8 | `synthetic` | `None`（由训练集现场统计，**确定性**） | 确定性生成、非线性可分、不联网、不消耗全局 RNG |
+| `npz` | **0（占位）** | **0（占位）** | `npz` | `None` | 数组 `X[M,D]` / `y[M]`（键名 `X`/`y`，允许小写） |
+| `csv` | **0（占位）** | **0（占位）** | `csv` | `None` | 首行表头可选；**末列 = 标签** |
+| `json` | **0（占位）** | **0（占位）** | `json` | `None` | `{"X": [[...]], "y": [...]}` 对象形态 + `.jsonl` 逐行样本对象 |
+
+* **占位 0 的语义** = 「维度由数据文件现场决定」：这类来源**必须**在 CLI 显式给出
+  `--input-dim` / `--output-dim`（`Config` 构造期即报错，报文写明"必须显式给出"）；
+  真值一致性由数据层 `_check_dims` 在**加载后**用真实列数 / 最大标签校验，不一致即报错。
+* **单一解析点**：`data.resolve_dims(dataset, input_dim, output_dim)` 是
+  `input_dim` / `output_dim` 生效值的**唯一**决定处（`config.resolve_dataset_dims`
+  只是把入口放到 config 层，**实现完全委派**）。显式值优先、缺省取规格、
+  **两者冲突立即报错**（拒绝"配置说 784、数据只有 64 列"这类静默不一致）。
+
+### 21.2 `Config` 的维度解析与 `to_dict()` 的刻意取舍
+
+* `Config.input_dim` / `Config.output_dim` 的**字段默认值是 `None`**（"未显式给出"哨兵），
+  生效值由解析点给出，并存于 `_derived`；读取 `cfg.input_dim` / `cfg.output_dim` 时
+  **自动解析为生效值**（`Config.__getattribute__` 覆写），故 `model.py` / `train.py` /
+  验证脚本的全部既有调用点**一行不改**地读到 int。
+  **实测不变量**：`Config().input_dim == 784`（mnist 规格）且 `to_dict()["input_dim"] is None`。
+* **`to_dict()` 写出哨兵而不是生效值**（刻意的）：往返 `Config(**base.to_dict())`
+  必须保持"未给出"这一事实，否则换数据集后维度会被上一份配置的解析结果**粘住**。
+* **换数据集时清除遗留维度**：`train.apply_overrides` 在 `--dataset` 确实切换数据集时
+  `pop` 掉继承来的 `input_dim` / `output_dim`，交给新数据集的规格解析。
+  **为什么不在 `Config.__post_init__` 里按"值等于 mnist 规格"静默清除**：
+  "用户显式给出的 784"与"上一步继承来的 784"在构造期**不可区分**，
+  静默清除会把"显式给出冲突值（本应报错）"也放过，属放宽纪律。
+* 三个预设（SMALL/DEFAULT/HIGHACC）仍然**显式**写着 `input_dim=784, output_dim=10`
+  （mnist 的值，逐字段可读），其 `to_dict()` 因而保留这两个键；换数据集时由上面的
+  清除逻辑处理，`Config(**{**SMALL_CONFIG.to_dict(), "dataset": "synthetic"})` 因此可正常工作。
+
+### 21.3 CLI（8 个新增参数，**全部**纳入 `explicit` / `validate_override_args` / `apply_overrides`）
+
+| 参数 | 哨兵 | 语义 |
+| --- | --- | --- |
+| `--dataset NAME` | `""`（不覆盖，沿用预设 mnist） | 与 `--shape` / `--input-scope` **同一哨兵口径** |
+| `--data-root PATH` | `""` | 仅 mnist 使用（原 `Config.data_root` 首次暴露到 CLI） |
+| `--dataset-path PATH` | `""` | `npz` / `csv` / `json` 必需；相对路径按**当前工作目录**解析 |
+| `--input-dim D` | `None` | **必须 > 0**；与规格冲突即报错；`0` 在 CLI 层直接拒绝 |
+| `--output-dim C` | `None` | 同上 |
+| `--num-samples M` | `0` | 仅 synthetic（`0` = 取缺省 4000） |
+| `--norm-mean` / `--norm-std` | `None` | **哨兵是 `None` 而非浮点值**（`0.0` 是合法均值）；两者必须**同时**给出 |
+
+`--dataset-path` 对 `npz` / `csv` / `json` 为空时在 **CLI 层**就报错（拒绝静默使用空路径）。
+
+### 21.4 归一化口径（可复核）
+
+* 显式给定 `--norm-mean/--norm-std` -> 标量广播到全部特征，来源记为 `given`；
+* 缺省 -> **训练集现场统计**（逐特征 `mean` / `std`），来源记为 `computed`；
+  某特征方差为 0 时该维 `std` 取 `1.0` 并把来源记为 `computed(std=0 -> 1)`（否则会除 0）；
+* **归一化口径与数据集规格一起写入运行日志**（`log_info`），事后可复核；
+* **MNIST 例外**：该路径归一化固定为内置 `mean=0.1307 / std=0.3081`，
+  传其它值直接报错（**不静默忽略**），故 MNIST 口径不可能被本层改动。
+
+### 21.5 提前报错（六类；错误信息带字段名 / 行号）
+
+| 类别 | 触发点 | 报文要素（实测） |
+| --- | --- | --- |
+| 空集 | 加载期 | `... 为空集（样本数 M=0）` |
+| NaN / Inf | 加载期 | `JSON <path> 的 'X' 字段 第 2 行第 1 列的取值为 nan（NaN/Inf 或溢出，一律拒绝）` |
+| 列数不齐 | 加载期 | `JSONL <path> 第 2 个样本的特征长度为 3，与首个样本 2 不一致（列数不齐）` |
+| 维度与配置不一致 | 加载期 | `输入维度与数据不一致：配置 input_dim=2，但 ... 只有 3 列特征` |
+| 类别数与数据不一致 | 加载期 | `... 中出现了标签 7（合法标签必须落在 [0, output_dim-1] = [0, 2]）` |
+| 输入维度为 0 | `Config` / CLI / 加载期三层 | `input_dim 必须 > 0，当前 input_dim=0（dataset='json'）` |
+| JSON 语法错误 | 加载期 | `JSONL <path> 第 2 行不是合法 JSON：Expecting ',' delimiter（列 25）` |
+| 缺字段 | 加载期 | `... 缺少字段：需要 ['X', 'x'] 之一，当前对象的键为 ['features', 'labels']` |
+
+**小集可跑完**：`batch_size` 一律 `drop_last=False`，且切分保证**两个集合都非空**
+（`M <= test_every` 时测试集退化为最后一个样本；`M == 1` 的退化情形训练/测试都取该样本）。
+
+### 21.6 产物命名指纹（防撞名）与 MNIST 零回归
+
+三处指纹（`smoke_fingerprint` / `config_fingerprint` / `full_checkpoint_name`）**逐字一致**
+新增两段，位置 = `..._rs{scope}` -> `[_fc{n}]` -> `[_geo...]` -> **`[_ds{name}]`** ->
+**`[_d{D}x{C}]`** -> `_nosyn` -> `_s{seed}`：
+
+* `_ds{name}`：**仅 `dataset != "mnist"` 时插入**；
+* `_d{D}x{C}`：**仅当 `(input_dim, output_dim)` 偏离该数据集规格声明值时插入**。
+
+**MNIST 零回归的形式化条件**：`dataset == "mnist"` 且维度取规格缺省值时，两段**均为空**
+=> 既有 120 个 `full_*` / `verify_*` 产物名**逐字不变**。实测（`_probe_dataset_config.py`）：
+
+```text
+smoke_fingerprint(SMALL)      = shapesphere_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_bs32_nosyn_s42
+config_fingerprint(SMALL, 1)  = verify_1_shapesphere_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_nosyn_s42.pt
+full_checkpoint_name(DEFAULT fc-1 any any) = full_shapesphere_N256_y8x8_H0.1_D0.1_plfcc_axz_isany_rsany_fc-1_nosyn_s42.pt
+smoke(SMALL + explicit 784/10) = shapesphere_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_bs32_nosyn_s42   # 与缺省逐字相同
+synthetic: smoke=..._bs32_dssynthetic_nosyn_s42   full=..._dssynthetic_nosyn_s42.pt
+```
+
+**短路口径（刻意）**：`dataset_name_parts(config, baseline=SMALL_CONFIG)` 在
+"数据集相同且解析后维度相同"时直接返回空段 —— 这使 `Config()` 缺省构造与
+`apply_overrides` 用 `to_dict()` 重建（此时维度是**显式 int**）两种**语义等价**的对象
+产出**逐字相同**的产物名（与 `apply_overrides` 的"值等价即复用基线对象"纪律一致）。
+
+**可区分性断言**（常驻防线，`main()` 入口处调用，成本 5 数据集 x 3 指纹）：
+`assert_dataset_name_distinguishable()` 断言"同配置不同数据集的三处指纹两两不同"，
+并逐项非空。**注入反例实测**：把 `dataset_name_parts` 替换成恒返回 `("", "")` 后，
+断言立即报错并点名冲突数据集对（`dataset='csv'` 与 `dataset='json'` 指纹相同）——
+证明该断言**有区分力**（非空转）。
+
+**[!] 关于 `_d{D}x{C}` 段的覆盖范围（如实披露，含更正）**：
+
+* 对**声明了维度**的来源（`mnist` 784/10、`synthetic` 64/8），该段在**当前校验口径下不可达** ——
+  `Config` 构造期要求"显式维度 == 规格声明值"，故任何**合法**配置的该段恒为空。
+  它仍被实现并**由注入实验独立验证**（`_probe_dataset_config.py` 注入
+  `_derived["input_dim"]=64 / ["output_dim"]=8` 后实测产出
+  `..._dssynthetic_d64x8_nosyn_s42.pt`）；
+* 对**占位 0** 的来源（`npz` / `csv` / `json`），该段是**可达且真实生效**的：解析后的
+  真实维度（如 `64` / `8`）必然不等于注册表的占位 `0`，故**实测**产物名为
+  `full_shapesphere_N256_..._dsnpz_d64x8_nosyn_s42_ds_r4.pt`（R4 真实训练产物，退码 0）。
+
+**[!] 更正留档**：本节的早期草稿曾笼统写成"`_d{D}x{C}` 段始终不可达"，那只对**声明了维度**
+的来源成立；占位来源（`npz`/`csv`/`json`）恰恰是它最有价值的场景 ——
+**同一数据集名、不同维度的两个文件**（例如两个不同的 `.npz`）会因该段而**不撞名**。
+
+### 21.7 冒烟判据泛化（判据 `[5]`，仅 `--arch mlp` 分支）
+
+原判据硬编码 `input_dim == 784 and output_dim == 10`（换数据集后**必然 FAIL**，
+而模型其实完全正确）。第 21 轮改为"与 `DATASET_SPECS[dataset]` 的声明值比对"，
+但**漏了占位语义** —— 本节的最终口径是**占位感知**版本（与 `data.resolve_dims` 同源）：
+
+```text
+声明值为占位（spec.input_dim <= 0 / spec.num_classes <= 0，即 npz / csv / json）
+    -> 跳过规格比对，断言「生效维度 > 0」
+       （真值一致性已由数据层 _check_dims 在加载后用真实列数 / 最大标签校验）
+声明值为真值（mnist 784/10、synthetic 64/8）
+    -> 保持严格的规格相等比对
+两者之外另核：原始字段值（config.__dict__，即"显式给出的值 / 未给出哨兵"）
+              必须为 None 或等于生效值
+```
+
+**[!] 已修复的 error 级缺陷（皋陶审查 + 力牧/风后双重复现）**：占位语义漏判使
+`npz` / `csv` / `json` 的**一切合法配置**的 mlp 冒烟**恒判 FAIL**（生效维度恒 `!= 0`，
+而声明值是占位 `0`）。复现与修复实测：
+
+```text
+修复前：--smoke-test --arch mlp --dataset npz --dataset-path .../ds_probe_data.npz \
+        --input-dim 64 --output-dim 8
+        -> [FAIL] [5] ... input_dim=64（规格 0）... output_dim=8（规格 0）；退码 1
+修复后：同命令 -> [PASS] [5] ... input_dim=64（规格 占位，由数据决定）...；退码 0
+        csv / json（对象形态）/ json（.jsonl 形态）同口径同为 [PASS]、退码 0
+```
+
+**[!] 恒真断言已消除（皋陶 info 项）**：原判据里的
+`int(config.input_dim) == int(config.effective_input_dim)` 因
+`Config.__getattribute__` 把两个名字解析为**同一来源**而**恒真**（同源自洽、无区分力）。
+现改为读**原始字段值**（`config.__dict__`）与生效值核对，是**可 falsify** 的断言。
+
+**MNIST 情形（784 / 10）下与原硬编码断言完全等价**（回归锚点不变）。`neuron3d` 分支的
+维度一致性由模型构造期的 `[B, D]` 宽度契约天然把守，无需另加断言。
+
+**[!] 判据条数必须按分支读（避免误判验收为失败）**：`--arch mlp` 冒烟**只有 6 条判据
+（`[1][2][3][4][5][16]`）**，`[5]` 是其中的 mlp 分支、`[6]`–`[15]` 是 `neuron3d` 专属
+（`[5]` 在 neuron3d 分支下是"S_in 非空"）。故 `--arch mlp` 的**通过口径是 6/6**，
+不是 16/16 —— 计划文本曾把两者混写，此处如实登记。
+
+### 21.8 验收实测（真实执行）
+
+| 项 | 命令 | 实测 |
+| --- | --- | --- |
+| MNIST 冒烟 | `python n3d_shape/train.py --smoke-test` | **16/16 PASS，退出码 0**，产物仍写 `_verify/smoke_nosyn.pt`（名字逐字不变） |
+| 数据集层探针 | `python checkpoints/n3d_shape/_verify/_probe_dataset_data.py` | **30/30 PASS**（五来源 + 12 类提前报错 + 小集可跑完 + MNIST 委派路径） |
+| 配置层探针 | `python checkpoints/n3d_shape/_verify/_probe_dataset_config.py` | **全部 PASS**（含 MNIST 三处指纹逐字不变、`_ds` 段、可区分性断言与注入反例） |
+| 基准名核对 | `python n3d_shape/bench_shape_modes.py --dry-run` | **120/120 唯一**，且与磁盘 `.pt` **逐一对应**（missing=0 / extra=0） |
+| 真实产物自检 | `python n3d_shape/bench_shape_modes.py --check-real-artifact` | **4/4 全绿**（B1 新夹具），夹具 SHA256 自测前后一致 |
+| 限批冒烟（synthetic） | `--dataset synthetic --epochs 1 --max-batches 3 ... --tag dsprobe` | 退出码 0，产物名含 `_dssynthetic` 且写 `_verify/`，未覆盖正式产物 |
+
+**五次端到端演练 R1–R5（真实执行，全部退码 0）**：统一口径 `--preset default --epochs 20
+--seed 42 --n 256 --shape sphere --input-scope/--readout-scope any_isolated --threads 0`
+（`R3` 为同参对照 `--arch mlp`，故不传 `--n`），**五组共享同一 `seed=42` 前提**：
+
+| 编号 | 数据来源 | 额外开关 | 产物名 | `test_acc` | 退码 |
+| --- | --- | --- | --- | --- | --- |
+| R1 | `synthetic` | `--fc-dim -1 --geo-field none` | `full_..._fc-1_dssynthetic_nosyn_s42_ds_r1.pt` | **0.7700** | 0 |
+| R2 | `synthetic` | `--fc-dim -1 --geo-field additive` | `full_..._fc-1_geoadditive_k12_dssynthetic_nosyn_s42_ds_r2.pt` | **0.7625** | 0 |
+| R3 | `synthetic` | `--arch mlp`（同参对照基线） | `full_..._dssynthetic_nosyn_s42_ds_r3.pt` | **0.7650** | 0 |
+| R4 | `npz`（1600/40000 合成数据落盘） | `--input-dim 64 --output-dim 8` | `full_..._dsnpz_d64x8_nosyn_s42_ds_r4.pt` | **0.7725** | 0 |
+| R5 | `json`（`.jsonl` 逐行形态，1600 样本） | `--input-dim 64 --output-dim 8` | `full_..._dsjson_d64x8_nosyn_s42_ds_r5.pt` | **0.7844** | 0 |
+
+* 验收判据「非 mnist 通路 `test_acc > 0.30`」**五组全部满足**；
+* **[!] 与 MNIST 绝对水平不可直接比**：合成数据的类别结构、样本量（1600/400）与
+  MNIST（60000/10000）完全不同，这里的数字**只证明"通路打通且真的在学"**，
+  **不构成任何"哪种数据集更好/更难"的结论**；
+* R1/R2 共享同一 seed 且只差 `geo_field`，`Δacc = -0.75 pp` 落在单 seed 噪声量级内，
+  **不足以支撑"几何场有效/无效"的结论**（与 §20.7 的判定规则一致：只报数，不下结论）；
+* R4/R5 的产物名同时含 `_ds{...}` 与 `_d64x8` 两段，是"占位维度来源"下
+  `_d{D}x{C}` 段真实生效的**实测证据**（见 §21.6）。
+* **[!] 产物落盘位置（必须如实披露的操作事实）**：这 5 条演练命令用的是**正式训练参数**
+  （无 `--max-batches`），故按 `train.resolve_checkpoint_path` 的设计它们先落到了
+  `checkpoints/n3d_shape/` **根目录**；为保持本模块的 120 条标定产物**一条不增不改**
+  （`--dry-run` 的 120/120 与磁盘逐一对应是硬约束），这 5 个文件已被**移动**到
+  `checkpoints/n3d_shape/_verify/`（文件名逐字未变），移动后重跑 `--dry-run` 复核：
+  `120/120 唯一`、`missing=[]`、`extra=[]`、根目录 `.pt` 仍为 **120**。
+  后续若要复跑 R1–R5，请显式加 `--max-batches`（限批模式会自动写 `_verify/`）
+  或 `--checkpoint` 指定到 `_verify/` 下，以免再次落到根目录。
+
+**回修轮补充验收（判据 `[5]` 占位感知修复，全部真实执行）**：
+
+| 项 | 命令 | 实测 |
+| --- | --- | --- |
+| B1 npz mlp 冒烟 | `--smoke-test --arch mlp --dataset npz --dataset-path .../ds_probe_data.npz --input-dim 64 --output-dim 8` | 修复前 **[FAIL] [5]**；修复后 **[PASS] [5]、6/6 通过、退码 0** |
+| B2 csv 占位 | `--dataset csv --dataset-path .../ds_probe_data.csv --input-dim 64 --output-dim 8` | **[PASS] [5]、6/6、退码 0** |
+| B2 json 对象形态 | `--dataset json --dataset-path .../ds_probe_data.json ...` | **[PASS] [5]、6/6、退码 0** |
+| B2 json `.jsonl` 形态 | `--dataset json --dataset-path .../ds_probe_data.jsonl ...` | **[PASS] [5]、6/6、退码 0** |
+| B3 MNIST 零回归 | `python n3d_shape/train.py --smoke-test` | **16/16 PASS、退码 0**，产物仍 `_verify/smoke_nosyn.pt`（名字逐字不变） |
+| B4 synthetic（真值路径） | `--smoke-test --arch mlp --dataset synthetic` | **[PASS] [5]、6/6、退码 0** |
+| B5 编译与验证 | `compileall -q n3d_shape`；`verify_shape.py --quick` / 全量 | 退码 **0**；`--quick` **113/113**、全量 **180/180**、退码 0 |
+| B6 基准名核对 | `bench_shape_modes.py --dry-run` | **120/120 唯一**且与磁盘逐一对应（missing=[] / extra=[]） |
+| B7 产物完整性 | 现场枚举 | 根目录 `.pt` **120**、最新 mtime 仍 `2026-10-02T18:51:46`；`model.pt` **未写入**；删除清单仍 **65393 B** |
+
+新增夹具（留在 `_verify/` 作为取证）：`ds_probe_data.csv`（975,946 B，带表头）、
+`ds_probe_data.json`（1,071,483 B，对象形态）、`ds_probe_data.jsonl`（1,089,069 B，逐行形态），
+由 `_make_ds_fixtures.py` 现场生成（口径同 `_probe_dataset_data.py`：从
+`make_synthetic_arrays(4000, 64)` **打乱后**取 1600 行，避免生成器排序导致的单标签样本集）。
+
+### 21.9 接入新数据集三步（扩展指引）
+
+1. **注册**：在 `data.DATASET_SPECS` 增加条目（`name` / `input_dim` / `num_classes` /
+   `kind` / `norm_*` / `notes`）；新 `kind` 需在 `build_dataloaders` 的分派处加分支，
+   并写一个 `load_<kind>_arrays(path) -> (X, y)`（**必须**在加载期做完空集 / NaN /
+   列数不齐的校验，报文带字段名或行号）；
+2. **维度**：在注册表里给出**声明值**（或按 `npz`/`csv`/`json` 的先例用占位 `0` 表示
+   "由文件决定"）；若给出声明值，则 `Config` 会把 `--input-dim` / `--output-dim`
+   当作**一致性校验**而不是自由覆盖；
+3. **回归**：`python n3d_shape/train.py --smoke-test` 必须仍 **16/16 / 退码 0**、
+   `bench_shape_modes.py --dry-run` 必须仍 **120/120 且与磁盘逐一对应**；
+   两者分别守住"MNIST 零回归"与"既有产物零改名"。

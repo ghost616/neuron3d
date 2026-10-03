@@ -27,6 +27,20 @@
 --readout-scope S       读出判据 any_isolated / all_isolated（缺省沿用预设）
 --placement P           神经元放置方式，当前仅 fcc（FCC 规则堆积）
 
+数据集通用层（第 6 轮新增：数据集可插拔）
+----------------------------------------
+--dataset NAME          数据集来源：mnist（缺省，回归锚点）/ synthetic / npz / csv / json。
+                        注册表见 `data.DATASET_SPECS`；`--dataset mnist` **委派既有
+                        `get_mnist_loaders`**，签名 / 行为 / 加载顺序 / 归一化逐字不变。
+--data-root PATH        MNIST 数据根目录（缺省 data/mnist；仅 mnist 使用）。
+--dataset-path PATH     npz / csv / json 的数据文件路径（相对路径按当前工作目录解析）。
+--input-dim D          覆盖输入维数（缺省 = 取数据集规格；与规格声明值冲突时报错）。
+--output-dim C         覆盖类别数（缺省 = 取数据集规格；与规格声明值冲突时报错）。
+--num-samples M         仅 synthetic：总样本数（0 = 取缺省 4000）。
+--norm-mean / --norm-std
+                        归一化统计量（两者必须同时给出；缺省 = 训练集现场统计并写日志）。
+                        归一化口径与 `--dataset` 的取值一起写入运行日志，便于事后复核。
+
 产物保护
 --------
 * 本模块产物目录为 `checkpoints/n3d_shape/`，与一期 `checkpoints/` 与二期
@@ -85,6 +99,8 @@ _reconfigure_stdio()
 
 try:
     from .config import (
+        DATASET_CHOICES,
+        DATASET_SPECS,
         Config,
         DEFAULT_CONFIG,
         FLOW_AXIS_CHOICES,
@@ -95,7 +111,7 @@ try:
         SHAPE_CHOICES,
         SMALL_CONFIG,
     )
-    from .data import get_mnist_loaders
+    from .data import MNIST_MEAN, MNIST_STD, build_dataloaders
     from .model import MLPBaseline, ThreeDNeuronSpace
     from .utils import (
         count_parameters,
@@ -108,6 +124,8 @@ try:
     )
 except ImportError:  # pragma: no cover
     from config import (  # type: ignore
+        DATASET_CHOICES,
+        DATASET_SPECS,
         Config,
         DEFAULT_CONFIG,
         FLOW_AXIS_CHOICES,
@@ -118,7 +136,7 @@ except ImportError:  # pragma: no cover
         SHAPE_CHOICES,
         SMALL_CONFIG,
     )
-    from data import get_mnist_loaders  # type: ignore
+    from data import MNIST_MEAN, MNIST_STD, build_dataloaders  # type: ignore
     from model import MLPBaseline, ThreeDNeuronSpace  # type: ignore
     from utils import (  # type: ignore
         count_parameters,
@@ -136,6 +154,11 @@ PRESETS: Dict[str, Config] = {
     "default": DEFAULT_CONFIG,
     "highacc": HIGHACC_CONFIG,
 }
+
+# 归一化参数的"未提供"哨兵（第 6 轮新增）：`None` 而非浮点值 —— 均值的合法取值含
+# 0.0（把数据平移到原点附近是常见做法），若用 -1.0 之类浮点哨兵就会与合法值冲突。
+# 因此 CLI 侧 `--norm-mean` / `--norm-std` 的 default 是 `None`，只判 `is not None`。
+NORM_SENTINEL_NOTE: str = "norm_mean / norm_std 的哨兵是 None（0.0 是合法均值）"
 
 # 阶段 A 验收阈值
 GRAD_NORM_MIN: float = 0.0    # 所有可学习参数梯度范数必须 > 0
@@ -171,6 +194,129 @@ SMOKE_CRITERIA_DOC: Tuple[str, ...] = (
     "选取度量 == 按形状度量取最近 N 个的实测值、层数 K == 唯一流向轴坐标数",
     "16 CPU 单 batch 前向+反向耗时 < 120s",
 )
+
+
+def dataset_name_parts(
+    config: Config,
+    baseline: Optional[Config] = None,
+    short_circuit: bool = True,
+) -> Tuple[str, str]:
+    """返回产物名的**数据集命名段**：`(dataset_part, dims_part)`（第 6 轮新增，防撞名）。
+
+    口径（`smoke_fingerprint` / `config_fingerprint` / `full_checkpoint_name` / 冒烟默认判定
+    四处**必须逐字一致**）
+    ------------------------------------------------------------------------------
+    * `dataset_part = ""` 当 `config.dataset == "mnist"`（**缺省来源不加段**，保证既有
+      120 个 `full_*` / `verify_*` 产物名**逐字不变**）；否则为 `_ds{name}`；<br>
+    * `dims_part = ""` 当 `(input_dim, output_dim)` 等于**该数据集规格的缺省值**；
+      否则为 `_d{D}x{C}`。
+
+    "MNIST 且维度取规格缺省"这一组合因此**恒为空段** —— 这正是"既有产物名逐字不变"的
+    形式化条件，并由 `assert_dataset_name_distinguishable` 与冒烟默认判定共同守护。
+
+    `baseline`（可选，用于**短路口径**）
+    ---------------------------------
+    当调用方传入 `baseline=SMALL_CONFIG`（冒烟默认判定路径）且
+    `config.dataset == baseline.dataset` 且**两者解析后的维度相同**时，直接返回
+    `("", "")`。理由：`Config.__init__` 的两个入口（`Config()` 缺省构造 vs
+    `apply_overrides` 用 `to_dict()` 重建，此时 `input_dim` / `output_dim` 是**显式 int**）
+    会得到**语义完全相同**的配置对象。既然配置语义相同，产物名也必须逐字相同 ——
+    否则"裸跑冒烟"与"显式传 `--input-dim 784` 的冒烟"会写同一份默认产物的两个名字，
+    与 `apply_overrides` 的"值等价即复用基线对象"纪律冲突。**默认开启该短路口径**；
+    数据集与维度确有差异时照常生成段。
+
+    参数
+    ----
+    config : Config
+        本次生效的配置。
+    baseline : Optional[Config]
+        可选的基准确认配置（通常 `SMALL_CONFIG`）；`None` 表示不做短路。
+    short_circuit : bool
+        是否允许上述短路口径（缺省 True）。
+
+    返回
+    ----
+    Tuple[str, str]
+        `(dataset_part, dims_part)`，例如 `("_dssynthetic", "")` 或 `("", "_d64x4")`。
+    """
+    if short_circuit and baseline is not None:
+        if str(config.dataset) == str(baseline.dataset) and (
+            int(config.effective_input_dim) == int(baseline.effective_input_dim)
+            and int(config.effective_output_dim) == int(baseline.effective_output_dim)
+        ):
+            return "", ""
+    dataset_part = "" if str(config.dataset) == "mnist" else f"_ds{config.dataset}"
+    spec = DATASET_SPECS.get(str(config.dataset))
+    dims_part = ""
+    if spec is not None and (
+        int(config.effective_input_dim) != int(spec.input_dim)
+        or int(config.effective_output_dim) != int(spec.num_classes)
+    ):
+        dims_part = f"_d{int(config.effective_input_dim)}x{int(config.effective_output_dim)}"
+    return dataset_part, dims_part
+
+
+def assert_dataset_name_distinguishable() -> None:
+    """**可区分性断言**：同配置不同数据集的产物名必须互不相同（第 6 轮新增）。
+
+    口径
+    ----
+    在同一份基线（`SMALL_CONFIG`）上只改 `dataset`，逐个数据集取
+    `smoke_fingerprint` / `config_fingerprint` / `full_checkpoint_name` **三处指纹**，
+    断言"任意两个数据集的指纹两两不同"。这条断言把"数据集维度漏进指纹"这一
+    必然导致**同名互覆**的缺陷挡在入口处（与形状 / `fc_dim` / `geo_field` 的历史
+    纠正记录同源）。
+
+    参数：无。
+
+    返回
+    ----
+    None
+
+    异常
+    ------
+    ValueError
+        任一数据集的任一指纹为空，或两个数据集在某处指纹相同（即命名段缺失）时抛出，
+        报文列出冲突的数据集对与指纹值。
+    """
+    variants: Dict[str, Tuple[str, str, str]] = {}
+    for name in DATASET_CHOICES:
+        spec = DATASET_SPECS[name]
+        # [!] `npz` / `csv` / `json` 的注册表维度是**占位 0**
+        #     （"由数据文件现场决定"），因此构造这类配置必须显式给出维度。
+        #     这里刻意给出与 mnist 相同的 (784, 10)：本断言只关心"数据集维度是否进指纹"，
+        #     且这样能让"命名段本身"成为唯一的差异来源，判据最锐利。
+        cfg = Config(
+            **{
+                **SMALL_CONFIG.to_dict(),
+                "dataset": name,
+                "input_dim": int(spec.input_dim) if int(spec.input_dim) > 0 else 784,
+                "output_dim": (
+                    int(spec.num_classes) if int(spec.num_classes) > 0 else 10
+                ),
+            }
+        )
+        variants[name] = (
+            smoke_fingerprint(cfg),
+            config_fingerprint(cfg, 1),
+            full_checkpoint_name(cfg),
+        )
+    for name, fp in variants.items():
+        if not all(fp):
+            raise ValueError(
+                f"[可区分性断言] dataset={name!r} 的产物名指纹为空：{fp}"
+                f"（数据集命名段缺失，会导致同名互覆）"
+            )
+    names = sorted(variants)
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            a, b = names[i], names[j]
+            if variants[a] == variants[b]:
+                raise ValueError(
+                    f"[可区分性断言] 同配置不同数据集的产物名相同：dataset={a!r} 与 "
+                    f"dataset={b!r} 的三处指纹均为 {variants[a]}（数据集维度未进指纹）"
+                )
+    return None
 
 
 def smoke_fingerprint(config: Config) -> str:
@@ -244,6 +390,11 @@ def smoke_fingerprint(config: Config) -> str:
         )
         if str(config.geo_field) != "none" else ""
     )
+    # ---- 数据集通用层（第 6 轮新增）：`_ds{name}` / `_d{D}x{C}` 两段 ----
+    # [!] 命名段位置口径（四处逐字一致）：`..._rs{scope}` -> [_fc{n}] -> [_geo...]
+    #     -> [_ds{name}] -> [_d{D}x{C}] -> _nosyn -> [_R{space_radius}] -> _s{seed}。
+    #     `mnist` + 规格缺省维度时两段**均为空** => 既有产物名逐字不变（零回归）。
+    ds_part, dim_part = dataset_name_parts(config)
     return (
         f"{config.shape_tag()}_"
         f"N{config.N}_y{config.y_in}x{config.y_out}"
@@ -255,6 +406,8 @@ def smoke_fingerprint(config: Config) -> str:
         f"_bs{config.batch_size}"
         f"{fc_part}"
         f"{geo_part}"
+        f"{ds_part}"
+        f"{dim_part}"
         f"{nosyn_part}"
         f"{radius_part}"
         f"_s{config.seed}"
@@ -472,6 +625,90 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=["", *PLACEMENT_CHOICES],
         help="神经元放置方式（缺省 = 沿用预设 fcc）。当前仅支持 FCC 规则堆积",
     )
+    # ---- 数据集通用层 CLI（第 6 轮新增；缺省 mnist = 回归锚点）----
+    # [!] 这 8 个参数**全部**必须纳入 `validate_override_args`（取值合法性）
+    #     与 `apply_overrides`（真正生效）+ `build_smoke_config` 的 explicit 判定，
+    #     否则会被**静默丢弃**（与 `--shape` / `--fc-dim` / `--geo-field` 的历史陷阱同源）。
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="",
+        choices=["", *DATASET_CHOICES],
+        help=(
+            "数据集来源（缺省 = 沿用预设 mnist = 零回归锚点）："
+            "mnist（IDX，委派既有 get_mnist_loaders，行为逐字不变）/ "
+            "synthetic（确定性生成、非线性可分、不联网）/ "
+            "npz（X[M,D] / y[M]）/ csv（末列标签）/ "
+            "json（{\"X\": [[...]], \"y\": [...]} 对象形态 + .jsonl 逐行样本对象）。"
+            "输入维数与类别数的缺省值由注册表 data.DATASET_SPECS 单一解析点给出。"
+            "**空串 = 不覆盖**（与 --shape / --input-scope 同一哨兵口径）"
+        ),
+    )
+    parser.add_argument(
+        "--data-root",
+        dest="data_root",
+        type=str,
+        default="",
+        help="MNIST 数据根目录（缺省 = 沿用预设 data/mnist；仅 --dataset mnist 使用）",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        dest="dataset_path",
+        type=str,
+        default="",
+        help=(
+            "数据集文件路径（npz / csv / json 必需；相对路径按当前工作目录解析）。"
+            "json 支持 .json 对象形态与 .jsonl / .ndjson 逐行样本对象两种形态"
+        ),
+    )
+    parser.add_argument(
+        "--input-dim",
+        dest="input_dim",
+        type=int,
+        default=None,
+        help=(
+            "输入维数（缺省 = None，取数据集规格；**必须 > 0**）。"
+            "显式给出且与数据集规格声明值冲突时立即报错（拒绝静默不一致）"
+        ),
+    )
+    parser.add_argument(
+        "--output-dim",
+        dest="output_dim",
+        type=int,
+        default=None,
+        help=(
+            "类别数（缺省 = None，取数据集规格；**必须 > 0**）。"
+            "显式给出且与数据集规格声明值冲突时立即报错（拒绝静默不一致）"
+        ),
+    )
+    parser.add_argument(
+        "--num-samples",
+        dest="num_samples",
+        type=int,
+        default=0,
+        help="仅 --dataset synthetic：总样本数（0 = 取缺省 4000；必须 >= 0）",
+    )
+    parser.add_argument(
+        "--norm-mean",
+        dest="norm_mean",
+        type=float,
+        default=None,
+        help=(
+            "归一化均值（缺省 = None，由训练集现场统计并写日志）。"
+            "**必须与 --norm-std 同时给出**（只给一个直接报错）。"
+            "缺省会覆盖为该值；注意哨兵不是浮点值而是 None（0.0 是合法均值）"
+        ),
+    )
+    parser.add_argument(
+        "--norm-std",
+        dest="norm_std",
+        type=float,
+        default=None,
+        help=(
+            "归一化标准差（缺省 = None，由训练集现场统计；给出时必须 > 0）。"
+            "**必须与 --norm-mean 同时给出**。注意哨兵不是浮点值而是 None"
+        ),
+    )
     # ---- 形状 CLI（本模块新增维度；缺省空串 = 沿用预设 sphere）----
     # [!] 帮助文案一律 ASCII 数学记号（`||p||2` / `||p||inf` / `|p_axis|`）：
     #    Windows GBK 控制台无法编码 `‖`（U+2016）、下标 `2`（U+2082）、`∞`（U+221E）
@@ -657,6 +894,14 @@ def build_model_and_data(
     Tuple[nn.Module, DataLoader, DataLoader]
         (model, train_loader, test_loader)。
 
+    数据来源（第 6 轮修订）
+    ----------------------
+    原先此处的调用点硬编码 `get_mnist_loaders(...)`，现改为通用入口
+    `data.build_dataloaders(...)`。`config.dataset == "mnist"` 时该入口**委派**
+    `get_mnist_loaders`（参数与返回顺序逐字不变），故 MNIST 路径零回归；
+    其余来源（synthetic / npz / csv / json）由同一入口按注册表分派。
+    解析后的数据集规格写入运行日志（含归一化口径）。
+
     异常
     ------
     RuntimeError
@@ -669,11 +914,24 @@ def build_model_and_data(
         model: nn.Module = MLPBaseline(config).to(device)
     else:
         model = ThreeDNeuronSpace(config).to(device)
-    train_loader, test_loader = get_mnist_loaders(
+    # ---- 数据：唯一通用入口（mnist 分支委派 get_mnist_loaders，行为逐字不变）----
+    train_loader, test_loader, data_spec = build_dataloaders(
+        dataset=str(config.dataset),
         batch_size=config.batch_size,
         data_root=config.data_root,
+        dataset_path=str(config.dataset_path or ""),
         num_workers=config.num_workers,
         seed=config.seed,
+        input_dim=config.__dict__["input_dim"],
+        output_dim=config.__dict__["output_dim"],
+        num_samples=int(config.num_samples),
+        norm_mean=config.norm_mean,
+        norm_std=config.norm_std,
+    )
+    log_info(
+        f"数据集装配完成：{data_spec.describe()}；"
+        f"生效维度 input_dim={int(config.effective_input_dim)}, "
+        f"output_dim={int(config.effective_output_dim)}（{config.dims_source}）"
     )
 
     # ---- 设备一致性断言（装配后立即校验，尽早暴露设备错误） ----
@@ -962,6 +1220,47 @@ def validate_override_args(args: argparse.Namespace) -> None:
             f"但显式给出了 --cyl-aspect={args.cyl_aspect}。请改用 --shape cylinder "
             f"或移除 --cyl-aspect（拒绝静默无效参数）。"
         )
+    # ---- 数据集通用层校验（第 6 轮新增）----
+    # [!] 维度哨兵是 `None`（**不是浮点/整数哨兵**）：`--input-dim 0` 与
+    #     `--output-dim 0` 都是**非法显式值**，必须在 CLI 层就报错 ——
+    #     否则 `0` 会被当成"未提供"而静默取规格，与计划验收第 6 条
+    #     "input_dim=0 提前报错"直接冲突。
+    if args.input_dim is not None and int(args.input_dim) <= 0:
+        raise ValueError(
+            f"--input-dim 必须 > 0（缺省 = 不覆盖、取数据集规格），"
+            f"当前 --input-dim={args.input_dim}"
+        )
+    if args.output_dim is not None and int(args.output_dim) <= 0:
+        raise ValueError(
+            f"--output-dim 必须 > 0（缺省 = 不覆盖、取数据集规格），"
+            f"当前 --output-dim={args.output_dim}"
+        )
+    if int(args.num_samples) < 0:
+        raise ValueError(
+            f"--num-samples 必须 >= 0（0 表示取该数据集的缺省样本数），"
+            f"当前 --num-samples={args.num_samples}"
+        )
+    # 归一化：哨兵是 None；两者必须**同时**给出（只给一个直接报错，拒绝半套统计量）
+    if (args.norm_mean is None) != (args.norm_std is None):
+        raise ValueError(
+            f"--norm-mean 与 --norm-std 必须同时给出（缺省 = 两者都不给、由训练集现场统计）："
+            f"当前 --norm-mean={args.norm_mean}, --norm-std={args.norm_std}"
+        )
+    if args.norm_std is not None and not (float(args.norm_std) > 0.0):
+        raise ValueError(
+            f"--norm-std 必须 > 0，当前 --norm-std={args.norm_std}"
+        )
+    # 未注册的数据集名由 argparse 的 choices 直接拒绝；此处再校验需要外部文件的来源
+    # 是否给了路径（空路径在 `build_dataloaders` 里也会报错，这里提前到 CLI 层更友好）。
+    # [!] 只看 `args.dataset` **非空**（用户确实给了）的情形：留空 = 沿用预设的 mnist，
+    #     此时 `--dataset-path` 对 mnist 无意义，不该被当成"缺路径"而误报。
+    if args.dataset:
+        _spec = DATASET_SPECS.get(str(args.dataset))
+        if _spec is not None and _spec.kind in ("npz", "csv", "json") and not args.dataset_path:
+            raise ValueError(
+                f"--dataset {args.dataset} 需要 --dataset-path 指定数据文件路径"
+                f"（拒绝静默使用空路径）。"
+            )
     # 其余字符串型几何参数由 argparse 的 choices 直接拒绝非法取值（空串 = 未提供）
 
 
@@ -1059,6 +1358,51 @@ def apply_overrides(
         log_info(f"seed 覆盖：{overrides['seed']} -> {args.seed_override}")
         overrides["seed"] = args.seed_override
         changed = True
+    # ---- 数据集通用层覆盖（第 6 轮新增；哨兵："" / None / 0）----
+    # [!] 这一段是"数据集可插拔"的**唯一生效路径**：漏一个字段就会被
+    #     `Config(**base.to_dict())` 静默丢弃（历史陷阱同源）。
+    if args.dataset:
+        overrides["dataset"] = str(args.dataset)
+        changed = True
+        # [!] **换数据集时必须清掉上一份配置遗留的显式维度**（本模块第 6 轮的关键纪律）：
+        #     `to_dict()` 里 `input_dim` / `output_dim` 可能是**显式值**
+        #     （预设自身写着 784/10，或上一轮显式给了值），那些数字属于**上一个数据集**。
+        #     若原样带进新数据集，`Config` 构造期会因"显式值与新规格冲突"直接报错
+        #     （例如 `--preset default --dataset synthetic` 会因 `784 != 64` 失败），
+        #     而用户的意图显然是"用新数据集自己的维度"。
+        #     为什么清在这里、而不是在 `Config.__post_init__`：只有本入口**确知**
+        #     "数据集确实被切换了"，因此可以安全区分
+        #       (a) 遗留值（继承自上一步）-> 清成哨兵，交给规格解析；
+        #       (b) 用户显式给出的冲突值 -> 仍走下方的显式写入与解析期报错。
+        #     在构造期按"值等于 mnist 规格就清除"会把 (b) 也静默放过，属放宽纪律。
+        overrides.pop("input_dim", None)
+        overrides.pop("output_dim", None)
+    if args.data_root:
+        overrides["data_root"] = str(args.data_root)
+        changed = True
+    if args.dataset_path:
+        overrides["dataset_path"] = str(args.dataset_path)
+        changed = True
+    if int(args.num_samples) > 0:
+        overrides["num_samples"] = int(args.num_samples)
+        changed = True
+    if args.norm_mean is not None:
+        overrides["norm_mean"] = float(args.norm_mean)
+        overrides["norm_std"] = float(args.norm_std)
+        changed = True
+    # [!] `--input-dim` / `--output-dim` 的写法与其它字段**不同**（刻意）：
+    #     只有当显式值**偏离**"该数据集规格的缺省值"时才写进 overrides。
+    #     理由：`to_dict()` 写出的是哨兵（`None` = 未给出），若把"与规格一致的显式值"
+    #     （如 mnist 的 784/10）也写进去，`Config(...) == base` 会因**原始字段值**不同
+    #     而判不相等，于是 `apply_overrides` 的"值等价即复用基线对象"优化失效，
+    #     同一语义的配置会产出不同字节的产物（离朱第 11 轮 D1 的同类缺陷）。
+    #     语义等价的显式值，其**生效值**本来就等于规格缺省值，故等价性完全保留。
+    if args.input_dim is not None and int(args.input_dim) != int(base.effective_input_dim):
+        overrides["input_dim"] = int(args.input_dim)
+        changed = True
+    if args.output_dim is not None and int(args.output_dim) != int(base.effective_output_dim):
+        overrides["output_dim"] = int(args.output_dim)
+        changed = True
     if args.readout_bias is not None:
         overrides["readout_bias"] = bool(args.readout_bias)
         changed = True
@@ -1144,6 +1488,17 @@ def build_smoke_config(args: argparse.Namespace) -> Config:
         or bool(args.geo_field)
         or args.geo_rbf_k > 0
         or args.geo_alpha_init >= 0.0
+        # 数据集通用层（第 6 轮新增）：必须计入 explicit，否则 --dataset / --dataset-path
+        # / --input-dim / --output-dim / --num-samples / --norm-mean / --norm-std
+        # 会被静默丢弃（`--data-root` 亦同）。
+        or bool(args.dataset)
+        or bool(args.data_root)
+        or bool(args.dataset_path)
+        or args.input_dim is not None
+        or args.output_dim is not None
+        or int(args.num_samples) > 0
+        or args.norm_mean is not None
+        or args.norm_std is not None
     )
     if not explicit:
         return SMALL_CONFIG
@@ -1153,7 +1508,9 @@ def build_smoke_config(args: argparse.Namespace) -> Config:
         warn_message=(
             "冒烟测试配置已被显式覆盖（--preset/--n/--y-in/--y-out/--h/--d/--seed/--lr/"
             "--flow-axis/--space-radius/--input-scope/--readout-scope/--placement/"
-            "--shape/--cyl-aspect/--fc-dim/--geo-field 之一）："
+            "--shape/--cyl-aspect/--fc-dim/--geo-field/--dataset/--data-root/"
+            "--dataset-path/--input-dim/--output-dim/--num-samples/--norm-mean/--norm-std "
+            "之一）："
             f"预设={args.preset}；阶段 A 的默认基线仅在默认组合下成立"
         ),
     )
@@ -1554,12 +1911,58 @@ def run_smoke_test(
             )
         )
     else:
+        # [5]（mlp 分支）：结构断言泛化 + **占位感知**（第 21 轮的修订与回修）
+        # ---------------------------------------------------------------
+        # 原先把 `input_dim == 784 and output_dim == 10` **硬编码**在判据里，
+        # 换成非 MNIST 数据集后该判据必然 FAIL（而模型其实完全正确）。
+        # 第 21 轮改为"与 `DATASET_SPECS[dataset]` 的声明值比对"，但**漏了占位语义**：
+        # `npz` / `csv` / `json` 的注册表声明值是**占位 `0`**（含义 = "由数据文件现场解析"），
+        # 这三个来源又**必须**显式给 `--input-dim` / `--output-dim`，故生效维度恒 `!= 0`
+        # => 判据恒为 False => 这三个来源的**一切合法配置**的 mlp 冒烟必判 FAIL
+        # （实测：`--smoke-test --arch mlp --dataset npz --dataset-path ... --input-dim 64
+        # --output-dim 8` 时 [FAIL]，而同口径 synthetic 为 [PASS]）。
+        # 本次回修把该判据改成与 `data.resolve_dims` **同一口径的占位感知比对**：
+        #   * 声明值为**占位**（`<= 0`，即 npz / csv / json）-> 跳过规格比对，
+        #     只断言"生效维度为正"（真值一致性已由数据层 `_check_dims` 在加载后用
+        #     真实列数 / 最大标签校验，此处不重复也不越权）；
+        #   * 声明值为**真值**（mnist 784/10、synthetic 64/8）-> 保持原判据
+        #     （与规格声明值严格相等）。
+        # MNIST 情形（784 / 10）下与最初的硬编码断言**完全等价**（回归锚点不变）。
+        _spec = DATASET_SPECS[str(config.dataset)]
+        _eff_in = int(config.effective_input_dim)
+        _eff_out = int(config.effective_output_dim)
+        _spec_in = int(_spec.input_dim)
+        _spec_out = int(_spec.num_classes)
+        # 占位判定与 `data.resolve_dims` 完全同源（`<= 0` 即占位）
+        _in_placeholder = _spec_in <= 0
+        _out_placeholder = _spec_out <= 0
+        _in_ok = (_eff_in > 0) if _in_placeholder else (_eff_in == _spec_in)
+        _out_ok = (_eff_out > 0) if _out_placeholder else (_eff_out == _spec_out)
+        # [!] 皋陶 info 项（第 21 轮回修）：原先写作
+        #     `int(config.input_dim) == int(config.effective_input_dim)` —— 由于
+        #     `Config.__getattribute__` 把这两个名字**读取时解析为同一来源**（`_derived`），
+        #     该断言**恒真**（无区分力，属"同源自洽"）。现改为读**原始字段值**
+        #     （`config.__dict__`，即"显式给出的值 / 未给出哨兵"），与生效值做**真实的**
+        #     一致性核对：原始值为 `None`（未给出）或与生效值相等都算通过；
+        #     二者不等说明构造期解析出了问题（那才是真缺陷）。
+        _raw_decls = (
+            config.__dict__.get("input_dim"),
+            config.__dict__.get("output_dim"),
+        )
+        _raw_consistent = all(
+            raw is None or int(raw) == int(eff)
+            for raw, eff in zip(_raw_decls, (_eff_in, _eff_out))
+        )
+        _dims_match = _in_ok and _out_ok and _raw_consistent
         checks.append(
             (
-                "[5] arch=mlp 结构正确（input -> hidden -> output）",
-                int(config.input_dim) == 784 and int(config.output_dim) == 10,
-                f"input_dim={config.input_dim}, hidden_dim={config.hidden_dim}, "
-                f"output_dim={config.output_dim}",
+                "[5] arch=mlp 结构正确（input -> hidden -> output，dims 与数据集规格口径一致）",
+                _dims_match,
+                f"dataset={config.dataset}；input_dim={_eff_in}"
+                f"（{('规格 占位，由数据决定' if _in_placeholder else '规格 ' + str(_spec_in))}），"
+                f"hidden_dim={config.hidden_dim}，output_dim={_eff_out}"
+                f"（{('规格 占位，由数据决定' if _out_placeholder else '规格 ' + str(_spec_out))}）；"
+                f"原始声明值={_raw_decls}（与生效值一致={_raw_consistent}）"
             )
         )
     checks.append(
@@ -1620,6 +2023,19 @@ def run_smoke_test(
         # batch_size 进指纹粒度之外，但它直接影响探针 batch 的规模，故一并比对，
         # 避免"几何相同但批大小不同"的配置覆盖默认产物
         and int(config.batch_size) == int(small.batch_size)
+        # 数据集通用层（第 6 轮新增）**必须纳入默认判定**：否则 `--smoke-test
+        # --dataset synthetic` 会静默覆盖默认产物（用别的数据集的冒烟结果冒充
+        # "默认 MNIST 冒烟产物"）。判定口径 = 命名段逐字相同：
+        #   `dataset_name_parts(config, baseline=small)` 比对 `("", "")`，
+        #    既覆盖 `dataset`，也覆盖"显式维度偏离规格缺省值"的情形；
+        #    `baseline=small` 开启短路口径（语义等价的显式 784/10 视为缺省）。
+        # [!] 这里**复用指纹自身的函数**而不是手写维度清单：指纹与默认判定的维度
+        #     因此天然对齐（下面的等价守卫还会再钉一次）。
+        #     另**显式**比对 `dataset` 本身：短路口径会把"数据集不同但生效维度恰好相同"
+        #     的配置也短路成 `("", "")`（属预期），故必须补这一条，否则
+        #     `--dataset synthetic --input-dim 784 --output-dim 10` 会被误判为默认组合。
+        and str(config.dataset) == str(small.dataset)
+        and dataset_name_parts(config, baseline=small) == dataset_name_parts(small)
     )
     # [!] `_nosyn`（第 4 轮新增）是**格式常量**（与 config 无关），因此**不进入**上式判定：
     #     默认组合写 `_verify/smoke_nosyn.pt`（**判定维度不变，仅默认产物名加格式段**）。
@@ -1681,6 +2097,20 @@ def run_smoke_test(
             "placement_within_circum_ratio": float(
                 getattr(model, "placement_within_circum_ratio", float("nan"))
             ),
+            # ---- 数据集通用层（第 6 轮新增；产物自带来源/维度/归一化取证）----
+            # [!] `input_dim` / `output_dim` 写**生效值**（规格解析后），另写规格声明值，
+            #     使"配置 -> 规格 -> 生效值"三者的关系在产物里可复核。
+            "dataset": config.dataset,
+            "dataset_path": str(config.dataset_path or ""),
+            "dataset_kind": DATASET_SPECS[str(config.dataset)].kind,
+            "num_samples": int(config.num_samples),
+            "input_dim": int(config.effective_input_dim),
+            "output_dim": int(config.effective_output_dim),
+            "dataset_spec_input_dim": int(DATASET_SPECS[str(config.dataset)].input_dim),
+            "dataset_spec_num_classes": int(DATASET_SPECS[str(config.dataset)].num_classes),
+            "dims_source": config.dims_source,
+            "norm_mean_arg": config.norm_mean,
+            "norm_std_arg": config.norm_std,
             # ---- 几何权重场（第 5 轮新增；冒烟产物自带可复核取证信息）----
             "geo_field": config.geo_field,
             "geo_rbf_k": int(config.geo_rbf_k),
@@ -1796,6 +2226,9 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
         )
         if str(config.geo_field) != "none" else ""
     )
+    # ---- 数据集通用层（第 6 轮新增）：`_ds{name}` / `_d{D}x{C}`；口径与段位见
+    #      `smoke_fingerprint` 的同一段注释（三处必须逐字一致）。 ----
+    ds_part, dim_part = dataset_name_parts(config)
     name = (
         f"verify_{max_batches}"
         f"_{config.shape_tag()}"
@@ -1809,6 +2242,8 @@ def config_fingerprint(config: Config, max_batches: int, tag: str = "") -> str:
         f"_rs{scope_abbrev(config.readout_scope)}"
         f"{fc_part}"
         f"{geo_part}"
+        f"{ds_part}"
+        f"{dim_part}"
         f"{nosyn_part}"
         f"_s{config.seed}"
     )
@@ -1865,6 +2300,9 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
         )
         if str(config.geo_field) != "none" else ""
     )
+    # ---- 数据集通用层（第 6 轮新增）：`_ds{name}` / `_d{D}x{C}`；口径与段位见
+    #      `smoke_fingerprint` 的同一段注释（三处必须逐字一致）。 ----
+    ds_part, dim_part = dataset_name_parts(config)
     name = (
         f"full_{config.shape_tag()}"
         f"_N{config.N}"
@@ -1877,6 +2315,8 @@ def full_checkpoint_name(config: Config, tag: str = "") -> str:
         f"_rs{scope_abbrev(config.readout_scope)}"
         f"{fc_part}"
         f"{geo_part}"
+        f"{ds_part}"
+        f"{dim_part}"
         f"{nosyn_part}"
         f"_s{config.seed}"
     )
@@ -2414,6 +2854,18 @@ def _run_training_with_config(
             "effective_space_radius": config.effective_space_radius,
             "min_space_radius": config.min_space_radius,
             "max_space_radius": config.max_space_radius,
+            # ---- 数据集通用层（第 6 轮新增；正式产物同样自带来源/维度取证）----
+            "dataset": config.dataset,
+            "dataset_path": str(config.dataset_path or ""),
+            "dataset_kind": DATASET_SPECS[str(config.dataset)].kind,
+            "num_samples": int(config.num_samples),
+            "input_dim": int(config.effective_input_dim),
+            "output_dim": int(config.effective_output_dim),
+            "dataset_spec_input_dim": int(DATASET_SPECS[str(config.dataset)].input_dim),
+            "dataset_spec_num_classes": int(DATASET_SPECS[str(config.dataset)].num_classes),
+            "dims_source": config.dims_source,
+            "norm_mean_arg": config.norm_mean,
+            "norm_std_arg": config.norm_std,
             "input_scope": config.input_scope,
             "readout_scope": config.readout_scope,
             "lr_schedule": config.lr_schedule,
@@ -2512,6 +2964,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     try:
         validate_override_args(args)
+        # ---- 数据集命名可区分性断言（第 6 轮新增，常驻防线）----
+        # 代价极小（5 个数据集 x 3 处指纹），但它把"数据集维度漏进指纹 -> 同名互覆"
+        # 这类缺陷挡在**任何**产物写入之前；缺失该段的后果是静默覆盖既有取证产物。
+        assert_dataset_name_distinguishable()
         apply_threads(args.threads)
         if args.smoke_test:
             ok = run_smoke_test(

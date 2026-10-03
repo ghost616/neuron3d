@@ -94,11 +94,19 @@ _reconfigure_stdio()
 import torch  # noqa: E402
 
 try:
-    from .config import Config, SHAPE_CHOICES, shape_spec  # noqa: E402
+    # [!] 第 21 轮：`DATASET_SPECS` 用于把三期 `to_dict()` 的维度哨兵（`None`）折算成
+    #     二期 `Config` 可接受的生效值（mnist = 784 / 10），使 S12 / S17-1b 的
+    #     "逐张量比对"仍建立在"同配置、同维度"之上。
+    from .config import DATASET_SPECS, Config, SHAPE_CHOICES, shape_spec  # noqa: E402
     from .model import ThreeDNeuronSpace  # noqa: E402
     from . import train as train_mod  # noqa: E402
 except ImportError:  # pragma: no cover
-    from config import Config, SHAPE_CHOICES, shape_spec  # type: ignore
+    from config import (  # type: ignore
+        DATASET_SPECS,
+        Config,
+        SHAPE_CHOICES,
+        shape_spec,
+    )
     from model import ThreeDNeuronSpace  # type: ignore
     import train as train_mod  # type: ignore
 
@@ -780,6 +788,14 @@ def check_phase2_equality(rep: Report) -> None:
             #     `geo_signed_delta` 五个仅三期字段（同一回归由本轮 `verify_shape.py`
             #     `--quick` 首次运行再次实测捕获：`TypeError: unexpected keyword argument
             #     'geo_field'`），已一并登记。
+            #     第 21 轮新增 `dataset` / `dataset_path` / `num_samples` / `norm_mean` /
+            #     `norm_std` 五个仅三期字段（同一回归**又一次**由 `--quick` 实测捕获：
+            #     `TypeError: Config.__init__() got an unexpected keyword argument 'dataset'`），
+            #     已一并登记 —— 该过滤元组是"跨模块字段差异"的唯一登记点，故保持集中可审计。
+            #     [!] `input_dim` / `output_dim` **不在**过滤名单内：三期 `to_dict()` 写出的是
+            #     哨兵（缺省 `None`），二期 `Config` 也接受这两个字段名，但 `None` 会让二期的
+            #     张量构造失败；故此处把哨兵**替换为该数据集的生效值**（mnist = 784 / 10），
+            #     使"逐张量比对"的语义保持"同配置、同维度"。
             mine_dict = make_config(size_kw, shape, lam).to_dict()
             phase2_kw = {
                 k: v for k, v in mine_dict.items()
@@ -787,8 +803,13 @@ def check_phase2_equality(rep: Report) -> None:
                     "shape", "cyl_aspect", "fc_dim",
                     "geo_field", "geo_rbf_k", "geo_hidden", "geo_alpha_init",
                     "geo_signed_delta",
+                    "dataset", "dataset_path", "num_samples", "norm_mean", "norm_std",
                 )
             }
+            if phase2_kw.get("input_dim") is None:
+                phase2_kw["input_dim"] = int(DATASET_SPECS["mnist"].input_dim)
+            if phase2_kw.get("output_dim") is None:
+                phase2_kw["output_dim"] = int(DATASET_SPECS["mnist"].num_classes)
             other = Phase2Model(Phase2Config(**phase2_kw))
             bad = [n for n in tensors + params
                    if not torch.equal(getattr(mine, n), getattr(other, n))]
@@ -887,14 +908,22 @@ def check_geo_field(rep: Report) -> None:
         from n3d_sphere.config import Config as Phase2Config  # noqa: WPS433
         from n3d_sphere.model import ThreeDNeuronSpace as Phase2Model  # noqa: WPS433
         mine_dict = none_cfg.to_dict()
+        # 第 21 轮：三期新增的 5 个数据集字段必须过滤掉（跨模块字段差异的唯一登记点）；
+        # `input_dim` / `output_dim` 保留字段名，但把哨兵 `None` 替换为 mnist 生效值，
+        # 否则二期 `Config(input_dim=None)` 会在张量构造期失败。
         phase2_kw = {
             k: v for k, v in mine_dict.items()
             if k not in (
                 "shape", "cyl_aspect", "fc_dim",
                 "geo_field", "geo_rbf_k", "geo_hidden", "geo_alpha_init",
                 "geo_signed_delta",
+                "dataset", "dataset_path", "num_samples", "norm_mean", "norm_std",
             )
         }
+        if phase2_kw.get("input_dim") is None:
+            phase2_kw["input_dim"] = int(DATASET_SPECS["mnist"].input_dim)
+        if phase2_kw.get("output_dim") is None:
+            phase2_kw["output_dim"] = int(DATASET_SPECS["mnist"].num_classes)
         p2 = Phase2Model(Phase2Config(**phase2_kw))
         names = [
             "neuron_pos", "input_syn_pos", "output_syn_pos", "syn_dist",
