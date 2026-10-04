@@ -1,27 +1,49 @@
-"""n3d_triviaqa.verify_dataset —— 产物验证（E1–E6，逐项真实执行、结论可复核）。
+"""n3d_qa.verify_dataset —— 通用 QA 数据集处理模块的产物验证（E0–E8，逐项真实执行、结论可复核）。
+
+定位
+----
+本模块是**通用 QA 数据集处理模块**（任意问答数据集 -> N3D 数组格式）；验证器当前校验的是
+内置的 TriviaQA 参考实现产物（下述 split / 列定义 / 口径均为 TriviaQA 口径），
+后续挂入的 QA 数据集 adapter 复用同一套 E0–E8 契约检查。
 
 验证项
 ------
+* **E0 meta 口径回读**（恒定，逐产物）：按**产物自己 meta 的实际生效值**比对
+  ``no_bag`` / ``hash_dim`` / ``features``（base/rich）/ ``extra_dim`` / 逐列定义 /
+  ``counts`` 自洽；``rich`` 额外校验 IDF 口径（公式、语料文档数 M、词表规模、
+  ``counts.extra.rich.column_start`` 与 ``counts.extra.idf.*``）。
 * **E1 构建幂等**：同参数连跑两次构建 -> 两个 npz 逐字节一致（SHA256 相同），
-  且与正式产物一致（正式产物 = 可复现产物）；
+  且与正式产物一致（正式产物 = 可复现产物）。
 * **E2 产物契约**：委派 ``n3d_shape.data.load_npz_arrays`` 读取，断言
   ``X.dtype == float32`` / ``y.dtype == int64`` / 无 NaN/Inf / 形状 ``[M, D]``
-  （``D`` 由产物 meta 的 ``features.feature_dim`` 给出：缺省 70 / ``--no-bag`` 6）；
+  （``D`` 由产物 meta 的 ``features.feature_dim`` 给出：base 70 / base+no-bag 6 /
+  rich 74 / rich+no-bag 10）。
 * **E3 标签均衡 + 答案复核**：正负 1:1；确定性抽样 N=20 正 / N=20 负，
-  **从归档重新抽取这 40 个文档**（一遍流式扫描）重算答案命中并与 meta 记录的值比对，
-  同时打印命中窗口片段供人工复核；
-* **E4 无跨 split 泄漏**：同一 QuestionId 的文档不得同时出现在正负两侧；
-  ``(QuestionId, 文档)`` 不得重复；两个 npz 的 QuestionId 集合互不相交；
+  **从归档重新抽取这 40 个文档**（一遍流式扫描）重算答案命中并与 meta 记录的值比对。
+* **E4 无泄漏 + 变体一致**：同一 QuestionId 的文档不得同时出现在正负两侧；
+  ``(QuestionId, 文档)`` 不得重复；同 split 的 ``h64``/``nobag`` 与 ``base``/``rich``
+  必须样本口径逐条一致，且附加特征块逐位一致（base 的 6 列 = rich 附加块前 6 列）。
 * **E5 端到端训练**：``python n3d_shape/train.py --dataset npz ...``（其余同 R1 口径），
-  断言退出码 0 且 ``test_acc > 0.75``（二分类，随机基线 0.5）；
+  断言退出码 0 且 ``test_acc > 0.75``（二分类，随机基线 0.5）。
 * **E6 零回归**：``git status --porcelain`` 中 n3d_proto / n3d_sphere / n3d_shape /
   n3d_viz 一律无改动（本模块不触碰任何既有模块文件）。
+* **E7 rich 特征判别力分解**（新增）：对每个 verified split 做 5 折逻辑回归 CV，
+  逐列给 |Pearson r|、逐子集给 acc/AUC，并按实测给出"rich 是否优于 base"的**结论**
+  （无增益则如实报无增益，不粉饰）。
+* **E8 无泄漏（新增）**：同 QuestionId 正负交集 = 0、无重复对，且 **verified 与 dev 的
+  QuestionId 交集 = 0**（覆盖 base / rich / dev 全部产物；缺产物记 SKIP 不计失败）。
+
+产物组与缺省行为
+----------------
+``--product-set {base,rich,dev,all}``（缺省 ``base`` = 既有 4 个正式产物）；
+``--checks`` 缺省 ``E1,E2,E3,E4,E5,E6``（保持历史行为），E7/E8 需显式加入
+（``--checks E7,E8`` 或 ``--checks E1,E2,E3,E4,E5,E6,E7,E8``）；E0 恒定执行。
 
 元信息口径回读
 --------------
 每项检查都会把产物 meta 里的口径（归档 SHA256、哈希维度与盐、负样本种子、
-特征列定义、短数字阈值、1:1 比例）与 :mod:`n3d_triviaqa.build_dataset` 的**写死常量**
-逐字比对 —— meta 只写不读等于没有约束。
+特征列定义与 IDF 口径、短数字阈值、1:1 比例）与 :mod:`n3d_qa.build_dataset` 的
+**写死常量**逐字比对 —— meta 只写不读等于没有约束。
 """
 
 from __future__ import annotations
@@ -49,6 +71,11 @@ VERIFY_DIR: str = bd.VERIFY_OUT_DIR
 SPLITS: Tuple[str, ...] = ("wiki", "web")
 # 正式产物的**口径变体**（(标签, no_bag)）：口径修订后 D=70（_h64）与 D=6（_nobag）都是正式产物
 PRODUCT_VARIANTS: Tuple[Tuple[str, bool], ...] = (("h64", False), ("nobag", True))
+# 新增（2026-10-04 扩容）产物的**特征集合变体**：(文件名标签, 特征集合)
+PRODUCT_FEATURE_SETS: Tuple[Tuple[str, str], ...] = (("base", "base"), ("rich", "rich"))
+# 非 verified 的 dev split（compact 路径产出，只有 rich 口径；base 口径不存在故不校验）
+DEV_SPLITS: Tuple[str, ...] = ("wiki-dev", "web-dev")
+DEV_FEATURE_SETS: Tuple[Tuple[str, str], ...] = (("rich", "rich"),)
 MODULE_DIRS_UNTOUCHED: Tuple[str, ...] = ("n3d_proto", "n3d_sphere", "n3d_shape", "n3d_viz")
 
 # E3 人工复核抽样数（正/负各 N 条）
@@ -127,46 +154,69 @@ def configure_console_encoding() -> None:
             continue
 
 
-def product_path(split: str, no_bag: bool = False) -> str:
-    """正式产物路径（**口径标签恒定在文件名内**，见 build_dataset.out_name_for）。
+def product_path(split: str, no_bag: bool = False, features: str = "base") -> str:
+    """产物路径（**口径标签恒定在文件名内**，见 build_dataset.out_name_for）。
 
     参数
     ----
     split : str
-        ``wiki`` / ``web``。
+        ``wiki`` / ``web`` / ``wiki-dev`` / ``web-dev``。
     no_bag : bool
-        是否取 ``--no-bag`` 版本（D=6）。
+        是否取 ``--no-bag`` 版本（base 为 D=6 / rich 为 D=10）。
+    features : str
+        ``base`` / ``rich``：``base`` 取正式产物目录，``rich`` 取 ``_verify/``（构建侧
+        ``resolve_out_dir`` 对非缺省 ``--features`` 的路由口径——见 build_dataset.resolve_out_dir）。
 
     返回
     ----
     str
-        绝对路径，形如 ``..._dev_h64.npz``（缺省 D=70）或 ``..._dev_nobag.npz``（D=6）。
+        绝对路径，形如 ``..._dev_h64.npz`` / ``..._dev_h64_rich.npz``。
     """
+    base_dir = PRODUCT_DIR if str(features) == "base" else VERIFY_DIR
     return os.path.join(
-        PRODUCT_DIR,
-        bd.out_name_for(split, 0, bd.HASH_DIM, bd.DEFAULT_ARCHIVE, bool(no_bag)),
+        base_dir,
+        bd.out_name_for(split, 0, bd.HASH_DIM, bd.DEFAULT_ARCHIVE, bool(no_bag), str(features)),
     )
 
 
-def product_list(args: argparse.Namespace) -> List[Tuple[str, str, bool, str]]:
-    """列出本轮要验证的正式产物列表（口径修订后缺省为 4 个）。
+def product_list(
+    args: argparse.Namespace, product_set: str = "base"
+) -> List[Tuple[str, str, bool, str]]:
+    """列出本轮要验证的产物列表。
 
     参数
     ----
     args : argparse.Namespace
         命令行参数（用 ``--split``）。
+    product_set : str
+        ``base``（缺省，既有 4 个正式产物：wiki/web x (h64, nobag)）/ ``rich``
+        （新增 4 个 rich 产物：wiki/web x (h64_rich, nobag_rich)，落 ``_verify/``）/
+        ``dev``（2 个非 verified dev 产物：wiki-dev/web-dev x h64_rich）/ ``all``。
 
     返回
     ----
     List[Tuple[str, str, bool, str]]
-        ``[(split, 变体标签, no_bag, 产物绝对路径), ...]``；
-        缺省 ``--split all`` -> ``wiki/web x (h64, nobag)`` 共 4 个。
+        ``[(split, 变体标签, no_bag, 产物绝对路径), ...]``。
     """
-    splits = SPLITS if args.split == "all" else (str(args.split),)
     out: List[Tuple[str, str, bool, str]] = []
-    for split in splits:
-        for label, no_bag in PRODUCT_VARIANTS:
-            out.append((split, label, bool(no_bag), product_path(split, no_bag)))
+
+    def _push(split: str, label: str, no_bag: bool, features: str) -> None:
+        out.append((split, label, bool(no_bag), product_path(split, bool(no_bag), features)))
+
+    if product_set in ("base", "all"):
+        splits = SPLITS if args.split == "all" else (str(args.split),)
+        for split in splits:
+            for label, no_bag in PRODUCT_VARIANTS:
+                _push(split, label, bool(no_bag), "base")
+    if product_set in ("rich", "all"):
+        splits = SPLITS if args.split == "all" else (str(args.split),)
+        for split in splits:
+            for label, no_bag in PRODUCT_VARIANTS:
+                _push(split, label + "_rich", bool(no_bag), "rich")
+    if product_set in ("dev", "all"):
+        for split in DEV_SPLITS:
+            for label, feat in DEV_FEATURE_SETS:
+                _push(split, f"{label}_{split.replace('-', '_')}", False, feat)
     return out
 
 def sha256_file(path: str) -> str:
@@ -215,30 +265,43 @@ def load_arrays_via_shape_contract(path: str) -> Tuple[np.ndarray, np.ndarray, s
     return X, y, str(getattr(load_npz_arrays, "__module__", "n3d_shape.data"))
 
 
-def check_meta_contract(split: str, no_bag: bool = False) -> CheckResult:
+def check_meta_contract(
+    split: str, no_bag: bool = False, features: str = "base"
+) -> CheckResult:
     """E0：产物 meta 与写死常量的**逐字**比对 + 计数自洽（口径回读）。
 
-    口径修订后 ``features`` 段按**实际生效值**校验（``hash_dim`` / ``no_bag`` / 逐列定义），
-    故 D=70 与 D=6 两个版本都按各自 meta 回的维度与列定义比对，不做跨口径的硬编码比较。
+    ``features`` 段按**实际生效值**校验（``hash_dim`` / ``no_bag`` / ``features`` 特征集合 /
+    逐列定义），故 D=70 / D=6 / D=74 / D=10 各版本都按各自 meta 回的维度与列定义比对，
+    不做跨口径的硬编码比较。``rich`` 版本额外回读 IDF 语料口径（公式、语料文档数、词表规模）。
 
     参数
     ----
     split : str
-        ``wiki`` / ``web``。
+        ``wiki`` / ``web`` / ``wiki-dev`` / ``web-dev``。
     no_bag : bool
-        是否校验 ``--no-bag`` 版本（D=6）。
+        是否校验 ``--no-bag`` 版本。
+    features : str
+        ``base`` / ``rich``。
 
     返回
     ----
     CheckResult
         检查结果（明细含各项实测/期望值）。
     """
-    path = product_path(split, no_bag)
-    label_txt = f"{split}/{'nobag' if no_bag else 'h' + str(int(bd.HASH_DIM))}"
+    path = product_path(split, no_bag, features)
+    label_txt = f"{split}/{'nobag' if no_bag else 'h' + str(int(bd.HASH_DIM))}" + (
+        "_rich" if features == "rich" else ""
+    )
     lines: List[str] = [f"产物 {path}"]
     problems: List[str] = []
     if not os.path.isfile(path):
-        return CheckResult("E0", f"meta 口径回读 [{label_txt}]", False, detail=f"缺产物：{path}")
+        return CheckResult(
+            "E0",
+            f"meta 口径回读 [{label_txt}]",
+            True,
+            skipped=True,
+            detail=f"[SKIP] 缺产物（该口径尚未构建）：{path}",
+        )
     meta = bd.read_npz_meta(path)
     src = meta["source"]
     feats = meta["features"]
@@ -260,17 +323,89 @@ def check_meta_contract(split: str, no_bag: bool = False) -> CheckResult:
 
     hash_dim = int(feats["hash_dim"])
     expect(bool(feats["no_bag"]) is bool(no_bag), "features.no_bag 与实际口径一致", feats["no_bag"], no_bag)
-    expect(int(feats["extra_dim"]) == int(bd.EXTRA_DIM), "附加特征列数 extra_dim", feats["extra_dim"], bd.EXTRA_DIM)
     expect(
-        int(feats["feature_dim"]) == bd.feature_dim(hash_dim, bool(no_bag)),
+        int(feats["extra_dim"]) == bd.extra_dim_for(features),
+        "附加特征列数 extra_dim",
+        feats["extra_dim"],
+        bd.extra_dim_for(features),
+    )
+    expect(
+        int(feats["feature_dim"]) == bd.feature_dim(hash_dim, bool(no_bag), features),
         "特征维数 D = hash_dim + extra_dim",
         feats["feature_dim"],
-        bd.feature_dim(hash_dim, bool(no_bag)),
+        bd.feature_dim(hash_dim, bool(no_bag), features),
     )
+    want_cols_rich = bd.feature_columns(hash_dim, bool(no_bag), "rich")
+    _rich_base = (0 if bool(no_bag) else int(hash_dim)) + int(bd.EXTRA_DIM)
+    if features == "rich":
+        expect(feats.get("feature_block") == "rich", "features.feature_block", feats.get("feature_block"), "rich")
+        expect(
+            int(feats.get("base_extra_dim", -1)) == int(bd.EXTRA_DIM),
+            "rich 的基础附加列数 base_extra_dim",
+            feats.get("base_extra_dim"),
+            bd.EXTRA_DIM,
+        )
+        expect(
+            int(feats.get("rich_extra_dim", -1)) == int(bd.RICH_EXTRA_DIM),
+            "rich 的追加列数 rich_extra_dim",
+            feats.get("rich_extra_dim"),
+            bd.RICH_EXTRA_DIM,
+        )
+        idf_meta = feats.get("idf") or {}
+        expect(
+            str(idf_meta.get("formula", ""))
+            == "idf(token) = log((1 + M) / (1 + df(token))) + " + str(bd.IDF_SMOOTH_OFFSET),
+            "IDF 公式",
+            idf_meta.get("formula"),
+            "log((1 + M) / (1 + df)) + " + str(bd.IDF_SMOOTH_OFFSET),
+        )
+        expect(
+            int(idf_meta.get("M", -1)) == int(counts["pool_documents"]),
+            "IDF 语料文档数 M = 文档池大小",
+            idf_meta.get("M"),
+            counts["pool_documents"],
+        )
+        extra_meta = counts.get("extra") or {}
+        rich_stat = extra_meta.get("rich") or {}
+        idf_stat = extra_meta.get("idf") or {}
+        col_base = (0 if bool(no_bag) else int(hash_dim)) + int(bd.EXTRA_DIM)
+        expect(
+            int(rich_stat.get("column_start", -1)) == col_base,
+            "rich 列起点 counts.extra.rich.column_start",
+            rich_stat.get("column_start"),
+            col_base,
+        )
+        expect(
+            [str(x) for x in rich_stat.get("columns", [])]
+            == [c["name"] for c in want_cols_rich[-int(bd.RICH_EXTRA_DIM):]],
+            "rich 追加列名与 feature_columns(hash_dim, no_bag, rich) 一致",
+            rich_stat.get("columns"),
+            [c["name"] for c in want_cols_rich[-int(bd.RICH_EXTRA_DIM):]],
+        )
+        expect(
+            int(idf_stat.get("vocab_size") or 0) == int(idf_meta.get("vocab_size") or 0)
+            and int(idf_stat.get("vocab_size") or 0) > 0,
+            "IDF 词表规模 > 0 且 counts.extra.idf.vocab_size = meta.features.idf.vocab_size",
+            idf_stat.get("vocab_size"),
+            idf_meta.get("vocab_size"),
+        )
+        expect(
+            int(idf_stat.get("corpus_documents", -1)) == int(counts["pool_documents"]),
+            "counts.extra.idf.corpus_documents = 文档池大小",
+            idf_stat.get("corpus_documents"),
+            counts["pool_documents"],
+        )
+    elif "feature_block" in feats:
+        expect(False, "base 产物不应写 feature_block 字段", feats.get("feature_block"), "缺席")
     if no_bag:
         expect(hash_dim == 0, "no_bag 的 features.hash_dim", hash_dim, 0)
         expect("hash_algo" not in feats, "no_bag 不写哈希字段（hash_algo 缺席）", "hash_algo" in feats, False)
-        expect(int(feats["feature_dim"]) == int(bd.EXTRA_DIM), "no_bag 的 D = 6", feats["feature_dim"], bd.EXTRA_DIM)
+        expect(
+            int(feats["feature_dim"]) == int(bd.extra_dim_for(features)),
+            f"no_bag 的 D = extra_dim_for({features})",
+            feats["feature_dim"],
+            int(bd.extra_dim_for(features)),
+        )
     else:
         expect(hash_dim == int(bd.HASH_DIM), "缺省 hash_dim", hash_dim, bd.HASH_DIM)
         expect(feats["hash_algo"] == "blake2b" and int(feats["hash_digest_size"]) == bd.HASH_DIGEST_SIZE, "哈希算法/摘要长度", f"{feats['hash_algo']}/{feats['hash_digest_size']}", f"blake2b/{bd.HASH_DIGEST_SIZE}")
@@ -283,7 +418,12 @@ def check_meta_contract(split: str, no_bag: bool = False) -> CheckResult:
             "mod " + str(hash_dim),
         )
         expect(int(counts["bag_columns"]) == hash_dim, "counts.bag_columns = hash_dim", counts["bag_columns"], hash_dim)
-        expect(int(feats["feature_dim"]) == int(bd.FEATURE_DIM), "缺省口径 D（HASH_DIM + 6）", feats["feature_dim"], bd.FEATURE_DIM)
+        expect(
+            int(feats["feature_dim"]) == bd.feature_dim(int(bd.HASH_DIM), False, features),
+            "缺省口径 D（HASH_DIM + extra_dim_for(features)）",
+            feats["feature_dim"],
+            bd.feature_dim(int(bd.HASH_DIM), False, features),
+        )
     if hash_dim == int(bd.HASH_DIM_PLAN_ORIGINAL):
         lines.append(f"  [信息] 该产物为**原计划口径** hash_dim={hash_dim}（D={feats['feature_dim']}，已实测不达标，作失败对照）")
     elif (not no_bag) and hash_dim != int(bd.HASH_DIM):
@@ -296,7 +436,7 @@ def check_meta_contract(split: str, no_bag: bool = False) -> CheckResult:
     expect(bool(ans["case_insensitive"]) is True, "答案匹配大小写不敏感", ans["case_insensitive"], True)
 
     cols = feats["columns"]
-    want_cols = bd.feature_columns(hash_dim, bool(no_bag))
+    want_cols = bd.feature_columns(hash_dim, bool(no_bag), features)
     expect(len(cols) == len(want_cols), "特征列定义条目数", len(cols), len(want_cols))
     cover_ok = True
     cursor = 0
@@ -304,10 +444,10 @@ def check_meta_contract(split: str, no_bag: bool = False) -> CheckResult:
         if int(c["start"]) != cursor:
             cover_ok = False
         cursor = int(c["end"]) + 1
-    expect(cover_ok and cursor == bd.feature_dim(hash_dim, bool(no_bag)), "特征列定义无缝覆盖 [0, D-1]", f"cursor={cursor}", bd.feature_dim(hash_dim, bool(no_bag)))
+    expect(cover_ok and cursor == bd.feature_dim(hash_dim, bool(no_bag), features), "特征列定义无缝覆盖 [0, D-1]", f"cursor={cursor}", bd.feature_dim(hash_dim, bool(no_bag), features))
     expect(
         [c["name"] for c in cols] == [c["name"] for c in want_cols],
-        "特征列名与 feature_columns(hash_dim, no_bag) 一致",
+        "特征列名与 feature_columns(hash_dim, no_bag, features) 一致",
         [c["name"] for c in cols],
         [c["name"] for c in want_cols],
     )
@@ -337,8 +477,9 @@ def check_meta_contract(split: str, no_bag: bool = False) -> CheckResult:
 def check_e1_idempotent(args: argparse.Namespace) -> CheckResult:
     """E1：**每个产物口径各连跑两次**，npz 逐字节一致（并与正式产物一致）。
 
-    实现要点：每次构建都用 ``--split <args.split>``（缺省 ``all``），故一个口径的
-    两个 split 共享**同一遍**归档扫描 -> 4 个口径共 4 遍（而非 8 遍）。
+    覆盖范围：**产物口径变体 × 特征集合**（base/rich）的笛卡尔积，外加 dev split 的 rich 产物
+    —— 即 base 4 个 + rich 4 个 + dev 2 个（共 10 个口径，每个口径连跑两次并与该口径的产物 SHA256 比对）。
+    ``--split all`` 时不触发 dev 全量 compact 构建（单 split 数小时），dev 相关口径记 SKIP。
 
     参数
     ----
@@ -352,52 +493,87 @@ def check_e1_idempotent(args: argparse.Namespace) -> CheckResult:
     """
     lines: List[str] = []
     problems: List[str] = []
-    splits = SPLITS if args.split == "all" else (str(args.split),)
+    # [!] R34-1 修复：A6 重写时误删了 ``splits`` 的定义，导致 E1（以及缺省
+    #     ``--checks E1,E2,...``）直接 NameError。这里补回，并让 dev 分支复用同一口径。
+    ambiguous = str(args.split) == "all"
+    splits: Tuple[str, ...] = SPLITS if ambiguous else (str(args.split),)
+    # [!] 覆盖范围 = **产物口径变体 × 特征集合**（base/rich），外加 dev split 的 rich 产物：
+    #     即 base 4 个（h64/nobag × wiki/web）+ rich 4 个 + dev 2 个。
+    #     ``--split all`` 时对 dev 走 **compact 全量构建非常耗时**（单 split 数小时），故与
+    #     dev 相关的两个口径记 SKIP 并说明——"缺产物记 SKIP"是本模块的统一口径。
+    targets: List[Tuple[str, str, bool, str]] = []
     for label, no_bag in PRODUCT_VARIANTS:
-        shas: Dict[str, List[str]] = {s: [] for s in splits}
+        for _flab, feat in PRODUCT_FEATURE_SETS:
+            for split in splits:
+                targets.append((split, label, bool(no_bag), feat))
+    if ambiguous:
+        for split in DEV_SPLITS:
+            for flab, feat in DEV_FEATURE_SETS:
+                lines.append(
+                    f"  [SKIP] {split}/{flab}: --split all 不触发 dev 全量 compact 构建"
+                    f"（单 split 数小时）；如需覆盖请显式 --split {split}"
+                )
+    elif str(args.split) in DEV_SPLITS:
+        # [!] 只有显式指定 **dev split** 时才追加 dev 口径（base/rich 的 dev 产物都在 dev split 下）；
+        #     早期实现无条件追加，导致 `--split wiki` 会多跑一遍 wiki 的 rich 口径（既慢又是重复覆盖）。
+        for flab, feat in DEV_FEATURE_SETS:
+            targets.append((str(args.split), flab, False, feat))
+    built: Dict[Tuple[str, bool, str], List[str]] = {}
+    for split, label, no_bag, feat in targets:
+        key = (split, bool(no_bag), feat)
+        shas: List[str] = []
         failed = False
         for run_i, sub in enumerate(("idem_a", "idem_b"), start=1):
-            out_dir = os.path.join(VERIFY_DIR, sub, label)
-            argv = ["--split", str(args.split), "--archive", str(args.archive), "--out-dir", out_dir]
+            out_dir = os.path.join(VERIFY_DIR, sub, f"{label}_{feat}")
+            argv = [
+                "--split", split,
+                "--archive", str(args.archive),
+                "--out-dir", out_dir,
+                "--features", feat,
+            ]
             if no_bag:
                 argv.append("--no-bag")
             t0 = time.time()
             rc = bd.main(argv)
-            lines.append(f"  [{label}] 第 {run_i} 次构建（--split {args.split}）：退出码 {rc}，用时 {time.time() - t0:.1f} s，目录 {out_dir}")
+            lines.append(
+                f"  [{split}/{label}/{feat}] 第 {run_i} 次构建：退出码 {rc}，"
+                f"用时 {time.time() - t0:.1f} s，目录 {out_dir}"
+            )
             if rc != 0:
-                problems.append(f"{label} 第 {run_i} 次构建退出码 {rc}")
+                problems.append(f"{split}/{label}/{feat} 第 {run_i} 次构建退出码 {rc}")
                 failed = True
                 break
-            for split in splits:
-                name = os.path.basename(product_path(split, no_bag))
-                fp = os.path.join(out_dir, name)
-                if not os.path.isfile(fp):
-                    problems.append(f"{label} 第 {run_i} 次构建缺产物 {fp}")
-                    failed = True
-                    continue
-                shas[split].append(sha256_file(fp))
+            name = os.path.basename(product_path(split, no_bag, feat))
+            fp = os.path.join(out_dir, name)
+            if not os.path.isfile(fp):
+                problems.append(f"{split}/{label}/{feat} 第 {run_i} 次构建缺产物 {fp}")
+                failed = True
+                continue
+            shas.append(sha256_file(fp))
         if failed:
             continue
-        for split in splits:
-            prod = product_path(split, no_bag)
-            if len(shas[split]) != 2 or not os.path.isfile(prod):
-                problems.append(f"{split}/{label} 无法比对（构建次数 {len(shas[split])}）")
-                continue
-            sha_prod = sha256_file(prod)
-            same = shas[split][0] == shas[split][1] == sha_prod
-            lines.append(
-                f"  {split}/{label}: A={shas[split][0][:16]}... B={shas[split][1][:16]}... "
-                f"正式产物={sha_prod[:16]}... -> {'一致' if same else '不一致'}"
-            )
-            if not same:
-                problems.append(f"{split}/{label} 三次 SHA256 不一致")
+        built[key] = shas
+    for (split, no_bag, feat), shas in built.items():
+        prod = product_path(split, no_bag, feat)
+        tag = f"{split}/{'nobag' if no_bag else 'h64'}" + ("_rich" if feat == "rich" else "")
+        if len(shas) != 2 or not os.path.isfile(prod):
+            problems.append(f"{tag} 无法比对（构建次数 {len(shas)}）")
+            continue
+        sha_prod = sha256_file(prod)
+        same = shas[0] == shas[1] == sha_prod
+        lines.append(
+            f"  {tag}: A={shas[0][:16]}... B={shas[1][:16]}... "
+            f"正式产物={sha_prod[:16]}... -> {'一致' if same else '不一致'}"
+        )
+        if not same:
+            problems.append(f"{tag} 三次 SHA256 不一致")
     passed = not problems
     if problems:
         lines.append("  问题：" + "；".join(problems))
     return CheckResult("E1", "构建幂等（每个口径逐字节一致）", passed, detail="\n".join(lines))
 
 
-def check_e2_contract(args: argparse.Namespace) -> CheckResult:
+def check_e2_contract(args: argparse.Namespace, product_set: str = "base") -> CheckResult:
     """E2：委派 ``n3d_shape.data.load_npz_arrays`` 读取产物并断言契约。
 
     **[!] 口径修订（风后 R28 warning 1）**：期望维度由**产物 meta 的
@@ -416,7 +592,10 @@ def check_e2_contract(args: argparse.Namespace) -> CheckResult:
     """
     lines: List[str] = []
     problems: List[str] = []
-    for split, label, no_bag, path in product_list(args):
+    for split, label, no_bag, path in product_list(args, product_set):
+        if not os.path.isfile(path):
+            lines.append(f"  [SKIP] {split}/{label}: 缺产物（该口径尚未构建）：{path}")
+            continue
         try:
             meta = bd.read_npz_meta(path)
         except Exception as exc:  # noqa: BLE001
@@ -455,7 +634,7 @@ def check_e2_contract(args: argparse.Namespace) -> CheckResult:
         lines.append("  问题：" + "；".join(problems))
     return CheckResult("E2", "产物契约（按 meta.feature_dim 断言 + n3d_shape 数据层可读）", passed, detail="\n".join(lines))
 
-def check_e4_no_leak(args: argparse.Namespace) -> CheckResult:
+def check_e4_no_leak(args: argparse.Namespace, product_set: str = "base") -> CheckResult:
     """E4：同一 QuestionId 的文档不得同时出现在正负两侧；无重复样本对。
 
     覆盖 4 个产物；并新增两条**口径修订专项**断言：
@@ -474,14 +653,14 @@ def check_e4_no_leak(args: argparse.Namespace) -> CheckResult:
     CheckResult
         检查结果。
     """
-    products = product_list(args)
+    products = product_list(args, product_set)
     lines: List[str] = []
     problems: List[str] = []
     per_product: Dict[str, Dict[str, Any]] = {}
     for split, label, no_bag, path in products:
         key = f"{split}/{label}"
         if not os.path.isfile(path):
-            problems.append(f"缺产物：{path}")
+            lines.append(f"  [SKIP] {key}: 缺产物（该口径尚未构建）：{path}")
             continue
         meta = bd.read_npz_meta(path)
         questions = meta["questions"]
@@ -528,16 +707,14 @@ def check_e4_no_leak(args: argparse.Namespace) -> CheckResult:
         }
 
     # ① 同 split 的 h64 / nobag 必须样本口径一致 + 6 列附加特征逐位一致
-    for split in sorted({p[0] for p in products}):
-        keys = [f"{split}/{lab}" for lab, _nb in PRODUCT_VARIANTS if f"{split}/{lab}" in per_product]
-        if len(keys) < 2:
-            continue
-        a, b = per_product[keys[0]], per_product[keys[1]]
+    def _compare_variants(split: str, key_a: str, key_b: str, tag: str) -> None:
+        """对比同 split 两个产物的样本口径与附加特征块（逐条 + 逐位）。"""
+        a, b = per_product[key_a], per_product[key_b]
         if a["triples"] != b["triples"]:
-            problems.append(f"{split} 的 {keys[0]} 与 {keys[1]} 样本口径不一致（行序/文档/label 有差异）")
-            lines.append(f"  [FAIL] {split}: {keys[0]} 与 {keys[1]} 的样本口径**不一致**")
+            problems.append(f"{split} 的 {key_a} 与 {key_b} 样本口径不一致（行序/文档/label 有差异）")
+            lines.append(f"  [FAIL] {split}: {key_a} 与 {key_b} 的样本口径**不一致**")
         else:
-            lines.append(f"  [OK]   {split}: {keys[0]} 与 {keys[1]} 的样本口径（行序/QuestionId/文档/label）逐条一致")
+            lines.append(f"  [OK]   {split}: {key_a} 与 {key_b} 的样本口径（行序/QuestionId/文档/label）逐条一致")
         try:
             with np.load(a["path"], allow_pickle=False) as za, np.load(b["path"], allow_pickle=False) as zb:
                 Xa = np.asarray(za["X"])
@@ -546,15 +723,39 @@ def check_e4_no_leak(args: argparse.Namespace) -> CheckResult:
             hb = int(b["meta"]["features"]["hash_dim"])
             extra_a = Xa[:, ha:] if ha > 0 else Xa
             extra_b = Xb[:, hb:] if hb > 0 else Xb
-            same_extra = extra_a.shape == extra_b.shape and np.array_equal(extra_a, extra_b)
+            if tag == "base_rich":
+                # base 的附加块 = rich 附加块的前 6 列（同一 token 集合口径；rich 只追加 4 列）
+                if extra_b.shape[1] < extra_a.shape[1]:
+                    raise AssertionError(f"rich 附加块列数 {extra_b.shape[1]} < base {extra_a.shape[1]}")
+                head_b = extra_b[:, : extra_a.shape[1]]
+                same_extra = extra_a.shape == head_b.shape and np.array_equal(extra_a, head_b)
+                detail = f"base 附加块 {extra_a.shape} vs rich 附加块前 {extra_a.shape[1]} 列 {head_b.shape}"
+            else:
+                same_extra = extra_a.shape == extra_b.shape and np.array_equal(extra_a, extra_b)
+                detail = f"{extra_a.shape} vs {extra_b.shape}"
             lines.append(
-                f"  {'[OK]  ' if same_extra else '[FAIL]'} {split}: 两个口径的 6 列附加特征"
-                f"{'逐位一致' if same_extra else '**不一致**'}（{extra_a.shape} vs {extra_b.shape}）"
+                f"  {'[OK]  ' if same_extra else '[FAIL]'} {split}: {key_a} 与 {key_b} 的附加特征"
+                f"{'逐位一致' if same_extra else '**不一致**'}（{detail}）"
             )
             if not same_extra:
-                problems.append(f"{split} 的 {keys[0]} 与 {keys[1]} 附加特征不一致")
+                problems.append(f"{split} 的 {key_a} 与 {key_b} 附加特征不一致")
         except Exception as exc:  # noqa: BLE001
-            problems.append(f"{split} 附加特征比对失败：{type(exc).__name__}: {exc}")
+            problems.append(f"{split} 附加特征比对失败（{key_a} vs {key_b}）：{type(exc).__name__}: {exc}")
+
+    for split in sorted({p[0] for p in products}):
+        keys = [f"{split}/{lab}" for lab, _nb in PRODUCT_VARIANTS if f"{split}/{lab}" in per_product]
+        if len(keys) < 2:
+            continue
+        _compare_variants(split, keys[0], keys[1], "hash_nobag")
+
+    # ①-b base 与 rich 必须共享同一采样（追加的特征列不得改变样本口径），且 base 的附加块
+    #     必须与 rich 附加块的前 6 列逐位一致（rich 只在末尾追加 4 列）
+    for split in sorted({p[0] for p in products}):
+        for lab, _nb in PRODUCT_VARIANTS:
+            ka = f"{split}/{lab}"
+            kb = f"{split}/{lab}_rich"
+            if ka in per_product and kb in per_product:
+                _compare_variants(split, ka, kb, "base_rich")
 
     # ② 跨 split 信息项：同 label 的两个 split 产物之间
     for label, _nb in PRODUCT_VARIANTS:
@@ -608,7 +809,7 @@ def _first_match_window(text: str, patterns: Sequence[re.Pattern], width: int = 
     return matched, " ".join(snippet.split())
 
 
-def check_e3_balance_and_answer(args: argparse.Namespace) -> CheckResult:
+def check_e3_balance_and_answer(args: argparse.Namespace, product_set: str = "base") -> CheckResult:
     """E3：标签 1:1 均衡；确定性抽样 N=20 正 / N=20 负并从归档**重算**答案命中。
 
     **[!] 口径修订（风后 R28 warning 2）**：QA 缓存键由原先硬编码的
@@ -633,7 +834,7 @@ def check_e3_balance_and_answer(args: argparse.Namespace) -> CheckResult:
     CheckResult
         检查结果（明细含逐条抽样证据）。
     """
-    products = product_list(args)
+    products = product_list(args, product_set)
     n_audit = int(args.audit_n)
     lines: List[str] = []
     problems: List[str] = []
@@ -649,7 +850,9 @@ def check_e3_balance_and_answer(args: argparse.Namespace) -> CheckResult:
     for split, label, no_bag, path in products:
         key = f"{split}/{label}"
         if not os.path.isfile(path):
-            problems.append(f"缺产物：{path}")
+            # [!] 缺产物记 SKIP（该口径尚未构建），不得记 FAIL —— 否则 --product-set all/dev
+            #     在 dev 全量产物未就绪时会被误判为失败（R32-1 即此）。
+            lines.append(f"  [SKIP] {key}: 缺产物（该口径尚未构建）：{path}")
             continue
         meta = bd.read_npz_meta(path)
         counts = meta["counts"]
@@ -668,7 +871,7 @@ def check_e3_balance_and_answer(args: argparse.Namespace) -> CheckResult:
         if pos_rate < float(POSITIVE_ANSWER_HIT_MIN):
             problems.append(f"{key} 正样本含答案比例 {pos_rate:.4f} 低于下限 {POSITIVE_ANSWER_HIT_MIN}")
         if split not in records_cache:
-            raw_qa, _passes, _status = bd.load_archive_qa(args.archive, archive_sha, [split])
+            raw_qa, _passes, _status, _members = bd.load_archive_qa(args.archive, archive_sha, [split])
             records, _head = bd.parse_qa_json(raw_qa[split], split)
             if int(meta["max_questions"]) > 0:
                 records = records[: int(meta["max_questions"])]
@@ -816,7 +1019,7 @@ def _run_e5_once(path: str, epochs: int, tag: str) -> Tuple[int, List[float], st
     return rc, accs, out, data_line.strip(), norm_line.strip()[:160]
 
 
-def check_e5_train(args: argparse.Namespace) -> CheckResult:
+def check_e5_train(args: argparse.Namespace, product_set: str = "base") -> CheckResult:
     """E5：``n3d_shape/train.py --dataset npz`` 端到端训练（其余同 R1 口径）。
 
     口径修订后**逐产物各跑一次**（缺省 4 个：wiki/web x D=70/D=6），每个产物用**它自己 meta 的**
@@ -837,15 +1040,16 @@ def check_e5_train(args: argparse.Namespace) -> CheckResult:
     if args.e5_path:
         targets: List[Tuple[str, str, bool, str]] = [("(显式指定)", os.path.basename(str(args.e5_path)), False, str(args.e5_path))]
     else:
-        targets = list(product_list(args))
+        targets = list(product_list(args, product_set))
     lines: List[str] = []
     problems: List[str] = []
     n_ok = 0
     for split, label, no_bag, path in targets:
         key = f"{split}/{label}"
         if not os.path.isfile(path):
-            problems.append(f"缺产物：{path}")
-            lines.append(f"  [FAIL] {key}: 缺产物 {path}")
+            # [!] 与 E2/E3/E4 同族口径：缺产物 = 该口径尚未构建 -> 记 SKIP，不得记 FAIL
+            #     （否则 --product-set all 在不带 --skip-e5 时会因 dev 全量产物缺失而整体失败）
+            lines.append(f"  [SKIP] {key}: 缺产物（该口径尚未构建）：{path}")
             continue
         meta = bd.read_npz_meta(path)
         dim = int(meta["features"]["feature_dim"])
@@ -967,9 +1171,315 @@ def check_e6_untouched(args: argparse.Namespace) -> CheckResult:
 
 
 # ======================================================================
+CV_FOLDS: int = 5
+CV_SEED: int = 0
+CV_ITERS: int = 400
+CV_LR: float = 0.5
+CV_LAM: float = 1e-3
+E7_MAX_SAMPLES: int = 12000
+E7_TOL: float = 1e-12
+
+
+def _fit_logistic(
+    Xtr: np.ndarray, ytr: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """L2 正则逻辑回归（全批量梯度下降，确定性；不依赖 sklearn）。
+
+    参数
+    ----
+    Xtr : np.ndarray
+        ``[n, d]`` 训练特征（float64）。
+    ytr : np.ndarray
+        ``[n]`` 0/1 标签（float64）。
+
+    返回
+    ----
+    Tuple[np.ndarray, np.ndarray, np.ndarray]
+        ``(coef[b, w...], mu, sd)``：均值/标准差标准化参数与系数。
+    """
+    mu = Xtr.mean(axis=0)
+    sd = Xtr.std(axis=0)
+    sd = np.where(sd <= 0, 1.0, sd)
+    Z = (Xtr - mu) / sd
+    w = np.zeros(Z.shape[1], dtype=np.float64)
+    b = 0.0
+    n = Z.shape[0]
+    for _ in range(int(CV_ITERS)):
+        logits = Z @ w + b
+        p = 1.0 / (1.0 + np.exp(-logits))
+        g = p - ytr
+        w -= CV_LR * (Z.T @ g / n + CV_LAM * w)
+        b -= CV_LR * float(g.mean())
+    return np.concatenate([[b], w]), mu, sd
+
+
+def _cv_scores(X: np.ndarray, y: np.ndarray, folds: int = CV_FOLDS) -> Tuple[float, float]:
+    """5 折交叉验证，返回 ``(准确率, AUC)``（折划分由固定 seed 决定，确定性）。
+
+    参数
+    ----
+    X : np.ndarray
+        ``[M, d]`` 特征（float64）。
+    y : np.ndarray
+        ``[M]`` 0/1 标签。
+    folds : int
+        折数。
+
+    返回
+    ----
+    Tuple[float, float]
+        ``(平均准确率, 池化 AUC)``。
+    """
+    m = X.shape[0]
+    order = np.random.default_rng(CV_SEED).permutation(m)
+    scores = np.zeros(m, dtype=np.float64)
+    for k in range(int(folds)):
+        te = order[k::folds]
+        tr = np.setdiff1d(order, te, assume_unique=True)
+        coef, mu, sd = _fit_logistic(X[tr], y[tr].astype(np.float64))
+        Z = (X[te] - mu) / np.where(sd <= 0, 1.0, sd)
+        scores[te] = Z @ coef[1:] + coef[0]
+    acc = float(((scores >= 0.0).astype(np.int64) == y).mean())
+    order2 = np.argsort(scores, kind="mergesort")
+    ranks = np.empty(m, dtype=np.float64)
+    ranks[order2] = np.arange(1, m + 1, dtype=np.float64)
+    n_pos = float((y == 1).sum())
+    n_neg = float((y == 0).sum())
+    if n_pos <= 0 or n_neg <= 0:
+        return acc, float("nan")
+    auc = float((ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+    return acc, auc
+
+
+def check_e7_feature_power(args: argparse.Namespace) -> CheckResult:
+    """E7：rich 特征判别力分解（5 折 CV）——**rich 是否优于 base**，结论按实测给出。
+
+    口径：对每个 verified split，最多取 ``--e7-max-samples`` 条样本（固定 seed 抽样，
+    控制运行时长），对 6 组列子集各做一次 5 折逻辑回归 CV，并逐列算 |Pearson r|。
+    判据（**只作读数，不作粉饰**）：``qcov_idf`` 相对 ``qcov`` 有提升、且 ``tfidf_cos``
+    相对 ``qcov`` 有提升；两者都无提升即如实报「rich 相对 base 无增益」。
+
+    参数
+    ----
+    args : argparse.Namespace
+        命令行参数（用 ``--split`` / ``--e7-max-samples``）。
+
+    返回
+    ----
+    CheckResult
+        检查结果（明细含逐列 |r| 与 6 组 CV 数字）。
+    """
+    n_max = int(getattr(args, "e7_max_samples", E7_MAX_SAMPLES))
+    splits = SPLITS if args.split == "all" else (str(args.split),)
+    lines: List[str] = []
+    problems: List[str] = []
+    def _col_start(meta: Dict[str, Any]) -> Dict[str, int]:
+        """从产物 meta 的 ``features.columns`` 回读 ``列名 -> 起始列号``（避免硬编码错位）。"""
+        return {str(c["name"]): int(c["start"]) for c in meta["features"]["columns"]}
+    for split in splits:
+        pb = product_path(split, False, "base")
+        pr = product_path(split, False, "rich")
+        if not (os.path.isfile(pb) and os.path.isfile(pr)):
+            lines.append(f"  [SKIP] {split}: 缺 base/rich 产物（{pb} / {pr}）")
+            continue
+        with np.load(pb, allow_pickle=False) as z:
+            Xb = np.asarray(z["X"], dtype=np.float64)
+            y = np.asarray(z["y"]).astype(np.int64)
+        with np.load(pr, allow_pickle=False) as z:
+            Xr = np.asarray(z["X"], dtype=np.float64)
+        m = int(y.size)
+        if n_max > 0 and m > n_max:
+            idx = np.random.default_rng(CV_SEED).choice(m, size=n_max, replace=False)
+            idx = np.sort(idx)
+            Xb = Xb[idx]
+            Xr = Xr[idx]
+            y = y[idx]
+            lines.append(f"  {split}: 抽样 {n_max}/{m} 条（种子 {CV_SEED}）用于 CV")
+        idx_r = _col_start(bd.read_npz_meta(pr))
+        idx_b = _col_start(bd.read_npz_meta(pb))
+        i_qcov = idx_b["q_to_d_coverage"]
+        i_qidf = idx_r["qcov_idf"]
+        i_cos = idx_r["tfidf_cos"]
+        # [!] 附加块起点**按产物 meta 的 features.hash_dim 推导桶数边界**，不再按列名
+        #     （旧写法 `c["name"] != "bow_hash64"` 一旦列名变更就会静默错位——与 R30-D7 同族隐患）。
+        #     口径：词袋块占前 hash_dim 列（no_bag 时 meta 记 hash_dim=0，故起点自然是 0），
+        #     故"非词袋列的起点" == hash_dim。该值由产物自己声明，与列名解耦。
+        feat_b = bd.read_npz_meta(pb)["features"]
+        feat_r = bd.read_npz_meta(pr)["features"]
+        start_b = int(feat_b["hash_dim"])
+        start_b_rich = int(feat_r["hash_dim"])
+        # 交叉校验（防 meta 自相矛盾，且**不依赖任何列名**）。口径：meta 的 columns[] 只登记
+        # **命名的非词袋列**（词袋块作为整体只登记一行、起点 0），故可断言：
+        #   (a) 起点严格递增且首列起点 = 0；
+        #   (b) 命名列条数 = feature_dim - hash_dim（词袋块宽度 = hash_dim）；
+        #   (c) 末列起点 = feature_dim - 1（铺满到最后一列）；
+        #   (d) no_bag=True 时 hash_dim 必须为 0。
+        for _tag, _feat in (("base", feat_b), ("rich", feat_r)):
+            _starts = [int(c["start"]) for c in _feat["columns"]]
+            _fdim = int(_feat["feature_dim"])
+            _hdim = int(_feat["hash_dim"])
+            if _starts != sorted(_starts) or len(set(_starts)) != len(_starts) or _starts[0] != 0:
+                problems.append(f"{split}/{_tag}: columns[].start 非严格递增或首列起点非 0：{_starts[:5]}")
+            # columns[] 会**把词袋块整体登记为 1 行**（起点 0），故条数 = 词袋行数 + 命名列数，
+            # 其中词袋行数 = 0（no_bag）/ 1（有词袋块）—— 该口径由现场枚举 meta 得到。
+            _expect = (0 if bool(_feat["no_bag"]) else 1) + _fdim - _hdim
+            if len(_starts) != _expect:
+                problems.append(
+                    f"{split}/{_tag}: columns 条数 {len(_starts)} != 词袋行数+命名列数 = {_expect}"
+                )
+            if _starts[-1] != _fdim - 1:
+                problems.append(f"{split}/{_tag}: 末列起点 {_starts[-1]} != feature_dim - 1 = {_fdim - 1}")
+            if bool(_feat["no_bag"]) and _hdim != 0:
+                problems.append(f"{split}/{_tag}: no_bag=True 但 hash_dim={_hdim}（应为 0）")
+        start_r = min(idx_r[n] for n in ("qcov_idf", "dcov_idf", "tfidf_cos", "ans_isnum_frac"))
+        extra_base = Xb[:, start_b:]
+        combos: List[Tuple[str, np.ndarray]] = [
+            ("base 附加块", extra_base),
+            ("base + qcov_idf", np.hstack([extra_base, Xr[:, i_qidf : i_qidf + 1]])),
+            ("base + tfidf_cos", np.hstack([extra_base, Xr[:, i_cos : i_cos + 1]])),
+            ("base + 两列 IDF", np.hstack([extra_base, Xr[:, i_qidf : i_qidf + 1], Xr[:, i_cos : i_cos + 1]])),
+            ("rich 附加块（十列）", Xr[:, start_b_rich:]),
+            ("单列 qcov(base)", Xb[:, i_qcov : i_qcov + 1]),
+        ]
+        acc: Dict[str, float] = {}
+        auc: Dict[str, float] = {}
+        for name, Xs in combos:
+            a, u = _cv_scores(Xs, y)
+            acc[name] = a
+            auc[name] = u
+            lines.append(f"    CV {name}: acc={a:.4f} auc={u:.4f}（d={Xs.shape[1]}）")
+        yc = y.astype(np.float64) - float(y.mean())
+        r_line: List[str] = []
+        for name in ("q_to_d_coverage", "qcov_idf", "dcov_idf", "tfidf_cos", "ans_isnum_frac"):
+            col = Xr[:, idx_r[name]]
+            xc = col - float(col.mean())
+            den = float(np.sqrt((xc ** 2).sum() * (yc ** 2).sum()))
+            r = float((xc * yc).sum() / den) if den > 0 else 0.0
+            r_line.append(f"|r({name})|={abs(r):.4f}")
+        lines.append("    逐列相关性：" + "，".join(r_line))
+        base_acc = acc["base 附加块"]
+        qcov_acc = acc["单列 qcov(base)"]
+        gain_idf = acc["base + qcov_idf"] - base_acc
+        gain_cos = acc["base + tfidf_cos"] - base_acc
+        gain_both = acc["base + 两列 IDF"] - base_acc
+        gain_rich = acc["rich 附加块（十列）"] - base_acc
+        qcov_gain_idf = acc["base + qcov_idf"] - qcov_acc
+        qcov_gain_cos = acc["base + tfidf_cos"] - qcov_acc
+        lines.append(
+            f"    相对 base 增量：+qcov_idf {gain_idf:+.4f}，+tfidf_cos {gain_cos:+.4f}，"
+            f"+两列 {gain_both:+.4f}，rich 十列 {gain_rich:+.4f}"
+        )
+        lines.append(
+            f"    相对单列 qcov：+qcov_idf {qcov_gain_idf:+.4f}，+tfidf_cos {qcov_gain_cos:+.4f}"
+        )
+        lines.append(
+            "    [结论] "
+            + (
+                f"rich 优于 base（rich 十列 {acc['rich 附加块（十列）']:.4f} > base {base_acc:.4f}）"
+                if acc["rich 附加块（十列）"] > base_acc + E7_TOL
+                else f"**rich 相对 base 无增益**（rich 十列 {acc['rich 附加块（十列）']:.4f} <= base {base_acc:.4f}）"
+            )
+        )
+    passed = not problems
+    if problems:
+        lines.append("  问题：" + "；".join(problems))
+    return CheckResult(
+        "E7", "rich 特征判别力分解（5 折 CV：rich 是否优于 base）", passed, detail="\n".join(lines)
+    )
+
+
+def _question_ids_from_artifact(split: str, no_bag: bool, features: str) -> Tuple[Optional[set], str]:
+    """从产物 meta 里取该 split 的 QuestionId 集合（缺产物返回 ``(None, 原因)``）。"""
+    path = product_path(split, no_bag, features)
+    if not os.path.isfile(path):
+        return None, f"缺产物 {path}"
+    meta = bd.read_npz_meta(path)
+    return {str(q["question_id"]) for q in meta["questions"]}, ""
+
+def check_e8_no_leak(args: argparse.Namespace) -> CheckResult:
+    """E8：无泄漏（同 QuestionId 正负交集 = 0；verified 与 dev 的 QuestionId 交集 = 0）。
+
+    覆盖既有 4 个正式产物 + 新增 rich / dev 产物；缺产物时记 SKIP 并说明，不计失败。
+
+    参数
+    ----
+    args : argparse.Namespace
+        命令行参数（用 ``--split``）。
+
+    返回
+    ----
+    CheckResult
+        检查结果。
+    """
+    lines: List[str] = []
+    problems: List[str] = []
+    targets: List[Tuple[str, bool, str]] = []
+    for split in (SPLITS if args.split == "all" else (str(args.split),)):
+        for _lab, no_bag in PRODUCT_VARIANTS:
+            targets.append((split, bool(no_bag), "base"))
+            targets.append((split, bool(no_bag), "rich"))
+    for split in DEV_SPLITS:
+        for _lab, feat in DEV_FEATURE_SETS:
+            targets.append((split, False, feat))
+    qids: Dict[str, set] = {}
+    for split, no_bag, feat in targets:
+        key = f"{split}/{'nobag' if no_bag else 'h64'}" + ("_rich" if feat == "rich" else "")
+        path = product_path(split, no_bag, feat)
+        if not os.path.isfile(path):
+            lines.append(f"  [SKIP] {key}: 缺产物 {path}")
+            continue
+        meta = bd.read_npz_meta(path)
+        questions = meta["questions"]
+        documents = meta["documents"]
+        pos: Dict[str, set] = {}
+        neg: Dict[str, set] = {}
+        dup = 0
+        seen_pairs = set()
+        for qi, di, lab, _hit in meta["samples"]:
+            qid = str(questions[int(qi)]["question_id"])
+            doc = str(documents[int(di)])
+            if (qid, doc) in seen_pairs:
+                dup += 1
+            seen_pairs.add((qid, doc))
+            (pos if int(lab) == 1 else neg).setdefault(qid, set()).add(doc)
+        overlap = [q for q in pos if pos[q] & neg.get(q, set())]
+        lines.append(
+            f"  {key}: QuestionId {len(set(pos) | set(neg))} 个，同题正负文档交集 {len(overlap)}，"
+            f"重复 (QuestionId,文档) 对 {dup}"
+        )
+        if overlap:
+            problems.append(f"{key} 存在同一 QuestionId 的正负文档交集（示例 {overlap[:3]}）")
+        if dup:
+            problems.append(f"{key} 存在重复 (QuestionId,文档) 对 {dup} 个")
+        if not overlap and not dup:
+            qids[key] = {str(q["question_id"]) for q in questions}
+    # verified 与 非 verified 的 QuestionId 交集必须为空
+    for verified_key, dev_key in (
+        ("wiki/h64", "wiki-dev/rich_wiki_dev"),
+        ("web/h64", "web-dev/rich_web_dev"),
+    ):
+        a, b = qids.get(verified_key), qids.get(dev_key)
+        if a is None or b is None:
+            lines.append(f"  [SKIP] {verified_key} vs {dev_key}: 缺一侧产物，交集未校验")
+            continue
+        inter = a & b
+        lines.append(
+            f"  {verified_key} vs {dev_key}: QuestionId 交集 = {len(inter)}"
+            f"（示例 {sorted(inter)[:5]}），两侧规模 {len(a)} / {len(b)}"
+        )
+        if inter:
+            problems.append(f"verified 与 dev 的 QuestionId 交集非空：{sorted(inter)[:5]}")
+    passed = not problems
+    if problems:
+        lines.append("  问题：" + "；".join(problems))
+    return CheckResult("E8", "无泄漏（同题正负不交叉 + verified/dev QuestionId 交集为 0）", passed, detail="\n".join(lines))
+
+
 # CLI
 # ======================================================================
-ALL_CHECKS: Tuple[str, ...] = ("E1", "E2", "E3", "E4", "E5", "E6")
+ALL_CHECKS: Tuple[str, ...] = ("E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8")
+# 缺省执行顺序（E7/E8 为新增检查：E7 需 rich 产物、E8 需 dev 产物，缺产物时记 SKIP）
+DEFAULT_CHECKS: Tuple[str, ...] = ("E1", "E2", "E3", "E4", "E5", "E6")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -986,13 +1496,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         含 split / archive / checks / audit_n / e5_split / e5_epochs / e5_path / skip_e5 字段。
     """
     parser = argparse.ArgumentParser(
-        description="n3d_triviaqa 产物验证（E1 幂等 / E2 契约 / E3 均衡+答案复核 / E4 无泄漏 / E5 端到端 / E6 零回归）"
+        description="n3d_qa 产物验证（E1 幂等 / E2 契约 / E3 均衡+答案复核 / E4 无泄漏 / E5 端到端 / E6 零回归）"
     )
     parser.add_argument("--split", type=str, default="all", choices=list(bd.SPLIT_CHOICES),
                         help="验证哪个 split（缺省 all）")
     parser.add_argument("--archive", type=str, default=bd.DEFAULT_ARCHIVE,
                         help="triviaqa-rc.tar.gz 路径（E1 / E3 需要）")
-    parser.add_argument("--checks", type=str, default=",".join(ALL_CHECKS),
+    parser.add_argument("--checks", type=str, default=",".join(DEFAULT_CHECKS),
                         help=f"要执行的检查项（逗号分隔，缺省 {','.join(ALL_CHECKS)}；另恒定执行 E0 口径回读）")
     parser.add_argument("--audit-n", type=int, default=AUDIT_N, help=f"E3 人工复核抽样条数（缺省 {AUDIT_N}）")
     parser.add_argument("--e5-split", type=str, default="", choices=["", *bd.SPLIT_CHOICES[:2]],
@@ -1005,6 +1515,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="E5 使用的 npz 路径（缺省 = 正式产物；可用它复核非计划维度等对照产物）",
     )
     parser.add_argument("--skip-e5", action="store_true", help="跳过 E5（仅做数据侧验证时用）")
+    parser.add_argument(
+        "--product-set",
+        type=str,
+        default="base",
+        choices=["base", "rich", "dev", "all"],
+        help=(
+            "验证哪一组产物：base（缺省，既有 4 个正式产物）/ rich（新增 4 个 rich 产物）/"
+            "dev（2 个非 verified dev 产物）/ all（上述全部）"
+        ),
+    )
+    parser.add_argument(
+        "--e7-max-samples",
+        type=int,
+        default=E7_MAX_SAMPLES,
+        help=f"E7 每个 split 最多用多少条样本做 5 折 CV（缺省 {E7_MAX_SAMPLES}，0 = 全量）",
+    )
     return parser.parse_args(argv)
 
 
@@ -1026,18 +1552,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     wanted = tuple(x.strip().upper() for x in str(args.checks).split(",") if x.strip())
     unknown = [x for x in wanted if x not in ALL_CHECKS]
     if unknown:
-        print(f"[n3d_triviaqa.verify] 未知检查项 {unknown}；可选 {ALL_CHECKS}", file=sys.stderr)
+        print(f"[n3d_qa.verify] 未知检查项 {unknown}；可选 {ALL_CHECKS}", file=sys.stderr)
         return 1
     if bool(args.skip_e5) and "E5" in wanted:
         wanted = tuple(x for x in wanted if x != "E5")
     t0 = time.time()
+    product_sets: Tuple[str, ...] = (
+        ("base", "rich", "dev") if str(args.product_set) == "all" else (str(args.product_set),)
+    )
     print("=" * 78)
-    print("n3d_triviaqa 产物验证报告")
+    print("n3d_qa 产物验证报告")
     print("=" * 78)
     print(f"产物目录：{PRODUCT_DIR}")
     print(f"验证产物目录：{VERIFY_DIR}")
     print(f"检查项：E0（恒定，逐产物） + {list(wanted)}")
-    print(f"产物口径变体：{[(lab, ('D=6' if nb else 'D=' + str(int(bd.HASH_DIM) + int(bd.EXTRA_DIM)))) for lab, nb in PRODUCT_VARIANTS]}")
+    print(f"产物口径变体：{[(lab, ("D=6" if nb else "D=" + str(int(bd.HASH_DIM) + int(bd.EXTRA_DIM)))) for lab, nb in PRODUCT_VARIANTS]}")
+    print(f"验证产物组：{list(product_sets)}（base = 既有 4 个正式产物；rich / dev 落 _verify/）")
     print("-" * 78)
 
     results: List[CheckResult] = []
@@ -1051,20 +1581,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(res.detail)
         print("-" * 78)
 
-    for split, label, no_bag, _path in product_list(args):
-        emit(check_meta_contract(split, no_bag))
+    for pset in product_sets:
+        for split, label, no_bag, _path in product_list(args, pset):
+            emit(check_meta_contract(split, no_bag, "rich" if label.endswith("_rich") else "base"))
+    for pset in product_sets:
+        if "E2" in wanted:
+            emit(check_e2_contract(args, pset))
+        if "E3" in wanted:
+            emit(check_e3_balance_and_answer(args, pset))
+        if "E4" in wanted:
+            emit(check_e4_no_leak(args, pset))
     if "E1" in wanted:
         emit(check_e1_idempotent(args))
-    if "E2" in wanted:
-        emit(check_e2_contract(args))
-    if "E3" in wanted:
-        emit(check_e3_balance_and_answer(args))
-    if "E4" in wanted:
-        emit(check_e4_no_leak(args))
+    if "E7" in wanted:
+        emit(check_e7_feature_power(args))
+    if "E8" in wanted:
+        emit(check_e8_no_leak(args))
     if "E5" in wanted:
         if args.e5_split:
             args.split = str(args.e5_split)  # 仅按该 split 的产物跑 E5
-        emit(check_e5_train(args))
+        emit(check_e5_train(args, str(args.product_set)))
     if "E6" in wanted:
         emit(check_e6_untouched(args))
 
