@@ -453,22 +453,32 @@ def build_registry(
     参数
     ----
     vectorizer_config : Optional[VectorizerConfig]
-        向量化口径；为 ``None`` 时用默认口径。
+        向量化口径；为 ``None`` 时用默认口径（若同时给了 ``input_dim`` 则以 ``input_dim``
+        为唯一来源，见下）。
     input_dim : Optional[int]
-        显式覆盖 ``D``；与向量化口径冲突时立即报错。
+        显式覆盖 ``D``；与向量化口径**同时给出**且冲突时立即报错。
 
     返回
     ----
     BackendRegistry
         已登记全部可构造后端的注册表。
+
+    说明
+    ----
+    「只给 ``input_dim``、不给 ``vectorizer_config``」是**可插拔编码器**（如
+    :mod:`n3d_qa_learn.encoders` 的 HF 编码器，其 ``D = hidden_size`` 不由
+    ``VectorizerConfig`` 决定）的入口：此时 ``input_dim`` 即连接参数 ``D``。
     """
-    cfg = vectorizer_config if vectorizer_config is not None else VectorizerConfig()
-    dim = int(cfg.dim)
-    if input_dim is not None and int(input_dim) != dim:
-        raise ValueError(
-            f"显式 input_dim={input_dim} 与向量化口径维度 {dim} 冲突；"
-            "连接参数 D 只有唯一来源（向量化口径），拒绝两处各写一个维度"
-        )
+    if input_dim is not None and vectorizer_config is None:
+        dim = int(input_dim)
+    else:
+        cfg = vectorizer_config if vectorizer_config is not None else VectorizerConfig()
+        dim = int(cfg.dim)
+        if input_dim is not None and int(input_dim) != dim:
+            raise ValueError(
+                f"显式 input_dim={input_dim} 与向量化口径维度 {dim} 冲突；"
+                "连接参数 D 只有唯一来源（向量化口径），拒绝两处各写一个维度"
+            )
     reg = BackendRegistry(dim)
     reg.register_all()
     return reg

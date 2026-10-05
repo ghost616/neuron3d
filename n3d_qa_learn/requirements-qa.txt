@@ -2,20 +2,51 @@
 #
 # 口径（本文件是 **QA 侧依赖的唯一落点**）
 # ---------------------------------------------------------------------------
-# 1. 本模块当前**零新依赖**：只用 torch / numpy 与 Python 标准库。
+# 1. 本模块使用 torch / numpy 与 Python 标准库；**另有一项可选依赖**
+#    `transformers`（及其传递依赖），只在选择 HF 编码器（`encoders.HFTextEncoder`，
+#    如注册表里的 `bge-m3`）时才需要 —— **默认口径（`local-hash` / `zh-bag`
+#    确定性词袋）不需要它**，未安装时选择 HF 编码器会给出可读报错。
 # 2. 后续若确有新增依赖，一律写入**本文件**，**不写入仓库根 requirements.txt**
 #    —— 根 requirements.txt 属 **framework 模块**管辖（其内容为 N3D 一期原型的
 #    torch / torchvision / numpy 清单），QA 侧依赖不写入根文件。
 # 3. 本文件是**口径声明文件**，不被任何脚本以 `pip install -r` 执行；它存在的目的
 #    是让"依赖边界"有唯一、可审计的落点。
 #
-# 现场实测运行时版本（见 README 第八节）
+# 依赖清单（第 6 轮新增 `transformers` 一族）
 # ---------------------------------------------------------------------------
-#   python 3.12.10 / torch 2.14.0+cpu / numpy 2.5.3
+#   transformers          # 通用 HF 编码器适配器（encoders.HFTextEncoder）
+#   tokenizers            # transformers 传递依赖（XLM-R sentencepiece 快分词器）
+#   huggingface_hub       # transformers 传递依赖（模型下载 / revision 锁定）
+#   safetensors           # transformers 传递依赖（本仓库 bge-m3 无 safetensors 变体，
+#                         #   但 transformers 仍要求该包存在）
+#   hf-xet                # huggingface_hub 传递依赖（**本环境须禁用**，见下）
+#   regex / requests / tqdm / pyyaml / filelock / packaging / typing-extensions 等
 #
-# 「零新依赖」表述的适用范围（如实说明）
+# **现场实测的下载口径（不得省略）**
 # ---------------------------------------------------------------------------
-# features.py / train.py / zh_features.py 里出现的「零新依赖」表述，源自本项目对
+#   1. huggingface.co **直连超时**，必须设置 `HF_ENDPOINT=https://hf-mirror.com`；
+#   2. `hf-xet` 的 CAS 服务在镜像下返回 `401 Unauthorized`
+#      （`RuntimeError: ... CAS Client Error: HTTP status client error (401 Unauthorized),
+#      domain: https://cas-server.xethub.hf.co/v2/reconstructions/...`），
+#      必须设置 `HF_HUB_DISABLE_XET=1` 走普通 HTTP 下载；
+#   3. 模型 revision 固定为 `5617a9f61b028005a4858fdac845db406aefb181`（**不得浮动 main**）；
+#   4. 下载目标 `models/bge-m3/`（仓库根），驱动命令见
+#      `python -m n3d_qa_learn.encoders_run fetch`。
+#
+# 现场实测运行时版本
+# ---------------------------------------------------------------------------
+#   python 3.12.10 / torch 2.14.1+cpu / numpy 2.5.3
+#   transformers 5.18.0 / tokenizers 0.23.2 / huggingface_hub 1.33.0 / safetensors 0.8.0
+#
+# 「零新依赖」表述的适用范围（如实说明，第 6 轮更新）
+# ---------------------------------------------------------------------------
+# `features.py` / `train.py` / `zh_features.py` 里出现的「零新依赖」表述，源自本项目对
 # **N3D 核心与 n3d_viz** 的约束（核心计算路径不得引入新依赖），**不应默认外推到
-# 数据/特征层**：数据层与特征层允许引入新的文本/数值处理依赖，只是 n3d_qa_learn
-# 与本模块当前的实现**恰好没有引入任何新依赖**（这是实测事实，不是约束推论）。
+# 数据/特征层**：数据层与特征层允许引入新的文本/数值处理依赖。
+# 该表述的**现状口径**是：
+#   * 默认特征实现（`local-hash` / `zh-bag` 确定性词袋）与步骤 1/2 的既有路径：
+#     **仍然零新依赖**（只用 torch / numpy 与标准库），逐位行为不变；
+#   * **可选**的 HF 编码器实现（`encoders.HFTextEncoder` + `bge-m3`）新增
+#     `transformers` 一族依赖 —— 这是本文件新增清单的**唯一**来源，
+#     不再与「零新依赖」矛盾。
+

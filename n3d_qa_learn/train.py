@@ -54,6 +54,13 @@ from .data import (  # noqa: F401 - QACorpus 等类型在签名中使用
     load_text_lines,
     make_splits,
 )
+from .encoders import (
+    ROLE_QUESTION,
+    EncoderConfig,
+    build_vectorizer,
+    declared_dim,
+    vectorizer_from_meta,
+)
 from .features import TextVectorizer, VectorizerConfig
 from .heads import N3DQA, N3DQAConfig
 
@@ -280,13 +287,25 @@ def split_seed_of(cfg: TrainConfig) -> int:
     return int(cfg.seed) if int(cfg.split_seed) < 0 else int(cfg.split_seed)
 
 
-def build_training_data(cfg: TrainConfig) -> TrainingData:
+def build_training_data(
+    cfg: TrainConfig,
+    encoder_name: str = "",
+    encoder_config: Optional[EncoderConfig] = None,
+) -> TrainingData:
     """按配置装配训练数据（读 QA 缓存 -> 答案表 -> 切分 -> 文本行）。
 
     参数
     ----
     cfg : TrainConfig
         配置。
+    encoder_name : str
+        **可插拔特征实现的入口**（注册表键；空串 = 角色默认实现
+        ``ROLE_DEFAULT_ENCODER["question"]``，即现状的 ``local-hash`` 口径）。
+        传 ``"bge-m3"`` 即切到 HF 编码器适配器（D = ``hidden_size``）。
+    encoder_config : Optional[EncoderConfig]
+        完整的编码器配置（**优先于** ``encoder_name``）；需要指定 ``source`` /
+        ``max_length`` / ``expect_dim`` 等时用它（如 ``source="models/bge-m3"``
+        指向本地权重目录，避免走 HF 缓存或联网）。
 
     返回
     ----
@@ -308,7 +327,13 @@ def build_training_data(cfg: TrainConfig) -> TrainingData:
         raise RuntimeError(
             "训练侧（known）为空：请放宽 min_questions / max_classes，或换用样本更丰富的 QA 缓存"
         )
-    vectorizer = TextVectorizer(VectorizerConfig())
+    # 向量化器经**可插拔编码器注册表**构造；空串 = 角色默认实现（与历史逐位一致）
+    enc_cfg = (
+        encoder_config
+        if encoder_config is not None
+        else EncoderConfig(name=str(encoder_name), role=ROLE_QUESTION)
+    )
+    vectorizer = build_vectorizer(enc_cfg)
     return TrainingData(
         corpus=corpus,
         splits=splits,
@@ -445,6 +470,8 @@ def run_training(
     max_batches: int = 0,
     artifact_path: str = "",
     save: bool = True,
+    encoder_name: str = "",
+    encoder_config: Optional[EncoderConfig] = None,
 ) -> TrainingResult:
     """执行训练（含可选限批模式）并落盘产物。
 
@@ -458,6 +485,10 @@ def run_training(
         产物路径；空串时按 ``DEFAULT_ARTIFACT_DIR`` + 指纹名生成。
     save : bool
         是否落盘。
+    encoder_name : str
+        可插拔特征实现的注册表键（空串 = 角色默认实现，与历史行为逐位一致）。
+    encoder_config : Optional[EncoderConfig]
+        完整的编码器配置（**优先于** ``encoder_name``）。
 
     返回
     ----
@@ -468,7 +499,9 @@ def run_training(
     set_deterministic_seed(int(cfg.seed))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    data = build_training_data(cfg)
+    data = build_training_data(
+        cfg, encoder_name=str(encoder_name), encoder_config=encoder_config
+    )
     model, adapter, _registry = _build_model(data, cfg)
     model = model.to(device)
     model.train()
@@ -870,8 +903,8 @@ def load_artifact(path: str, *, verify: bool = True) -> Dict[str, Any]:
         )
 
     # ---- 守卫 2：向量化口径指纹 ----
-    from .features import vectorizer_from_meta
-
+    # 走**按口径分派**的重建入口：hash 家族委派 features 的历史路径（逐位不变），
+    # HF 家族按编码器声明重建（revision + 权重 SHA256 任一变化都会改指纹）。
     vectorizer_from_meta(meta)
     return {"meta": meta, "state_dict": state, "answer_table": table}
 
@@ -896,8 +929,6 @@ def rebuild_model(meta: Dict[str, Any], state_dict: Dict[str, Any]) -> N3DQA:
     RuntimeError
         状态字典与重建模型结构不一致（``strict=True``）。
     """
-    from .features import vectorizer_from_meta
-
     vectorizer = vectorizer_from_meta(meta)
     registry = build_registry(vectorizer.config)
     backend = str(meta["backend"]["backend"])

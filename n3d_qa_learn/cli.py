@@ -33,8 +33,14 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:  # noqa: BLE001 - 老环境无 reconfigure 时忽略
         pass
 
-from .backends import BACKEND_NAMES, build_registry
+from .backends import BACKEND_NAMES
 from .data import load_text_lines
+from .encoders import (
+    ROLE_QUESTION,
+    EncoderConfig,
+    declared_dim,
+    vectorizer_from_meta as _vectorizer_from_meta,
+)
 from .evaluate import (
     acceptance_check,
     boundary_selftest,
@@ -42,7 +48,6 @@ from .evaluate import (
     evaluate_step1,
     guard_rejection_proof,
 )
-from .features import VectorizerConfig
 from .probe import end_to_end_drill, probe_backends
 from .route import NO_MATCH_TEXT, QuestionRouter
 from .train import (
@@ -62,6 +67,23 @@ def _dump(obj: Any) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=1, default=str))
 
 
+def _encoder_config(args: argparse.Namespace) -> EncoderConfig:
+    """由 CLI 参数装配**可插拔编码器**配置（唯一的选择实现入口）。
+
+    空 ``--encoder`` = 角色默认实现（历史口径），故默认运行行为逐位不变。
+    """
+    return EncoderConfig(
+        name=str(args.encoder), role=ROLE_QUESTION, hash_dim=int(args.hash_dim)
+    )
+
+
+def _resolve_dim(args: argparse.Namespace) -> int:
+    """解析连接参数 ``D``：显式 ``--dim`` 优先，否则取编码器注册表声明维度。"""
+    if int(args.dim) > 0:
+        return int(args.dim)
+    return int(declared_dim(_encoder_config(args)))
+
+
 # ---------------------------------------------------------------------------
 # 子命令实现
 # ---------------------------------------------------------------------------
@@ -69,8 +91,7 @@ def _dump(obj: Any) -> None:
 
 def cmd_probe(args: argparse.Namespace) -> int:
     """P0 探针：登记三后端可用性。"""
-    cfg = VectorizerConfig(hash_dim=int(args.hash_dim))
-    result = probe_backends(int(args.dim) if args.dim > 0 else cfg.dim)
+    result = probe_backends(int(_resolve_dim(args)))
     _dump(result)
     if result["all_failed"]:
         print("[FAIL] 三个后端全部构造失败，P0 门禁未通过", file=sys.stderr)
@@ -84,14 +105,15 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
 def cmd_drill(args: argparse.Namespace) -> int:
     """单条端到端演练。"""
-    cfg = VectorizerConfig(hash_dim=int(args.hash_dim))
     try:
         res = end_to_end_drill(
-            dim=int(args.dim) if args.dim > 0 else cfg.dim,
+            dim=int(_resolve_dim(args)),
             backend=str(args.backend),
             output_mode=str(args.output_mode),
             batch_size=int(args.batch_size),
             seed=int(args.seed),
+            encoder=str(args.encoder),
+            role=ROLE_QUESTION,
         )
     except Exception as exc:  # noqa: BLE001 - 演练失败必须退码 1 并给出原因
         print(f"[FAIL] 端到端演练失败：{type(exc).__name__}: {exc}", file=sys.stderr)
@@ -137,10 +159,13 @@ def cmd_train(args: argparse.Namespace) -> int:
     )
     out_dir = DEFAULT_VERIFY_DIR if args.verify else DEFAULT_ARTIFACT_DIR
     artifact = str(args.artifact) if args.artifact else os.path.join(
-        out_dir, artifact_name(cfg, VectorizerConfig(hash_dim=int(args.hash_dim)).dim)
+        out_dir, artifact_name(cfg, int(_resolve_dim(args)))
     )
     t0 = time.time()
-    result = run_training(cfg, max_batches=int(args.max_batches), artifact_path=artifact)
+    result = run_training(
+        cfg, max_batches=int(args.max_batches), artifact_path=artifact,
+        encoder_name=str(args.encoder),
+    )
     metrics = evaluate_step1(
         result.model, result.data, k=int(args.topk), device=result.device
     )
@@ -189,9 +214,7 @@ def _load_and_route(artifact: str, question: str, text_dir: str, threshold: floa
     bundle = load_artifact(artifact)
     meta = bundle["meta"]
     model = rebuild_model(meta, bundle["state_dict"])
-    from .features import vectorizer_from_meta
-
-    vectorizer = vectorizer_from_meta(meta)
+    vectorizer = _vectorizer_from_meta(meta)
     answer_keys = list(meta["answer_keys"])
     answer_display = dict(meta["answer_display"])
     lines = load_text_lines(text_dir)
@@ -303,9 +326,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     """边界处置自检。"""
     bundle = load_artifact(str(args.model))
     meta = bundle["meta"]
-    from .features import vectorizer_from_meta
-
-    vectorizer = vectorizer_from_meta(meta)
+    vectorizer = _vectorizer_from_meta(meta)
     lines = load_text_lines(str(args.text_dir))
     cases = boundary_selftest(
         vectorizer,
@@ -341,7 +362,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--hash-dim", type=int, default=80,
                        help="哈希词袋桶数（默认 80；D = hash_dim + 8）")
         p.add_argument("--dim", type=int, default=0,
-                       help="特征维 D（0 = 由向量化口径决定；显式给出必须与口径一致）")
+                       help="特征维 D（0 = 由编码器注册表声明维度决定；显式给出必须与口径一致）")
+        p.add_argument("--encoder", type=str, default="",
+                       help="可插拔特征实现的注册表键（空 = 角色默认实现，即历史词袋口径）；"
+                            "合法值见 `python -m n3d_qa_learn.encoders_run registry`")
 
     p = sub.add_parser("probe", help="P0 探针：三后端可用性登记")
     add_common(p)

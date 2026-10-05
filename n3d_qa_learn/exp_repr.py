@@ -75,9 +75,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from . import step2 as S2
+from .backends import BackendRegistry
 from .data import DEFAULT_QA_CACHE_DIR, DEFAULT_TEXT_DIR
+from .encoders import (
+    DEFAULT_MODEL_DIR,
+    ENCODER_BGE_M3,
+    ENCODER_LOCAL_HASH,
+    ROLE_QUESTION,
+    ROLE_TEXT_LINE,
+    EncoderConfig,
+    build_vectorizer,
+    canonical_dumps,
+    sha256_bytes,
+)
 from .evaluate import evaluate_refusal, evaluate_step1
-from .heads import HEAD_INPUT_MODES, N3DQA
+from .heads import HEAD_INPUT_MODES, N3DQA, N3DQAConfig
 from .train import (
     DEFAULT_VERIFY_DIR,
     TrainConfig,
@@ -247,7 +260,476 @@ def group_by_name(name: str) -> ReprGroup:
 
 
 # ---------------------------------------------------------------------------
-# 基础工具
+# 特征档（词面 D=88 vs 语义 bge-m3 D=1024）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FeatureProfile:
+    """一个**特征档**：步骤 1（题面）与步骤 2（文本行）各自的编码器口径。
+
+    属性
+    ----
+    name : str
+        档名（报告键）。
+    label : str
+        中文标签（报告可读性）。
+    question : EncoderConfig
+        步骤 1 题面口径（决定模型连接参数 ``D``）。
+    text_line : EncoderConfig
+        步骤 2 文本行口径（**必须与 ``question`` 同维**，否则同一条 q 通路不可用）。
+    expect_dim : int
+        该档的 ``D``（现场与 ``declared_dim`` 对账）。
+
+    口径声明（**非平凡**）
+    --------------------
+    ``step2.py`` 的默认文本行口径是 ``zh-bag``（``D=192``），而本实验的模型由
+    **步骤 1** 的 ``D`` 决定；为了让「同一条 q 通路」在步骤 2 上可用，
+    文本行一律用**与步骤 1 同族**的编码器（词面档 ``local-hash`` D=88 /
+    语义档 ``bge-m3`` ``role=text_line`` D=1024）。这一点在报告中显式标注，
+    不与 ``step2_run`` 的默认口径混为一谈。
+    """
+
+    name: str
+    label: str
+    question: EncoderConfig
+    text_line: EncoderConfig
+    expect_dim: int
+
+    def as_dict(self) -> Dict[str, Any]:
+        """JSON 化（含两端口径的 ``to_dict``）。"""
+        return {
+            "name": str(self.name),
+            "label": str(self.label),
+            "expect_dim": int(self.expect_dim),
+            "question": self.question.to_dict(),
+            "text_line": self.text_line.to_dict(),
+        }
+
+
+#: 词面档（现状口径，**基线**）。
+PROFILE_LEXICAL: str = "lexical-88"
+#: 语义档（新特征，``BAAI/bge-m3``，``D = hidden_size = 1024``）。
+PROFILE_SEMANTIC: str = "bge-m3-1024"
+#: 默认档（= 现状口径；不显式选档时行为与历史一致）。
+DEFAULT_PROFILE: str = PROFILE_LEXICAL
+
+#: 特征档注册表（**唯一注册点**）。
+FEATURE_PROFILES: Dict[str, FeatureProfile] = {
+    PROFILE_LEXICAL: FeatureProfile(
+        name=PROFILE_LEXICAL,
+        label="词面口径（blake2b 哈希词袋 + 8 长度特征 + L2）",
+        question=EncoderConfig(name=ENCODER_LOCAL_HASH, role=ROLE_QUESTION),
+        text_line=EncoderConfig(name=ENCODER_LOCAL_HASH, role=ROLE_TEXT_LINE),
+        expect_dim=88,
+    ),
+    PROFILE_SEMANTIC: FeatureProfile(
+        name=PROFILE_SEMANTIC,
+        label="语义口径（BAAI/bge-m3，手工 CLS pooling + L2）",
+        question=EncoderConfig(
+            name=ENCODER_BGE_M3, role=ROLE_QUESTION, source=DEFAULT_MODEL_DIR
+        ),
+        text_line=EncoderConfig(
+            name=ENCODER_BGE_M3, role=ROLE_TEXT_LINE, source=DEFAULT_MODEL_DIR
+        ),
+        expect_dim=1024,
+    ),
+}
+
+
+def profile_by_name(name: str) -> FeatureProfile:
+    """按档名取特征档（未知名立即报错，不静默回落）。"""
+    key = str(name) if str(name) else DEFAULT_PROFILE
+    if key not in FEATURE_PROFILES:
+        raise KeyError(
+            f"未知特征档 {key!r}；可用档 = {sorted(FEATURE_PROFILES.keys())}"
+        )
+    return FEATURE_PROFILES[key]
+
+
+def split_qids_digest(qids: Dict[str, List[str]]) -> Dict[str, Any]:
+    """四子集 qid 序列的**sha256 摘要**（报告里不必重复存整表，又能逐位对账）。"""
+    return {
+        "per_split_sha256": {
+            k: sha256_bytes(canonical_dumps([str(x) for x in v]))
+            for k, v in sorted(qids.items())
+        },
+        "n_per_split": {k: int(len(v)) for k, v in sorted(qids.items())},
+    }
+
+
+def split_qids_equal(a: Dict[str, List[str]], b: Dict[str, List[str]]) -> bool:
+    """四子集 qid 有序序列是否**逐位相同**（跨特征档的切分一致性判据）。"""
+    for key in ("train_known", "test_known", "train_unknown", "test_unknown"):
+        if list(a.get(key, [])) != list(b.get(key, [])):
+            return False
+    return True
+
+
+def dimension_cost(
+    dim: int,
+    *,
+    n_train_known: int,
+    n_train_unknown: int,
+    n_classes: int,
+    backend: str = "n3d_shape",
+) -> Dict[str, Any]:
+    """连接参数 ``D`` 的**代价实测**（现场构造，不凭记忆写）。
+
+    报告内容
+    --------
+    * 骨干逐参数形状与元素数（``W_in`` / ``W_out`` / ``edge_weight`` / ``neuron_bias``）
+      与骨干合计；
+    * ``q`` 头逐参数（``q_head.weight`` / ``q_head.bias`` / ``logit_scale``）与合计；
+    * ``answer_table`` 是 **buffer**（``centroid`` 口径下冻结，不入优化器）的字节数；
+    * 总参数量、每样本参数比（分母 = ``train_known + train_unknown``）；
+    * **两种情形的可训参数量**：
+      「冻结嵌入 + 质心答案表」（``freeze_scope="logit_only"``，只训 ``logit_scale``）
+      与「打开表示训练」（``head`` / ``head_backbone``）。
+
+    参数
+    ----
+    dim : int
+        连接参数 ``D``。
+    n_train_known / n_train_unknown : int
+        训练侧样本数（每样本参数比的分母）。
+    n_classes : int
+        答案类别数 ``C``。
+    backend : str
+        后端名（默认 ``n3d_shape``，与矩阵口径一致）。
+
+    返回
+    ----
+    Dict[str, Any]
+        代价实测字典。
+    """
+    reg = BackendRegistry(int(dim))
+    adapter = reg.register(str(backend))
+    backbone = adapter.model
+    backbone_shapes = {n: [int(x) for x in p.shape] for n, p in backbone.named_parameters()}
+    backbone_numel = {n: int(p.numel()) for n, p in backbone.named_parameters()}
+    backbone_total = int(sum(backbone_numel.values()))
+
+    head_model = N3DQA(
+        adapter,
+        int(n_classes),
+        N3DQAConfig(dim=int(dim), output_mode="index", head_input_mode="raw",
+                    logit_scale_init=BASE_LOGIT_SCALE_INIT, learn_logit_scale=True,
+                    answer_table_mode="centroid"),
+    )
+    head_numel = {n: int(p.numel()) for n, p in head_model.named_parameters()}
+    head_shapes = {n: [int(x) for x in p.shape] for n, p in head_model.named_parameters()}
+    head_total = int(sum(head_numel.values()))
+    table = head_model.answer_table
+    answer_table = {
+        "shape": [int(x) for x in table.shape],
+        "numel": int(table.numel()),
+        "bytes_float32": int(table.numel() * 4),
+        "trainable": bool(isinstance(table, nn.Parameter)),
+        "role": "buffer（centroid 口径：由训练样本逐类质心确定性写入，冻结）",
+    }
+    n_samples = int(n_train_known) + int(n_train_unknown)
+    frozen_trainable = int(head_numel.get("logit_scale", 0))
+    opened_trainable = int(
+        head_numel.get("logit_scale", 0)
+        + head_numel.get("q_head.weight", 0)
+        + head_numel.get("q_head.bias", 0)
+    )
+    return {
+        "dim": int(dim),
+        "backend": str(backend),
+        "topology": {k: float(v) for k, v in adapter.topology_stats().items()},
+        "backbone_parameters": backbone_numel,
+        "backbone_shapes": backbone_shapes,
+        "backbone_total": int(backbone_total),
+        "head_parameters": head_numel,
+        "head_shapes": head_shapes,
+        "head_total": int(head_total),
+        "total_parameters": int(backbone_total + head_total),
+        "answer_table_buffer": answer_table,
+        "n_train_samples": int(n_samples),
+        "params_per_sample": (
+            float(backbone_total + head_total) / float(n_samples) if n_samples > 0 else 0.0
+        ),
+        "trainable_frozen_embedding": {
+            "scope": "logit_only（冻结嵌入 + 质心答案表）",
+            "n_trainable": int(frozen_trainable),
+            "names": ["head.logit_scale"],
+            "note": ("q 头与骨干都冻结；answer_table 是 buffer（不在优化器内）；"
+                     "「训练」只改一个正标量尺度，而正标量缩放不改变 argmax"),
+        },
+        "trainable_open_representation": {
+            "scope": "head / head_backbone（打开表示训练）",
+            "n_trainable_head": int(opened_trainable),
+            "n_trainable_head_backbone": int(opened_trainable + backbone_total),
+            "names_head": ["head.logit_scale", "head.q_head.bias", "head.q_head.weight"],
+            "names_head_backbone_extra": sorted(backbone_numel.keys()),
+            "note": ("head 档训 q 头；head_backbone 档额外声明骨干可训，"
+                     "但在 head_input_mode='raw' 下骨干结构性不在计算图上（见 12.8）"),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# 步骤 2 自检索（同一 q 通路）—— 主判据的第二半
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Step2Bundle:
+    """一个特征档的**步骤 2 自检索**共用件（与模型无关的部分，每档只建一次）。
+
+    属性
+    ----
+    profile : str
+        特征档名。
+    product_dir : str
+        ``n3d_qa`` 冻结产物目录（只读）。
+    vectorizer : Any
+        文本行向量化器（与步骤 1 同族、**同维**）。
+    rows : List[Any]
+        文本行（``n3d_qa`` 冻结行表全量，只读）。
+    split : Any
+        库/查询划分（**只作划分复核与查询集来源**）。
+    pool_index : List[int]
+        **检索池**下标。口径与 ``step2_run eval`` **逐字一致**：``n3d_qa`` 产物的
+        ``label_rule`` 是「candidate library row IS the query row」，故检索池 =
+        冻结行表全量（否则「命中自身行」不可定义）；冻结划分出的库/查询互斥性另行复核。
+    query_index : List[int]
+        查询集下标（= 冻结划分出的 query 行 ∩ 检索池）。
+    key_table : Any
+        冻结候选键表（由**该档特征**在检索池上构造）。
+    det_baseline : Dict[str, Any]
+        **不经 N3D** 的纯特征余弦检索 ``Recall@1/@5``（与模型无关，故每档只算一次）；
+        这是「换特征」最干净的可比量。
+    evidence : Dict[str, Any]
+        取证（行数、池/查询规模、口径指纹、D）。
+    """
+
+    profile: str
+    product_dir: str
+    vectorizer: Any
+    rows: List[Any]
+    split: Any
+    pool_index: List[int]
+    query_index: List[int]
+    key_table: Any
+    det_baseline: Dict[str, Any]
+    evidence: Dict[str, Any]
+
+
+def build_step2_bundle(
+    profile: FeatureProfile,
+    *,
+    product_dir: str = "",
+    topk: int = 5,
+    pool_cap: int = 0,
+    batch_size: int = 256,
+) -> Step2Bundle:
+    """构造某特征档的步骤 2 自检索共用件（**只读** ``n3d_qa`` 冻结产物）。
+
+    参数
+    ----
+    profile : FeatureProfile
+        特征档（用它的 ``text_line`` 口径）。
+    product_dir : str
+        ``n3d_qa`` 冻结产物目录；空串 = ``step2.resolve_product_dir`` 自动定位。
+    topk : int
+        ``Recall@k`` 的最大 k（同时报 ``@1``）。
+    pool_cap : int
+        检索池行数上限（``0`` = 全量；限批演练用，**报告里显式登记是否限批**）。
+    batch_size : int
+        编码批大小。
+
+    返回
+    ----
+    Step2Bundle
+        共用件。
+
+    异常
+    ------
+    ValueError
+        向量化维度与声明 ``expect_dim`` 不一致（拒绝静默错配）。
+    """
+    resolved = S2.resolve_product_dir(str(product_dir))
+    rows = S2.load_text_rows(resolved)
+    row_index = S2.load_row_index(resolved)
+    meta = S2.load_doclines_meta(resolved)
+    vectorizer = build_vectorizer(profile.text_line)
+    if int(vectorizer.dim) != int(profile.expect_dim):
+        raise ValueError(
+            f"特征档 {profile.name!r} 的文本行向量化维度 {vectorizer.dim} "
+            f"与声明 expect_dim={profile.expect_dim} 不一致（拒绝静默错配）"
+        )
+    split = S2.reproduce_doc_split(rows, row_index, meta)
+    pool_index = list(range(len(rows)))
+    limited = False
+    if int(pool_cap) > 0 and len(pool_index) > int(pool_cap):
+        pool_index = pool_index[: int(pool_cap)]
+        limited = True
+    pool_set = set(pool_index)
+    # 查询集 = 冻结划分出的查询行 ∩ 检索池（限批时可能被截掉一部分）
+    query_index = [int(i) for i in split.query_index if int(i) in pool_set]
+    key_table = S2.build_key_table(vectorizer, rows, pool_index)
+    det = S2.deterministic_baseline(
+        vectorizer, rows, query_index, pool_index, key_table,
+        topk=int(topk), batch_size=int(batch_size),
+    )
+    evidence = {
+        "product_dir": resolved,
+        "n_rows": int(len(rows)),
+        "n_pool": int(len(pool_index)),
+        "n_query": int(len(query_index)),
+        "pool_cap": int(pool_cap),
+        "pool_limited": bool(limited),
+        "frozen_split": {
+            "library_rows": int(split.n_library),
+            "query_rows": int(split.n_query),
+            "intersection": int(split.evidence["intersection"]),
+            "union": int(split.evidence["union"]),
+        },
+        "retrieval_pool_rule": (
+            "检索池 = 冻结行表全量（n3d_qa label_rule: candidate library row IS the "
+            "query row）；查询集 = 冻结划分出的 query 行 ∩ 检索池"
+        ),
+        "dim": int(vectorizer.dim),
+        "encoder_fingerprint": str(vectorizer.fingerprint()),
+        "role": str(profile.text_line.role),
+        "max_length": int(profile.text_line.resolved_max_length()),
+        "split_seed": int(split.seed),
+        "key_table_sha256": str(key_table.sha256()),
+        "deterministic_baseline": dict(det),
+    }
+    return Step2Bundle(
+        profile=str(profile.name), product_dir=resolved, vectorizer=vectorizer,
+        rows=list(rows), split=split, pool_index=pool_index, query_index=query_index,
+        key_table=key_table, det_baseline=dict(det), evidence=evidence,
+    )
+
+
+@torch.no_grad()
+def step2_recall_of_model(
+    model: N3DQA,
+    bundle: Step2Bundle,
+    *,
+    topk: int = 5,
+    batch_size: int = 128,
+) -> Dict[str, Any]:
+    """把**训练好的模型**接到步骤 2：``q = q_head(enc(text_line))`` → 库内检索。
+
+    口径（与 :mod:`n3d_qa_learn.step2` 的自检索**同构**）
+    ------------------------------------------------
+    * **检索池 = 冻结行表全量**（``n3d_qa`` 的 ``label_rule``：「candidate library row
+      IS the query row」），查询集 = 冻结划分出的 query 行 ∩ 检索池；这与
+      ``step2_run eval`` 的口径**逐字一致**（不是「库=1999 行子集」那一种）；
+    * 查询行经**同一条 q 通路**在池中检索，命中自身行即正确；
+    * 另报**不经 N3D** 的纯特征检索（``bundle.det_baseline``）作为参照下限。
+
+    参数
+    ----
+    model : N3DQA
+        训练好的模型（``model.config.dim`` 必须等于 ``bundle.vectorizer.dim``）。
+    bundle : Step2Bundle
+        步骤 2 共用件。
+    topk / batch_size : int
+        运行参数。
+
+    返回
+    ----
+    Dict[str, Any]
+        ``q_path``（经 N3D）与 ``deterministic``（不经 N3D）两组 ``Recall@1/@5``。
+    """
+    if int(model.config.dim) != int(bundle.vectorizer.dim):
+        raise ValueError(
+            f"步骤 2 的向量化维度 {bundle.vectorizer.dim} 与模型 q 维度 "
+            f"{model.config.dim} 不一致；拒绝在错配的特征空间上检索"
+        )
+    matcher = S2.TextRowMatcher(model, bundle.vectorizer, "index", bundle.key_table)
+    q_idx = [int(i) for i in bundle.query_index]
+    if _pool_matches_table(bundle):
+        # 非限批：直接复用 step2 的母实现（口径逐字一致）
+        qpath = S2.self_retrieval(
+            matcher, bundle.rows, q_idx, list(bundle.pool_index), bundle.key_table,
+            topk=int(topk), batch_size=int(batch_size),
+        )
+    else:
+        # 限批演练：口径相同，只把「库下标来源」换成键表自身（见函数 docstring）
+        qpath = _self_retrieval_limited(
+            matcher, bundle, q_idx, topk=int(topk), batch_size=int(batch_size)
+        )
+    return {
+        "q_path": {k: qpath[k] for k in
+                   ("n", "n_library", "topk", "recall_at_1", "recall_at_5",
+                    "rank_1", "rank_miss_topk")},
+        "q_path_misses_head": list(qpath.get("misses_head", []))[:10],
+        "deterministic": dict(bundle.det_baseline),
+        "dim": int(bundle.vectorizer.dim),
+        "protocol": (
+            "检索池 = n3d_qa 冻结行表全量；查询集 = 冻结划分的 query 行；查询行经同一 "
+            "q 通路检索，命中自身行即正确；deterministic 为不经 N3D 的同池同查询参照下限"
+        ),
+    }
+
+
+def _pool_matches_table(bundle: Step2Bundle) -> bool:
+    """检索池下标序列是否与键表行序一致（限批时不一致，需走专用路径）。"""
+    pool_ids = [str(bundle.rows[int(i)].row_id) for i in bundle.pool_index]
+    return pool_ids == [str(x) for x in bundle.key_table.line_ids]
+
+
+def _self_retrieval_limited(
+    matcher: Any,
+    bundle: Step2Bundle,
+    query_index: Sequence[int],
+    *,
+    topk: int = 5,
+    batch_size: int = 128,
+) -> Dict[str, Any]:
+    """限批检索池上的自检索（口径与 :func:`step2.self_retrieval` 相同，只换池下标来源）。
+
+    存在理由：``step2.self_retrieval`` 会显式断言「库行顺序 == 键表行 id 顺序」，
+    限批（``pool_cap > 0``）时该断言必然失败；本函数用**键表自身的行 id 顺序**
+    作为池顺序，保持其余口径逐字不变。
+    """
+    q_idx = [int(i) for i in query_index]
+    pos_of = {str(lid): i for i, lid in enumerate(bundle.key_table.line_ids)}
+    kk = max(1, int(topk))
+    hits1 = 0
+    hits5 = 0
+    misses: List[Dict[str, Any]] = []
+    ranks: List[int] = []
+    for b0 in range(0, len(q_idx), int(batch_size)):
+        chunk = q_idx[b0: b0 + int(batch_size)]
+        texts = [bundle.rows[i].text for i in chunk]
+        logits = matcher.logits(texts)
+        order = torch.argsort(logits, dim=1, descending=True)[:, :kk]
+        for i, row_i in enumerate(chunk):
+            gold = str(bundle.rows[row_i].row_id)
+            gold_pos = pos_of.get(gold)
+            if gold_pos is None:
+                raise ValueError(f"查询行 {gold!r} 不在限批库中；拒绝在缺金标的库上算命中")
+            rank_list = [int(x) for x in order[i].tolist()]
+            rank = (rank_list.index(gold_pos) + 1) if gold_pos in rank_list else -1
+            ranks.append(int(rank))
+            hits1 += int(rank == 1)
+            hits5 += int(1 <= rank <= kk)
+            if rank != 1 and len(misses) < 10:
+                misses.append({"row_id": gold, "rank": int(rank)})
+    n = len(q_idx)
+    return {
+        "n": int(n),
+        "n_library": int(bundle.key_table.size),
+        "topk": int(kk),
+        "recall_at_1": float(hits1 / max(1, n)),
+        "recall_at_5": float(hits5 / max(1, n)),
+        "rank_1": int(hits1),
+        "rank_miss_topk": int(sum(1 for r in ranks if r < 0)),
+        "misses_head": misses,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 基础工具（续）
 # ---------------------------------------------------------------------------
 
 
@@ -1035,6 +1517,10 @@ def run_group(
     stage2_epochs: int = STAGE2_EPOCHS,
     qa_cache_dir: str = "",
     text_dir: str = "",
+    profile: str = DEFAULT_PROFILE,
+    step2_bundle: Optional[Step2Bundle] = None,
+    step2_topk: int = 5,
+    step2_batch_size: int = 128,
 ) -> Dict[str, Any]:
     """跑一个对照组（固定切分 + 指定训练 seed），返回完整结果字典。
 
@@ -1048,13 +1534,24 @@ def run_group(
     group : ReprGroup
         组定义。
     其余为实验超参（默认值即基线锚点档）。
+    profile : str
+        **特征档**名（见 :data:`FEATURE_PROFILES`）。默认 = 词面档（现状口径，
+        行为与历史逐位一致）；``"bge-m3-1024"`` 即把步骤 1 的特征换成
+        ``BAAI/bge-m3``（``D = hidden_size = 1024``）。
+    step2_bundle : Optional[Step2Bundle]
+        步骤 2 自检索共用件；给出时本组额外计算
+        「同一 q 通路」的 ``Recall@1/@5``（主判据的第二半）。
+    step2_topk / step2_batch_size : int
+        步骤 2 的运行参数。
 
     返回
     ----
     Dict[str, Any]
-        含 ``group`` / ``config`` / ``split`` / ``split_qids`` / ``metric_step1`` /
-        ``refusal`` / ``geo`` / ``history`` / ``gate`` / ``shifts`` / ``param_deltas``。
+        含 ``group`` / ``profile`` / ``config`` / ``split`` / ``split_qids`` /
+        ``metric_step1`` / ``refusal`` / ``geo`` / ``step2`` / ``history`` /
+        ``gate`` / ``shifts`` / ``param_deltas``。
     """
+    prof = profile_by_name(profile)
     cfg = build_group_config(
         group,
         split_seed=split_seed,
@@ -1074,7 +1571,12 @@ def run_group(
     )
     device = _device()
     set_deterministic_seed(int(train_seed))
-    data = build_training_data(cfg)
+    data = build_training_data(cfg, encoder_config=prof.question)
+    if int(data.vectorizer.dim) != int(prof.expect_dim):
+        raise ValueError(
+            f"特征档 {prof.name!r} 的步骤 1 实测维度 {data.vectorizer.dim} "
+            f"与声明 expect_dim={prof.expect_dim} 不一致（拒绝静默错配）"
+        )
     model, _adapter, _registry = _build_model(data, cfg)
     model.to(device)
     model.train()
@@ -1205,9 +1707,16 @@ def run_group(
     step1 = evaluate_step1(model, data, k=3, device=str(device))
     refusal = evaluate_refusal(model, data, device=str(device))
     geo = representation_geometry(model, data, device)
+    step2_metric: Optional[Dict[str, Any]] = None
+    if step2_bundle is not None:
+        step2_metric = step2_recall_of_model(
+            model, step2_bundle, topk=int(step2_topk), batch_size=int(step2_batch_size)
+        )
 
     return {
         "group": group.as_dict(),
+        "profile": prof.name,
+        "profile_detail": prof.as_dict(),
         "config": {
             "split_seed": int(split_seed),
             "train_seed": int(train_seed),
@@ -1244,6 +1753,7 @@ def run_group(
         "metric_step1": step1.as_dict(),
         "refusal": {k: float(v) for k, v in refusal.items()},
         "geo": geo,
+        "step2": step2_metric,
         "history": history,
         "gate": gate,
         "ungrouped_trainable_names": ungrouped,
@@ -1316,22 +1826,25 @@ def run_experiment(
     progress : Optional[Callable[[str], None]]
         进度回调（只接收一行文本；本模块自身不打印任何东西）。
     kwargs
-        透传给 :func:`run_group` 的超参。
+        透传给 :func:`run_group` 的超参（含 ``profile`` / ``step2_bundle``）。
 
     返回
     ----
     Dict[str, Any]
-        报告字典（含 ``groups`` / ``split_identical`` / ``anchor_comparison``）。
+        报告字典（含 ``profile`` / ``groups`` / ``split_identical`` /
+        ``anchor_comparison`` / ``cost``）。
     """
     names = list(group_names) if group_names else [g.name for g in MATRIX]
     wanted = [group_by_name(n) for n in names]
+    prof = profile_by_name(str(kwargs.get("profile", DEFAULT_PROFILE)))
     results: List[Dict[str, Any]] = []
     reference: Optional[Dict[str, List[str]]] = None
     ref_name = ""
     for group in wanted:
         if progress is not None:
             progress(
-                f"[start] {group.name} (freeze_scope={group.freeze_scope}, "
+                f"[start] {group.name} (profile={prof.name}, "
+                f"freeze_scope={group.freeze_scope}, "
                 f"head_input_mode={group.head_input_mode}, loss_mode={group.loss_mode})"
             )
         t0 = time.time()
@@ -1346,17 +1859,31 @@ def run_experiment(
         results.append(res)
         if progress is not None:
             gate = res["gate"]
+            s2 = res.get("step2") or {}
+            s2_txt = (
+                f" step2R@1={(s2.get('q_path') or {}).get('recall_at_1'):.4f}"
+                if s2 else ""
+            )
             progress(
                 f"[done ] {group.name} gap/σ={res['geo']['gap_over_sigma']:.4f} "
-                f"macro={res['metric_step1']['macro_acc']:.4f} "
+                f"macro={res['metric_step1']['macro_acc']:.4f}{s2_txt} "
                 f"refusal={res['refusal']['refusal_rate']:.4f} "
                 f"gate={'PASS' if gate['passed'] else 'FAIL'} "
                 f"({res['seconds']:.1f}s)"
             )
 
     baseline = next((r for r in results if r["group"]["name"] == BASELINE_GROUP), None)
+    cost: Optional[Dict[str, Any]] = None
+    if baseline is not None:
+        cost = dimension_cost(
+            int(baseline["dim"]),
+            n_train_known=int(baseline["split"]["train_known"]),
+            n_train_unknown=int(baseline["split"]["train_unknown"]),
+            n_classes=int(baseline["n_classes"]),
+        )
     return {
         "experiment": "n3d_qa_learn/exp_repr",
+        "profile": prof.as_dict(),
         "matrix": [g.as_dict() for g in MATRIX],
         "dimensions": [dict(d) for d in DIMENSIONS],
         "anchor": dict(ANCHOR),
@@ -1364,7 +1891,14 @@ def run_experiment(
         "groups": results,
         "split_reference_group": str(ref_name),
         "split_identical": True,
+        "split_digest": split_qids_digest(reference) if reference else {},
         "anchor_comparison": anchor_comparison(baseline["geo"]) if baseline else None,
+        "cost": cost,
+        "step2_protocol": (
+            dict(kwargs["step2_bundle"].evidence)
+            if kwargs.get("step2_bundle") is not None else None
+        ),
+        "seconds_total": float(sum(float(r.get("seconds", 0.0)) for r in results)),
     }
 
 
@@ -1392,6 +1926,534 @@ def summarize(report: Dict[str, Any]) -> List[Dict[str, Any]]:
             "gate_passed": bool(res["gate"]["passed"]),
         })
     return out
+
+
+def _metric_row(res: Dict[str, Any]) -> Dict[str, Any]:
+    """从一组结果里抽出**主判据与另报量**（缺项如实记 ``None``，不填 0 冒充）。"""
+    s2 = res.get("step2") or None
+    qpath = (s2 or {}).get("q_path") or {}
+    det = (s2 or {}).get("deterministic") or {}
+    return {
+        "macro_acc": float(res["metric_step1"]["macro_acc"]),
+        "top1_acc": float(res["metric_step1"]["top1_acc"]),
+        "step2_recall_at_1": (float(qpath["recall_at_1"]) if "recall_at_1" in qpath else None),
+        "step2_recall_at_5": (float(qpath["recall_at_5"]) if "recall_at_5" in qpath else None),
+        "step2_det_recall_at_1": (float(det["recall_at_1"]) if "recall_at_1" in det else None),
+        "step2_det_recall_at_5": (float(det["recall_at_5"]) if "recall_at_5" in det else None),
+        "gap": float(res["geo"]["gap"]),
+        "within_sigma": float(res["geo"]["within_sigma"]),
+        "gap_over_sigma": float(res["geo"]["gap_over_sigma"]),
+        "nn1_top1_raw": float(res["geo"]["nn1_top1_raw"]),
+        "nn1_top1_repr": float(res["geo"]["nn1_top1_repr"]),
+        "refusal_rate": float(res["refusal"]["refusal_rate"]),
+        "argmax_changed_frac": float(res["shifts"]["argmax_changed_frac"]),
+        "gate_passed": bool(res["gate"]["passed"]),
+        "seconds": float(res.get("seconds", 0.0)),
+    }
+
+
+def _delta(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    """``b - a``（任一为 ``None`` 时返回 ``None``，不把缺失当 0）。"""
+    if a is None or b is None:
+        return None
+    return float(b) - float(a)
+
+
+def run_comparison(
+    *,
+    profiles: Sequence[str] = (PROFILE_LEXICAL, PROFILE_SEMANTIC),
+    group_names: Optional[Sequence[str]] = None,
+    step2_product_dir: str = "",
+    step2_pool_cap: int = 0,
+    step2_topk: int = 5,
+    progress: Optional[Callable[[str], None]] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """**同切分**下逐组对照两个特征档（词面 ``D=88`` vs ``bge-m3`` ``D=1024``）。
+
+    口径（**必须显式**）
+    ------------------
+    * 两个档共用同一 ``split_seed`` 与同一 ``train_seed``，因而共用同一份切分；
+      脚本对两档的四子集 qid 有序序列做 :func:`assert_same_split`（G1）；
+    * 步骤 2 的文本行口径**与该档步骤 1 同族同维**（词面档 ``local-hash`` /
+      语义档 ``bge-m3`` ``role=text_line``），以便「同一条 q 通路」可用；
+      该口径与 ``step2_run`` 默认的 ``zh-bag``（``D=192``）**不同**，报告中显式标注；
+    * 每个档的步骤 2 共用件（文本行向量化 + 冻结键表 + 纯特征参照下限）**只建一次**
+      并复用于该档全部组。
+
+    参数
+    ----
+    profiles : Sequence[str]
+        要对照的档（默认两档）。
+    group_names : Optional[Sequence[str]]
+        只跑这些组（``None`` = 全部 8 组）。
+    step2_product_dir : str
+        ``n3d_qa`` 冻结产物目录（空 = 自动定位）。
+    step2_pool_cap : int
+        检索池行数上限（``0`` = 全量）。
+    step2_topk : int
+        ``Recall@k`` 的 k。
+    progress : Optional[Callable[[str], None]]
+        进度回调。
+    kwargs
+        其余透传给 :func:`run_group`。
+
+    返回
+    ----
+    Dict[str, Any]
+        ``{"experiment", "profiles", "runs", "split", "comparison",
+        "attribution", "verdict", "cost", "seconds"}``。
+    """
+    profs = [profile_by_name(p) for p in profiles]
+    if len(profs) < 2:
+        raise ValueError("run_comparison 至少需要两个特征档")
+    runs: Dict[str, Dict[str, Any]] = {}
+    bundles: Dict[str, Step2Bundle] = {}
+    for prof in profs:
+        if progress is not None:
+            progress(f"[profile] {prof.name} 构造步骤 2 共用件（{prof.label}）")
+        bundle = build_step2_bundle(
+            prof, product_dir=str(step2_product_dir), topk=int(step2_topk),
+            pool_cap=int(step2_pool_cap),
+        )
+        bundles[prof.name] = bundle
+        if progress is not None:
+            progress(
+                f"[profile] {prof.name} 步骤 2：池 {bundle.evidence['n_pool']} / "
+                f"查询 {bundle.evidence['n_query']} / D={bundle.evidence['dim']} / "
+                f"纯特征 Recall@1={bundle.det_baseline['recall_at_1']:.4f}"
+            )
+        runs[prof.name] = run_experiment(
+            group_names=group_names, progress=progress,
+            profile=prof.name, step2_bundle=bundle, **kwargs,
+        )
+
+    # ---- G1：跨档切分一致性 -------------------------------------------
+    ref_name = profs[0].name
+    ref_groups = {r["group"]["name"]: r["split_qids"] for r in runs[ref_name]["groups"]}
+    cross_checks: List[Dict[str, Any]] = []
+    for prof in profs[1:]:
+        for res in runs[prof.name]["groups"]:
+            gname = res["group"]["name"]
+            if gname not in ref_groups:
+                continue
+            same = split_qids_equal(ref_groups[gname], res["split_qids"])
+            cross_checks.append({
+                "group": gname, "reference_profile": ref_name, "profile": prof.name,
+                "identical": bool(same),
+            })
+            if not same:
+                # 跨档切分不一致 -> 该对照判无效（与组内断言同口径）
+                raise AssertionError(
+                    f"[{prof.name}/{gname}] 跨特征档切分一致性断言失败：四子集 qid "
+                    f"有序序列与 {ref_name}/{gname} 不逐位相同；该对照判无效"
+                )
+
+    # ---- 逐组对照 ------------------------------------------------------
+    def _by_group(run: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        return {r["group"]["name"]: r for r in run["groups"]}
+
+    rows: List[Dict[str, Any]] = []
+    by_profile = {p.name: _by_group(runs[p.name]) for p in profs}
+    names = [g["group"]["name"] for g in runs[ref_name]["groups"]]
+    for gname in names:
+        base = by_profile[ref_name].get(gname)
+        if base is None:
+            continue
+        b_row = _metric_row(base)
+        entry: Dict[str, Any] = {
+            "group": gname,
+            "freeze_scope": base["group"]["freeze_scope"],
+            "head_input_mode": base["group"]["head_input_mode"],
+            "loss_mode": base["group"]["loss_mode"],
+            "reference_profile": ref_name,
+            "reference": b_row,
+            "others": {},
+        }
+        both_better_all = True
+        for prof in profs[1:]:
+            other = by_profile[prof.name].get(gname)
+            if other is None:
+                continue
+            o_row = _metric_row(other)
+            d_macro = _delta(b_row["macro_acc"], o_row["macro_acc"])
+            d_recall = _delta(b_row["step2_recall_at_1"], o_row["step2_recall_at_1"])
+            d_det = _delta(b_row["step2_det_recall_at_1"], o_row["step2_det_recall_at_1"])
+            better_macro = bool(d_macro is not None and d_macro > 0.0)
+            better_recall = bool(d_recall is not None and d_recall > 0.0)
+            entry["others"][prof.name] = {
+                "metrics": o_row,
+                "delta_macro_acc": d_macro,
+                "delta_step2_recall_at_1": d_recall,
+                "delta_step2_det_recall_at_1": d_det,
+                "delta_gap_over_sigma": _delta(b_row["gap_over_sigma"], o_row["gap_over_sigma"]),
+                "delta_refusal_rate": _delta(b_row["refusal_rate"], o_row["refusal_rate"]),
+                "delta_seconds": _delta(b_row["seconds"], o_row["seconds"]),
+                "macro_better": better_macro,
+                "step2_recall_better": better_recall,
+                "step2_det_recall_better": bool(d_det is not None and d_det > 0.0),
+                "both_better": bool(better_macro and better_recall),
+                "gate_passed": bool(o_row["gate_passed"]),
+            }
+            both_better_all = both_better_all and bool(better_macro and better_recall)
+        entry["all_profiles_both_better"] = bool(both_better_all)
+        rows.append(entry)
+
+    # ---- 归因分解（**换特征** 与 **打开表示训练** 不得合并）-------------
+    attribution = _attribution(by_profile, profs)
+
+    verdict = {
+        "criterion": "步骤 1 macro 与步骤 2 自检索 Recall@1 **同时**高于参照档",
+        "reference_profile": ref_name,
+        "n_groups": int(len(rows)),
+        "groups_both_better": [r["group"] for r in rows if r["all_profiles_both_better"]],
+        "groups_not_both_better": [r["group"] for r in rows
+                                   if not r["all_profiles_both_better"]],
+        "any_group_both_better": bool(any(r["all_profiles_both_better"] for r in rows)),
+        "all_groups_both_better": bool(rows) and all(
+            r["all_profiles_both_better"] for r in rows
+        ),
+        "note": (
+            "本判据是**逐组**的联合条件；同时给出纯特征（不经 N3D）Recall@1 的"
+            "同组增量 delta_step2_det_recall_at_1，用于把「特征好坏」与「q 通路好坏」分开看"
+        ),
+    }
+
+    return {
+        "experiment": "n3d_qa_learn/exp_repr/feature-comparison",
+        "profiles": [p.as_dict() for p in profs],
+        "runs": runs,
+        "step2_bundles": {k: dict(v.evidence) for k, v in bundles.items()},
+        "split": {
+            "cross_profile_checks": cross_checks,
+            "identical_across_profiles": bool(all(c["identical"] for c in cross_checks))
+            if cross_checks else True,
+            "digest": {p.name: runs[p.name]["split_digest"] for p in profs},
+        },
+        "comparison": rows,
+        "attribution": attribution,
+        "verdict": verdict,
+        "cost": {p.name: runs[p.name]["cost"] for p in profs},
+        "seconds": {
+            "per_profile_total": {p.name: float(runs[p.name]["seconds_total"]) for p in profs},
+            "per_group": {
+                p.name: {r["group"]["name"]: float(r["seconds"]) for r in runs[p.name]["groups"]}
+                for p in profs
+            },
+            "grand_total": float(sum(runs[p.name]["seconds_total"] for p in profs)),
+        },
+        "config": {
+            "split_seed": int(kwargs.get("split_seed", BASE_SPLIT_SEED)),
+            "train_seed": int(kwargs.get("train_seed", BASE_TRAIN_SEED)),
+            "epochs": int(kwargs.get("epochs", BASE_EPOCHS)),
+            "batch_size": int(kwargs.get("batch_size", BASE_BATCH_SIZE)),
+        },
+    }
+
+
+def _attribution(
+    by_profile: Dict[str, Dict[str, Dict[str, Any]]],
+    profs: Sequence[FeatureProfile],
+) -> Dict[str, Any]:
+    """把「**换特征**」与「**打开表示训练**」两种贡献**分开**量化（不得合并归因）。
+
+    口径
+    ----
+    * **只换特征**：同一组配置下，参照档 vs 其它档（``A1_baseline`` 组即
+      ``logit_only/raw/ce``，可训参数只有 ``logit_scale``，故该差异**只**来自特征）；
+    * **只打开表示训练**：同一档内，``A1_baseline`` vs ``A2_head`` / ``A3_head_backbone``
+      （特征不变，只把 ``q`` 头/骨干放进优化器）；
+    * **两者叠加**：其它档的 ``A2``/``A3`` vs 参照档的 ``A1``。
+
+    返回
+    ----
+    Dict[str, Any]
+        三个分节 + 一句口径声明。
+    """
+    ref = profs[0].name
+    out: Dict[str, Any] = {
+        "sep": "换特征 / 打开表示训练 / 两者叠加 —— 三节分开报，**禁止合并归因**",
+        "feature_only": [],
+        "training_only": [],
+        "combined": [],
+    }
+    a1, a2, a3 = "A1_baseline", "A2_head", "A3_head_backbone"
+
+    # 只换特征：A1_baseline 同组、跨档
+    if a1 in by_profile.get(ref, {}):
+        base = _metric_row(by_profile[ref][a1])
+        for prof in profs[1:]:
+            other = by_profile.get(prof.name, {}).get(a1)
+            if other is None:
+                continue
+            o = _metric_row(other)
+            out["feature_only"].append({
+                "group": a1,
+                "reference_profile": ref,
+                "profile": prof.name,
+                "macro_acc": {"reference": base["macro_acc"], "other": o["macro_acc"],
+                              "delta": _delta(base["macro_acc"], o["macro_acc"])},
+                "step2_recall_at_1": {
+                    "reference": base["step2_recall_at_1"], "other": o["step2_recall_at_1"],
+                    "delta": _delta(base["step2_recall_at_1"], o["step2_recall_at_1"])},
+                "step2_det_recall_at_1": {
+                    "reference": base["step2_det_recall_at_1"],
+                    "other": o["step2_det_recall_at_1"],
+                    "delta": _delta(base["step2_det_recall_at_1"], o["step2_det_recall_at_1"])},
+                "gap_over_sigma": {"reference": base["gap_over_sigma"],
+                                   "other": o["gap_over_sigma"],
+                                   "delta": _delta(base["gap_over_sigma"],
+                                                   o["gap_over_sigma"])},
+                "refusal_rate": {"reference": base["refusal_rate"], "other": o["refusal_rate"],
+                                 "delta": _delta(base["refusal_rate"], o["refusal_rate"])},
+                "note": "A1_baseline 只训 logit_scale（正标量，不改 argmax），故该差异只来自特征",
+            })
+
+    # 只打开表示训练：同档内 A1 -> A2 / A3
+    for prof in profs:
+        packs = by_profile.get(prof.name, {})
+        if a1 not in packs:
+            continue
+        base = _metric_row(packs[a1])
+        for gname in (a2, a3):
+            if gname not in packs:
+                continue
+            o = _metric_row(packs[gname])
+            out["training_only"].append({
+                "profile": prof.name,
+                "from_group": a1,
+                "to_group": gname,
+                "macro_acc": {"reference": base["macro_acc"], "other": o["macro_acc"],
+                              "delta": _delta(base["macro_acc"], o["macro_acc"])},
+                "step2_recall_at_1": {
+                    "reference": base["step2_recall_at_1"], "other": o["step2_recall_at_1"],
+                    "delta": _delta(base["step2_recall_at_1"], o["step2_recall_at_1"])},
+                "gap_over_sigma": {"reference": base["gap_over_sigma"],
+                                   "other": o["gap_over_sigma"],
+                                   "delta": _delta(base["gap_over_sigma"],
+                                                   o["gap_over_sigma"])},
+                "refusal_rate": {"reference": base["refusal_rate"], "other": o["refusal_rate"],
+                                 "delta": _delta(base["refusal_rate"], o["refusal_rate"])},
+                "note": "特征不变，只把 q 头（/ 骨干）放进优化器",
+            })
+
+    # 两者叠加：其它档的 A2/A3 vs 参照档 A1
+    if a1 in by_profile.get(ref, {}):
+        base = _metric_row(by_profile[ref][a1])
+        for prof in profs[1:]:
+            for gname in (a2, a3):
+                other = by_profile.get(prof.name, {}).get(gname)
+                if other is None:
+                    continue
+                o = _metric_row(other)
+                out["combined"].append({
+                    "reference": f"{ref}/{a1}",
+                    "profile": prof.name,
+                    "group": gname,
+                    "macro_acc": {"reference": base["macro_acc"], "other": o["macro_acc"],
+                                  "delta": _delta(base["macro_acc"], o["macro_acc"])},
+                    "step2_recall_at_1": {
+                        "reference": base["step2_recall_at_1"],
+                        "other": o["step2_recall_at_1"],
+                        "delta": _delta(base["step2_recall_at_1"],
+                                        o["step2_recall_at_1"])},
+                    "gap_over_sigma": {"reference": base["gap_over_sigma"],
+                                       "other": o["gap_over_sigma"],
+                                       "delta": _delta(base["gap_over_sigma"],
+                                                       o["gap_over_sigma"])},
+                    "refusal_rate": {"reference": base["refusal_rate"],
+                                     "other": o["refusal_rate"],
+                                     "delta": _delta(base["refusal_rate"], o["refusal_rate"])},
+                })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 报告（对照版）
+# ---------------------------------------------------------------------------
+
+
+def render_comparison_markdown(report: Dict[str, Any]) -> str:
+    """把**特征档对照**报告渲染为 Markdown。"""
+    lines: List[str] = []
+    lines.append("# n3d_qa_learn 特征档对照实验（exp_repr × 词面 D=88 vs bge-m3 D=1024）")
+    lines.append("")
+    lines.append("> 全部数字由 `python -m n3d_qa_learn.exp_repr_run compare` 现场产出；")
+    lines.append("> 产物只落 `checkpoints/qa_learn/_verify/exp_repr/`，训练路径不落盘任何 zip。")
+    lines.append("")
+    cfg = report.get("config", {})
+    lines.append("## 固定口径")
+    lines.append("")
+    lines.append("| 项 | 值 |")
+    lines.append("| --- | --- |")
+    for key in ("split_seed", "train_seed", "epochs", "batch_size"):
+        lines.append(f"| {key} | {cfg.get(key)} |")
+    lines.append("")
+    for prof in report.get("profiles", []):
+        lines.append(
+            f"- **{prof['name']}**（{prof['label']}）D={prof['expect_dim']}；"
+            f"文本行口径 = `{prof['text_line'].get('name')}` "
+            f"max_length={prof['text_line'].get('max_length')}"
+        )
+    lines.append("")
+    sp = report.get("split", {})
+    lines.append(
+        "G1 切分一致性：组内断言**全部通过**（`run_experiment` 内 `assert_same_split`）；"
+        "跨档断言**" + ("全部通过" if sp.get("identical_across_profiles") else "未通过")
+        + f"**（{len(sp.get('cross_profile_checks', []))} 项逐组比对）"
+    )
+    lines.append("")
+
+    lines.append("## 逐组对照（主判据：macro 与 步骤 2 自检索 Recall@1 同时更优）")
+    lines.append("")
+    prof_names = [p["name"] for p in report.get("profiles", [])]
+    hdr = "| 组 | freeze_scope | head_input_mode | loss_mode |"
+    for p in prof_names:
+        hdr += f" macro({p}) | R@1({p}) | detR@1({p}) | refusal({p}) | gap/σ({p}) | s({p}) |"
+    hdr += " Δmacro | ΔR@1 | ΔdetR@1 | 同时更优 |"
+    lines.append(hdr)
+    sep = "| --- | --- | --- | --- |" + " --- |" * (6 * len(prof_names)) + " --- | --- | --- | --- |"
+    lines.append(sep)
+    ref = report["verdict"]["reference_profile"]
+    for row in report.get("comparison", []):
+        m = row["reference"]
+        line = (f"| {row['group']} | {row['freeze_scope']} | {row['head_input_mode']} | "
+                f"{row['loss_mode']} |")
+        line += (f" {m['macro_acc']:.4f} | {_fmt(m['step2_recall_at_1'])} | "
+                 f"{_fmt(m['step2_det_recall_at_1'])} | {m['refusal_rate']:.4f} | "
+                 f"{m['gap_over_sigma']:.4f} | {m['seconds']:.1f} |")
+        for pname in prof_names[1:]:
+            o = (row.get("others") or {}).get(pname)
+            if o is None:
+                line += " — | — | — | — | — | — |"
+                continue
+            om = o["metrics"]
+            line += (f" {om['macro_acc']:.4f} | {_fmt(om['step2_recall_at_1'])} | "
+                     f"{_fmt(om['step2_det_recall_at_1'])} | {om['refusal_rate']:.4f} | "
+                     f"{om['gap_over_sigma']:.4f} | {om['seconds']:.1f} |")
+            line += (f" {_fmt_d(o['delta_macro_acc'])} | {_fmt_d(o['delta_step2_recall_at_1'])} | "
+                     f"{_fmt_d(o['delta_step2_det_recall_at_1'])} | "
+                     f"{'是' if o['both_better'] else '否'} |")
+        lines.append(line)
+    lines.append("")
+    v = report.get("verdict", {})
+    lines.append(
+        f"**主判据结论**：同时更优的组 = `{v.get('groups_both_better')}`；"
+        f"未同时更优的组 = `{v.get('groups_not_both_better')}`；"
+        f"`any_group_both_better = {v.get('any_group_both_better')}`；"
+        f"`all_groups_both_better = {v.get('all_groups_both_better')}`。"
+    )
+    lines.append("")
+
+    lines.append("## 归因分解（**换特征** / **打开表示训练** / 两者叠加，不合并）")
+    lines.append("")
+    attr = report.get("attribution", {})
+    lines.append("### 只换特征（`A1_baseline`：只训 logit_scale，正标量不改 argmax）")
+    lines.append("")
+    lines.append("| 组 | 参照档 | 其它档 | Δmacro | ΔR@1(自检索) | ΔdetR@1(纯特征) | Δgap/σ | Δrefusal |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+    for r in attr.get("feature_only", []):
+        lines.append(
+            f"| {r['group']} | {r['reference_profile']} | {r['profile']} | "
+            f"{_fmt_d(r['macro_acc']['delta'])} | {_fmt_d(r['step2_recall_at_1']['delta'])} | "
+            f"{_fmt_d(r['step2_det_recall_at_1']['delta'])} | "
+            f"{_fmt_d(r['gap_over_sigma']['delta'])} | {_fmt_d(r['refusal_rate']['delta'])} |"
+        )
+    lines.append("")
+    lines.append("### 只打开表示训练（特征不变）")
+    lines.append("")
+    lines.append("| 档 | 从 | 到 | Δmacro | ΔR@1 | Δgap/σ | Δrefusal |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+    for r in attr.get("training_only", []):
+        lines.append(
+            f"| {r['profile']} | {r['from_group']} | {r['to_group']} | "
+            f"{_fmt_d(r['macro_acc']['delta'])} | {_fmt_d(r['step2_recall_at_1']['delta'])} | "
+            f"{_fmt_d(r['gap_over_sigma']['delta'])} | {_fmt_d(r['refusal_rate']['delta'])} |"
+        )
+    lines.append("")
+    lines.append("### 两者叠加（其它档 A2/A3 vs 参照档 A1）")
+    lines.append("")
+    lines.append("| 参照 | 档 | 组 | Δmacro | ΔR@1 | Δgap/σ | Δrefusal |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+    for r in attr.get("combined", []):
+        lines.append(
+            f"| {r['reference']} | {r['profile']} | {r['group']} | "
+            f"{_fmt_d(r['macro_acc']['delta'])} | {_fmt_d(r['step2_recall_at_1']['delta'])} | "
+            f"{_fmt_d(r['gap_over_sigma']['delta'])} | {_fmt_d(r['refusal_rate']['delta'])} |"
+        )
+    lines.append("")
+
+    lines.append("## D 的代价（现场构造实测）")
+    lines.append("")
+    lines.append("| 档 | D | 骨干合计 | `W_in` 形状/元素 | `W_out` 形状/元素 | q 头合计 | 总参数 | 每样本参数 | 冻结嵌入可训 | 打开表示可训 | answer_table(buffer) |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for pname, cost in (report.get("cost") or {}).items():
+        if not cost:
+            continue
+        wi = cost["backbone_shapes"].get("W_in")
+        wo = cost["backbone_shapes"].get("W_out")
+        lines.append(
+            f"| {pname} | {cost['dim']} | {cost['backbone_total']} | "
+            f"{wi} / {cost['backbone_parameters'].get('W_in')} | "
+            f"{wo} / {cost['backbone_parameters'].get('W_out')} | {cost['head_total']} | "
+            f"{cost['total_parameters']} | {cost['params_per_sample']:.1f} | "
+            f"{cost['trainable_frozen_embedding']['n_trainable']} | "
+            f"{cost['trainable_open_representation']['n_trainable_head']} | "
+            f"{cost['answer_table_buffer']['shape']} |"
+        )
+    lines.append("")
+
+    sec = report.get("seconds", {})
+    lines.append("## CPU 耗时（秒）")
+    lines.append("")
+    lines.append("| 档 | 合计 | 逐组 |")
+    lines.append("| --- | --- | --- |")
+    for pname, total in (sec.get("per_profile_total") or {}).items():
+        per = ", ".join(f"{k}={v:.1f}" for k, v in (sec.get("per_group") or {}).get(pname, {}).items())
+        lines.append(f"| {pname} | {total:.1f} | {per} |")
+    lines.append(f"| **总计** | {sec.get('grand_total', 0.0):.1f} | — |")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _fmt(value: Any) -> str:
+    """可空浮点的表格渲染（缺失显式写 ``n/a``，不写 0）。"""
+    return "n/a" if value is None else f"{float(value):.4f}"
+
+
+def _fmt_d(value: Any) -> str:
+    """可空增量的表格渲染（带符号）。"""
+    return "n/a" if value is None else f"{float(value):+.4f}"
+
+
+def write_comparison_report(report: Dict[str, Any], out_dir: str = "") -> Dict[str, str]:
+    """把对照报告写为 UTF-8（无 BOM）的 JSON 与 Markdown（**只写验证目录**）。"""
+    target = out_dir or EXP_REPR_DIR
+    os.makedirs(target, exist_ok=True)
+    json_path = os.path.join(target, "exp_repr_compare.json")
+    md_path = os.path.join(target, "exp_repr_compare.md")
+    with open(json_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(report, ensure_ascii=False, indent=1, default=str))
+    with open(md_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(render_comparison_markdown(report))
+    return {"json": json_path, "markdown": md_path}
+
+
+def load_comparison_report(path: str = "") -> Dict[str, Any]:
+    """读取已落盘的**对照**报告 JSON。"""
+    target = path or os.path.join(EXP_REPR_DIR, "exp_repr_compare.json")
+    if not os.path.isfile(target):
+        raise FileNotFoundError(
+            f"对照报告不存在：{target!r}；请先执行 "
+            "`python -m n3d_qa_learn.exp_repr_run compare`"
+        )
+    with open(target, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+# ---------------------------------------------------------------------------
+# 报告（单档版）
+# ---------------------------------------------------------------------------
 
 
 def render_markdown(report: Dict[str, Any]) -> str:
@@ -1569,6 +2631,18 @@ __all__ = [
     "ALLOWED_UNGROUPED_TRAINABLE",
     "ReprGroup",
     "group_by_name",
+    "FeatureProfile",
+    "FEATURE_PROFILES",
+    "PROFILE_LEXICAL",
+    "PROFILE_SEMANTIC",
+    "DEFAULT_PROFILE",
+    "profile_by_name",
+    "split_qids_digest",
+    "split_qids_equal",
+    "dimension_cost",
+    "Step2Bundle",
+    "build_step2_bundle",
+    "step2_recall_of_model",
     "split_qids",
     "assert_same_split",
     "build_group_config",
@@ -1585,9 +2659,13 @@ __all__ = [
     "phase_plan",
     "run_group",
     "run_experiment",
+    "run_comparison",
     "anchor_comparison",
     "summarize",
     "render_markdown",
     "write_report",
     "load_report",
+    "render_comparison_markdown",
+    "write_comparison_report",
+    "load_comparison_report",
 ]

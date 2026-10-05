@@ -145,3 +145,50 @@ N3D 问答学习框架模块（n3d_qa_learn）。
 - **info ③（`drill` 的 epochs 口径）**：**选择「显式标注」**而非暴露 `--epochs`；理由：`drill` 的职责是「通路成立 + 与 `run_training` 逐位等价」这条门槛，多 epoch 只增加运行时间与误读空间，矩阵档预算由 `run --epochs` 承担。标注落在运行日志首行（`epochs = 1（演练口径，非矩阵档）`）与子命令 `--help`/`description` 文本中。
 - **info ④（`param_deltas` 前缀前提）**：docstring 已登记前提 —— `head.` / `backbone.` 前缀仅当 `N3DQA` **不把骨干持有为 `nn.Module` 子模块**时成立（现状下两次 `state_dict()` 遍历键集合不相交、不重名）；若日后 `adapter.model` 被登记为子模块，键会重名且 `make_optimizer` / `ungrouped_trainable_names` / `update_gate` 的名字口径会失配（门禁会把真实更新的参数判为 `missing_from_snapshot`），届时必须同步改口径。
 **口径澄清（对上一段 warning 项的补充，避免 `265.6` 被误当作当前值）**：本登记（及 README 12.12）中出现的 `265.6` **一律是历史值引用**（来自一次已被覆盖的早期全量运行），**当前值为 `273.1s`**，来源为 `checkpoints/qa_learn/_verify/exp_repr/run_full.log` 的 `[run] 全部组完成（273.1s）`（逐组 32.8+34.3+35.3+36.9+34.8+32.8+33.1+33.2 = 273.2s）。README 全文 `265.6` 出现次数为 **0**（已直接更正为 `273.1`），本 spec 中的出现均带历史值标注并同处给出 `273.1s`。
+**第 2 期：bge-m3 语义特征（D=1024）下的 8 组矩阵与同切分对照（`exp_repr_run compare`）**
+
+- **特征档注册表**（`exp_repr.FEATURE_PROFILES`）：`lexical-88`（词面：`local-hash`，D=88）与 `bge-m3-1024`（语义：`BAAI/bge-m3`，`D=hidden_size=1024`，`source=models/bge-m3`）。每档同时声明**步骤 1 题面口径**（`role=question`，`max_length=512`）与**步骤 2 文本行口径**（`role=text_line`，`max_length=8192`），二者**必须同维**，否则同一条 q 通路不可用。`FeatureProfile` 是唯一注册点，`profile_by_name` 未知名立即报错。
+- **`run_comparison`**：两档共用同一 `split_seed`/`train_seed`，逐组跑 8 组矩阵；跨档逐组断言四子集 qid 有序序列逐位相同（不一致抛 `AssertionError` 并判该对照无效）；每档的步骤 2 共用件（文本行向量化 + 冻结键表 + 纯特征参照下限）只建一次并复用于该档全部组。
+- **步骤 2 自检索接入**（`build_step2_bundle` / `step2_recall_of_model`）：口径与 `step2_run eval` **逐字一致** —— **检索池 = `n3d_qa` 冻结行表全量**（2665，`label_rule`: candidate library row IS the query row），查询集 = 冻结划分出的 query 行 ∩ 检索池（666）；查询行经**同一条 q 通路**检索、命中自身行即正确；另报**不经 N3D** 的纯特征余弦检索作为参照下限。`Step2Bundle` 携带 `pool_index`/`query_index`/`key_table`/`det_baseline`/`evidence`；限批（`pool_cap>0`）时走 `_self_retrieval_limited`（口径不变，只换池下标来源），报告显式登记 `pool_limited`。
+- **维度代价实测**（`dimension_cost`）：现场构造骨干与 `N3DQA`，逐参数枚举形状与元素数，给出 `W_in`/`W_out`/骨干合计/`q` 头合计/总参数/每样本参数/`answer_table` buffer 字节，以及**两种情形的可训参数量**——「冻结嵌入 + 质心答案表」（`logit_only`，可训恒为 `head.logit_scale` 1 个，`answer_table` 是 buffer 不入优化器）与「打开表示训练」（`head` / `head_backbone`）。
+- **归因分解**（`_attribution`）：**三节分开报** —— 只换特征（`A1_baseline` 跨档，该组只训 `logit_scale` 这个不改 argmax 的正标量，故差异只来自特征）、只打开表示训练（同档 `A1→A2`/`A1→A3`）、两者叠加（其它档 `A2`/`A3` vs 参照档 `A1`）。
+- **现场实测（train_seed=42，epochs=40）**：G1 组内 16 组 + 跨档 8 项切分一致性断言**全部通过**；G2 词面档重跑与 12.6 登记值**在 4 位小数上逐项精确一致**（MATCH×8），锚点对账 `all_within_tolerance=True`（语义档下为 False，属**正确行为**：锚点只对词面口径标定）；G5 **16 组门禁全部 PASS**（`names_consistent=True`、`missing_from_snapshot=[]`），`A3` 的 4 个骨干参数在两档下都零更新、`B1` 的 `head.mix_logit` 在两档下都落在显式允许名单内。
+- **主判据（macro 与步骤 2 自检索 Recall@1 同时更优）**：`any_group_both_better=True`、`all_groups_both_better=False`，**4/8 通过**（`A2_head` / `A3_head_backbone` / `C2_staged` / `C3_supcon`），4/8 不通过（`A1_baseline` / `B1_concat` / `B2_n3d` / `C1_no_irr_centroid`）。**「只换特征」最强的 `A1_baseline` 不通过**：`Δmacro +0.0500` 但 `ΔR@1 −0.0075`。`B1`/`B2` 语义档下同时退化（`macro 0.1000→0.0000`、`R@1 0.0015→0.0000`、`refusal 1.0000`）为**真实负结果**；`C1` 反向（`ΔR@1 +0.3438`、`Δmacro −0.0500`）。
+- **D 的代价**：`W_in [88,55]→[1024,55]`（4840→56320）、`W_out [88,64]→[1024,64]`（5632→65536）、骨干 10642→122026、`q` 头 7833→1049601、总参数 18475→1171627（63.42×）、每样本参数 28.5→1805.3（训练样本 649）；骨干拓扑 `E/K/S_in/S_out = 106/7/55/53` **完全相同**（与 D 无关）。
+- **CPU 耗时**：词面档 287.5s、语义档 329.5s、两档总计 **617.1s**（只含矩阵本身）；一次性嵌入编码（2449 题面 + 2665 文本行）落 `checkpoints/qa_learn/_cache/emb/` 跨进程复用 —— 冷缓存单组 1 epoch 演练 1556.8s，缓存预热后同组 ~34~43s。
+- **零回归**：`checkpoints/qa_learn/` 顶层 9 个 `qa_*.pt.zip` 的 SHA256/字节/mtime 逐项不变；`git status --porcelain -- n3d_qa n3d_shape n3d_sphere n3d_proto` 为空；`compare` 路径**不落盘任何 zip 产物**（全部落 `checkpoints/qa_learn/_verify/exp_repr/`）。
+- **未达标项（如实登记）**：① 主判据未全组通过；② 12.13 第 1 条的「同时重建答案表」**未做**（两档答案表口径完全相同，12.9(1) 的空间错配风险未被排除）；③ 步骤 2 文本行口径为与步骤 1 同维而改用 `local-hash`/`bge-m3`，**不可**与 README_step2 的 `zh-bag` 自检索数字直接比较；④ 固定 `train_seed=42` 单 seed，Δ 不含训练随机性区间。
+## 可插拔特征生成接口
+
+把「文本 → D 维特征」从具体实现里抽出为**可插拔接口 + 编码器注册表**，使步骤 1（features 侧）与步骤 2（step2.ZhBagVectorizer 侧）接到**同一接口**，上层评估 / 训练 / 推理 / CLI 的特征调用点零改动，只改「选择实现的入口」。
+
+**统一接口（与既有向量化器逐字同形）**：`dim`（连接参数 D）/ `fingerprint()` / `encode(text)` / `encode_batch(texts)` / `encode_with_stats(text)`；步骤 2 侧另有 `encode_matrix(texts)`。
+
+**编码器注册表**（唯一注册点，注册时声明 `expect_dim`）：`bge-m3`（kind=`hf`，expect_dim=1024，pooling=`cls`，model_id=`BAAI/bge-m3`，revision 固定 `5617a9f61b028005a4858fdac845db406aefb181`，weight_file=`pytorch_model.bin`，mirror_endpoint=`https://hf-mirror.com`；**首个 HF 默认项**）、`local-hash`（kind=`hash`，expect_dim=88，步骤 1 现状口径）、`zh-bag`（kind=`hash`，expect_dim=192，步骤 2 现状口径）。角色默认实现保持现状：`question -> local-hash`、`text_line -> zh-bag`，切 HF 必须显式选择（`--encoder`）。
+
+**HF 编码器适配器**：传模型名或本地路径即可用；从模型 config 读 `hidden_size` 作为连接参数 D；**手工 CLS pooling + L2 归一化**，不引 sentence-transformers / FlagEmbedding；`config.hidden_size` 与声明维度不符在**构造期**抛 `EncoderDimMismatchError`（拒绝静默错配）。模型缺失 / 权重不全 / 缺依赖 / 无网络抛 `EncoderUnavailableError`（可读报文）。**可复算**：固定 revision + 权重文件 SHA256 全部折进 `fingerprint()`。
+
+**编码口径**：题面（role=`question`）`max_length=512`；文本行（role=`text_line`）`max_length=8192`。不同口径的指纹与缓存键都不同。
+
+**嵌入缓存**（`checkpoints/qa_learn/_cache/emb/`）：键 = `sha256(schema, model_id, revision, pooling, max_length, normalize, weight_sha256, text_sha256)`（即「模型名 + revision + pooling + max_length + 文本哈希」）。条目为 `float32` 小端裸字节 `.bin` + 元数据 `.json`（充当提交标记），可跨进程复用；缓存**不参与**口径指纹（`fingerprint()` 原样委派），只影响速度。`hf` 家族默认开启，`hash` 家族默认关闭（可用 `--force-cache` 开启）。
+
+**接入点**：`train.build_training_data(cfg, encoder_name=)` / `run_training(..., encoder_name=)`；`cli` 全局 `--encoder` 与 `_resolve_dim`（`--dim` 优先，否则取注册表声明维度）；`probe.end_to_end_drill(..., encoder=, role=)`（D 的唯一来源 = 编码器注册表）；`step2.build_step2_vectorizer(cfg)`；`step2_run` 的 `--encoder` 等开关与 `verify-vectorizer` 子命令；`train.load_artifact` / `rebuild_model` 与 `cli` 的 `ask` / `selftest` 一律走 `encoders.vectorizer_from_meta`（按口径分派：HF 走注册表，其余委派历史路径逐位不变）。**默认档行为逐位不变**。
+
+**边界处置**（与 features 契约对齐）：空 / 仅空白 → 零向量；超长 → 截断且 `n_truncated` 可见；模型缺失 / 权重不全 / 无网络 → 可读报错；hidden size ≠ 注册维度 → 构造期报错。自检入口 `encoders.boundary_selftest`。
+
+**步骤 2 的验证口径（重建）**：由 `step2.verify_vectorizer_contract` 承担三条 —— ① `fingerprint()` == 注册表 / 落盘声明；② 同文本重复编码**逐位一致**；③ 与**落盘缓存**逐位比对。原「与 `n3d_qa` 冻结产物逐元素比对」（`verify_features_against_product`）降级为 **hash 家族的旁证**，不再作为本接口的验证口径（HF 与该产物不在同一特征空间）。
+
+**验收入口**：`python -m n3d_qa_learn.encoders_run {registry|fetch|info|drill|verify|boundary}`（G1 结构量与来源核实 / G2 单条端到端演练含缓存写入与跨进程二次读取 / G3 三检查 / G4 边界自检）；`python -m n3d_qa_learn.step2_run verify-vectorizer`。取证报告写 `checkpoints/qa_learn/_verify/encoders/`，缓存写 `checkpoints/qa_learn/_cache/emb/`，日志一律由 Python 以 UTF-8（无 BOM）自写。
+
+**现场实测（第 6 轮）**：`hidden_size=1024` / `max_position_embeddings=8194` / `pooling_mode_cls_token=true` / 权重 `pytorch_model.bin` 2271145830 字节 SHA256 `b5e0ce3470abf5ef3831aa1bd5553b486803e83251590ab7ff35a117cf6aad38`；下载须 `HF_ENDPOINT=https://hf-mirror.com` 且 `HF_HUB_DISABLE_XET=1`（xet CAS 在镜像下 401）。口径指纹：question/512 = `67a0e6cdde04cf57274fa5115a2383da5b1b8e76aefc3cab997d86525a278ebd`，text_line/8192 = `bc643ccc98b4a9a2dd755683505e8d4c56ef8a79ff91184e4e5cec0302334228`。G1~G4 全部退码 0（G4 4/4 PASS，含超长 `n_tokens=1794 / n_truncated=1282`）；步骤 2 验证口径在 `zh-bag`（192 维 × 8 条）与 `bge-m3`（1024 维 × 4 条，`max_length=8192`）上均全通过。`checkpoints/qa_learn/` 顶层 9 个 `qa_*.pt.zip` 的 SHA256 / 字节数 / mtime 逐项不变，顶层除新增 `_cache/` 外无新文件；`git status --porcelain -- n3d_qa n3d_shape n3d_sphere n3d_proto` 为空。
+
+**如实登记的未做项**：本批**未**用 `bge-m3` 跑完整步骤 1 / 步骤 2 训练（`D=1024` 与历史纠正记录 #12 的「样本 1e3 量级词袋维度 10^1~10^2」正面冲突，且本轮门禁未要求），故 `bge-m3` 在步骤 1/2 上的准确率**本轮无任何实测数字**。依赖：默认路径仍零新依赖；可选 HF 路径新增 `transformers 5.18.0` / `tokenizers 0.23.2` / `huggingface_hub 1.33.0` / `safetensors 0.8.0`，清单与下载口径登记在 `n3d_qa_learn/requirements-qa.txt`，根 `requirements.txt` 未改动。
+**审查修复轮（离朱 R45：106/111 断言通过，3 真缺陷 + 1 假阴性，全部已修）**
+
+- **D1（高）** `zh-bag` 直接调 `encode_with_stats` 抛 `AttributeError`，导致 `encoders_run boundary / drill --encoder zh-bag` 退码 1 + 裸 Traceback。修复：① `step2.ZhBagVectorizer` 补齐 `encode_with_stats`（截断统计如实恒为 0）；② 新增 `encoders.encode_with_stats_of(encoder, text)` 统一入口（无该成员时回退 `encode`），自检/演练一律走它；③ `drill` / `verify` 的缓存默认开启（这两个子命令的职责就是演练缓存链路）。
+- **D2（中）** 边界自检没有「不适用」语义，hash 家族被误判失败。修复：`EncoderSpec` 新增能力声明 `truncation_stats` / `requires_model_files`；每项用例带 `applicable`；新增 `summarize_selftest` / `failed_selftest_cases`，CLI 只对**适用项**判失败并报出不适用清单（「不适用」既不伪装成「通过」也不算「失败」）。
+- **D3（中）** `build_vectorizer` 的 hash 分支完全忽略 `config.source`。修复：`source` 非空且不存在 → `EncoderUnavailableError`（与 HF 分支同形）；存在 → `EncoderError`（明确拒绝而非静默忽略）。修复后「模型缺失 -> 可读报错」对两家族都成立。
+- **N1（假阴性）** `check2` 叠加 `list` 相等判定，缓存还原的 float32 与首次实算的 float64 末位差导致「字节相同却判失败」。修复：`encoders_run.cmd_verify` 与 `step2.verify_vectorizer_contract` 的 ② 一律**只用 float32 裸字节**判定。
+- **N2/N3（健壮性）** `EncoderConfig.__post_init__` 校验 `role ∈ ROLES` / `hash_dim >= 1` / `max_length >= 0`；`EmbeddingCache.key_for` 校验 `max_length >= 1` 且 `model_id` / `pooling` / `normalize` 非空（`revision` 允许为空：hash 家族无 revision 概念，HF 侧构造期已拒绝空 revision）。
+
+**修复后现场复测**：`boundary --encoder zh-bag` = 退码 0（3/3 适用项 PASS，1 项不适用）、`zh-bag --no-cache` = 0、`local-hash` = 4/4 退码 0、`drill --encoder zh-bag` = 0、`drill --encoder zh-bag --reuse-only` = 0、`verify --encoder local-hash` = 0；含 `bge-m3` 的全套 G1~G4 + 步骤 2 两条验证口径共 9 条命令**全部退码 0**；`cli probe / drill(index) / drill(pointer) / selftest / guard / ask` 与 `step2_run probe` 退码全 0。修复轮**未**改变任何默认口径指纹（`local-hash` `d4a4881aaa8dfa8c…` / `zh-bag` `8f2523e41484adf3…` / `bge-m3` question `67a0e6cdde04cf57…`、text_line `bc643ccc98b4a9a2…`），G5（顶层九产物 SHA256/字节/mtime 逐项不变）与 G6（上游零改动）保持通过。

@@ -410,6 +410,21 @@ class TextVectorizer:
         """批量向量化（顺序保持）。"""
         return [self.encode(t) for t in texts]
 
+    def encode_matrix(self, texts: Sequence[str]):
+        """批量向量化并堆成 ``float32[n, D]``（**步骤 2 键表构造**用，统一接口的补齐）。
+
+        存在理由：``step2.build_key_table`` / ``step2.deterministic_baseline`` 走
+        ``vectorizer.encode_matrix(...)``；本类早期只暴露 ``encode`` / ``encode_batch``，
+        在「步骤 2 文本行用与步骤 1 同族同维的编码器（``local-hash``，``D=88``）」这一
+        口径下会抛 ``AttributeError``。本方法**只是批量化的包装**，取值与 ``encode``
+        逐位一致（同一个 ``float32`` 舍入），不改变任何既有口径。
+        """
+        import numpy as np
+
+        items = [str(t) for t in texts]
+        mat = np.asarray(self.encode_batch(items), dtype=np.float32)
+        return mat.reshape((len(items), self.dim))
+
     def token_count(self, text: str) -> int:
         """返回词元数（不含截断）。"""
         return len(tokenize(text))

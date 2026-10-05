@@ -9,6 +9,11 @@
 * ``python -m n3d_qa_learn.exp_repr_run run``
   放全量对照矩阵（8 组），执行切分一致性断言，写报告到
   ``checkpoints/qa_learn/_verify/exp_repr/``。
+* ``python -m n3d_qa_learn.exp_repr_run compare``
+  **同切分**下逐组对照两个**特征档**（词面 ``D=88`` vs ``bge-m3`` ``D=1024``）：
+  跨档切分一致性断言（G1）+ 逐组 macro / 步骤 2 自检索 ``Recall@1`` / ``gap``/σ /
+  ``refusal_rate`` / CPU 耗时 + 「换特征 vs 打开表示训练」的**分开归因** +
+  ``D`` 的代价实测，写 ``exp_repr_compare.json`` / ``exp_repr_compare.md``。
 * ``python -m n3d_qa_learn.exp_repr_run summary``
   读取已落盘报告并打印逐组摘要表。
 
@@ -89,6 +94,7 @@ def _kwargs(args: argparse.Namespace, *, epochs: int) -> Dict[str, Any]:
         "stage2_epochs": int(args.stage2_epochs),
         "qa_cache_dir": str(args.qa_cache_dir),
         "text_dir": str(args.text_dir),
+        "profile": str(getattr(args, "profile", "") or exp_repr.DEFAULT_PROFILE),
     }
 
 
@@ -128,12 +134,14 @@ def cmd_drill(args: argparse.Namespace) -> int:
             return 1
 
         # ---- 等价性对账：同一配置跑模块自带训练循环（save=False，不落盘） ----
-        # build_group_config 只负责「组定义 -> TrainConfig」，不认识阶段划分参数，
-        # 故显式剔除这两个键，避免把实验编排参数泄漏进配置装配。
+        # build_group_config 只负责「组定义 -> TrainConfig」，不认识阶段划分参数与
+        # 特征档，故显式剔除这三个键，避免把实验编排参数泄漏进配置装配。
         cfg_kwargs = {k: v for k, v in kwargs.items()
-                      if k not in ("stage1_epochs", "stage2_epochs")}
+                      if k not in ("stage1_epochs", "stage2_epochs", "profile")}
         cfg = exp_repr.build_group_config(group, **cfg_kwargs)
-        ref = run_training(cfg, max_batches=0, artifact_path="", save=False)
+        prof = exp_repr.profile_by_name(str(kwargs["profile"]))
+        ref = run_training(cfg, max_batches=0, artifact_path="", save=False,
+                           encoder_config=prof.question)
         ref_metrics = evaluate_step1(ref.model, ref.data, k=3, device=ref.device)
         ref_refusal = evaluate_refusal(ref.model, ref.data, device=ref.device)
         mine = res["metric_step1"]
@@ -286,6 +294,94 @@ def cmd_summary(args: argparse.Namespace) -> int:
         logger.close()
 
 
+def cmd_compare(args: argparse.Namespace) -> int:
+    """**同切分**下逐组对照两个特征档（词面 D=88 vs bge-m3 D=1024）并写报告。"""
+    logger = Logger(str(args.log_file))
+    try:
+        names = [s for s in str(args.groups).split(",") if s.strip()] if args.groups else None
+        profiles = [s for s in str(args.profiles).split(",") if s.strip()]
+        kwargs = _kwargs(args, epochs=int(args.epochs))
+        # profile 由 --profiles 决定，逐档注入；这里先剔除单档写法
+        kwargs.pop("profile", None)
+        step2_topk = int(args.step2_topk)
+        t0 = time.time()
+        logger.log("[compare] 组 = " + repr(names if names else [g.name for g in exp_repr.MATRIX]))
+        logger.log(f"[compare] 特征档 = {profiles}")
+        logger.log(
+            "[compare] 固定切分：split_seed={split_seed}；训练 seed={train_seed}；"
+            "epochs={epochs}；batch_size={batch_size}".format(
+                split_seed=kwargs["split_seed"], train_seed=kwargs["train_seed"],
+                epochs=kwargs["epochs"], batch_size=kwargs["batch_size"],
+            )
+        )
+        logger.log(
+            "[compare] 步骤 2 口径：文本行用**与该档步骤 1 同族同维**的编码器"
+            "（词面档 local-hash / 语义档 bge-m3 role=text_line）；"
+            f"检索池上限={int(args.step2_pool_cap)}（0=全量），topk={step2_topk}"
+        )
+
+        def _progress(msg: str) -> None:
+            logger.log(msg)
+
+        report = exp_repr.run_comparison(
+            profiles=profiles,
+            group_names=names,
+            step2_product_dir=str(args.step2_product_dir),
+            step2_pool_cap=int(args.step2_pool_cap),
+            step2_topk=step2_topk,
+            progress=_progress,
+            **kwargs,
+        )
+        logger.log(f"[compare] 全部组完成（{time.time() - t0:.1f}s）")
+        out_dir = str(args.out_dir) if args.out_dir else exp_repr.EXP_REPR_DIR
+        paths = exp_repr.write_comparison_report(report, out_dir)
+        logger.log(f"[compare] 报告：{paths['json']}")
+        logger.log(f"[compare] 报告：{paths['markdown']}")
+
+        # ---- G5：逐组门禁 ----
+        bad: List[str] = []
+        for pname, run in report["runs"].items():
+            for res in run["groups"]:
+                if not res["gate"]["passed"]:
+                    bad.append(f"{pname}/{res['group']['name']}")
+        v = report["verdict"]
+        logger.log(
+            "[compare] 主判据（macro 与 步骤2 自检索 Recall@1 同时更优）："
+            f"同时更优 = {v['groups_both_better']}；"
+            f"未同时更优 = {v['groups_not_both_better']}；"
+            f"any={v['any_group_both_better']} all={v['all_groups_both_better']}"
+        )
+        logger.log(
+            "[compare] G1 跨档切分一致性断言："
+            + ("通过" if report["split"]["identical_across_profiles"] else "未通过")
+            + f"（{len(report['split']['cross_profile_checks'])} 项）"
+        )
+        logger.log(f"[compare] CPU 耗时（秒）：{report['seconds']['per_profile_total']}；"
+                   f"总计 {report['seconds']['grand_total']:.1f}")
+        _dump({
+            "verdict": v,
+            "attribution_feature_only": report["attribution"]["feature_only"],
+            "attribution_training_only": report["attribution"]["training_only"],
+            "split_identical_across_profiles": report["split"]["identical_across_profiles"],
+            "seconds": report["seconds"]["per_profile_total"],
+        })
+        if bad:
+            logger.log(f"[FAIL] 以下组门禁未通过（结果判无效）：{bad}")
+            return 1
+        logger.log("[OK] compare 完成：全部组门禁 PASS，跨档切分一致性断言通过")
+        return 0
+    except KeyError as exc:
+        print(f"[FAIL] compare 失败：组名/档名不可用 —— {exc}", file=sys.stderr)
+        print(f"[INFO] 可用组名 = {[g.name for g in exp_repr.MATRIX]}", file=sys.stderr)
+        print(f"[INFO] 可用档 = {sorted(exp_repr.FEATURE_PROFILES)}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"[FAIL] compare 失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        logger.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造 CLI 解析器。"""
     parser = argparse.ArgumentParser(
@@ -311,6 +407,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--stage2-epochs", type=int, default=exp_repr.STAGE2_EPOCHS)
         p.add_argument("--qa-cache-dir", type=str, default="checkpoints/triviaqa/_cache")
         p.add_argument("--text-dir", type=str, default="data/doc")
+        p.add_argument("--profile", type=str, default=exp_repr.DEFAULT_PROFILE,
+                       choices=sorted(exp_repr.FEATURE_PROFILES.keys()),
+                       help="特征档：lexical-88（词面，现状）或 bge-m3-1024（语义）")
         p.add_argument("--out-dir", type=str, default="", help="输出目录（默认验证目录）")
         p.add_argument("--log-file", type=str, default="", help="UTF-8 无 BOM 日志文件")
 
@@ -338,6 +437,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--report", type=str, default="", help="报告 JSON 路径")
     p.add_argument("--log-file", type=str, default="")
     p.set_defaults(func=cmd_summary)
+
+    p = sub.add_parser(
+        "compare",
+        help="同切分下逐组对照两个特征档（词面 D=88 vs bge-m3 D=1024）并写报告",
+        description=(
+            "在**同一 split_seed / train_seed** 下逐组跑两个特征档，执行跨档切分一致性"
+            "断言（G1），逐组报 macro / 步骤 2 自检索 Recall@1 / gap/σ / refusal / 耗时，"
+            "并把「换特征」与「打开表示训练」的贡献分开归因。"
+        ),
+    )
+    add_common(p)
+    p.add_argument("--epochs", type=int, default=exp_repr.BASE_EPOCHS)
+    p.add_argument("--groups", type=str, default="",
+                   help="逗号分隔的组名子集（空 = 全部 8 组）")
+    p.add_argument("--profiles", type=str,
+                   default=f"{exp_repr.PROFILE_LEXICAL},{exp_repr.PROFILE_SEMANTIC}",
+                   help="逗号分隔的特征档（第一个为参照档）")
+    p.add_argument("--step2-product-dir", type=str, default="",
+                   help="n3d_qa 冻结产物目录（空 = 自动定位）")
+    p.add_argument("--step2-pool-cap", type=int, default=0,
+                   help="步骤 2 检索池行数上限（0 = 全量；限批会在报告中显式登记）")
+    p.add_argument("--step2-topk", type=int, default=5)
+    p.set_defaults(func=cmd_compare)
     return parser
 
 

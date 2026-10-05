@@ -27,11 +27,59 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from . import encoders as E
 from . import step2 as S
 from .route import QuestionRouter
 from .train import ZIP_EPOCH
 
 Json = Dict[str, Any]
+
+#: ``encoders_run`` 写入的取证文件（``verify-vectorizer`` 的 ① 项基准来源）。
+ENCODERS_VERIFY_DIR: str = os.path.join("checkpoints", "qa_learn", "_verify", "encoders")
+
+
+def _encoder_config(args: argparse.Namespace) -> Optional[E.EncoderConfig]:
+    """由 CLI 参数装配步骤 2 的可插拔编码器配置（空 ``--encoder`` = 现状 ``zh-bag``）。"""
+    name = str(getattr(args, "encoder", "") or "")
+    if not name:
+        return None
+    return E.EncoderConfig(
+        name=name,
+        role=E.ROLE_TEXT_LINE,
+        max_length=int(getattr(args, "enc_max_length", 0) or 0),
+        source=str(getattr(args, "enc_source", "") or ""),
+        revision=str(getattr(args, "enc_revision", "") or ""),
+        cache_dir=str(getattr(args, "enc_cache_dir", "") or E.DEFAULT_EMB_CACHE_DIR),
+        use_cache=True if bool(getattr(args, "enc_force_cache", False)) else None,
+        local_files_only=bool(getattr(args, "enc_local_files_only", False)),
+    )
+
+
+def _declared_fingerprint(args: argparse.Namespace, name: str, role: str) -> Tuple[str, str]:
+    """取 ① 项的基准指纹：显式参数优先，其次 ``encoders_run`` 的落盘取证。
+
+    **落盘取证必须与当前请求的编码器 + 角色一致**才被采用 —— 否则 bge-m3 的
+    ``drill.json`` 会被误当作 ``zh-bag`` 的基准（现场实测过该错配）。
+    """
+    explicit = str(getattr(args, "declared_fingerprint", "") or "")
+    if explicit:
+        return explicit, "--declared-fingerprint（命令行显式给出）"
+    for file_name in ("drill.json", "info.json"):
+        path = os.path.join(str(getattr(args, "encoders_dir", "") or ENCODERS_VERIFY_DIR),
+                            file_name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r", encoding="utf-8") as handle:
+            recorded = dict(json.load(handle))
+        recorded_name = str(recorded.get("name") or recorded.get("encoder") or "")
+        recorded_role = str(recorded.get("role", ""))
+        if recorded_name != str(name):
+            continue
+        if recorded_role and recorded_role != str(role):
+            continue
+        if str(recorded.get("fingerprint", "")):
+            return str(recorded["fingerprint"]), path.replace("\\", "/")
+    return "", "（无同口径落盘声明 -> 现场按注册表构造基准）"
 
 
 class _Tee:
@@ -157,7 +205,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     rows = S.load_text_rows(product_dir)
     row_index = S.load_row_index(product_dir)
     meta = S.load_doclines_meta(product_dir)
-    vectorizer = S.ZhBagVectorizer()
+    vectorizer = S.build_step2_vectorizer(_encoder_config(args))
     _log(f"[probe] 文本行数 = {len(rows)}；向量化口径 D = {vectorizer.dim}；"
          f"spec_hash = {vectorizer.fingerprint()[:16]}...")
 
@@ -170,11 +218,24 @@ def cmd_probe(args: argparse.Namespace) -> int:
     assert ev["union"] == len(rows), "库并查询必须等于全量"
     assert ev["reproduced_equals_index"] is True, "划分必须可被产物自身复核"
 
-    feat = S.verify_features_against_product(rows, vectorizer.config)
-    _log(f"[probe] 特征重算取证：检查 {feat['checked_rows']} 行，"
-         f"最大绝对偏差 {feat['max_abs_deviation']:.3e}，超容差 {feat['rows_over_atol']} 行，"
-         f"atol = {feat['atol']:.0e}")
-    assert feat["rows_over_atol"] == 0, "特征重算必须与产物在容差内一致"
+    # 与 n3d_qa 冻结产物的逐元素重算比对**只对 hash 家族成立**（第 2 轮重建后已
+    # 降级为旁证）；切到 HF 编码器时该空间不存在，故显式标注不适用而非静默跳过。
+    if isinstance(getattr(vectorizer.config, "bag_dim", None), int):
+        feat = S.verify_features_against_product(rows, vectorizer.config)
+        _log(f"[probe] 特征重算取证：检查 {feat['checked_rows']} 行，"
+             f"最大绝对偏差 {feat['max_abs_deviation']:.3e}，超容差 {feat['rows_over_atol']} 行，"
+             f"atol = {feat['atol']:.0e}")
+        assert feat["rows_over_atol"] == 0, "特征重算必须与产物在容差内一致"
+    else:
+        feat = {
+            "applicable": False,
+            "reason": (
+                f"当前编码器 {str(getattr(args, 'encoder', '') or 'zh-bag')!r} 不是 hash 家族，"
+                "与 n3d_qa 冻结产物不在同一特征空间；步骤 2 的验证口径见 "
+                "step2.verify_vectorizer_contract（指纹对账 / 重复编码逐位一致 / 落盘缓存逐位比对）"
+            ),
+        }
+        _log(f"[probe] 特征重算取证：不适用（{feat['reason']}）")
 
     # 向量化确定性（同文本两次编码逐位一致）
     t0 = rows[0].text
@@ -241,7 +302,7 @@ def _prepare(args: argparse.Namespace) -> Json:
     rows = S.load_text_rows(product_dir)
     row_index = S.load_row_index(product_dir)
     meta = S.load_doclines_meta(product_dir)
-    vectorizer = S.ZhBagVectorizer()
+    vectorizer = S.build_step2_vectorizer(_encoder_config(args))
     split = S.reproduce_doc_split(rows, row_index, meta)
     keys, display, _ = S.load_answer_table(product_dir)
     kept, held, held_evidence = S.select_held_out_per_task(product_dir, keys, S.TASKS)
@@ -794,6 +855,57 @@ def cmd_eval(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify_vectorizer(args: argparse.Namespace) -> int:
+    """步骤 2 的**验证口径（第 2 轮重建）**：指纹对账 / 重复编码 / 落盘缓存逐位比对。
+
+    替代原先的「与 ``n3d_qa`` 冻结产物逐位比对」：后者只在 hash 家族内可行，对可插拔
+    接口（尤其 HF 编码器）无从成立。三条检查的口径见
+    :func:`n3d_qa_learn.step2.verify_vectorizer_contract`。
+    """
+    product_dir = S.resolve_product_dir(str(args.product_dir))
+    rows = S.load_text_rows(product_dir)
+    cfg = _encoder_config(args)
+    vectorizer = S.build_step2_vectorizer(cfg)
+    n_texts = max(1, int(args.n_texts))
+    texts = [rows[i].text for i in range(min(n_texts, len(rows)))]
+    registry_name = str(getattr(args, "encoder", "") or E.ENCODER_ZH_BAG)
+    declared_fp, declared_source = _declared_fingerprint(args, registry_name, E.ROLE_TEXT_LINE)
+    _log(f"[verify-vectorizer] 产物目录 = {product_dir}；编码器 = {registry_name!r}；"
+         f"role = {E.ROLE_TEXT_LINE!r}；D = {vectorizer.dim}；比对文本 {len(texts)} 条")
+    ev = S.verify_vectorizer_contract(
+        vectorizer,
+        texts,
+        registry_name=registry_name,
+        role=E.ROLE_TEXT_LINE,
+        declared_fingerprint=declared_fp,
+        declared_source=declared_source,
+    )
+    out_dir = str(args.verify_dir) if args.verify_dir else S.STEP2_VERIFY_DIR
+    payload: Json = {
+        "product_dir": product_dir,
+        "encoder_config": (cfg.to_dict() if cfg is not None else {
+            "name": E.ENCODER_ZH_BAG, "role": E.ROLE_TEXT_LINE,
+            "note": "空 --encoder = 角色默认实现（现状 zh-bag 口径）",
+        }),
+        "evidence": ev,
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    path = os.path.join(out_dir, "verify_vectorizer.json")
+    digest = _write_json(path, payload)
+    _dump(payload)
+    _log(f"[verify-vectorizer] 取证 -> {path} (sha256={digest[:16]}...)")
+    if not ev["passed"]:
+        _log("[verify-vectorizer] FAIL：三条检查未全部通过")
+        return 1
+    _log("[verify-vectorizer] OK")
+    return 0
+
+
+def _dump(obj: Any) -> None:
+    """UTF-8 安全 JSON 打印。"""
+    print(json.dumps(obj, ensure_ascii=False, indent=1, default=str))
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
     parser = argparse.ArgumentParser(
@@ -808,6 +920,19 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--backend", default=S.DEFAULT_BACKEND, help="N3D 后端名")
         p.add_argument("--log-file", default="",
                        help="同时把 stdout 写入该 UTF-8(无 BOM) 日志文件")
+        # 可插拔编码器（空 = 角色默认实现 = 现状 zh-bag 口径，行为逐位不变）
+        p.add_argument("--encoder", default="",
+                       help="可插拔特征实现的注册表键（空 = 现状 zh-bag）；"
+                            "合法值见 `python -m n3d_qa_learn.encoders_run registry`")
+        p.add_argument("--enc-max-length", type=int, default=0,
+                       help="文本行截断长度（0 = 角色冻结口径 text_line=8192）")
+        p.add_argument("--enc-source", default="", help="模型来源（本地目录 / HF 仓库 id）")
+        p.add_argument("--enc-revision", default="", help="固定 revision（空 = 注册表声明）")
+        p.add_argument("--enc-cache-dir", default="", help="嵌入缓存目录")
+        p.add_argument("--enc-force-cache", action="store_true",
+                       help="强制开启嵌入缓存（hash 家族默认关闭）")
+        p.add_argument("--enc-local-files-only", action="store_true",
+                       help="只允许本地文件（无网络场景）")
 
     p_probe = sub.add_parser("probe", help="数据与口径取证（不训练）")
     common(p_probe)
@@ -852,6 +977,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_replay.add_argument("--full-metrics", action="store_true",
                           help="额外复算按任务分项 5 项指标（较慢）")
     p_replay.set_defaults(func=cmd_replay)
+
+    p_vv = sub.add_parser(
+        "verify-vectorizer",
+        help="步骤 2 验证口径（重建）：指纹对账 / 重复编码逐位一致 / 落盘缓存逐位比对",
+    )
+    common(p_vv)
+    p_vv.add_argument("--verify-dir", default="", help="取证输出目录")
+    p_vv.add_argument("--n-texts", type=int, default=8, help="参与比对的文本条数")
+    p_vv.add_argument("--declared-fingerprint", default="",
+                      help="① 项基准指纹（空 = 读 encoders_run 的落盘取证）")
+    p_vv.add_argument("--encoders-dir", default="", help="encoders_run 取证目录")
+    p_vv.set_defaults(func=cmd_verify_vectorizer)
     return parser
 
 

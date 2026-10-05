@@ -68,6 +68,14 @@ from n3d_qa.zh_features import ZhFeatureConfig, hash_bag_vector, l2_normalize_bl
 
 from .backends import BACKEND_NAMES, BackendAdapter, BackendRegistry
 from .data import QACorpus, QARecord, SplitSpec, TextRecord
+from .encoders import (
+    ENCODER_ZH_BAG,
+    ROLE_TEXT_LINE,
+    EncodeResult,
+    EncoderConfig,
+    EmbeddingCache,
+    build_vectorizer,
+)
 from .evaluate import evaluate_refusal, evaluate_step1
 from .heads import OUTPUT_MODES, N3DQA, N3DQAConfig
 from .route import NO_MATCH_TEXT, QuestionRouter
@@ -222,6 +230,176 @@ class ZhBagVectorizer:
             row = hash_bag_vector(str(text), self.config)
             mat[i] = l2_normalize_block(row)
         return mat
+
+    def encode_with_stats(self, text: str) -> EncodeResult:
+        """单条编码 + 统计（**统一接口的补齐**）。
+
+        口径（**如实**）：n-gram 哈希词袋**没有词元上限**，因此
+        ``n_tokens`` / ``n_truncated`` 恒为 ``0``；该家族在注册表里声明
+        ``truncation_stats=False``，故「超长 -> n_truncated > 0」这条边界对它是
+        **不适用**而不是失败（见 :func:`n3d_qa_learn.encoders.summarize_selftest`）。
+
+        存在理由：统一接口要求 ``encode_with_stats`` 可用 —— 缺失会让
+        ``encoders_run drill / boundary`` 在 ``zh-bag`` 上抛
+        ``AttributeError: 'ZhBagVectorizer' object has no attribute 'encode_with_stats'``。
+        """
+        if not isinstance(text, str):
+            raise TypeError(f"encode 需要 str，当前类型 {type(text).__name__}")
+        return EncodeResult(vector=self.encode(text), n_tokens=0, n_truncated=0, cached=False)
+
+
+# ---------------------------------------------------------------------------
+# 步骤 2 的可插拔编码器入口 + 重建后的验证口径
+# ---------------------------------------------------------------------------
+
+
+def build_step2_vectorizer(cfg: Optional[EncoderConfig] = None) -> Any:
+    """构造步骤 2 的文本行向量化器（**可插拔编码器注册表的步骤 2 入口**）。
+
+    参数
+    ----
+    cfg : Optional[EncoderConfig]
+        编码器选择配置；``None`` = ``zh-bag`` + ``role="text_line"``（现状口径，
+        与历史逐位一致）。切 HF 编码器需显式给 ``EncoderConfig(name="bge-m3",
+    role=ROLE_TEXT_LINE)``（文本行 ``max_length = 8192``）。
+
+    返回
+    ----
+    Any
+        满足统一接口（``dim`` / ``fingerprint`` / ``encode`` / ``encode_batch`` /
+        ``encode_matrix``）的向量化器。
+    """
+    config = cfg if cfg is not None else EncoderConfig(
+        name=ENCODER_ZH_BAG, role=ROLE_TEXT_LINE
+    )
+    return build_vectorizer(config)
+
+
+def verify_vectorizer_contract(
+    vectorizer: Any,
+    texts: Sequence[str],
+    *,
+    registry_name: str = "",
+    role: str = ROLE_TEXT_LINE,
+    declared_fingerprint: str = "",
+    declared_source: str = "",
+    canonical: Any = None,
+) -> Dict[str, Any]:
+    """步骤 2 的**验证口径（第 2 轮重建，替代「与 n3d_qa 冻结产物逐位比对」）**。
+
+    三条检查
+    --------
+    ① ``fingerprint()`` == 注册表 / 落盘声明 —— 证明步骤 2 用的就是注册表登记的口径
+       （修订 / 权重 / 池化 / ``max_length`` 任一变化都会改变指纹）；
+    ② 同文本重复编码**逐位一致** —— 证明确定性（无随机、无跨调用状态）；
+    ③ 与**落盘缓存**逐位比对 —— 证明「跨进程复用同一缓存」不改变任何一位。
+
+    口径声明（**如实**）
+    ------------------
+    * 旧的 `verify_features_against_product`（与 ``n3d_qa`` 冻结产物 ``feature`` 字段
+      逐元素比对）**降级为 hash 家族的旁证**，不再是本接口的验证口径 —— 它对
+      HF 编码器无法成立（两者根本不在同一特征空间）；
+    * ③ 只在向量化器挂了落盘缓存时适用（``applicable=False`` 时不计入 ``passed``）。
+
+    参数
+    ----
+    vectorizer : Any
+        被测向量化器。
+    texts : Sequence[str]
+        比对用文本（至少 1 条）。
+    registry_name : str
+        注册表键（用于在未给声明时现场构造基准）。
+    role : str
+        角色。
+    declared_fingerprint : str
+        落盘声明里的指纹；非空时作为 ① 的基准。
+    declared_source : str
+        声明来源（取证用）。
+    canonical : Any
+        已构造好的基准向量化器（避免重复加载模型）；为空则按注册表现场构造。
+
+    返回
+    ----
+    Dict[str, Any]
+        ``{check1, check2, check3, passed, ...}``。
+    """
+    items = [str(t) for t in texts]
+    if not items:
+        raise ValueError("verify_vectorizer_contract 至少需要 1 条文本")
+
+    # --- ① 指纹 == 注册表 / 落盘声明 ------------------------------------
+    actual_fp = str(vectorizer.fingerprint())
+    expected_fp = str(declared_fingerprint)
+    basis = "落盘声明"
+    if not expected_fp:
+        if canonical is None:
+            canonical = build_vectorizer(
+                EncoderConfig(name=str(registry_name) or ENCODER_ZH_BAG, role=str(role))
+            )
+        expected_fp = str(canonical.fingerprint())
+        basis = "注册表现场构造"
+    check1 = bool(expected_fp) and (actual_fp == expected_fp)
+
+    # --- ② 同文本重复编码逐位一致 ---------------------------------------
+    # 判据**只用 float32 裸字节**（修复 N1）：缓存命中会把条目里的 float32 还原成
+    # Python float，与首次实算的 float64 值在末位可能不同，若再叠一层 list 相等
+    # 判断会产生「字节相同但判失败」的假阴性。逐位一致的语义就是字节一致。
+    first = [vectorizer.encode(t) for t in items]
+    second = [vectorizer.encode(t) for t in items]
+    first_bytes = b"".join(np.asarray(v, dtype="<f4").tobytes() for v in first)
+    second_bytes = b"".join(np.asarray(v, dtype="<f4").tobytes() for v in second)
+    check2 = bool(first_bytes == second_bytes)
+
+    # --- ③ 与落盘缓存逐位比对 -------------------------------------------
+    attached = getattr(vectorizer, "cache", None)
+    cache = attached if isinstance(attached, EmbeddingCache) else None
+    per_text: List[Dict[str, Any]] = []
+    if cache is not None and hasattr(vectorizer, "cache_key"):
+        for text, vec in zip(items, first):
+            key = str(vectorizer.cache_key(text))
+            blob = cache.read_bytes(key)
+            encoded = np.asarray(vec, dtype="<f4").tobytes()
+            per_text.append(
+                {
+                    "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "cache_key": key,
+                    "cache_written": bool(blob is not None),
+                    "bitwise_equal": bool(blob is not None and blob == encoded),
+                    "bytes": int(len(encoded)),
+                }
+            )
+    applicable3 = bool(per_text)
+    check3 = bool(applicable3 and all(e["bitwise_equal"] for e in per_text))
+
+    return {
+        "registry_name": str(registry_name),
+        "role": str(role),
+        "dim": int(vectorizer.dim),
+        "n_texts": int(len(items)),
+        "check1_fingerprint_matches_declaration": {
+            "passed": bool(check1),
+            "basis": str(basis),
+            "declared_source": str(declared_source),
+            "declared_fingerprint": str(expected_fp),
+            "actual_fingerprint": str(actual_fp),
+        },
+        "check2_repeat_encode_bitwise_equal": {
+            "passed": bool(check2),
+            "n_bytes": int(len(first_bytes)),
+            "first_sha256": hashlib.sha256(first_bytes).hexdigest(),
+            "second_sha256": hashlib.sha256(second_bytes).hexdigest(),
+        },
+        "check3_cache_bitwise_equal": {
+            "passed": bool(check3),
+            "applicable": bool(applicable3),
+            "note": (
+                "未挂载落盘缓存 -> 本项不适用（不计入 passed）"
+                if not applicable3 else "逐条与落盘缓存裸字节比对"
+            ),
+            "per_text": per_text,
+        },
+        "passed": bool(check1 and check2 and (check3 if applicable3 else True)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +616,13 @@ def verify_features_against_product(
     本模块的**行向量**取同口径下的**单份文本**词袋 ``L2(hash_bag(text))``。两者的差别仅在
     接缝处的少量 n-gram，因此本函数以**自配对口径**做重算比对，从而对
     「哈希盐 / 桶数 / 阶数 / L2 归一化」四件事给出**产物驱动**的等价证明。
+
+    **口径地位（第 2 轮重建后，如实声明）**
+    ------------------------------------
+    本函数**只是 hash 家族的旁证**，**不再是步骤 2 的验证口径**。步骤 2 的验证口径已
+    重建为 :func:`verify_vectorizer_contract` 的三条（指纹对账 / 重复编码逐位一致 /
+    与落盘缓存逐位比对）；本函数的「与 ``n3d_qa`` 冻结产物逐元素比对」对可插拔接口
+    （尤其 HF 编码器）根本无从成立 —— 两者不在同一特征空间。
 
     参数
     ----

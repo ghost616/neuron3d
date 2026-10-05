@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from .backends import BACKEND_NAMES, BackendRegistry, build_registry
-from .features import VectorizerConfig
+from .encoders import ROLE_QUESTION, EncoderConfig, declared_dim
 from .heads import N3DQA, N3DQAConfig
 
 
@@ -123,6 +123,9 @@ def end_to_end_drill(
     n_classes_pointer: int = 3,
     batch_size: int = 8,
     seed: int = 42,
+    *,
+    encoder: str = "",
+    role: str = ROLE_QUESTION,
 ) -> DrillResult:
     """单条端到端演练：1 batch 前向 + 反向 + 一步更新，断言梯度非零。
 
@@ -142,6 +145,11 @@ def end_to_end_drill(
         演练批大小。
     seed : int
         种子（固定随机输入）。
+    encoder : str
+        **可插拔特征实现的注册表键**（空串 = 角色默认实现）；用于把 ``dim`` 与
+        编码器注册表声明对账 —— 连接参数 ``D`` 的唯一来源是编码器注册表。
+    role : str
+        角色（决定声明维度与 ``max_length``）。
 
     返回
     ----
@@ -150,15 +158,19 @@ def end_to_end_drill(
 
     异常
     ------
+    ValueError
+        ``dim`` 与编码器注册表声明维度不一致。
     RuntimeError
         任一可学习参数的梯度为 ``None`` 或全零（**硬门禁**）。
     """
     torch.manual_seed(int(seed))
-    registry = build_registry(VectorizerConfig())
-    if int(dim) != registry.input_dim:
+    declared = int(declared_dim(EncoderConfig(name=str(encoder), role=str(role))))
+    if int(dim) != declared:
         raise ValueError(
-            f"演练的 dim={dim} 与向量化口径维度 {registry.input_dim} 不一致（连接参数唯一来源）"
+            f"演练的 dim={dim} 与编码器注册表声明维度 {declared} 不一致"
+            "（连接参数唯一来源 = 可插拔编码器注册表）"
         )
+    registry = build_registry(input_dim=int(dim))
     if backend not in registry.available:
         raise RuntimeError(
             f"后端 {backend!r} 不可用；已登记 = {registry.available}，"
