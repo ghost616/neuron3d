@@ -1,0 +1,61 @@
+{
+  "module_name": "n3d_qa_learn",
+  "files": [
+    {
+      "path": "n3d_qa_learn/step2.py",
+      "description": "步骤 2（文本数据集匹配）核心实现：中文确定性文本向量化器（复用只读上游 n3d_qa.zh_features 的哈希词袋，D=192，接口与 features.TextVectorizer 一致以便零改动复用既有评估协议）；n3d_qa 冻结产物的只读读取与库/查询划分复现及独立复核（交集为 0、并集为全量、复现结果须等于产物行索引表 positives>=1）；特征重算对产物 feature 字段的等价取证；统一答案表读取与按任务分层的留出类开集协议（构造显式「不相关」类，留出类清单冻结）；各任务的 QACorpus/SplitSpec 装配与 TrainingData 合并/按任务过滤；经代理层构造后端适配器与 N3DQA 模型；本模块自建训练循环（交叉熵 + 显式不相关类，头/后端分组学习率，含 answer_table_mode=centroid 的质心确定性初始化适配）；冻结候选键表的构造、自写 zip 落盘与两道守卫加载（键表 SHA256 + 特征口径指纹）；TextRowMatcher（索引式冻结键表 / 指针式输入候选键，两模式共用同一 q）；自检索留出法 Recall@1/@5；纯确定性特征检索参照下限；双模式一致性取证（top-1 一致率 + logits 逐位对照）；分项 5 项指标计算（步骤1准确率、路由命中/未命中判定、无匹配类精确率与召回、端到端正确率）；跨 seed 均值±极差聚合与报告 Markdown/JSON 落盘（含溯源字段与产物 SHA256）。"
+    },
+    {
+      "path": "n3d_qa_learn/step2_run.py",
+      "description": "步骤 2 的命令行驱动与验收入口：probe（数据与口径取证：划分复核、特征重算、答案表与留出明细，不训练）；drill（单条端到端演练：限批训练 + 逐参数梯度取证，零梯度即硬失败，再做极小自检索/参照下限/双模式一致性与 top-1 行回填）；guard（产物守卫拒绝证明：合法产物加载成功、篡改键表张量或篡改 meta 特征口径指纹均须被拒）；eval（跨 seed × 双模式的正式验收：训练两个模式的模型并落盘、构造冻结键表产物、自检索与参照下限、双模式一致性、按任务分项 5 项指标、跨 seed 聚合与报告落盘，含消费产物文件的 SHA256 溯源清单与如实登记项）。"
+    },
+    {
+      "description": "步骤 2（文本数据集匹配）的专项文档：定位与业务流向、冻结口径表（D=192 / 特征口径指纹 / 库查询划分 / 检索池口径 / 统一答案表 / 按任务分层留出 / 拓扑 seed 前提）、四个验收入口的命令、现场实测结果（probe 取证表、drill 梯度与极小自检索、guard 拒绝证明、自检索留出法 Recall@1/@5、纯确定性特征参照下限与增益、双模式一致性、分项 5 项指标的逐 seed 表与跨 seed 均值±极差表）、产物清单与 SHA256，以及如实登记（未达标项、库/查询分离与命中自身行的口径冲突、不相关样本的构造口径、小样本任务噪声、不可复现项、上游漂移）。",
+      "path": "n3d_qa_learn/README_step2.md"
+    },
+    {
+      "path": "n3d_qa_learn/__init__.py",
+      "description": "包声明与模块定位：n3d_qa_learn 是 N3D 问答学习框架（固定三级业务路由：QA 数据集 top-1 命中 -> 文本数据集匹配 -> 无匹配；命中判定 = 输出「不相关」类即视为未命中）。列出对外能力（features / backends / heads / data / route / train / probe / evaluate / cli）与上游边界（只读 import n3d_shape / n3d_sphere / n3d_proto 的 model 与 config，只读读取 n3d_qa 已落盘的 QA JSON 缓存；不修改任何上游源码、产物与 current_spec.md；产物写 checkpoints/qa_learn/，验证类写其 _verify/ 子目录）。"
+    },
+    {
+      "path": "n3d_qa_learn/features.py",
+      "description": "确定性文本向量化器（连接契约的数据侧一半）：把问题文本与文本行映射到同一个 D 维特征空间，供后端模型 input_dim=D 输入、指针实现的候选键表 K in R^[L, D]、以及步骤 2 的词袋余弦打分共用。含归一化链（NFKC -> casefold -> 空白折叠）、词元化（拉丁词 + CJK 单字 + 字符 bigram）、blake2b 哈希桶映射（不用内置 hash，跨进程确定性）、8 个冻结口径的长度/结构特征（tanh 饱和到 [0,1]）、L2 归一化（空文本恒为零向量）与 cosine 打分；VectorizerConfig 冻结全部口径并产出 SHA256 口径指纹，vectorizer_from_meta 在加载产物时校验指纹（不一致立即报错）。冻结常量：FEATURE_SCHEMA_VERSION / HASH_SALT / MAX_TOKENS=256 / LENGTH_FEATURE_SPECS / MAX_FEATURE_DIM=128 / DEFAULT_HASH_DIM=80 / SUBLINEAR_TF=False（实测原始计数优于次线性缩放，已留档）。"
+    },
+    {
+      "path": "n3d_qa_learn/backends.py",
+      "description": "连接契约代理层：BackendAdapter 注册表，只承担「数据集特征维 D -> 后端模型构造参数」这一件事，不承载训练编排、不干预后端内部超参；三后端（n3d_shape / n3d_sphere / n3d_proto）只读 import 其 model 与 config，上游零改动。含 BACKEND_NAMES / BackendSpec / BACKEND_SPECS 注册点、recommended_config（各后端在 QA 任务上的推荐构型，含 n3d_shape 必须显式 dataset='npz' 的占位维口径）、BackendAdapter（build_input / features 的 D 维度硬校验、count_parameters、topology_stats 现场算 E/K/|S_in|/|S_out|、describe）、BackendRegistry（register / register_all 失败者显式登记为不可用、manifest、structural_fingerprint、assert_distinguishable 四元组可区分性断言）与 build_registry（D 的唯一来源）。"
+    },
+    {
+      "path": "n3d_qa_learn/heads.py",
+      "description": "N3D 问答学习模型的输出头：D 维 q 头（不是类别数宽度的分类头）+ 两种互斥的候选打分实现（全局开关）。索引生成式（index）：候选键表 A in R^[C+1, D]，末位固定「不相关」，logits = s * (q @ A^T)；指针 Softmax（pointer）：候选键 K in R^[B, L, D] 由输入提供，不存任何固定候选参数表（hasattr(model,'answer_table') 为假），logits = s * (q @ K^T)；两模式共用同一个 q 头。含 N3DQAConfig 的构造期不变量（output_mode / head_input_mode / label_smoothing / normalize_query / logit_scale_init / learn_logit_scale / mix_logit_init / answer_table_mode）、N3DQA（q_head / backbone_norm / logit_scale / 可选 answer_table、query/logits_from_index/logits_from_pointer/logits/forward、cross_entropy 支持逐样本权重与标签平滑、set_answer_table_from_centroids 的 centroid 口径、describe / trainable_parameter_names / zero_grad_parameters）。默认口径经实测选定：head_input_mode='raw'、normalize_query=True、learn_logit_scale=False、answer_table_mode='centroid'。"
+    },
+    {
+      "path": "n3d_qa_learn/data.py",
+      "description": "数据装配层：只读读取 n3d_qa 已落盘的 QA JSON 缓存（DEFAULT_QA_CACHE_FILES 四个同批归档缓存，按 QuestionId 去重）构建 QARecord，并以 NormalizedValue 为类别键构建全局答案表（build_answer_space：频次门槛 + 类别数上限 + 确定性排序）、按问题切分训练/测试四子集（make_splits：test_every 交错切分 + test_per_class 让主测试集按类别均衡、unknown 侧逐类配额与总量上限去偏、blake2b 确定性打乱），以及读取 data/doc/*.md 逐行文本语料（TextRecord，MAX_LINE_CHARS 截断标志）。另含问题文本边界处置 check_question（超长报错、空/空白放行）。冻结常量：DEFAULT_QA_CACHE_DIR / DEFAULT_QA_CACHE_FILES / QA_CACHE_PATTERNS / MAX_LINE_CHARS / MAX_QUESTION_CHARS / UNKNOWN_TRAIN_PER_CLASS / UNKNOWN_TRAIN_CAP。"
+    },
+    {
+      "path": "n3d_qa_learn/route.py",
+      "description": "业务路由（固定顺序，不可配置）：步骤 1 用模型 logits 取 top-1，命中具体答案即返回（不再查文本）；top-1 为「不相关」类即视为未命中并进入步骤 2；步骤 2 在文本行语料取词袋余弦最高者，达到阈值则返回该行；两级都未命中返回「无匹配」。RouteResult 必须携带来源标记（qa/text/none）与分数、步骤 1 下标与不相关标记、步骤 2 行 id 与原因；QuestionRouter 构造期一次性预计算文本行向量。边界处置：空问题/仅空白 -> 无匹配（reason=empty_question）；超长 -> 报错；候选为空 -> 跳过步骤 1；文本语料为空 -> 无匹配。"
+    },
+    {
+      "path": "n3d_qa_learn/train.py",
+      "description": "自建训练循环、确定性产物落盘与加载守卫。TrainConfig 汇集数据装配与训练配置（backend / output_mode / epochs / batch_size / lr / weight_decay / seed / max_classes / min_questions / test_every / test_per_class / unknown_class_weight / unknown_train_cap / label_smoothing / max_train_samples / text_threshold / train_backbone / train_head / backbone_lr / head_input_mode / logit_scale_init / learn_logit_scale / answer_table_mode）。build_training_data 组装数据；run_training 执行训练（centroid 口径答案表由训练样本逐类质心确定性写入、按需冻结 q 头或后端、两个 param group 的 lr、逐样本权重交叉熵、限批模式、loss 有限性契约）；build_meta / answer_table_sha256 产出含 D 落点与两道指纹的 meta；build_artifact_bytes 自写 zip（meta.json + model_state_dict.pt + answer_table.pt，固定 1980-01-01 时间戳，同参数逐字节一致）；load_artifact 执行答案表指纹与向量化口径指纹两道守卫；rebuild_model 按 meta 严格重建并载入。"
+    },
+    {
+      "path": "n3d_qa_learn/probe.py",
+      "description": "P0 探针（硬门禁）与单条端到端演练。probe_backends 逐个现场构造三后端模型并记录 par量/E/K/|S_in|/|S_out|/构造耗时，构造失败者给出可读原因并显式登记为不可用（禁止静默丢弃），全部失败则 all_failed=True；end_to_end_drill 取 1 个 batch 做前向 + 反向 + 一步更新，逐参数枚举梯度范数并硬断言可学习参数梯度非零、参数确实被更新（index 模式先按 batch 类别质心写入候选键，避免随机候选键造成的结构性零梯度），返回 DrillResult（损失前后、逐参数梯度范数、零梯度参数名单、参数变化计数与最大变化、logits 形状、耗时）。"
+    },
+    {
+      "path": "n3d_qa_learn/evaluate.py",
+      "description": "评估协议、加载守卫拒绝证明与边界处置自检。evaluate_step1 在 test_known 上算 top1_acc / macro_acc（逐类宏平均，恒输出「不相关」的退化预测器 macro=0）/ topk_acc / 多数类基线 / 随机基线 1/C / 逐类准确率 / 步骤 1 误拒数；evaluate_refusal 在 test_known + test_unknown 合并口径上算「不相关」类的拒绝率与 precision/recall/F1；acceptance_check 按任务给定门槛判定（含「macro >= 10/C 恒不可满足」的显式 applicable=False 登记）；guard_rejection_proof 在临时副本上做三类注入（交换答案键、替换向量化指纹、扰动候选键张量）并断言加载必须报错；boundary_selftest 覆盖空问题/仅空白/超长问题/空候选集/超长文本行/空文本语料/步骤 1 命中跳过文本七项。"
+    },
+    {
+      "path": "n3d_qa_learn/cli.py",
+      "description": "纯 CLI 入口（python -m n3d_qa_learn.cli <子命令>）：probe（P0 探针）/ drill（端到端演练）/ train（训练 + 步骤 1 与不相关评估 + 落盘 + 报告）/ ask（--question 单次问答，输出 答案 / 匹配行 / 无匹配 + 来源 + 分数）/ eval（既有产物评估）/ guard（加载守卫拒绝证明）/ selftest（边界处置自检）。全局开关 --output-mode {index,pointer}（全局一个、不做级联），含 --hash-dim / --dim / 数据装配与训练超参 / --artifact / --verify（写 _verify 子目录）等参数；入口显式把 stdout/stderr 重配为 UTF-8 以适配 GBK 控制台；退出码 0 成功 / 1 业务失败 / 2 参数错误。"
+    },
+    {
+      "path": "n3d_qa_learn/README.md",
+      "description": "模块说明文档（步骤 1 骨架）：业务逻辑固定三级路由表、模块构成与零新依赖声明、连接契约代理层职责边界与三后端 D 连接口径实测表（含 n3d_shape 必须 dataset='npz'、K 需现场去重计数两条易错约束）、三后端可区分性断言与 n3d_shape/n3d_sphere 数值同构的如实披露、两种候选打分实现对照表与候选键表两种来源口径、实测与口径标定（为何默认 head_input_mode=raw / train_head=False / answer_table_mode=centroid）、步骤 1 三 seed 实测表（macro 0.30/0.20/0.10，均值恰等门槛、未稳定通过）、指针模式实测与不可用原因、边界处置表、产物与两道加载守卫拒绝证明表、CLI 用法与三种真实输出、验收命令实测结果表、上游改动归属披露（n3d_qa 与 checkpoints/qa_learn 顶层的改动来自并行会话）与已声明限制清单。"
+    }
+  ]
+}

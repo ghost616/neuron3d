@@ -1,0 +1,49 @@
+{
+  "module_name": "n3d_qa",
+  "files": [
+    {
+      "path": "n3d_qa/__init__.py",
+      "description": "包声明与模块定位：n3d_qa 是通用 QA 数据集处理模块（任意问答数据集 -> N3D npz 数组），当前内置 TriviaQA（证据段落二分类）作为参考实现，后续 QA 数据集按 adapter 挂入（输入解析 / 文档定位 / 答案合并 / split 表）共用特征层与 npz 落盘层；声明对外能力 build_dataset（流式构建 X[M,D] float32 / y[M] int64 的 npz，D=70/6/74/10 按 hash_dim/no_bag/features 口径）与 verify_dataset（E0–E8 产物验证），并明确本包不导入、不修改 n3d_proto / n3d_sphere / n3d_shape / n3d_viz / framework 任何代码（仅只读导入 n3d_shape.data.load_npz_arrays 判定契约），同时声明产物路径 checkpoints/triviaqa/、产物名前缀 n3d_triviaqa_verified_* 与产物 meta.module 字段冻结为 TriviaQA 参考实现口径。增量扩展（2026-10-05）：docstring 追加中文口径段落并扩充 __all__ 为 7 个模块——zh_features（中文文本特征口径：字符级 1/2/3-gram 哈希词袋 + 6 列覆盖度/长度特征，复用 blake2b 与 L2 口径，口径参数进 meta 并折叠为 spec_hash）、adapters（Math1 / data/doc 适配器、答案归一化、跨任务统一答案表、负样本采样、库-查询划分）、build_qa（QA 匹配与文本行产物构建，落 checkpoints/qa_learn/dataset/ 的 npz + 文本侧 JSONL + manifest）、probe_zh（中文判别力探针硬门禁，E7 同口径 5 折 CV）、verify_qa（F0–F10 新增产物验证）；同时把「不导入不修改」的描述补为 verify_dataset 与 verify_qa 均只只读导入 n3d_shape.data.load_npz_arrays。"
+    },
+    {
+      "path": "n3d_qa/build_dataset.py",
+      "description": "通用 QA 数据集处理模块的构建层（当前内置 TriviaQA 参考实现）：以 tarfile \"r|gz\" 顺序流式扫描 + extractfile 按需抽取（从不 extractall、从不整包解压）解析官方 QA JSON 与 evidence 文档，产出 X[M,D] float32 / y[M] int64 + meta 的确定性 npz（自写 zip、固定时间戳、blake2b 确定性哈希词袋、不触碰全局 RNG，同参数重复构建逐字节一致）；含归档 SHA256/大小/成员数守卫、QA JSON 缓存与成员索引缓存、base/rich 两套特征口径（哈希词袋 64 桶 + 6 列基础特征，rich 追加 qcov_idf/dcov_idf/tfidf_cos/ans_isnum_frac 共 10 列）、答案匹配（大小写不敏感 + 词边界 + 别名合并 + 短数字保护）、1:1 负样本采样与正负严格交替行序、verified 与 dev split 的 QuestionId 剔除口径、compact 路径与 meta 口径自解释写入（split / 归档 SHA / 特征列定义 / 计数 / provenance），并提供 CLI（--split / --no-bag / --features / --hash-dim / --max-questions / --out-dir / --archive）。【冻结项】产物目录 checkpoints/triviaqa/、产物名模板 n3d_triviaqa_verified_{slug}_dev.npz 与 n3d_triviaqa_{slug}.npz、meta[\"module\"]=\"n3d_triviaqa\"、HASH_SALT 均为参考实现的字节口径，改名不得改动。"
+    },
+    {
+      "path": "n3d_qa/verify_dataset.py",
+      "description": "通用 QA 数据集处理模块的验证层（当前校验 TriviaQA 参考实现产物）：E0 meta 口径回读（逐产物比对 no_bag/hash_dim/features/extra_dim/列定义/计数与写死常量，rich 校验 IDF 口径）、E1 构建幂等（同参连跑两次逐字节一致且等于正式产物）、E2 产物契约（委派 n3d_shape.data.load_npz_arrays 只读导入，断言 dtype/shape/无 NaN-Inf）、E3 标签均衡 + 归档重抽答案复核、E4 无泄漏与变体一致、E5 端到端训练（n3d_shape/train.py --dataset npz）、E6 零回归（git status 中 n3d_proto/n3d_sphere/n3d_shape/n3d_viz 无改动）、E7 rich 特征判别力 5 折 CV 分解、E8 verified 与 dev 的 QuestionId 交集为 0；支持 --checks/--product-set {base,rich,dev,all}/--split/--skip-e5/--e5-path 等 CLI，缺产物记 SKIP 不计失败。"
+    },
+    {
+      "path": "n3d_qa/README.md",
+      "description": "模块说明文档（通用 QA 数据集处理模块定位 + TriviaQA 参考实现口径 + 中文增量扩展口径）：§1–§8 保持原有内容（数据源与归档实测、QA JSON 成员表与四 split 口径、文档映射规则与流式访问口径、任务定义、特征口径与维度对照 D=70/6/74/10、8 个 npz 产物路径与形状及键契约、build/verify 用法命令、与 n3d_shape 的对接命令与实测读数、产物命名隔离、每 5 取 1 切分、历史留档与维护边界）。新增「附录 A：中文文本特征口径与新增产物」：A.1 既有 [a-z0-9]+ 丢弃全部非 ASCII 导致中文词袋全零的阻塞项实测；A.2 中文口径（NFKC→去空白→casefold、字符 1/2/3-gram、blake2b 盐与落桶规则、L2、9 条列定义、两侧桶数与维度选择依据、spec_hash 实测值）；A.3 Math1 八文件与 data/doc 的现场实测数字及答案归一化前后类数变化表；A.4 各任务答案选择规则与保留/剔除/覆盖率表 + 统一答案表 298 类与不相关 25,637 题 + TriviaQA 覆盖率仅 3.7% 的「假因 vs 数据特性」两段式说明；A.5 新增产物清单（npz 形状、JSONL 字段、manifest、标签规则、库-查询划分实测）；A.6 判别力探针读数表（lexical/doclines bag-only AUC 0.8309 通过门禁；math1judge 近随机 0.1799 如实登记 + 根因 + 桶数扫描曲线）；A.7 构建/探针/验证/快照/复核的可复跑命令；A.8 F0–F10 验证项清单与实测；A.9 零回归证据（189 条快照、8 个正式产物 SHA256 逐个列出、既有验证器通过 15/失败 0）；A.10 不可复现项与边界登记（耗时类读数、sweep 读数、TriviaQA 规模、solve 覆盖率 6.03%、词面级口径边界）。"
+    },
+    {
+      "path": "n3d_qa/zh_features.py",
+      "description": "中文文本特征口径（通用特征层，数据集无关）：字符级 1/2/3-gram 哈希词袋 + 6 列共享覆盖度/长度特征。规范化为 NFKC→去全部 Unicode 空白→casefold；落桶复用既有 blake2b 口径（盐 ZH_HASH_SALT=b\"n3d-qa-zh-charbow-v1\\x00\"、unit=f\"{order}:{ngram}\"、digest_size=8、mod buckets_per_order、块偏移 order_index*buckets_per_order），块做 L2 归一化（范数 0 保持全零，不产生 NaN）。口径参数（阶数/每阶桶数/盐/归一化方式/分词规则/落桶规则/块归一化）全部进产物 meta 并折叠为单一 spec_hash；不消耗全局 RNG、无缓存依赖，同文本重复调用逐位一致。默认 QA 侧 buckets_per_order=100（bag_dim=300、D=306）、文本行侧 64（192、198），符合「样本量 1e3 量级时桶数取 10^1~10^2」的历史纠正 #12。对外：ZhFeatureConfig / zh_normalize / char_ngrams / unit_hash / unit_bucket / hash_bag_vector / ngram_universe / l2_normalize_block / feature_columns / extra_columns / build_feature_vector / DEFAULT_ZH_CONFIG。"
+    },
+    {
+      "path": "n3d_qa/adapters.py",
+      "description": "数据集适配层（与数据集强相关的输入解析，不混入通用特征层）：①Math1 adapter（八文件 jsonl，字段键集合实测八文件一致；问题文本=question+choices、答案文本=候选答案表层串+explanation；答案归一化 ANSWER_NORM_RULE=NFKC→去全部空白→casefold，键空间单一 canonical）；②data/doc 文本行 adapter（非空行切分、row_id=blake2b 行标识、每文件行号）；③跨任务统一答案表（build_answer_table / AnswerTable / AnswerClass，按 canonical key 合并去重、每类记录 count 与 sources，含别名索引与「不相关题目」口径）；④负样本采样（class_sampling_weights 类级按 count 加权 + sample_wrong_answers 禁用自身正确类、可选 restrict 限于任务家族，保证负样本数精确等于请求数）；⑤库/查询留出集划分 split_library_query（固定 seed 置换，升序、互斥、覆盖全部行）。所有随机性来自显式 seed 的 np.random.default_rng，不触碰全局 RNG；不写文件。"
+    },
+    {
+      "path": "n3d_qa/build_qa.py",
+      "description": "新增产物构建与编排层：把 Math1 四题型 + TriviaQA（归档 split 的答案频次 top-100，复用既有 build_dataset 归档层只读读取）+ 跨任务统一答案表 + data/doc 文本行，转成 checkpoints/qa_learn/dataset/ 下的 npz（X[M,D] float32 / y[M] int64 / meta，D=306；doclines 为 D=198）与文本侧 JSONL（n3d_qa_<task>_pairs.jsonl、doclines_rows.jsonl 行表、doclines_row_index.jsonl 行索引、answer_table.jsonl 统一答案表）与 manifest.json（逐文件 bytes/sha256 + 两侧 spec_hash）。npz 复用 save_npz_deterministic 自写 zip；JSONL 为 LF/UTF-8/不转义非 ASCII/先 tmp 后 replace。确定性硬约束：产物 meta 不得含挂钟或缓存状态字段（build_seconds、archive_passes 已移出，由 F10 守卫）。构建期不变量断言：答案表键集合 == 各任务选中键并集、questions_paired == kept_samples、kept+removed+unkeyed == total、形状与计数自洽、每行 bag 非全零。CLI：--tasks/--doclines/--neg-per-question/--out-dir/--ngram-orders/--buckets-per-order/--triviaqa-splits/--triviaqa-topn/--doc-query-ratio/--doc-neg-per-query/--max-records/--seed/--drill/--dry-run。实测：全量构建 17 个文件、退码 0、用时 329 s（冷缓存）。"
+    },
+    {
+      "path": "n3d_qa/probe_zh.py",
+      "description": "中文判别力探针（硬门禁，全量构建前先跑）：在真实中文数据上验证中文特征非全零且有判别力，读数如实打印。评估集合 lexical（data/doc 文本行词面匹配，products 同款 split）、doclines（实际产物行）、math1judge（Math1 判断题 QA 匹配，只报读数不设门禁）。指标用既有 E7 同口径 5 折 CV（_cv_scores/_fit_logistic 直接从 verify_dataset 只读导入）报 bag-only/extra-only/full 的 acc 与 AUC 及主类基线。门禁：empty_bag_fraction ≤ 0.01 且 bag-only AUC ≥ 0.75，失败退码 3（--no-gate 只报不失败）。实测：前两者 bag-only AUC 0.8309/acc 0.7598（full 1.0000）、全零行 0；math1judge bag-only AUC 0.1799（近随机，根因：答案为计算得出的短串且 explanation 占主导稀释词面信号）。含 --sweep 桶数扫描（report-only）与 --sets/--seed/--neg-per-query/--math1-neg/--min-auc/--max-empty-frac。"
+    },
+    {
+      "path": "n3d_qa/verify_qa.py",
+      "description": "新增产物验证层（F0–F10，与既有 E0–E8 并存；verify_dataset.py 一行未改，仅只读导入其 CV 函数）：F0 特征口径契约（meta 与 zh_features 常量逐字比对、spec_hash 重算、列定义无缝铺满）；F1 向量化确定性（同文本两次调用逐位一致）；F2 产物契约（dtype/shape/无 NaN-Inf/每行 bag 非全零/bag L2 范数=1/计数自洽）；F3 逐字节幂等（同参连跑两遍并逐文件 SHA256 与正式产物比对）；F4 文本侧 JSONL 可回读（与 npz 逐行一致、文本非空、row_id 唯一）；F5 行级重算（由 pairs.jsonl 文本重新向量化逐位等于 npz）；F6 统一答案表一致（键唯一、count==sum(sources)、与 meta 计数一致）；F7 剔除登记可回读（kept+removed+unkeyed==total、键算术闭合、coverage_loss==1-coverage_rate）；F8 文本行产物（行表/行索引覆盖全行、库∩查询=0、特征宽度一致）；F9 零回归（checkpoints/triviaqa 快照逐位不变 + 可选子进程运行 verify_dataset.py 断言退码 0）；F10 meta 可复现（meta 树不得含挂钟/缓存状态字段）。CLI：--dir/--checks/--tasks/--no-doclines/--run-verify-dataset/--verify-dataset-args。"
+    },
+    {
+      "path": "n3d_qa/tools/snapshot_triviaqa_sha256.py",
+      "description": "零回归快照工具（只读 checkpoints/triviaqa/）：枚举全部 .npz 产物的（相对路径、字节数、SHA256）写入 checkpoints/qa_learn/_snapshot/triviaqa_npz_sha256.json；--check 与快照逐条比对，输出新增/消失/变化三类差异，一致时打印逐位一致结论。用于证明本轮增量扩展未改动既有 TriviaQA 产物字节（实测 189 条快照全部一致，含 8 个正式产物）。"
+    },
+    {
+      "path": "n3d_qa/tools/recon_math1_doc.py",
+      "description": "现场复核调查工具（只读、输出全打到 stdout）：逐文件打印 Math1 八文件的路径/字节数/记录数、首条记录的实际键集合与字段类型、choices 长度分布、答案原始/归一化后类数与频次分布、各频次阈值（2/3/5/10）下的类数与覆盖率；并统计 data/doc 四文件的物理行数、非空行数、总字符数、汉字与 ASCII 占比及示例行。用于「禁止凭记忆手写字段名与数字」的现场取证（实测：八文件 37,639 条、键集合八文件一致、data/doc 非空行 2,665）。"
+    }
+  ]
+}

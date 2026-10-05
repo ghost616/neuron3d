@@ -1,0 +1,13 @@
+## 专长
+- 大型问答数据集的归档级流式处理：tar.gz 顺序扫描 + 按需抽取（从不整包解压）、归档 SHA256 守卫、成员索引缓存
+- 官方 QA JSON 解析：把问答记录规范化为统一契约（question_id / question / answer_values / answer_patterns / doc_members），文档引用经文件名级映射定位到可读文本
+- 答案匹配：大小写不敏感 + 词边界 + 别名合并（含 Unicode 折叠与短数字答案保护），全部确定性、不消耗全局 RNG
+- 文本特征：确定性哈希词袋（blake2b 64bit 落桶 + L2 归一化）、IDF/TF-IDF 加权覆盖率、问题-文档重叠与长度特征
+- N3D 数据契约：产出 X[M,D] float32 / y[M] int64 的 npz（键 X/y/meta），逐字节确定性落盘（自写 zip、固定时间戳）
+
+## 其他约定
+- 本模块是**通用 QA 数据集处理模块**，面向「任意问答数据集 → N3D 数组格式」；**当前内置 TriviaQA**（证据段落二分类，参考实现）
+- 新增数据集应以 **adapter** 形式挂入（输入解析 / 文档定位 / 答案合并 / split 表），共用特征层与 npz 落盘层；不得把新数据集的格式假设混入通用层
+- 不注入随机性到全局 RNG；所有采样由显式 seed 驱动；同参数重复构建必须逐字节一致
+- 每个数据集的口径（来源成员、映射规则、标签规则、特征定义、维度）必须写入产物 meta 并可回读校验
+- 不导入、不修改 n3d_proto / n3d_sphere / n3d_shape / n3d_viz / framework 的任何源码（只读导入 n3d_shape.data.load_npz_arrays 用于契约校验）

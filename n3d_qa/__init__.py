@@ -22,10 +22,37 @@ TriviaQA 口径；后续 QA 数据集按 adapter 挂入（输入解析 / 文档�
 * :mod:`n3d_qa.verify_dataset`：产物契约 / 幂等 / 标签均衡 / 无泄漏 / 端到端训练验证
   （E0–E8；E7 为 rich 特征判别力 5 折 CV，E8 为 verified 与 dev 的 QuestionId 交集为 0）。
 
+增量扩展（中文口径，与上述 TriviaQA 口径**并存且互不影响**）
+------------------------------------------------------------
+* :mod:`n3d_qa.zh_features`：**中文文本特征口径**（字符级 1/2/3-gram 哈希词袋 + 6 列覆盖度/
+  长度特征）。复用既有 blake2b 落桶与 L2 归一化口径，不消耗全局 RNG；口径参数（n-gram 阶数、
+  每阶桶数、盐、归一化方式、分词规则）全部写入产物 meta 并折叠为单一 ``spec_hash``。
+  修掉了既有英文口径 ``TOKEN_RE = [a-z0-9]+`` 对中文**丢掉全部字符**（词袋恒全零）的阻塞项。
+* :mod:`n3d_qa.adapters`：数据集 adapter（Math1 八文件 QA 解析 / ``data/doc`` 文本行切分 /
+  答案归一化 / 跨任务统一答案表 / 负样本采样 / 库-查询留出集划分）。
+* :mod:`n3d_qa.build_qa`：新增产物构建（QA 匹配任务 5 个 + ``all`` 合并 + 文本行产物），
+  落 ``checkpoints/qa_learn/dataset/``：npz（``X[M,D] float32`` / ``y[M] int64`` / ``meta``，
+  复用 :func:`n3d_qa.build_dataset.save_npz_deterministic` 的确定性 zip）+ 文本侧 JSONL
+  （问答对 / 文本行表 / 行表索引 / 统一答案表）+ ``manifest.json``（逐文件 SHA256）。
+* :mod:`n3d_qa.probe_zh`：中文判别力探针（硬门禁；用 :mod:`n3d_qa.verify_dataset` 的 E7 同口径
+  5 折 CV）与逐桶数扫描，读数如实打印。
+* :mod:`n3d_qa.verify_qa`：新增产物验证（F0–F9：口径回读 / 向量化确定性 / 产物契约 /
+  逐字节幂等 / 文本侧可回读 / 行级重算 / 答案表一致 / 剔除登记 / 库查询无交集 / 零回归）。
+
 本包**不导入、不修改** n3d_proto / n3d_sphere / n3d_shape / n3d_viz / framework 的任何代码
-（:mod:`verify_dataset` 只**只读**导入 ``n3d_shape.data.load_npz_arrays`` 判定产物契约）。
+（:mod:`verify_dataset` 与 :mod:`verify_qa` 只**只读**导入 ``n3d_shape.data.load_npz_arrays``
+判定产物契约）。
 """
 
 from __future__ import annotations
 
-__all__ = ["build_dataset", "verify_dataset"]
+__all__ = [
+    "build_dataset",
+    "verify_dataset",
+    "zh_features",
+    "adapters",
+    "build_qa",
+    "probe_zh",
+    "verify_qa",
+]
+
