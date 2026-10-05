@@ -1,0 +1,352 @@
+"""n3d_qa_learn 表示训练对照实验的 CLI 入口。
+
+用法
+----
+* ``python -m n3d_qa_learn.exp_repr_run drill``
+  单条端到端演练：基线组 **1 个 epoch**，断言「可训参数更新量 > 0」，
+  并与 ``train.run_training``（``save=False``）**逐项对账**，证明本实验的训练循环
+  与模块自带循环同构（等价性检查，不是"看起来跑了"）。
+* ``python -m n3d_qa_learn.exp_repr_run run``
+  放全量对照矩阵（8 组），执行切分一致性断言，写报告到
+  ``checkpoints/qa_learn/_verify/exp_repr/``。
+* ``python -m n3d_qa_learn.exp_repr_run summary``
+  读取已落盘报告并打印逐组摘要表。
+
+退出码
+------
+``0`` 成功；``1`` 业务失败（门禁未通过 / 切分不一致 / 报告缺失）；``2`` 参数错误。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from typing import Any, Dict, List, Optional, Sequence
+
+# 控制台编码加固：源码与运行日志含中文，GBK 控制台下必须显式重配
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - 老环境无 reconfigure 时忽略
+        pass
+
+from . import exp_repr
+from .evaluate import evaluate_refusal, evaluate_step1
+from .train import TrainConfig, run_training
+
+
+class Logger:
+    """同时写 stdout 与 UTF-8（无 BOM）日志文件的极简 tee（禁用 PS 的 Tee-Object）。"""
+
+    def __init__(self, path: str = "") -> None:
+        self.path = str(path)
+        if self.path:
+            parent = os.path.dirname(os.path.abspath(self.path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        self.handle = (
+            open(self.path, "w", encoding="utf-8", newline="\n") if self.path else None
+        )
+
+    def log(self, message: str) -> None:
+        """打印一行并（若配置了日志文件）追加落盘。"""
+        print(message)
+        if self.handle is not None:
+            self.handle.write(message + "\n")
+            self.handle.flush()
+
+    def close(self) -> None:
+        """关闭日志文件（幂等）。"""
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
+def _dump(obj: Any) -> None:
+    """以 UTF-8 安全的 JSON 打印。"""
+    print(json.dumps(obj, ensure_ascii=False, indent=1, default=str))
+
+
+def _kwargs(args: argparse.Namespace, *, epochs: int) -> Dict[str, Any]:
+    """把 CLI 参数映射为 run_group 的关键字参数。"""
+    return {
+        "split_seed": int(args.split_seed),
+        "train_seed": int(args.train_seed),
+        "epochs": int(epochs),
+        "batch_size": int(args.batch_size),
+        "lr": float(args.lr),
+        "backbone_lr": float(args.backbone_lr),
+        "logit_scale_init": float(args.logit_scale_init),
+        "unknown_train_cap": int(args.unknown_train_cap),
+        "max_classes": int(args.max_classes),
+        "min_questions": int(args.min_questions),
+        "test_every": int(args.test_every),
+        "test_per_class": int(args.test_per_class),
+        "stage1_epochs": int(args.stage1_epochs),
+        "stage2_epochs": int(args.stage2_epochs),
+        "qa_cache_dir": str(args.qa_cache_dir),
+        "text_dir": str(args.text_dir),
+    }
+
+
+def cmd_drill(args: argparse.Namespace) -> int:
+    """单条端到端演练（1 组 1 epoch）+ 与模块自带训练循环的等价性对账。
+
+    **epochs 口径（审查收口，皋陶 info —— 口径必须显式标注）**：本子命令的
+    ``epochs`` **硬编码为 1**（``_kwargs(args, epochs=1)``），且 ``--epochs``
+    **不在** ``drill`` 的参数表内（它只属于 ``run``）。保留硬编码而非暴露
+    ``--epochs`` 的理由：``drill`` 的职责是"通路是否成立 + 与 ``run_training``
+    是否逐位等价"这条**门槛**，多 epoch 会同时放大运行时间与"看起来跑了"的
+    误导空间；矩阵档的 epoch 预算由 ``run --epochs`` 提供（现场实测 40，
+    ``C2``/``C3`` 为 ``stage1 30 + stage2 10``）。为避免把演练档误读为矩阵档，
+    该口径同时打印在运行日志首行与 ``--help`` 文本中。
+    """
+    logger = Logger(str(args.log_file))
+    try:
+        group = exp_repr.group_by_name(str(args.group))
+        kwargs = _kwargs(args, epochs=1)
+        t0 = time.time()
+        logger.log(
+            f"[drill] 组 = {group.name}，"
+            f"epochs = 1（演练口径，非矩阵档；矩阵档见 `run --epochs`），"
+            f"split_seed = {kwargs['split_seed']}"
+        )
+        res = exp_repr.run_group(group, **kwargs)
+        logger.log(f"[drill] 本实验循环完成（{time.time() - t0:.1f}s）")
+        logger.log("[drill] 门禁：可训参数 = " + repr(res["gate"]["trainable_params"]))
+        logger.log(
+            "[drill] 门禁：更新量 L2 = {:.6e}，更新参数 {} 个 -> {}".format(
+                res["gate"]["total_update_l2"], res["gate"]["n_updated_params"],
+                "PASS" if res["gate"]["passed"] else "FAIL",
+            )
+        )
+        if not res["gate"]["passed"]:
+            print("[FAIL] 门禁未通过：可训参数的更新量不大于 0", file=sys.stderr)
+            return 1
+
+        # ---- 等价性对账：同一配置跑模块自带训练循环（save=False，不落盘） ----
+        # build_group_config 只负责「组定义 -> TrainConfig」，不认识阶段划分参数，
+        # 故显式剔除这两个键，避免把实验编排参数泄漏进配置装配。
+        cfg_kwargs = {k: v for k, v in kwargs.items()
+                      if k not in ("stage1_epochs", "stage2_epochs")}
+        cfg = exp_repr.build_group_config(group, **cfg_kwargs)
+        ref = run_training(cfg, max_batches=0, artifact_path="", save=False)
+        ref_metrics = evaluate_step1(ref.model, ref.data, k=3, device=ref.device)
+        ref_refusal = evaluate_refusal(ref.model, ref.data, device=ref.device)
+        mine = res["metric_step1"]
+        checks: List[Dict[str, Any]] = [
+            {"item": "final_loss", "mine": float(res["history"][-1]["loss"]),
+             "reference": float(ref.final_loss())},
+            {"item": "top1_acc", "mine": float(mine["top1_acc"]),
+             "reference": float(ref_metrics.top1_acc)},
+            {"item": "macro_acc", "mine": float(mine["macro_acc"]),
+             "reference": float(ref_metrics.macro_acc)},
+            {"item": "refusal_rate", "mine": float(res["refusal"]["refusal_rate"]),
+             "reference": float(ref_refusal["refusal_rate"])},
+            {"item": "logit_scale_after", "mine": float(res["shifts"]["logit_scale_after"]),
+             "reference": float(ref.model.logit_scale.detach().item())},
+        ]
+        for row in checks:
+            row["match"] = bool(abs(float(row["mine"]) - float(row["reference"])) <= 1e-9)
+        all_match = bool(all(row["match"] for row in checks))
+        _dump({
+            "group": group.as_dict(),
+            "split": res["split"],
+            "split_seed_effective": res["split_seed_effective"],
+            "train_seed_effective": res["train_seed_effective"],
+            "gate": res["gate"],
+            "ungrouped_trainable_names": res["ungrouped_trainable_names"],
+            "geo": res["geo"],
+            "metric_step1": mine,
+            "refusal": res["refusal"],
+            "shifts": res["shifts"],
+            "equivalence_with_run_training": {"checks": checks, "all_match": all_match},
+        })
+        out_dir = str(args.out_dir) if args.out_dir else exp_repr.EXP_REPR_DIR
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "drill.json"), "w", encoding="utf-8",
+                  newline="\n") as handle:
+            handle.write(json.dumps(
+                {"group": group.as_dict(), "gate": res["gate"],
+                 "ungrouped_trainable_names": res["ungrouped_trainable_names"],
+                 "geo": res["geo"], "metric_step1": mine, "refusal": res["refusal"],
+                 "shifts": res["shifts"],
+                 "equivalence_with_run_training": {"checks": checks,
+                                                   "all_match": all_match}},
+                ensure_ascii=False, indent=1, default=str))
+        if not all_match:
+            print("[FAIL] 与 run_training 的等价性对账不一致", file=sys.stderr)
+            return 1
+        logger.log(
+            "[OK] drill 通过：1 组 1 epoch 通路成立，门禁 PASS，"
+            "且与 run_training(save=False) 的 5 项训练后量逐位一致"
+        )
+        return 0
+    except Exception as exc:  # noqa: BLE001 - 演练失败必须退码 1 并给出原因
+        print(f"[FAIL] drill 失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        logger.close()
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """放全量对照矩阵，执行切分一致性断言并写报告。"""
+    logger = Logger(str(args.log_file))
+    try:
+        names = [s for s in str(args.groups).split(",") if s.strip()] if args.groups else None
+        kwargs = _kwargs(args, epochs=int(args.epochs))
+        t0 = time.time()
+        logger.log(
+            "[run] 组 = " + repr(names if names else [g.name for g in exp_repr.MATRIX])
+        )
+        logger.log(
+            "[run] 固定切分：split_seed={split_seed}；训练 seed={train_seed}；"
+            "epochs={epochs}；batch_size={batch_size}".format(**kwargs)
+        )
+        report = exp_repr.run_experiment(
+            group_names=names, progress=logger.log, **kwargs
+        )
+        logger.log(f"[run] 全部组完成（{time.time() - t0:.1f}s）")
+        logger.log("[run] 切分一致性断言：通过（qid 有序序列逐位相同）")
+        out_dir = str(args.out_dir) if args.out_dir else exp_repr.EXP_REPR_DIR
+        paths = exp_repr.write_report(report, out_dir)
+        logger.log(f"[run] 报告：{paths['json']}")
+        logger.log(f"[run] 报告：{paths['markdown']}")
+        _dump({"summary": exp_repr.summarize(report),
+               "anchor_comparison": report["anchor_comparison"],
+               "split_identical": report["split_identical"]})
+        failed = [r["group"]["name"] for r in report["groups"] if not r["gate"]["passed"]]
+        if failed:
+            logger.log(f"[FAIL] 以下组门禁未通过（结果判无效）：{failed}")
+            return 1
+        logger.log("[OK] run 完成：全部组门禁 PASS，切分一致性断言通过")
+        return 0
+    except KeyError as exc:
+        # 未知组名：给出可读原因与可用组名列表，避免只抛裸 KeyError
+        print(f"[FAIL] run 失败：组名不可用 —— {exc}", file=sys.stderr)
+        print(
+            f"[INFO] 可用组名 = {[g.name for g in exp_repr.MATRIX]}",
+            file=sys.stderr,
+        )
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"[FAIL] run 失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        logger.close()
+
+
+def cmd_summary(args: argparse.Namespace) -> int:
+    """读取已落盘报告并打印逐组摘要。"""
+    logger = Logger(str(args.log_file))
+    try:
+        # 报告缺失时给出可读原因（不向 stderr 抛全量 traceback），退码 1
+        report = exp_repr.load_report(str(args.report))
+        rows = exp_repr.summarize(report)
+        logger.log(
+            "| 组 | freeze_scope | head_input_mode | loss_mode | gap | σ(within) | gap/σ | "
+            "1-NN(raw) | 1-NN(repr) | macro | top1 | refusal | q 位移 | 答案表位移 | "
+            "argmax 变化率 | 门禁 |"
+        )
+        logger.log(
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | "
+            "--- | --- | --- | --- |"
+        )
+        for row in rows:
+            logger.log(
+                "| {group} | {freeze_scope} | {head_input_mode} | {loss_mode} | "
+                "{gap:.4f} | {sigma:.4f} | {gap_over_sigma:.4f} | {nn1_top1_raw:.4f} | "
+                "{nn1_top1_repr:.4f} | {macro_acc:.4f} | {top1_acc:.4f} | "
+                "{refusal_rate:.4f} | {q_shift_mean_l2:.4e} | "
+                "{answer_table_shift_l2:.4e} | {argmax_changed_frac:.4f} | {gate} |".format(
+                    gate="PASS" if row["gate_passed"] else "**FAIL**", **row
+                )
+            )
+        comp = report.get("anchor_comparison")
+        if comp:
+            logger.log("")
+            logger.log("锚点对账（基线组）：全部落在容差内 = "
+                       + ("是" if comp["all_within_tolerance"] else "否"))
+            for r in comp["rows"]:
+                logger.log(
+                    "  - {metric}: 锚点 {anchor:.4f} vs 实测 {measured:.4f} "
+                    "(偏差 {delta:+.4f}, 容差 {tolerance:.4f})".format(**r)
+                )
+        return 0
+    except FileNotFoundError as exc:
+        print(f"[FAIL] summary 失败：报告缺失 —— {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"[FAIL] summary 失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        logger.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """构造 CLI 解析器。"""
+    parser = argparse.ArgumentParser(
+        prog="n3d_qa_learn.exp_repr_run",
+        description="n3d_qa_learn 表示训练对照实验（只写 checkpoints/qa_learn/_verify/exp_repr/）",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_common(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--split-seed", type=int, default=exp_repr.BASE_SPLIT_SEED,
+                       help="切分种子（与训练种子分离；所有组共用同一份切分）")
+        p.add_argument("--train-seed", type=int, default=exp_repr.BASE_TRAIN_SEED)
+        p.add_argument("--batch-size", type=int, default=exp_repr.BASE_BATCH_SIZE)
+        p.add_argument("--lr", type=float, default=exp_repr.BASE_LR)
+        p.add_argument("--backbone-lr", type=float, default=exp_repr.BASE_BACKBONE_LR)
+        p.add_argument("--logit-scale-init", type=float, default=exp_repr.BASE_LOGIT_SCALE_INIT)
+        p.add_argument("--unknown-train-cap", type=int, default=exp_repr.BASE_UNKNOWN_TRAIN_CAP)
+        p.add_argument("--max-classes", type=int, default=exp_repr.BASE_MAX_CLASSES)
+        p.add_argument("--min-questions", type=int, default=exp_repr.BASE_MIN_QUESTIONS)
+        p.add_argument("--test-every", type=int, default=exp_repr.BASE_TEST_EVERY)
+        p.add_argument("--test-per-class", type=int, default=exp_repr.BASE_TEST_PER_CLASS)
+        p.add_argument("--stage1-epochs", type=int, default=exp_repr.STAGE1_EPOCHS)
+        p.add_argument("--stage2-epochs", type=int, default=exp_repr.STAGE2_EPOCHS)
+        p.add_argument("--qa-cache-dir", type=str, default="checkpoints/triviaqa/_cache")
+        p.add_argument("--text-dir", type=str, default="data/doc")
+        p.add_argument("--out-dir", type=str, default="", help="输出目录（默认验证目录）")
+        p.add_argument("--log-file", type=str, default="", help="UTF-8 无 BOM 日志文件")
+
+    p = sub.add_parser(
+        "drill",
+        help="单条端到端演练（1 组 1 epoch + 等价性对账）",
+        description=(
+            "单条端到端演练：固定 epochs = 1（演练口径，非矩阵档），"
+            "断言门禁并 train.run_training(save=False) 逐项对账。"
+            "本子命令不提供 --epochs；矩阵档的 epoch 预算请用 `run --epochs`。"
+        ),
+    )
+    add_common(p)
+    p.add_argument("--group", type=str, default=exp_repr.BASELINE_GROUP)
+    p.set_defaults(func=cmd_drill)
+
+    p = sub.add_parser("run", help="全量对照矩阵")
+    add_common(p)
+    p.add_argument("--epochs", type=int, default=exp_repr.BASE_EPOCHS)
+    p.add_argument("--groups", type=str, default="",
+                   help="逗号分隔的组名子集（空 = 全部 8 组）")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("summary", help="打印已落盘报告的摘要表")
+    p.add_argument("--report", type=str, default="", help="报告 JSON 路径")
+    p.add_argument("--log-file", type=str, default="")
+    p.set_defaults(func=cmd_summary)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """CLI 入口（返回进程退出码）。"""
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -15,7 +15,7 @@
     },
     {
       "path": "n3d_qa_learn/__init__.py",
-      "description": "包声明与模块定位：n3d_qa_learn 是 N3D 问答学习框架（固定三级业务路由：QA 数据集 top-1 命中 -> 文本数据集匹配 -> 无匹配；命中判定 = 输出「不相关」类即视为未命中）。列出对外能力（features / backends / heads / data / route / train / probe / evaluate / cli）与上游边界（只读 import n3d_shape / n3d_sphere / n3d_proto 的 model 与 config，只读读取 n3d_qa 已落盘的 QA JSON 缓存；不修改任何上游源码、产物与 current_spec.md；产物写 checkpoints/qa_learn/，验证类写其 _verify/ 子目录）。"
+      "description": "包声明与模块定位：n3d_qa_learn 是 N3D 问答学习框架（固定三级业务路由：QA 数据集 top-1 命中 -> 文本数据集匹配 -> 无匹配；命中判定 = 输出「不相关」类即视为未命中）。列出对外能力（features / backends / heads / data / route / train / probe / evaluate / exp_repr / exp_repr_run / cli）与上游边界（只读 import n3d_shape / n3d_sphere / n3d_proto 的 model 与 config，只读读取 n3d_qa 已落盘的 QA JSON 缓存；不修改任何上游源码、产物与 current_spec.md；产物写 checkpoints/qa_learn/，验证类写其 _verify/ 子目录）。"
     },
     {
       "path": "n3d_qa_learn/features.py",
@@ -39,7 +39,7 @@
     },
     {
       "path": "n3d_qa_learn/train.py",
-      "description": "自建训练循环、确定性产物落盘与加载守卫。TrainConfig 汇集数据装配与训练配置（backend / output_mode / epochs / batch_size / lr / weight_decay / seed / max_classes / min_questions / test_every / test_per_class / unknown_class_weight / unknown_train_cap / label_smoothing / max_train_samples / text_threshold / train_backbone / train_head / backbone_lr / head_input_mode / logit_scale_init / learn_logit_scale / answer_table_mode）。build_training_data 组装数据；run_training 执行训练（centroid 口径答案表由训练样本逐类质心确定性写入、按需冻结 q 头或后端、两个 param group 的 lr、逐样本权重交叉熵、限批模式、loss 有限性契约）；build_meta / answer_table_sha256 产出含 D 落点与两道指纹的 meta；build_artifact_bytes 自写 zip（meta.json + model_state_dict.pt + answer_table.pt，固定 1980-01-01 时间戳，同参数逐字节一致）；load_artifact 执行答案表指纹与向量化口径指纹两道守卫；rebuild_model 按 meta 严格重建并载入。"
+      "description": "自建训练循环、确定性产物落盘与加载守卫。TrainConfig 汇集数据装配与训练配置（backend / output_mode / epochs / batch_size / lr / weight_decay / seed / split_seed / max_classes / min_questions / test_every / test_per_class / unknown_class_weight / unknown_train_cap / label_smoothing / max_train_samples / text_threshold / train_backbone / train_head / backbone_lr / head_input_mode / logit_scale_init / learn_logit_scale / answer_table_mode）；其中 split_seed 是**切分种子**（-1 = 沿用 seed，即历史行为逐位不变），由模块级函数 split_seed_of(cfg) 唯一取用，使「固定切分 + 多训练 seed」可表达。build_training_data 组装数据（切分种子取自 split_seed_of）；run_training 执行训练（centroid 口径答案表由训练样本逐类质心确定性写入、按需冻结 q 头或后端、两个 param group 的 lr、逐样本权重交叉熵、限批模式、loss 有限性契约）；build_meta / answer_table_sha256 产出含 D 落点与两道指纹的 meta；artifact_name 生成防撞名文件名（仅在 split_seed >= 0 时追加 _sp<k> 后缀，默认档文件名逐字不变）；build_artifact_bytes 自写 zip（meta.json + model_state_dict.pt + answer_table.pt，固定 1980-01-01 时间戳）；load_artifact 执行答案表指纹与向量化口径指纹两道守卫；rebuild_model 按 meta 严格重建并载入。"
     },
     {
       "path": "n3d_qa_learn/probe.py",
@@ -51,11 +51,23 @@
     },
     {
       "path": "n3d_qa_learn/cli.py",
-      "description": "纯 CLI 入口（python -m n3d_qa_learn.cli <子命令>）：probe（P0 探针）/ drill（端到端演练）/ train（训练 + 步骤 1 与不相关评估 + 落盘 + 报告）/ ask（--question 单次问答，输出 答案 / 匹配行 / 无匹配 + 来源 + 分数）/ eval（既有产物评估）/ guard（加载守卫拒绝证明）/ selftest（边界处置自检）。全局开关 --output-mode {index,pointer}（全局一个、不做级联），含 --hash-dim / --dim / 数据装配与训练超参 / --artifact / --verify（写 _verify 子目录）等参数；入口显式把 stdout/stderr 重配为 UTF-8 以适配 GBK 控制台；退出码 0 成功 / 1 业务失败 / 2 参数错误。"
+      "description": "纯 CLI 入口（python -m n3d_qa_learn.cli <子命令>）：probe（P0 探针）/ drill（端到端演练）/ train（训练 + 步骤 1 与不相关评估 + 落盘 + 报告）/ ask（--question 单次问答，输出 答案 / 匹配行 / 无匹配 + 来源 + 分数）/ eval（既有产物评估，以 .get(\"split_seed\", -1) 向后兼容读取旧产物）/ guard（加载守卫拒绝证明）/ selftest（边界处置自检）。全局开关 --output-mode {index,pointer}（全局一个、不做级联），含 --hash-dim / --dim / --split-seed（切分种子，默认 -1 = 沿用 --seed）/ 数据装配与训练超参 / --artifact / --verify（写 _verify 子目录）等参数；产物命名统一走 train.artifact_name 避免两处口径分叉；入口显式把 stdout/stderr 重配为 UTF-8 以适配 GBK 控制台；退出码 0 成功 / 1 业务失败 / 2 参数错误。"
     },
     {
       "path": "n3d_qa_learn/README.md",
-      "description": "模块说明文档（步骤 1 骨架）：业务逻辑固定三级路由表、模块构成与零新依赖声明、连接契约代理层职责边界与三后端 D 连接口径实测表（含 n3d_shape 必须 dataset='npz'、K 需现场去重计数两条易错约束）、三后端可区分性断言与 n3d_shape/n3d_sphere 数值同构的如实披露、两种候选打分实现对照表与候选键表两种来源口径、实测与口径标定（为何默认 head_input_mode=raw / train_head=False / answer_table_mode=centroid）、步骤 1 三 seed 实测表（macro 0.30/0.20/0.10，均值恰等门槛、未稳定通过）、指针模式实测与不可用原因、边界处置表、产物与两道加载守卫拒绝证明表、CLI 用法与三种真实输出、验收命令实测结果表、上游改动归属披露（n3d_qa 与 checkpoints/qa_learn 顶层的改动来自并行会话）与已声明限制清单。"
+      "description": "模块说明文档（步骤 1 骨架 + 步骤 2 交叉引用 + 依赖边界 + 表示训练对照实验）。内容：业务逻辑固定三级路由表、模块构成与零新依赖声明、连接契约代理层职责边界与三后端 D 连接口径实测表（含 n3d_shape 必须 dataset='npz'、K 需现场去重计数两条易错约束）、三后端可区分性断言与 n3d_shape/n3d_sphere 数值同构的如实披露、两种候选打分实现对照表与候选键表两种来源口径、实测与口径标定（为何默认 head_input_mode=raw / train_head=False / answer_table_mode=centroid）、步骤 1 三 seed 实测表（macro 0.30/0.20/0.10，均值恰等门槛、未稳定通过）、指针模式实测与不可用原因、边界处置表、产物与两道加载守卫拒绝证明表、CLI 用法与三种真实输出、验收命令实测结果表、上游改动归属披露与已声明限制清单；第十一节登记模块级依赖边界（requirements-qa.txt 为唯一落点、根 requirements.txt 属 framework 管辖、「零新依赖」表述不得外推到数据/特征层）；第十二节登记表示训练对照实验（切分/训练 seed 分离与开关有效性实测、固定切分断言、8 组矩阵与指标口径、基线锚点对账与容差现场标定、全矩阵实测数字、逐 epoch 根因诊断与否证结论、门禁明细与两条结构事实、换特征 vs 打开训练的归因分离、目标修法负结果、风险与边界、命令实测、后续方向）。"
+    },
+    {
+      "path": "n3d_qa_learn/exp_repr.py",
+      "description": "表示训练对照实验核心（只读消费上游，不落盘任何 zip 产物）。含 ReprGroup 组定义与 8 组对照矩阵 MATRIX（维度 a 冻结范围 logit_only/head/head_backbone、维度 b 头输入口径 raw/concat/n3d、维度 c 目标修法 ce/no_irr_centroid/staged/supcon）与 DIMENSIONS 维度结构描述；切分一致性断言 split_qids / assert_same_split（四子集 qid 有序序列逐位相同，不一致即该对照判无效）；build_group_config 把组定义装配成 TrainConfig（连接参数唯一来源仍是 backends 代理层）；损失口径 supcon_loss（同答案问题为正样本、批内构造、温度 0.07 冻结、不相关样本不参与）与 batch_loss（ce / ce_masked / supcon 分派）；setup_answer_table（centroid 口径 + no_irr_centroid 的末位置零）；apply_freeze / make_optimizer（冻结口径与 run_training 同构；参数名以 model.named_parameters() 现场命名为唯一来源并用 id 映射，防名字口径不一致）与 ungrouped_trainable_names；param_deltas / update_gate（可训参数更新量 > 0 门禁，含 names_consistent、never_updated_params、missing_from_snapshot）；representation_geometry（池 = train_known+test_known 的 within/cross/gap/σ/gap_over_sigma 与 1-NN(raw)/1-NN(repr)/最近类质心 top-1，转导诊断量）；epoch_diagnostics（逐 epoch 记录 cos(q,不相关键)、cos(q,金标类质心)、cos(q,冻结参考方向)、训练侧拒绝占比与 known top-1）；phase_plan / run_group（与 run_training 同构的自建多阶段训练循环，含训练前快照与 q/答案表/argmax 位移量、类别不平衡权重质量）；run_experiment（顺序跑矩阵 + 切分断言 + 进度回调）；anchor_comparison（与风后锚点逐项对账，容差显式）；summarize / render_markdown / write_report / load_report（报告落 _verify/exp_repr/）。冻结常量：EXP_REPR_DIR / FREEZE_SCOPES / LOSS_MODES / SUPCON_TEMPERATURE / STAGE1_EPOCHS / STAGE2_EPOCHS / BASE_* 基线档口径 / ANCHOR / ANCHOR_TOL / MATRIX / DIMENSIONS / BASELINE_GROUP / ALLOWED_UNGROUPED_TRAINABLE。"
+    },
+    {
+      "path": "n3d_qa_learn/exp_repr_run.py",
+      "description": "表示训练对照实验 CLI 入口（python -m n3d_qa_learn.exp_repr_run {drill|run|summary}）。drill：基线组 1 个 epoch 的端到端演练，断言「可训参数更新量 > 0」门禁，并与 train.run_training(save=False) 的 5 项训练后量（final_loss / top1_acc / macro_acc / refusal_rate / logit_scale）逐位对账（等价性检查）；run：放全量 8 组对照矩阵，执行切分一致性断言并写 exp_repr_report.json / .md；summary：读取已落盘报告打印逐组摘要表与锚点对账。含 Logger（stdout + UTF-8 无 BOM 日志文件，禁用 PowerShell Tee-Object）与 --split-seed / --train-seed / 数据装配与训练超参 / --groups / --out-dir / --log-file 开关；退出码 0 成功 / 1 业务失败（门禁未通过 / 切分不一致 / 报告缺失） / 2 参数错误。所有输出只写 checkpoints/qa_learn/_verify/exp_repr/。"
+    },
+    {
+      "path": "n3d_qa_learn/requirements-qa.txt",
+      "description": "n3d_qa_learn 的模块级依赖清单（口径声明文件，不被任何脚本以 pip -r 执行）。声明三条口径：① 本模块当前零新依赖（仅 torch / numpy 与标准库）；② 后续新增依赖一律写入本文件，不写入仓库根 requirements.txt（根文件属 framework 模块管辖，内容为 N3D 一期原型的 torch / torchvision / numpy 清单）；③ 现场实测运行时版本 python 3.12.10 / torch 2.14.0+cpu / numpy 2.5.3。并如实说明：features.py / train.py 与上游 n3d_qa/zh_features.py 中的「零新依赖」表述源自本项目对 N3D 核心与 n3d_viz 的约束，不应默认外推到数据层/特征层。"
     }
   ]
 }

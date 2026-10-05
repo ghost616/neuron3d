@@ -49,6 +49,7 @@ from .train import (
     DEFAULT_ARTIFACT_DIR,
     DEFAULT_VERIFY_DIR,
     TrainConfig,
+    artifact_name,
     build_training_data,
     load_artifact,
     rebuild_model,
@@ -114,6 +115,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
         seed=int(args.seed),
+        split_seed=int(args.split_seed),
         max_classes=int(args.max_classes),
         min_questions=int(args.min_questions),
         test_every=int(args.test_every),
@@ -135,8 +137,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     )
     out_dir = DEFAULT_VERIFY_DIR if args.verify else DEFAULT_ARTIFACT_DIR
     artifact = str(args.artifact) if args.artifact else os.path.join(
-        out_dir, f"qa_{cfg.backend}_{cfg.output_mode}_D{VectorizerConfig(hash_dim=int(args.hash_dim)).dim}"
-                 f"_C{cfg.max_classes}_mq{cfg.min_questions}_s{cfg.seed}.pt.zip"
+        out_dir, artifact_name(cfg, VectorizerConfig(hash_dim=int(args.hash_dim)).dim)
     )
     t0 = time.time()
     result = run_training(cfg, max_batches=int(args.max_batches), artifact_path=artifact)
@@ -257,6 +258,8 @@ def cmd_eval(args: argparse.Namespace) -> int:
         test_every=int(meta["train_config"]["test_every"]),
         test_per_class=int(meta["train_config"].get("test_per_class", 0)),
         seed=int(meta["train_config"]["seed"]),
+        # 切分种子的**向后兼容读取**：旧产物 meta 无该键 -> -1 -> 沿用 seed（历史行为）
+        split_seed=int(meta["train_config"].get("split_seed", -1)),
         qa_cache_dir=str(meta["train_config"]["qa_cache_dir"]),
         text_dir=str(meta["train_config"]["text_dir"]),
     )
@@ -363,6 +366,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=5e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--split-seed", type=int, default=-1,
+                   help="切分种子（-1 = 沿用 --seed，即历史行为）；"
+                        "置为 >= 0 时切分只由它驱动，训练仍由 --seed 驱动")
     p.add_argument("--max-classes", type=int, default=8)
     p.add_argument("--min-questions", type=int, default=8)
     p.add_argument("--test-every", type=int, default=3)

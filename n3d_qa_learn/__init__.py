@@ -20,6 +20,10 @@
 * :mod:`n3d_qa_learn.train`：自建训练循环、确定性产物落盘、加载守卫；
 * :mod:`n3d_qa_learn.probe`：P0 探针与单条端到端演练（硬门禁）；
 * :mod:`n3d_qa_learn.evaluate`：步骤 1 评估协议、守卫拒绝证明、边界处置自检；
+* :mod:`n3d_qa_learn.exp_repr`：**表示训练对照实验**（gap/σ 与 1-NN 指标、冻结范围 /
+  头输入口径 / 目标修法三维对照、逐 epoch 退化诊断、可训参数更新量门禁）；
+* :mod:`n3d_qa_learn.exp_repr_run`：对照实验 CLI（``drill`` / ``run`` / ``summary``，
+  只写 ``checkpoints/qa_learn/_verify/exp_repr/``）；
 * :mod:`n3d_qa_learn.cli`：纯 CLI 入口（``probe`` / ``drill`` / ``train`` / ``ask`` /
   ``eval`` / ``guard`` / ``selftest``）。
 
@@ -42,6 +46,8 @@ __all__ = [
     "train",
     "probe",
     "evaluate",
+    "exp_repr",
+    "exp_repr_run",
     "cli",
 ]
 

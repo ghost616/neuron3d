@@ -93,6 +93,10 @@ class TrainConfig:
     epochs / batch_size / lr / weight_decay : 训练超参。
     seed : int
         单一随机种子（数据顺序 / 参数初始化已由局部 generator 隔离）。
+    split_seed : int
+        **切分种子**（``-1`` = 沿用 ``seed``，即历史行为，逐位不变）。置为 ``>= 0`` 时，
+        数据切分只由它驱动、训练仍由 ``seed`` 驱动 —— 这是「固定切分 + 多训练 seed」
+        这类对照实验得以表达的前提（否则切分变化会污染对照）。
     max_classes : int
         答案表类别数上限。
     min_questions : int
@@ -143,6 +147,7 @@ class TrainConfig:
     lr: float = 5e-3
     weight_decay: float = 0.0
     seed: int = 42
+    split_seed: int = -1
     max_classes: int = 8
     min_questions: int = 8
     test_every: int = 3
@@ -164,6 +169,10 @@ class TrainConfig:
             raise ValueError(f"lr 必须 > 0，当前 {self.lr}")
         if float(self.weight_decay) < 0.0:
             raise ValueError(f"weight_decay 必须 >= 0，当前 {self.weight_decay}")
+        if int(self.split_seed) < -1:
+            raise ValueError(
+                f"split_seed 必须 >= -1（-1 = 沿用 seed），当前 {self.split_seed}"
+            )
         if int(self.min_questions) < 2:
             raise ValueError(f"min_questions 必须 >= 2，当前 {self.min_questions}")
         if int(self.test_every) < 2:
@@ -195,6 +204,7 @@ class TrainConfig:
             "lr": float(self.lr),
             "weight_decay": float(self.weight_decay),
             "seed": int(self.seed),
+            "split_seed": int(self.split_seed),
             "max_classes": int(self.max_classes),
             "min_questions": int(self.min_questions),
             "test_every": int(self.test_every),
@@ -254,6 +264,22 @@ class TrainingData:
         return counts
 
 
+def split_seed_of(cfg: TrainConfig) -> int:
+    """返回**生效的切分种子**（``split_seed < 0`` 时沿用 ``seed``，即历史行为）。
+
+    参数
+    ----
+    cfg : TrainConfig
+        配置。
+
+    返回
+    ----
+    int
+        数据切分（``data._deterministic_order`` 与未知类配额截断）使用的种子。
+    """
+    return int(cfg.seed) if int(cfg.split_seed) < 0 else int(cfg.split_seed)
+
+
 def build_training_data(cfg: TrainConfig) -> TrainingData:
     """按配置装配训练数据（读 QA 缓存 -> 答案表 -> 切分 -> 文本行）。
 
@@ -274,7 +300,7 @@ def build_training_data(cfg: TrainConfig) -> TrainingData:
     splits = make_splits(
         corpus,
         test_every=int(cfg.test_every),
-        seed=int(cfg.seed),
+        seed=split_seed_of(cfg),
         unknown_train_cap=int(cfg.unknown_train_cap),
         test_per_class=int(cfg.test_per_class),
     )
@@ -710,11 +736,18 @@ def answer_table_sha256(
 
 
 def artifact_name(cfg: TrainConfig, dim: int) -> str:
-    """产物文件名（含后端 / 模式 / 维度 / 种子指纹，**防撞名**）。"""
-    return (
+    """产物文件名（含后端 / 模式 / 维度 / 种子指纹，**防撞名**）。
+
+    当 ``split_seed`` 被**显式给出**（``>= 0``）时额外附加 ``_sp<split_seed>`` 后缀；
+    默认档（``-1``）的文件名与历史**逐字不变**，避免既有产物被改名或覆盖。
+    """
+    name = (
         f"qa_{cfg.backend}_{cfg.output_mode}_D{dim}"
         f"_C{cfg.max_classes}_mq{cfg.min_questions}_s{cfg.seed}.pt.zip"
     )
+    if int(cfg.split_seed) >= 0:
+        name = f"{name[: -len('.pt.zip')]}_sp{int(cfg.split_seed)}.pt.zip"
+    return name
 
 
 def build_artifact_bytes(meta: Dict[str, Any], state_bytes: bytes, model: N3DQA) -> bytes:
@@ -902,6 +935,7 @@ __all__ = [
     "TrainingData",
     "TrainingResult",
     "set_deterministic_seed",
+    "split_seed_of",
     "build_training_data",
     "run_training",
     "build_meta",
