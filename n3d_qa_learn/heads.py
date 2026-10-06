@@ -25,6 +25,21 @@
 ``D`` 的落点
 ------------
 ``q`` 的维度恒等于 ``D``（**不是**类别数宽度）。``describe()`` 与产物 meta 必须落 ``D``。
+
+对齐机制（本轮新增，默认**关闭**）
+--------------------------------
+本模块新增两条**可选**的对齐通路，把「N3D 读出」与「编码器特征空间」显式耦合：
+
+* **机制 B（``align_mode="proj_supcon"``）**：N3D 支路接一个线性**投影头** ``D -> D``
+  （:attr:`N3DQAConfig.proj_dim` 控制开关），对齐损失 = 批内监督对比损失
+  （:func:`supcon_loss`，同答案互为正样本）；总损失 = ``ce + λ · supcon``；
+* **机制 C（``align_mode="distill"``）**：不建投影头，对齐损失 = 显式蒸馏
+  ``0.5 · [(1 - cos(n3d, 本样本编码器特征)) + (1 - cos(n3d, 本样本所属类质心))]``，
+  类质心**批内现场算、detach（不参与梯度）**；总损失 = ``ce + λ · distill``。
+
+纪律：``align_mode="off"`` 时**不创建任何模块、不消耗全局 RNG**，``query()`` 的路径与
+改动前**逐字符相同**；投影头初始化走**局部 generator**（固定种子
+:data:`PROJ_INIT_SEED`），绝不复用 ``q_head`` 的近恒等先验（那是 ``raw`` 档的先验）。
 """
 
 from __future__ import annotations
@@ -50,6 +65,28 @@ IRRELEVANT_AT_END: bool = True
 #: 答案表口径：``"centroid"``（默认，由训练样本的**逐类质心**确定性算出并归一化后固化）
 #: 或 ``"free"``（自由可学习参数）。
 ANSWER_TABLE_MODES: Tuple[str, ...] = ("centroid", "free")
+
+#: 对齐机制（全局开关；取值即口径，禁止改名）。
+#: ``off`` = 关闭（默认，逐位复现历史行为）；
+#: ``proj_supcon`` = 机制 B（投影头 + 监督对比损失）；
+#: ``distill`` = 机制 C（显式蒸馏：本样本编码器特征 + 所属类质心）。
+ALIGN_MODES: Tuple[str, ...] = ("off", "proj_supcon", "distill")
+
+#: 投影头初始化口径（唯一注册点；**都不允许近恒等**）。
+PROJ_INIT_MODES: Tuple[str, ...] = ("xavier_uniform", "orthogonal")
+
+#: 投影头初始化使用的**局部 generator 种子**（冻结常量）。
+#: 口径纪律：用局部 ``torch.Generator`` 播种，绝不消耗全局 RNG（否则会改变同一次运行里
+#: 后续所有采样，破坏对照组之间的可比性）。
+PROJ_INIT_SEED: int = 20261105
+
+#: 对齐目标（**逐项可报**；两项同时进入 ``distill`` 损失，并分别登记）。
+#: ``self_encoder_feature`` = 目标 (i)：本样本的编码器原始特征（逐样本蒸馏）；
+#: ``class_centroid`` = 目标 (ii)：本样本所属类的质心（批内现场算、detach、不参与梯度）。
+ALIGN_TARGETS: Tuple[str, ...] = ("self_encoder_feature", "class_centroid")
+
+#: 监督对比损失的温度（冻结常量；**唯一实现落点在本模块**，``exp_repr`` 只做再导出）。
+SUPCON_TEMPERATURE: float = 0.07
 
 
 @dataclass(frozen=True)
@@ -99,6 +136,22 @@ class N3DQAConfig:
         100% 而主测试集宏平均准确率掉到 ``0.09`` 量级；质心口径给出强几何先验，
         同一数据切分下实测 ``0.28`` 以上。该口径**不改变**「答案表 -> 候选键 ->
         ``q @ A^T``」的打分结构，只是把答案表的取值来源由"自由学习"改为"训练样本质心"。
+    align_mode : str
+        **对齐机制**（默认 ``"off"`` = 关闭，逐位复现历史行为）。取值见
+        :data:`ALIGN_MODES`。开启时**要求** ``head_input_mode ∈ {"concat", "n3d"}``：
+        对齐的左边是 N3D 读出，``raw`` 档下 ``adapter.features`` 根本不被调用
+        （现场实测），此时"开启对齐"只能是静默空转，故构造期直接报错。
+    align_lambda : float
+        对齐损失权重 ``λ``（总损失 = ``ce + λ · align``）。``align_mode == "off"``
+        时必须为 ``0.0``；开启时必须 ``> 0``。
+    proj_dim : int
+        **投影头宽度开关**（仅机制 B 使用）：``0`` = 关闭（默认，**不创建任何模块**）；
+        ``-1`` = 跟随 ``D``（即 ``D -> D``，本轮确认口径）；``> 0`` = 显式宽度，
+        必须等于 ``D``（该投影头位于 N3D 支路与混合之间，混合要求两路同维），否则
+        构造期报错。``> 0`` 时 ``align_mode`` 必须为 ``"proj_supcon"``。
+    proj_init : str
+        投影头初始化口径（取值见 :data:`PROJ_INIT_MODES`）。**不得沿用近恒等**
+        （``q_head`` 的近恒等是 ``raw`` 档的直通先验，与投影头的职责无关）。
     """
 
     dim: int
@@ -110,6 +163,10 @@ class N3DQAConfig:
     learn_logit_scale: bool = False
     mix_logit_init: float = -2.0
     answer_table_mode: str = "centroid"
+    align_mode: str = "off"
+    align_lambda: float = 0.0
+    proj_dim: int = 0
+    proj_init: str = "xavier_uniform"
 
     def __post_init__(self) -> None:
         if int(self.dim) < 1:
@@ -138,6 +195,57 @@ class N3DQAConfig:
                 "N3DQAConfig.logit_scale_init 必须 > 0，"
                 f"当前 {self.logit_scale_init}"
             )
+        # ---- 对齐机制（本轮新增；默认档必须逐位复现历史行为）----
+        if self.align_mode not in ALIGN_MODES:
+            raise ValueError(
+                f"N3DQAConfig.align_mode 仅允许 {list(ALIGN_MODES)}，"
+                f"当前 {self.align_mode!r}"
+            )
+        if self.proj_init not in PROJ_INIT_MODES:
+            raise ValueError(
+                f"N3DQAConfig.proj_init 仅允许 {list(PROJ_INIT_MODES)}，"
+                f"当前 {self.proj_init!r}"
+            )
+        if int(self.proj_dim) < -1:
+            raise ValueError(
+                f"N3DQAConfig.proj_dim 只允许 -1（跟随 D）或 >= 0（0 = 关闭），"
+                f"当前 {self.proj_dim}"
+            )
+        if int(self.proj_dim) > 0 and int(self.proj_dim) != int(self.dim):
+            raise ValueError(
+                "投影头位于 N3D 支路与凸混合之间，混合要求两路同维 D；"
+                f"proj_dim={self.proj_dim} 与 dim={self.dim} 不一致。"
+                "请用 proj_dim=-1（跟随 D）或 proj_dim=0（关闭）"
+            )
+        if self.align_mode == "off":
+            if int(self.proj_dim) != 0:
+                raise ValueError(
+                    "对齐关闭（align_mode='off'）时不得启用投影头："
+                    f"proj_dim={self.proj_dim}。关闭时不得创建任何模块、不得消耗 RNG"
+                )
+            if float(self.align_lambda) != 0.0:
+                raise ValueError(
+                    "对齐关闭（align_mode='off'）时 align_lambda 必须为 0.0，"
+                    f"当前 {self.align_lambda}"
+                )
+        else:
+            if self.head_input_mode not in ("concat", "n3d"):
+                raise ValueError(
+                    f"align_mode={self.align_mode!r} 要求 head_input_mode ∈ "
+                    f"{{'concat', 'n3d'}}（对齐的左边是 N3D 读出）；当前 "
+                    f"head_input_mode={self.head_input_mode!r}：raw 档下 "
+                    "adapter.features 从不被调用，开启对齐只能是静默空转，故直接拒绝"
+                )
+            if not (float(self.align_lambda) > 0.0):
+                raise ValueError(
+                    f"align_mode={self.align_mode!r} 时 align_lambda 必须 > 0，"
+                    f"当前 {self.align_lambda}"
+                )
+            if int(self.proj_dim) != 0 and self.align_mode != "proj_supcon":
+                raise ValueError(
+                    "投影头只属于机制 B（align_mode='proj_supcon'）；"
+                    f"当前 align_mode={self.align_mode!r} 但 proj_dim={self.proj_dim}"
+                )
 
 
 class N3DQA(nn.Module):
@@ -190,6 +298,17 @@ class N3DQA(nn.Module):
             # 两路的凸混合权重（标量，sigmoid 参数化 -> 恒在 (0,1)，两路谁都不会被抹掉）
             self.mix_logit = nn.Parameter(torch.tensor(float(config.mix_logit_init)))
 
+        # ---- 投影头（**仅机制 B**；默认关闭时一个模块都不建、一点 RNG 都不消耗）----
+        # 口径：线性 D -> D，位于 N3D 支路与凸混合之间（见 `n3d_branch` / `query`）。
+        self.proj: Optional[nn.Linear] = None
+        if int(config.proj_dim) != 0:
+            # [!] nn.Linear.__init__ 的 reset_parameters 会消耗**全局** RNG，进而改变同一次
+            #     运行里后续所有采样（数据打乱用独立的 torch.Generator，但骨干/其它模块的
+            #     初始化顺序会漂移）。这里用 fork_rng 把全局 RNG 状态原样保存并恢复，
+            #     保证「启用投影头」不改变其它任何模块的随机数消耗。
+            with torch.random.fork_rng(devices=[]):
+                self.proj = nn.Linear(dim, dim, bias=True)
+
         # ---- 候选键表：**仅 index 模式**存在 ----
         # 两种来源：free（可学习参数）/ centroid（训练样本质心，构造后由
         # `set_answer_table_from_centroids` 确定性写入；**不作为可学习参数**）。
@@ -240,6 +359,45 @@ class N3DQA(nn.Module):
                 self.answer_table.uniform_(
                     -1.0 / max(1.0, dim ** 0.5), 1.0 / max(1.0, dim ** 0.5), generator=gen
                 )
+            if self.proj is not None:
+                self._init_projection(dim, gen)
+
+    #: 投影头初始化的局部 generator 种子偏移（与 ``q_head`` 的 49 分开，互不串用）。
+    PROJ_INIT_SEED_OFFSET: int = 17
+
+    def _init_projection(self, dim: int, gen: torch.Generator) -> None:
+        """投影头的**确定性**初始化（局部 generator；口径见 :data:`PROJ_INIT_MODES`）。
+
+        口径声明（**不得沿用近恒等**）
+        ----------------------------
+        ``q_head`` 的近恒等（``W = I + 0.02·U(-1,1)``）是 ``raw`` 档"直通原始文本特征"
+        这一先验的载体，与投影头的职责（把 N3D 读出重参数化到一个对齐空间）无关；
+        若沿用近恒等，机制 B 在起点上等价于"没有投影头"，测不出任何东西。故此处：
+
+        * ``xavier_uniform``（默认）：``W ~ U(-b, b)``，``b = sqrt(6 / (dim + dim))``，
+          偏置零初始化 —— 与 PyTorch ``nn.Linear`` 的默认分布族同形，但**由局部
+          generator 生成**，不消耗全局 RNG；
+        * ``orthogonal``：由局部 generator 生成高斯矩阵再做 ``QR`` 正交化（范数保持，
+          排除"投影头把 N3D 支路量级放缩"这一混杂因素）。
+
+        两种口径都用 ``torch.Generator().manual_seed(PROJ_INIT_SEED)``（+ 偏移）播种，
+        因此同一 ``dim`` 下**逐位可复现**，且与全局 RNG 状态无关。
+        """
+        g = torch.Generator().manual_seed(int(PROJ_INIT_SEED) + int(self.PROJ_INIT_SEED_OFFSET))
+        weight = self.proj.weight  # type: ignore[union-attr]
+        if self.config.proj_init == "orthogonal":
+            raw = torch.randn((dim, dim), generator=g)
+            q, r = torch.linalg.qr(raw)
+            # QR 的符号规范化（确定性）：让 R 的对角元为正，避免同一旋转的符号歧义
+            signs = torch.sign(torch.diagonal(r))
+            signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+            weight.copy_(q * signs.unsqueeze(0))
+        else:
+            bound = float((6.0 / float(dim + dim)) ** 0.5)
+            weight.copy_(
+                (torch.rand((dim, dim), generator=g) * 2.0 - 1.0) * bound
+            )
+        self.proj.bias.zero_()  # type: ignore[union-attr]
 
     # -- 打分 -------------------------------------------------------------
     @property
@@ -251,22 +409,80 @@ class N3DQA(nn.Module):
         """「不相关」类下标（恒为末位 ``C``）。"""
         return int(self.n_answers)
 
-    def query(self, features: torch.Tensor) -> torch.Tensor:
+    def n3d_branch(self, features: torch.Tensor,
+                   readout: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """N3D 支路的**对外表示** ``[B, D]``：骨干读出 ->（concat 口径）LayerNorm ->（启用的）投影头。
+
+        口径（**顺序固定，不得调换**）
+        ----------------------------
+        ``readout = adapter.features(features)``
+        -> ``concat`` 口径下先过无仿射 ``LayerNorm``（压掉 N3D 读出与 raw 支路约 236 倍的
+        量级差，见 :attr:`N3DQAConfig.head_input_mode` 的实测口径）
+        -> 启用时再过线性投影头（``D -> D``）-> 返回。
+
+        参数
+        ----
+        features : torch.Tensor
+            ``[B, D]`` 原始文本特征。
+        readout : Optional[torch.Tensor]
+            已算好的骨干读出 ``[B, D]``；给出时不再重复前向。用于让
+            :meth:`query` 与 :meth:`alignment_loss` **共用同一次骨干前向**（既省一半算力，
+        也排除"两处各前向一次"带来的口径歧义）。
+
+        返回
+        ----
+        torch.Tensor
+            ``[B, D]``（**不做** L2 归一化；需要归一化时由调用方显式做）。
+        """
+        f = self.adapter.features(features) if readout is None else readout
+        norm = getattr(self, "backbone_norm", None)
+        if self.config.head_input_mode == "concat" and norm is not None:
+            f = norm(f)
+        if self.proj is not None:
+            f = self.proj(f)
+        return f
+
+    def alignment_representation(self, features: torch.Tensor,
+                                 readout: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """对齐所用的表示：**L2 归一化后的** :meth:`n3d_branch`（``[B, D]``）。
+
+        投影头存在时即"投影后"的表示（机制 B）；不存在时即 N3D 读出本身。
+        """
+        return F.normalize(self.n3d_branch(features, readout), dim=1)
+
+    def alignment_parameters(self) -> List[nn.Parameter]:
+        """对齐机制新增的可学习参数（投影头）；未启用时返回空列表。"""
+        if self.proj is None:
+            return []
+        return [p for p in self.proj.parameters()]
+
+    def query(self, features: torch.Tensor,
+              n3d_branch: Optional[torch.Tensor] = None) -> torch.Tensor:
         """``q = q_head(f)``：``[B, D] -> [B, D]``（**不是**类别数宽度的分类头）。
 
         当 ``config.normalize_query`` 为 ``True`` 时对 ``q`` 做 **L2 归一化**，
         使后续 ``q · key`` 成为有界余弦结构（见 ``N3DQAConfig.normalize_query``）。
+
+        参数
+        ----
+        features : torch.Tensor
+            ``[B, D]`` 原始文本特征。
+        n3d_branch : Optional[torch.Tensor]
+            已算好的 :meth:`n3d_branch` 输出（``[B, D]``）；给出时不再重复骨干前向。
+            **默认路径逐字符不变**：``None`` 时对 ``concat`` / ``n3d`` 两档的行为与
+            改动前完全一致；``raw`` 档**从不**触碰 N3D 支路（现场登记的结构事实：
+            raw 档下 ``adapter.features`` 不被调用、骨干不在计算图上）。
         """
         raw = F.normalize(features, dim=1)
         if self.config.head_input_mode == "raw":
             # 直通口径：q = 原始 D 维文本特征（归一化后）-> 头（近恒等初始化）
             q = raw
         elif self.config.head_input_mode == "concat":
-            n3d = self.backbone_norm(self.adapter.features(features))
+            n3d = self.n3d_branch(features) if n3d_branch is None else n3d_branch
             alpha = torch.sigmoid(self.mix_logit)
             q = alpha * raw + (1.0 - alpha) * n3d
         else:
-            q = self.adapter.features(features)
+            q = self.n3d_branch(features) if n3d_branch is None else n3d_branch
         q = self.q_head(q)
         if int(q.shape[1]) != int(self.config.dim):
             raise RuntimeError(
@@ -413,6 +629,139 @@ class N3DQA(nn.Module):
             )
         return (per * w).sum() / w.sum().clamp_min(1e-12)
 
+    # -- 对齐损失（本轮新增；作为 ce 的**附加项**，默认关闭时不参与计算）----
+    def alignment_loss(
+        self,
+        features: torch.Tensor,
+        targets: torch.Tensor,
+        n_classes: int,
+        *,
+        readout: Optional[torch.Tensor] = None,
+        branch: Optional[torch.Tensor] = None,
+        temperature: float = SUPCON_TEMPERATURE,
+    ) -> Dict[str, Any]:
+        """对齐损失 ``align``（**返回分项**，供报告逐项登记）。
+
+        口径（显式固定，不随运行变化）
+        -----------------------------
+        * 表示 ``z = alignment_representation(features)``（L2 归一化；机制 B 下为**投影后**）；
+        * **机制 B（``proj_supcon``）**：``align = supcon_loss(z, targets, C)``，
+          同答案互为正样本、温度 = :data:`SUPCON_TEMPERATURE`；
+        * **机制 C（``distill``）**：``align = 0.5·(L_i + L_ii)``，其中
+          ``L_i = mean(1 - cos(z, 本样本编码器原始特征))``（目标 (i)，逐样本蒸馏）、
+          ``L_ii = mean(1 - cos(z, 批内所属类质心))``（目标 (ii)）。类质心
+          **批内现场算、detach、不参与梯度**，且与 ``z`` 一样先做 L2 归一化；
+        * 「不相关」样本（``target == C``）**不参与**两种对齐（它们没有正样本对，
+          其"类质心"也不是答案类质心）；被排除的数量在 ``n_excluded`` 中可见。
+
+        参数
+        ----
+        features : torch.Tensor
+            ``[B, D]`` 原始文本特征（**也是**目标 (i)(ii) 的来源空间）。
+        targets : torch.Tensor
+            ``[B]`` 目标下标；等于 ``n_classes`` 的是「不相关」样本。
+        n_classes : int
+            答案类别数 ``C``。
+        readout : Optional[torch.Tensor]
+            已算好的骨干读出（避免重复前向）。
+        branch : Optional[torch.Tensor]
+            已算好的 :meth:`n3d_branch` 输出（**优先于** ``readout``）。
+        temperature : float
+            机制 B 的温度（``> 0``）。
+
+        返回
+        ----
+        Dict[str, Any]
+            ``{"mode", "applicable", "loss", "lambda", "weighted", "supcon",
+            "distill_self", "distill_centroid", "n_used", "n_excluded",
+            "skipped_reason"}``。``loss`` / ``weighted`` 是**可反传**的标量张量；
+            其余为已 detach 的浮点/整数（供报告落盘）。
+            ``applicable=False`` 表示本 batch 无可用对齐项（对应 ``loss=None``），
+            调用侧按「跳过该 batch 的对齐项」处置并计数可见。
+        """
+        mode = str(self.config.align_mode)
+        base: Dict[str, Any] = {
+            "mode": mode,
+            "applicable": False,
+            "loss": None,
+            "lambda": float(self.config.align_lambda),
+            "weighted": None,
+            "supcon": None,
+            "distill_self": None,
+            "distill_centroid": None,
+            "n_used": 0,
+            "n_excluded": 0,
+            "skipped_reason": None,
+        }
+        if mode == "off":
+            base["skipped_reason"] = "align_mode='off'（对齐关闭）"
+            return base
+        if targets.dim() != 1 or int(targets.shape[0]) != int(features.shape[0]):
+            raise ValueError(
+                f"targets 必须为 1D [B={features.shape[0]}]，当前 {tuple(targets.shape)}"
+            )
+        keep = targets != int(n_classes)
+        n_used = int(keep.sum().item())
+        base["n_excluded"] = int(targets.shape[0]) - n_used
+        base["n_used"] = n_used
+        if n_used < 1:
+            base["skipped_reason"] = "批内无（非不相关）样本"
+            return base
+
+        branch_out = branch if branch is not None else (
+            None if readout is None else self.n3d_branch(features, readout=readout)
+        )
+        z = (self.alignment_representation(features) if branch_out is None
+             else F.normalize(branch_out, dim=1))
+        if mode == "proj_supcon":
+            loss = supcon_loss(z, targets, int(n_classes), temperature=float(temperature))
+            if loss is None:
+                base["skipped_reason"] = "批内无同类正样本对（supcon 的锚点集合为空）"
+                return base
+            value = float(loss.detach().item())
+            base.update({
+                "applicable": True, "loss": loss, "supcon": value,
+                "weighted": loss * float(self.config.align_lambda),
+            })
+            return base
+        if mode == "distill":
+            dim = int(self.config.dim)
+            if int(features.shape[1]) != dim:
+                raise ValueError(
+                    f"features 必须为 2D [B, D={dim}]，当前 {tuple(features.shape)}"
+                )
+            with torch.no_grad():
+                raw = F.normalize(features, dim=1)
+                # 批内逐类质心（现场算、detach）：index_add_ 向量化，禁止逐类 Python 循环
+                cent = torch.zeros(
+                    int(n_classes) + 1, dim, dtype=raw.dtype, device=raw.device
+                )
+                cnt = torch.zeros(
+                    int(n_classes) + 1, dtype=raw.dtype, device=raw.device
+                )
+                cent.index_add_(0, targets, raw)
+                cnt.index_add_(0, targets, torch.ones_like(targets, dtype=raw.dtype))
+                cent = cent / cnt.clamp_min(1.0).unsqueeze(1)
+                cent = F.normalize(cent, dim=1)
+            if int(z.shape[1]) != dim:
+                raise ValueError(
+                    f"对齐表示必须为 D={dim} 维，当前 {z.shape[1]}"
+                )
+            cos_self = (z * raw).sum(dim=1)
+            cos_cent = (z * cent[targets]).sum(dim=1)
+            l_self = (1.0 - cos_self)[keep].mean()
+            l_cent = (1.0 - cos_cent)[keep].mean()
+            loss = 0.5 * (l_self + l_cent)
+            base.update({
+                "applicable": True, "loss": loss,
+                "distill_self": float(l_self.detach().item()),
+                "distill_centroid": float(l_cent.detach().item()),
+                "weighted": loss * float(self.config.align_lambda),
+                "n_used": n_used,
+            })
+            return base
+        raise ValueError(f"未知对齐机制 {mode!r}；合法集合 = {list(ALIGN_MODES)}")
+
     # -- 答案表（centroid 口径） ------------------------------------------
     @torch.no_grad()
     def set_answer_table_from_centroids(
@@ -480,6 +829,15 @@ class N3DQA(nn.Module):
         info["head_input_mode"] = str(self.config.head_input_mode)
         info["normalize_query"] = bool(self.config.normalize_query)
         info["logit_scale"] = float(self.logit_scale.detach().item())
+        # ---- 对齐机制（本轮新增；默认关闭时全为关闭口径，便于事后回答"这份数字带没带对齐"）
+        info["align_mode"] = str(self.config.align_mode)
+        info["align_lambda"] = float(self.config.align_lambda)
+        info["proj_dim"] = int(self.config.proj_dim)
+        info["proj_init"] = str(self.config.proj_init)
+        info["has_projection_head"] = bool(self.proj is not None)
+        info["alignment_parameters"] = int(
+            sum(p.numel() for p in self.alignment_parameters())
+        )
         return info
 
     def trainable_parameter_names(self) -> List[str]:
@@ -526,11 +884,77 @@ class N3DQA(nn.Module):
         return zeros
 
 
+def supcon_loss(
+    q: torch.Tensor,
+    targets: torch.Tensor,
+    n_classes: int,
+    temperature: float = SUPCON_TEMPERATURE,
+) -> Optional[torch.Tensor]:
+    """监督对比损失（同答案问题为正样本；**批内构造、不采样**）。
+
+    **唯一实现落点在本模块**（``exp_repr.supcon_loss`` 只做再导出，保证机制 B 与
+    ``loss_mode="supcon"`` 用的是同一段代码，不存在两份实现漂移的风险）。
+
+    口径（显式固定，不随运行变化）
+    -----------------------------
+    * 锚点集合 ``I`` = 批内**答案表内**样本中「至少有一个同类正样本」的那些样本；
+      「不相关」样本（``target == n_classes``）**不参与**（它们没有正样本）；
+    * 正样本集合 ``P(i)`` = 批内与 ``i`` 同答案类、且不等于 ``i`` 的样本；
+    * 负样本 = 批内其余样本（含其它类别），归一化后按 ``q @ q^T / temperature`` 打分；
+    * 损失 = ``-1/|I| * sum_i [ 1/|P(i)| * sum_{p in P(i)} log softmax_i(p) ]``。
+
+    参数
+    ----
+    q : torch.Tensor
+        ``[B, D]`` 的 **L2 归一化**表示（:meth:`N3DQA.query` 的输出，或机制 B 下的
+        投影后 N3D 表示）。
+    targets : torch.Tensor
+        ``[B]`` 目标下标；等于 ``n_classes`` 的是「不相关」样本。
+    n_classes : int
+        答案类别数 ``C``。
+    temperature : float
+        温度（``> 0``）。
+
+    返回
+    ----
+    Optional[torch.Tensor]
+        标量损失；批内可用锚点不足（``|I| == 0``）时返回 ``None``
+        （调用侧按「跳过该 batch」处置，并在诊断里计数可见）。
+    """
+    if float(temperature) <= 0.0:
+        raise ValueError(f"temperature 必须 > 0，当前 {temperature}")
+    keep = targets != int(n_classes)
+    z = q[keep]
+    y = targets[keep]
+    if int(z.shape[0]) < 2:
+        return None
+    eye = torch.eye(int(z.shape[0]), dtype=torch.bool, device=z.device)
+    sim = (z @ z.transpose(0, 1)) / float(temperature)
+    pos = (y.unsqueeze(0) == y.unsqueeze(1)) & (~eye)
+    pos_count = pos.sum(dim=1)
+    valid = pos_count > 0
+    if int(valid.sum().item()) == 0:
+        return None
+    sim = sim.masked_fill(eye, float("-inf"))
+    log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+    # [!] 必须用 ``where`` 而不是 ``* pos``：``-inf * False`` 在 PyTorch 里是 ``nan``
+    #     （对角线被填成 ``-inf``，乘 0 仍得 nan），会污染整个 batch 的损失。
+    log_prob = torch.where(pos, log_prob, torch.zeros_like(log_prob))
+    per_anchor = log_prob.sum(dim=1) / pos_count.clamp_min(1)
+    return -per_anchor[valid].mean()
+
+
 __all__ = [
     "OUTPUT_MODES",
     "HEAD_INPUT_MODES",
     "ANSWER_TABLE_MODES",
     "IRRELEVANT_AT_END",
+    "ALIGN_MODES",
+    "PROJ_INIT_MODES",
+    "PROJ_INIT_SEED",
+    "ALIGN_TARGETS",
+    "SUPCON_TEMPERATURE",
     "N3DQAConfig",
     "N3DQA",
+    "supcon_loss",
 ]

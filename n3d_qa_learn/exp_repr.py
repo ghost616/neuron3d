@@ -76,7 +76,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import step2 as S2
-from .backends import BackendRegistry
+from .backends import (
+    GEO_FIELD_CHOICES,
+    SHAPE_CHOICES,
+    STRUCTURE_DEFAULTS,
+    BackendRegistry,
+    BackendStructure,
+)
 from .data import DEFAULT_QA_CACHE_DIR, DEFAULT_TEXT_DIR
 from .encoders import (
     DEFAULT_MODEL_DIR,
@@ -90,7 +96,16 @@ from .encoders import (
     sha256_bytes,
 )
 from .evaluate import evaluate_refusal, evaluate_step1
-from .heads import HEAD_INPUT_MODES, N3DQA, N3DQAConfig
+from .heads import (
+    ALIGN_MODES,
+    ALIGN_TARGETS,
+    HEAD_INPUT_MODES,
+    PROJ_INIT_MODES,
+    SUPCON_TEMPERATURE,
+    N3DQA,
+    N3DQAConfig,
+    supcon_loss,
+)
 from .train import (
     DEFAULT_VERIFY_DIR,
     TrainConfig,
@@ -114,8 +129,20 @@ FREEZE_SCOPES: Tuple[str, ...] = ("logit_only", "head", "head_backbone")
 #: 目标修法（功能点 4c；取值即口径，禁止改名）。
 LOSS_MODES: Tuple[str, ...] = ("ce", "no_irr_centroid", "staged", "supcon")
 
-#: 监督对比损失的温度（冻结常量）。
-SUPCON_TEMPERATURE: float = 0.07
+#: 监督对比损失的温度（冻结常量）。**唯一实现与常量落点在** ``heads``
+#: （``exp_repr.supcon_loss`` / ``exp_repr.SUPCON_TEMPERATURE`` 只是再导出），
+#: 这样机制 B 的对齐损失与 ``loss_mode="supcon"`` 必然是同一段代码。
+#: 取值 :data:`n3d_qa_learn.heads.SUPCON_TEMPERATURE` = 0.07。
+
+#: 结构开关（本轮新增）的取值域：直接引用 ``backends`` 的注册点，避免两处各写一套枚举。
+SHAPES: Tuple[str, ...] = SHAPE_CHOICES
+
+#: 本轮实际测的几何权重场档（``class_tied`` / ``mlp`` 上游构造期显式拒绝，不进矩阵）。
+GEO_FIELDS: Tuple[str, ...] = ("none", "additive")
+
+#: 对齐机制与投影头初始化的取值域（引用 ``heads`` 的注册点）。
+ALIGN_MODE_CHOICES: Tuple[str, ...] = ALIGN_MODES
+PROJ_INIT_CHOICES: Tuple[str, ...] = PROJ_INIT_MODES
 
 #: 分阶段修法的两段 epoch 数（stage1 + stage2 = 40 = 基线 epoch 数，训练预算对齐）。
 STAGE1_EPOCHS: int = 30
@@ -166,7 +193,7 @@ ANCHOR_TOL: Dict[str, float] = {
 
 @dataclass(frozen=True)
 class ReprGroup:
-    """一个对照组的标识（恰好由三个被测维度的取值确定）。
+    """一个对照组的标识（由三个**原有**被测维度 + 本轮新增的**结构/对齐**维度共同确定）。
 
     属性
     ----
@@ -178,12 +205,30 @@ class ReprGroup:
         ``q`` 头输入口径，取值见 :data:`n3d_qa_learn.heads.HEAD_INPUT_MODES`。
     loss_mode : str
         目标修法，取值见 :data:`LOSS_MODES`。
+    shape / cyl_aspect / fc_dim / N / y_in / y_out / geo_field
+        **后端结构开关**（本轮新增）。默认值 = :data:`backends.STRUCTURE_DEFAULTS`
+        = 既有 8 组的口径，因此**原样保留既有 8 组时逐位可复现**。
+    align_mode / align_lambda / proj_dim
+        **对齐机制开关**（本轮新增）。默认 = 关闭（``off`` / ``0.0`` / ``0``），
+        与既有 8 组逐位一致。
     """
 
     name: str
     freeze_scope: str
     head_input_mode: str
     loss_mode: str
+    # ---- 结构开关（默认 = 既有口径）----
+    shape: str = "sphere"
+    cyl_aspect: float = 1.0
+    fc_dim: int = 0
+    N: int = 64
+    y_in: int = 4
+    y_out: int = 4
+    geo_field: str = "none"
+    # ---- 对齐开关（默认 = 关闭）----
+    align_mode: str = "off"
+    align_lambda: float = 0.0
+    proj_dim: int = 0
 
     def __post_init__(self) -> None:
         if self.freeze_scope not in FREEZE_SCOPES:
@@ -199,19 +244,63 @@ class ReprGroup:
             raise ValueError(
                 f"loss_mode 仅允许 {list(LOSS_MODES)}，当前 {self.loss_mode!r}"
             )
+        if self.shape not in SHAPES:
+            raise ValueError(f"shape 仅允许 {list(SHAPES)}，当前 {self.shape!r}")
+        if self.geo_field not in GEO_FIELDS:
+            raise ValueError(
+                f"geo_field 仅允许 {list(GEO_FIELDS)}（本轮矩阵口径），"
+                f"当前 {self.geo_field!r}"
+            )
+        if self.align_mode not in ALIGN_MODE_CHOICES:
+            raise ValueError(
+                f"align_mode 仅允许 {list(ALIGN_MODE_CHOICES)}，当前 {self.align_mode!r}"
+            )
 
-    def as_dict(self) -> Dict[str, str]:
+    def structure(self) -> BackendStructure:
+        """本组的结构开关（装配成 :class:`BackendStructure`，供代理层透传）。"""
+        return BackendStructure(
+            shape=str(self.shape),
+            cyl_aspect=float(self.cyl_aspect),
+            fc_dim=int(self.fc_dim),
+            N=int(self.N),
+            y_in=int(self.y_in),
+            y_out=int(self.y_out),
+            geo_field=str(self.geo_field),
+        )
+
+    def structure_is_default(self) -> bool:
+        """结构是否全默认（= 既有 8 组口径）。"""
+        return bool(self.structure().is_default())
+
+    def align_is_off(self) -> bool:
+        """对齐是否关闭（= 既有 8 组口径）。"""
+        return bool(self.align_mode == "off")
+
+    def as_dict(self) -> Dict[str, Any]:
         """JSON 化。"""
         return {
             "name": self.name,
             "freeze_scope": self.freeze_scope,
             "head_input_mode": self.head_input_mode,
             "loss_mode": self.loss_mode,
+            "structure": self.structure().as_dict(),
+            "align_mode": str(self.align_mode),
+            "align_lambda": float(self.align_lambda),
+            "proj_dim": int(self.proj_dim),
         }
 
 
-#: 对照组矩阵（8 组，逐维单独测；顺序即报告顺序）。
+#: 对照组矩阵（**既有 8 组 + 本轮 10 组**，顺序即报告顺序）。
+#:
+#: * 前 8 组 = 原样保留、**逐位复现**（既有口径：结构全默认 + 对齐关闭）；
+#: * 后 10 组 = 本轮新增：**公共基线** ``S0_base``（``concat`` + ``head_backbone`` +
+#:   结构默认 + 对齐关闭）+ **逐轴单换**（形状 / ``fc_dim`` / ``N`` / ``geo_field`` /
+#:   对齐 B / 对齐 C×2），加上**载体对照** ``B1_concat`` / ``B2_n3d``（复用既有组，
+#:   它们的 ``freeze_scope`` 是 ``logit_only``，正是"载体"这一轴的对照）。
+#:   ⑦ 特征档（``lexical-88`` / ``bge-m3-1024``）**不是矩阵组**，而是
+#:   :func:`run_comparison` 的 ``profiles`` 轴（同一组在两档下各跑一次）。
 MATRIX: Tuple[ReprGroup, ...] = (
+    # ---- 既有 8 组（逐位复现；不得改动其字段）----
     ReprGroup("A1_baseline", "logit_only", "raw", "ce"),
     ReprGroup("A2_head", "head", "raw", "ce"),
     ReprGroup("A3_head_backbone", "head_backbone", "raw", "ce"),
@@ -220,12 +309,31 @@ MATRIX: Tuple[ReprGroup, ...] = (
     ReprGroup("C1_no_irr_centroid", "head", "raw", "no_irr_centroid"),
     ReprGroup("C2_staged", "head", "raw", "staged"),
     ReprGroup("C3_supcon", "head", "raw", "supcon"),
+    # ---- 本轮新增：公共基线 ----
+    ReprGroup("S0_base", "head_backbone", "concat", "ce"),
+    # ---- 本轮新增：逐轴单换（每次只换一项，其余等于 S0_base）----
+    ReprGroup("S1_shape_cube", "head_backbone", "concat", "ce", shape="cube"),
+    ReprGroup("S2_shape_cylinder", "head_backbone", "concat", "ce",
+              shape="cylinder", cyl_aspect=1.0),
+    ReprGroup("S3_fc_follow", "head_backbone", "concat", "ce", fc_dim=-1),
+    ReprGroup("S4_fc_128", "head_backbone", "concat", "ce", fc_dim=128),
+    ReprGroup("S5_N256", "head_backbone", "concat", "ce", N=256),
+    ReprGroup("S6_geo_additive", "head_backbone", "concat", "ce", geo_field="additive"),
+    ReprGroup("S7_align_B", "head_backbone", "concat", "ce",
+              align_mode="proj_supcon", align_lambda=1.0, proj_dim=-1),
+    ReprGroup("S8_align_C_l01", "head_backbone", "concat", "ce",
+              align_mode="distill", align_lambda=0.1),
+    ReprGroup("S9_align_C_l10", "head_backbone", "concat", "ce",
+              align_mode="distill", align_lambda=1.0),
 )
 
-#: 基线组名（锚点对标与「换特征 vs 打开训练」归因的参照系）。
+#: 基线组名（锚点对标与「换特征 vs 打开训练」归因的参照系）—— **既有口径，不得改名**。
 BASELINE_GROUP: str = "A1_baseline"
 
-#: 三个被测维度的结构描述（基准组 + 变化项 + 被改变的字段）。
+#: 本轮「结构 / 对齐」各轴的**公共基线组名**（逐轴单换的参照系）。
+STRUCT_BASELINE_GROUP: str = "S0_base"
+
+#: 三个**原有**被测维度的结构描述（基准组 + 变化项 + 被改变的字段）。
 DIMENSIONS: Tuple[Dict[str, Any], ...] = (
     {
         "dim": "a_trainable_scope",
@@ -245,9 +353,49 @@ DIMENSIONS: Tuple[Dict[str, Any], ...] = (
         "base": "A2_head",
         "groups": ["A2_head", "C1_no_irr_centroid", "C2_staged", "C3_supcon"],
     },
+    # ---- 本轮新增的四条轴（基准 = S0_base；逐轴单换，禁止全交叉）----
+    {
+        "dim": "d_shape",
+        "varying_field": "shape (+cyl_aspect)",
+        "base": STRUCT_BASELINE_GROUP,
+        "groups": ["S0_base", "S1_shape_cube", "S2_shape_cylinder"],
+    },
+    {
+        "dim": "e_fc_dim",
+        "varying_field": "fc_dim",
+        "base": STRUCT_BASELINE_GROUP,
+        "groups": ["S0_base", "S3_fc_follow", "S4_fc_128"],
+    },
+    {
+        "dim": "f_capacity_N",
+        "varying_field": "N",
+        "base": STRUCT_BASELINE_GROUP,
+        "groups": ["S0_base", "S5_N256"],
+    },
+    {
+        "dim": "g_geo_field",
+        "varying_field": "geo_field",
+        "base": STRUCT_BASELINE_GROUP,
+        "groups": ["S0_base", "S6_geo_additive"],
+    },
+    {
+        "dim": "h_align",
+        "varying_field": "align_mode (+align_lambda/proj_dim)",
+        "base": STRUCT_BASELINE_GROUP,
+        "groups": ["S0_base", "S7_align_B", "S8_align_C_l01", "S9_align_C_l10"],
+    },
+    {
+        "dim": "i_carrier",
+        "varying_field": "freeze_scope (载体组：是否打开表示训练)",
+        "base": STRUCT_BASELINE_GROUP,
+        "groups": ["S0_base", "B1_concat", "B2_n3d"],
+    },
 )
 
 #: ``ungrouped_trainable_names`` 在现场允许出现的**完整**名单（显式列出，不放宽为"大部分"）。
+#: 本轮结论：**无需扩充**。投影头（机制 B）走 ``model.alignment_parameters()``，已在
+#: :func:`make_optimizer` / :func:`ungrouped_trainable_names` 里显式并入 ``head`` 组，
+#: 因此它**不在**本名单内；本名单仍然只有 ``concat`` 口径下恒不进优化器的 ``mix_logit``。
 ALLOWED_UNGROUPED_TRAINABLE: Tuple[str, ...] = ("head.mix_logit",)
 
 
@@ -257,6 +405,145 @@ def group_by_name(name: str) -> ReprGroup:
         if group.name == name:
             return group
     raise KeyError(f"未知组名 {name!r}；可用组名 = {[g.name for g in MATRIX]}")
+
+
+#: 「载体组」的取值 -> ``(freeze_scope, head_input_mode)``（本轮确认口径的显式注册点）。
+#: 载体组回答的是"q 的载体是什么 + 表示训练是否打开"这一**组合**问题：
+#: ``base`` = 公共基线（``head_backbone`` + ``concat``，表示训练打开）；
+#: ``B1_concat`` = 只训 ``logit_scale`` 且载体为 ``concat``（= 既有 B1 组口径）；
+#: ``B2_n3d`` = 只训 ``logit_scale`` 且载体为 ``n3d``（= 既有 B2 组口径）。
+CARRIER_GROUPS: Dict[str, Tuple[str, str]] = {
+    "base": ("head_backbone", "concat"),
+    "B1_concat": ("logit_only", "concat"),
+    "B2_n3d": ("logit_only", "n3d"),
+}
+
+#: 自定义组可覆盖的轴字段（顺序即命名顺序；**逐轴单换**的合法入口）。
+AXIS_FIELDS: Tuple[str, ...] = (
+    "carrier", "shape", "cyl_aspect", "fc_dim", "N", "y_in", "y_out",
+    "geo_field", "align_mode", "align_lambda", "proj_dim",
+)
+
+
+def custom_group(
+    *,
+    base: str = STRUCT_BASELINE_GROUP,
+    carrier: Optional[str] = None,
+    shape: Optional[str] = None,
+    cyl_aspect: Optional[float] = None,
+    fc_dim: Optional[int] = None,
+    N: Optional[int] = None,
+    y_in: Optional[int] = None,
+    y_out: Optional[int] = None,
+    geo_field: Optional[str] = None,
+    align_mode: Optional[str] = None,
+    align_lambda: Optional[float] = None,
+    proj_dim: Optional[int] = None,
+) -> ReprGroup:
+    """从某个矩阵组出发，按 CLI 给定的轴覆盖构造一个**自定义组**（逐轴单换）。
+
+    口径
+    ----
+    * 未给出的轴一律沿用 ``base``（默认 :data:`STRUCT_BASELINE_GROUP` = 公共基线），
+      因此这是"只换指定轴"的合法入口，不会引入隐式全交叉；
+    * 对齐三件套有**联动默认**：显式给了 ``align_mode != "off"`` 而未给
+      ``align_lambda`` / ``proj_dim`` 时，按机制取默认（B -> λ=1.0、proj_dim=-1；
+      C -> λ=0.1、proj_dim=0）；
+    * 组名由实际生效的覆盖**确定性**生成（``X_<field>=<value>__...``），
+      便于报告与产物对账；
+    * 结果仍是 :class:`ReprGroup`，构造期不变量（枚举合法性、对齐开关组合）照常生效。
+
+    参数
+    ----
+    base : str
+        起始组名（必须是 :data:`MATRIX` 里的组）。
+    其余 : 各轴的覆盖值；``None`` = 不覆盖。
+
+    返回
+    ----
+    ReprGroup
+        自定义组定义。
+
+    异常
+    ------
+    KeyError
+        ``base`` 不是已知组名。
+    ValueError
+        覆盖值本身非法（由 :class:`ReprGroup` / 对齐联动规则抛出）。
+    """
+    origin = group_by_name(str(base))
+    fields: Dict[str, Any] = {
+        "carrier": carrier,
+        "shape": shape,
+        "cyl_aspect": cyl_aspect,
+        "fc_dim": fc_dim,
+        "N": N,
+        "y_in": y_in,
+        "y_out": y_out,
+        "geo_field": geo_field,
+        "align_mode": align_mode,
+        "align_lambda": align_lambda,
+        "proj_dim": proj_dim,
+    }
+    used = {k: v for k, v in fields.items() if v is not None}
+    if not used:
+        return origin
+    kwargs: Dict[str, Any] = {
+        "freeze_scope": origin.freeze_scope,
+        "head_input_mode": origin.head_input_mode,
+        "loss_mode": origin.loss_mode,
+        "shape": origin.shape,
+        "cyl_aspect": origin.cyl_aspect,
+        "fc_dim": origin.fc_dim,
+        "N": origin.N,
+        "y_in": origin.y_in,
+        "y_out": origin.y_out,
+        "geo_field": origin.geo_field,
+        "align_mode": origin.align_mode,
+        "align_lambda": origin.align_lambda,
+        "proj_dim": origin.proj_dim,
+    }
+    if "carrier" in used:
+        key = str(used["carrier"])
+        if key not in CARRIER_GROUPS:
+            raise ValueError(
+                f"carrier 仅允许 {sorted(CARRIER_GROUPS)}（载体组注册表），当前 {key!r}"
+            )
+        scope, mode = CARRIER_GROUPS[key]
+        kwargs["freeze_scope"] = scope
+        kwargs["head_input_mode"] = mode
+    if "shape" in used:
+        kwargs["shape"] = str(used["shape"])
+    if "cyl_aspect" in used:
+        kwargs["cyl_aspect"] = float(used["cyl_aspect"])
+    if "fc_dim" in used:
+        kwargs["fc_dim"] = int(used["fc_dim"])
+    if "N" in used:
+        kwargs["N"] = int(used["N"])
+    if "y_in" in used:
+        kwargs["y_in"] = int(used["y_in"])
+    if "y_out" in used:
+        kwargs["y_out"] = int(used["y_out"])
+    if "geo_field" in used:
+        kwargs["geo_field"] = str(used["geo_field"])
+    if "align_mode" in used:
+        amode = str(used["align_mode"])
+        kwargs["align_mode"] = amode
+        if amode == "off":
+            kwargs["align_lambda"] = 0.0
+            kwargs["proj_dim"] = 0
+        elif amode == "proj_supcon":
+            kwargs["align_lambda"] = float(used.get("align_lambda", 1.0))
+            kwargs["proj_dim"] = int(used.get("proj_dim", -1))
+        else:  # distill
+            kwargs["align_lambda"] = float(used.get("align_lambda", 0.1))
+            kwargs["proj_dim"] = int(used.get("proj_dim", 0))
+    if "align_lambda" in used and "align_mode" not in used:
+        kwargs["align_lambda"] = float(used["align_lambda"])
+    if "proj_dim" in used and "align_mode" not in used:
+        kwargs["proj_dim"] = int(used["proj_dim"])
+    name = "X_" + "__".join(f"{k}={used[k]}" for k in AXIS_FIELDS if k in used)
+    return ReprGroup(name=name, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -373,13 +660,16 @@ def dimension_cost(
     n_train_unknown: int,
     n_classes: int,
     backend: str = "n3d_shape",
+    structure: Optional[BackendStructure] = None,
 ) -> Dict[str, Any]:
-    """连接参数 ``D`` 的**代价实测**（现场构造，不凭记忆写）。
+    """连接参数 ``D`` 与**结构开关**的**代价实测**（现场构造，不凭记忆写）。
 
     报告内容
     --------
-    * 骨干逐参数形状与元素数（``W_in`` / ``W_out`` / ``edge_weight`` / ``neuron_bias``）
-      与骨干合计；
+    * 骨干逐参数形状与元素数 —— **一律现场枚举 ``named_parameters()``**，
+      不假设存在 ``W_in`` / ``W_out``（现场实测：``fc_dim != 0`` 时骨干参数名被替换为
+      ``fc_in_weight`` / ``fc_in_bias`` / ``proj_weight`` / ``fc_out_weight`` /
+      ``fc_out_bias`` / ``head_weight`` / ``head_bias``，``W_in`` / ``W_out`` **消失**）；
     * ``q`` 头逐参数（``q_head.weight`` / ``q_head.bias`` / ``logit_scale``）与合计；
     * ``answer_table`` 是 **buffer**（``centroid`` 口径下冻结，不入优化器）的字节数；
     * 总参数量、每样本参数比（分母 = ``train_known + train_unknown``）；
@@ -397,13 +687,17 @@ def dimension_cost(
         答案类别数 ``C``。
     backend : str
         后端名（默认 ``n3d_shape``，与矩阵口径一致）。
+    structure : Optional[BackendStructure]
+        结构开关（``None`` = 全默认档）。
 
     返回
     ----
     Dict[str, Any]
-        代价实测字典。
+        代价实测字典。``backbone_shapes`` / ``backbone_parameters`` 是**现场枚举**结果，
+        **不保证**含 ``W_in`` / ``W_out`` 键；消费侧必须用 ``.get`` 且能把缺键渲染成
+        ``n/a``（本模块的 Markdown 渲染已如此）。
     """
-    reg = BackendRegistry(int(dim))
+    reg = BackendRegistry(int(dim), structure=structure)
     adapter = reg.register(str(backend))
     backbone = adapter.model
     backbone_shapes = {n: [int(x) for x in p.shape] for n, p in backbone.named_parameters()}
@@ -429,19 +723,25 @@ def dimension_cost(
         "role": "buffer（centroid 口径：由训练样本逐类质心确定性写入，冻结）",
     }
     n_samples = int(n_train_known) + int(n_train_unknown)
-    frozen_trainable = int(head_numel.get("logit_scale", 0))
-    opened_trainable = int(
-        head_numel.get("logit_scale", 0)
-        + head_numel.get("q_head.weight", 0)
-        + head_numel.get("q_head.bias", 0)
-    )
+    # 「打开表示训练」的可训集合**现场枚举**（不硬编码 q_head.weight 等名字），
+    # 只统计 head 侧（N3DQA 自己的参数）；骨干侧另计。
+    head_trainable = {
+        n: int(p.numel()) for n, p in head_model.named_parameters()
+    }
+    frozen_trainable = int(head_trainable.get("logit_scale", 0))
+    opened_trainable = int(sum(head_trainable.values()))
     return {
         "dim": int(dim),
         "backend": str(backend),
+        "structure": (
+            BackendStructure() if structure is None else structure
+        ).as_dict(),
         "topology": {k: float(v) for k, v in adapter.topology_stats().items()},
+        "backbone_parameter_names": sorted(backbone_numel.keys()),
         "backbone_parameters": backbone_numel,
         "backbone_shapes": backbone_shapes,
         "backbone_total": int(backbone_total),
+        "head_parameter_names": sorted(head_numel.keys()),
         "head_parameters": head_numel,
         "head_shapes": head_shapes,
         "head_total": int(head_total),
@@ -462,10 +762,11 @@ def dimension_cost(
             "scope": "head / head_backbone（打开表示训练）",
             "n_trainable_head": int(opened_trainable),
             "n_trainable_head_backbone": int(opened_trainable + backbone_total),
-            "names_head": ["head.logit_scale", "head.q_head.bias", "head.q_head.weight"],
+            # 现场枚举（不假设一定有 q_head.weight / q_head.bias）
+            "names_head": sorted(f"head.{k}" for k in head_trainable),
             "names_head_backbone_extra": sorted(backbone_numel.keys()),
             "note": ("head 档训 q 头；head_backbone 档额外声明骨干可训，"
-                     "但在 head_input_mode='raw' 下骨干结构性不在计算图上（见 12.8）"),
+                     "但在 head_input_mode='raw' 下骨干结构性不在计算图上（见 README 12.8）"),
         },
     }
 
@@ -870,68 +1171,29 @@ def build_group_config(
         learn_logit_scale=True,
         answer_table_mode="centroid",
         train_head=(group.freeze_scope in ("head", "head_backbone")),
+        # ---- 结构开关（本轮新增；默认 = 既有口径，逐位不变）----
+        structure_shape=str(group.shape),
+        structure_cyl_aspect=float(group.cyl_aspect),
+        structure_fc_dim=int(group.fc_dim),
+        structure_N=int(group.N),
+        structure_y_in=int(group.y_in),
+        structure_y_out=int(group.y_out),
+        structure_geo_field=str(group.geo_field),
+        # ---- 对齐开关（本轮新增；默认关闭，逐位不变）----
+        align_mode=str(group.align_mode),
+        align_lambda=float(group.align_lambda),
+        proj_dim=int(group.proj_dim),
     )
 
 
 # ---------------------------------------------------------------------------
 # 损失与冻结口径
 # ---------------------------------------------------------------------------
-
-
-def supcon_loss(
-    q: torch.Tensor,
-    targets: torch.Tensor,
-    n_classes: int,
-    temperature: float = SUPCON_TEMPERATURE,
-) -> Optional[torch.Tensor]:
-    """监督对比损失（同答案问题为正样本；**批内构造、不采样**）。
-
-    口径（显式固定，不随运行变化）
-    -----------------------------
-    * 锚点集合 ``I`` = 批内**答案表内**样本中「至少有一个同类正样本」的那些样本；
-      「不相关」样本（``target == n_classes``）**不参与**（它们没有正样本）；
-    * 正样本集合 ``P(i)`` = 批内与 ``i`` 同答案类、且不等于 ``i`` 的样本；
-    * 负样本 = 批内其余样本（含其它类别），归一化后按 ``q @ q^T / temperature`` 打分；
-    * 损失 = ``-1/|I| * sum_i [ 1/|P(i)| * sum_{p in P(i)} log softmax_i(p) ]``。
-
-    参数
-    ----
-    q : torch.Tensor
-        ``[B, D]`` 的 **L2 归一化**查询（:meth:`N3DQA.query` 的输出）。
-    targets : torch.Tensor
-        ``[B]`` 目标下标；等于 ``n_classes`` 的是「不相关」样本。
-    n_classes : int
-        答案类别数 ``C``。
-    temperature : float
-        温度（``> 0``）。
-
-    返回
-    ----
-    Optional[torch.Tensor]
-        标量损失；批内可用锚点不足（``|I| == 0``）时返回 ``None``
-        （调用侧按「跳过该 batch」处置，并在诊断里计数可见）。
-    """
-    if float(temperature) <= 0.0:
-        raise ValueError(f"temperature 必须 > 0，当前 {temperature}")
-    keep = targets != int(n_classes)
-    z = q[keep]
-    y = targets[keep]
-    if int(z.shape[0]) < 2:
-        return None
-    eye = torch.eye(int(z.shape[0]), dtype=torch.bool, device=z.device)
-    sim = (z @ z.transpose(0, 1)) / float(temperature)
-    pos = (y.unsqueeze(0) == y.unsqueeze(1)) & (~eye)
-    pos_count = pos.sum(dim=1)
-    valid = pos_count > 0
-    if int(valid.sum().item()) == 0:
-        return None
-    sim = sim.masked_fill(eye, float("-inf"))
-    log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
-    # [!] 必须用 ``where`` 而不是 ``* pos``：``-inf * False`` 在 PyTorch 里是 ``nan``
-    #     （对角线被填成 ``-inf``，乘 0 仍得 nan），会污染整个 batch 的损失。
-    log_prob = torch.where(pos, log_prob, torch.zeros_like(log_prob))
-    per_anchor = log_prob.sum(dim=1) / pos_count.clamp_min(1)
-    return -per_anchor[valid].mean()
+# 口径说明（本轮上移，审查收口）：监督对比损失的**唯一实现**落在
+# `n3d_qa_learn.heads.supcon_loss`（§模块 docstring 的「对齐机制」），本模块在文件头
+# `from .heads import supcon_loss` 做再导出 —— 因此 `exp_repr.supcon_loss` 与
+# `heads.supcon_loss` 是**同一个函数对象**，机制 B 与 `loss_mode="supcon"` 不可能漂移。
+# 默认参数 `temperature=SUPCON_TEMPERATURE`（0.07）随实现一起上移，取值不变。
 
 
 def batch_loss(
@@ -942,8 +1204,11 @@ def batch_loss(
     targets: torch.Tensor,
     weight: torch.Tensor,
     n_classes: int,
-) -> Optional[torch.Tensor]:
-    """按口径分派一个 batch 的损失。
+    *,
+    feats: Optional[torch.Tensor] = None,
+    n3d_branch: Optional[torch.Tensor] = None,
+) -> Dict[str, Any]:
+    """按口径分派一个 batch 的损失（**含对齐附加项**），返回含分项的诊断。
 
     ``kind`` 取值与语义
     ------------------
@@ -953,14 +1218,35 @@ def batch_loss(
       :func:`setup_answer_table`）；
     * ``"supcon"``：监督对比损失（见 :func:`supcon_loss`）。
 
+    对齐附加项（本轮新增）
+    --------------------
+    当 ``model.config.align_mode != "off"`` 时，总损失 = ``基础损失 + λ · align``，
+    其中 ``align`` 由 :meth:`N3DQA.alignment_loss` 给出（机制 B = supcon /
+    机制 C = 显式蒸馏两项）。**关闭对齐时路径逐字符不变**：不额外前向、不加任何项。
+
+    参数
+    ----
+    feats : Optional[torch.Tensor]
+        ``[B, D]`` 本 batch 的编码器原始特征。开启对齐时**必需**（蒸馏目标 (i)(ii)
+        都在这个空间里算）。
+    n3d_branch : Optional[torch.Tensor]
+        ``[B, D]`` 已算好的 :meth:`N3DQA.n3d_branch` 输出（与 ``query`` 共用同一次
+        骨干前向，避免两倍算力）。
+
     返回
     ----
-    Optional[torch.Tensor]
-        标量损失；本 batch 无可做功样本时返回 ``None``。
+    Dict[str, Any]
+        ``{"loss", "base", "align", "align_detail", "parts"}``：
+        ``loss`` 是本 batch 实际反传的标量（``None`` = 本 batch 无可做功样本，
+        调用侧按「跳过该 batch」处置并计数）；
+        ``base`` / ``align`` 是分项标量值（``float`` 或 ``None``）；
+        ``parts`` 是各分项的字典（供报告逐项登记）。
     """
+    align_detail: Optional[Dict[str, Any]] = None
+    base: Optional[torch.Tensor]
     if kind == "ce":
-        return model.cross_entropy(logits, targets, sample_weight=weight)
-    if kind == "ce_masked":
+        base = model.cross_entropy(logits, targets, sample_weight=weight)
+    elif kind == "ce_masked":
         per = F.cross_entropy(
             logits,
             targets,
@@ -969,13 +1255,76 @@ def batch_loss(
         )
         keep = targets != int(n_classes)
         if int(keep.sum().item()) == 0:
-            return None
-        per = per[keep]
-        w = weight[keep]
-        return (per * w).sum() / w.sum().clamp_min(1e-12)
-    if kind == "supcon":
-        return supcon_loss(q, targets, int(n_classes))
-    raise ValueError(f"未知损失口径 {kind!r}")
+            base = None
+        else:
+            base = (per[keep] * weight[keep]).sum() / weight[keep].sum().clamp_min(1e-12)
+    elif kind == "supcon":
+        base = supcon_loss(q, targets, int(n_classes))
+    else:
+        raise ValueError(f"未知损失口径 {kind!r}")
+
+    parts: Dict[str, Any] = {
+        "base": None if base is None else float(base.detach().item()),
+        "align": None,
+        "align_lambda": float(model.config.align_lambda),
+        "align_mode": str(model.config.align_mode),
+        "align_applicable": False,
+        "align_supcon": None,
+        "align_distill_self": None,
+        "align_distill_centroid": None,
+        "align_n_used": 0,
+        "align_n_excluded": 0,
+        "align_skipped_reason": None,
+        "distill_self_weight": None,
+        "distill_centroid_weight": None,
+    }
+    if str(model.config.align_mode) != "off":
+        if feats is None:
+            raise ValueError(
+                "align_mode 非 off 时必须提供 feats（对齐目标 (i)(ii) 都在编码器特征空间里算）"
+            )
+        align_detail = model.alignment_loss(
+            feats, targets, int(n_classes), branch=n3d_branch
+        )
+        parts.update({
+            "align": (None if align_detail["loss"] is None
+                      else float(align_detail["loss"].detach().item())),
+            "align_applicable": bool(align_detail["applicable"]),
+            "align_supcon": align_detail["supcon"],
+            "align_distill_self": align_detail["distill_self"],
+            "align_distill_centroid": align_detail["distill_centroid"],
+            "align_n_used": int(align_detail["n_used"]),
+            "align_n_excluded": int(align_detail["n_excluded"]),
+            "align_skipped_reason": align_detail["skipped_reason"],
+            # 两个对齐目标在总损失里的**实际权重**（都取 0.5 的分项系数 × λ）：
+            # 显式写出来，避免报告把它们与「λ 本身」混为一谈。
+            "distill_self_weight": (
+                0.5 * float(model.config.align_lambda)
+                if align_detail["distill_self"] is not None else None
+            ),
+            "distill_centroid_weight": (
+                0.5 * float(model.config.align_lambda)
+                if align_detail["distill_centroid"] is not None else None
+            ),
+        })
+
+    total: Optional[torch.Tensor]
+    if base is None and (align_detail is None or align_detail["loss"] is None):
+        total = None
+    elif base is None:
+        total = align_detail["weighted"]  # type: ignore[index]
+    elif align_detail is None or align_detail["loss"] is None:
+        total = base
+    else:
+        total = base + align_detail["weighted"]
+    parts["total"] = None if total is None else float(total.detach().item())
+    return {
+        "loss": total,
+        "base": None if base is None else float(base.detach().item()),
+        "align": parts["align"],
+        "align_detail": align_detail,
+        "parts": parts,
+    }
 
 
 def setup_answer_table(model: N3DQA, data: TrainingData,
@@ -1056,6 +1405,10 @@ def apply_freeze(model: N3DQA, scope: str, train_repr: bool, train_scale: bool) 
     train_backbone = bool(train_repr) and scope == "head_backbone"
     for p in model.q_head.parameters():
         p.requires_grad_(train_head)
+    # 投影头（机制 B）**随 head / head_backbone 档可训**：它属于"头侧"表示参数，
+    # 其全部梯度都来自对齐损失（见 `batch_loss`），不会被别的路径污染。
+    for p in model.alignment_parameters():
+        p.requires_grad_(train_head)
     for p in model.adapter.model.parameters():
         p.requires_grad_(train_backbone)
     model.logit_scale.requires_grad_(bool(train_scale))
@@ -1091,6 +1444,14 @@ def make_optimizer(
     for _n, p in model.q_head.named_parameters():
         if p.requires_grad:
             named.append((f"head.{name_of[id(p)]}", p))
+    # 投影头（机制 B；`proj.weight` / `proj.bias`）同属 head 组。名字一律取自
+    # `model.named_parameters()` 的**现场命名**（因此天然是 `head.proj.weight` 形态，
+    # 与 `param_deltas` 的键口径一致 —— 历史纠正记录 #9）。
+    proj = getattr(model, "proj", None)
+    if proj is not None:
+        for _n, p in proj.named_parameters():
+            if p.requires_grad:
+                named.append((f"head.{name_of[id(p)]}", p))
     if isinstance(getattr(model, "answer_table", None), nn.Parameter) and bool(
         model.answer_table.requires_grad
     ):
@@ -1129,6 +1490,8 @@ def ungrouped_trainable_names(model: N3DQA) -> List[str]:
     """
     grouped = {id(p) for p in model.q_head.parameters()}
     grouped.add(id(model.logit_scale))
+    # 投影头（机制 B）进入优化器，故属于 grouped；未启用时 `alignment_parameters()` 为空。
+    grouped.update(id(p) for p in model.alignment_parameters())
     if isinstance(getattr(model, "answer_table", None), nn.Parameter):
         grouped.add(id(model.answer_table))
     out: List[str] = []
@@ -1349,6 +1712,240 @@ def representation_geometry(model: N3DQA, data: TrainingData,
         "nn1_top1_repr": _top1(repr_tr, tr_lab, repr_te, te_lab),
         "nn1_top1_centroid_repr": float(
             (centroid_pred == te_lab).to(torch.float64).mean().item()
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 对齐度与有效秩（本轮新增的两个诊断量）
+# ---------------------------------------------------------------------------
+
+#: 有效秩的**容差口径**（显式固定，不得随运行变化）：奇异值 ``σ_i`` 计入"有效"当且仅当
+#: ``σ_i > σ_max * EFFECTIVE_RANK_REL_TOL``。取 ``1e-6`` 是 float32 下"数值零"与
+#: "真实小奇异值"的经验分界（float32 的相对精度约 ``1.2e-7``，取 1e-6 留一个数量级余量）。
+EFFECTIVE_RANK_REL_TOL: float = 1e-6
+
+
+@torch.no_grad()
+def effective_rank(
+    matrix: torch.Tensor, *, rel_tol: float = EFFECTIVE_RANK_REL_TOL
+) -> Dict[str, Any]:
+    """矩阵的**有效秩 / 参与比 / 占比**（口径在此显式固定，禁止各处各写一套）。
+
+    口径
+    ----
+    * 输入 ``matrix`` 为 ``[n, D]`` 的**原始**表示矩阵（**不中心化**、不归一化；
+      中心化与否会改变奇异谱，故必须固定下来并在报告里写明）；
+    * 对 ``matrix`` 做 SVD，取奇异值 ``σ``（降序，长度 ``min(n, D)``）；
+    * ``rel_tol`` 容差口径：``σ_i > σ_max * rel_tol`` 的个数即**有效秩**
+      （``σ_max`` 为最大奇异值；``σ_max == 0`` 时有效秩记 ``0``）；
+      **默认 ``rel_tol = 1e-6``**，见 :data:`EFFECTIVE_RANK_REL_TOL`；
+    * **参与比** = ``(Σσ)² / Σσ²``（谱的"有效维数"，对小幅奇异值敏感）；
+    * **占 R^D 的百分比** = ``有效秩 / D``（D = ``matrix.shape[1]``）；
+    * **占样本数 n 的百分比** = ``有效秩 / n``（``fc_dim=0`` 时读出是纯线性
+      ``f = W_out @ h``，``rank`` 天然 ``<= min(n, N)``，该比值用于识别"被样本数卡住"）。
+
+    参数
+    ----
+    matrix : torch.Tensor
+        ``[n, D]`` 表示矩阵（``n >= 2``）。
+    rel_tol : float
+        相对容差（``> 0``）。
+
+    返回
+    ----
+    Dict[str, Any]
+        ``{"n", "dim", "rank", "rel_tol", "rank_ratio_dim", "rank_ratio_n",
+        "participation_ratio", "sigma_max", "sigma_sum", "sigma_sq_sum",
+        "sigma_head"}``；``sigma_head`` 为前 8 个奇异值（报告可读性）。
+    """
+    if matrix.dim() != 2:
+        raise ValueError(f"effective_rank 需要 2D [n, D] 矩阵，当前 {tuple(matrix.shape)}")
+    if float(rel_tol) <= 0.0:
+        raise ValueError(f"rel_tol 必须 > 0，当前 {rel_tol}")
+    x = matrix.detach().to(torch.float32).cpu()
+    n, dim = int(x.shape[0]), int(x.shape[1])
+    if n < 2:
+        raise ValueError(f"effective_rank 需要 n >= 2 个样本，当前 n={n}")
+    sigma = torch.linalg.svdvals(x)
+    sigma_max = float(sigma[0].item()) if int(sigma.numel()) > 0 else 0.0
+    if sigma_max <= 0.0:
+        rank = 0
+    else:
+        rank = int((sigma > sigma_max * float(rel_tol)).sum().item())
+    sigma_sum = float(sigma.sum().item())
+    sigma_sq_sum = float((sigma ** 2).sum().item())
+    return {
+        "n": n,
+        "dim": dim,
+        "rank": rank,
+        "rel_tol": float(rel_tol),
+        "rank_ratio_dim": float(rank) / float(dim) if dim > 0 else 0.0,
+        "rank_ratio_n": float(rank) / float(n) if n > 0 else 0.0,
+        "participation_ratio": (
+            float(sigma_sum ** 2 / sigma_sq_sum) if sigma_sq_sum > 0.0 else 0.0
+        ),
+        "sigma_max": sigma_max,
+        "sigma_sum": sigma_sum,
+        "sigma_sq_sum": sigma_sq_sum,
+        "sigma_head": [float(v) for v in sigma[:8].tolist()],
+    }
+
+
+@torch.no_grad()
+def alignment_degree(model: N3DQA, data: TrainingData,
+                     device: torch.device) -> Dict[str, Any]:
+    """**对齐度**：N3D 支路表示与「答案表各类质心」的平均余弦（逐类 + 总体）。
+
+    口径（显式固定，只作诊断，不参与任何模型选择）
+    --------------------------------------------
+    * 评估池 = ``train_known + test_known``（与 :func:`representation_geometry` **同池**，
+      便于两处数字互相对账）；
+    * 表示 ``rep`` = :meth:`N3DQA.n3d_branch` 的输出（``concat`` 口径下已过无仿射
+      ``LayerNorm``，机制 B 下再经投影头 -> 即"投影后"），逐行 L2 归一化；
+    * **各类质心** = 模型自己的 ``answer_table``（``centroid`` 口径下由训练样本的**原始
+      编码器特征**逐类质心确定性写入、L2 归一化、冻结为 buffer），逐行 L2 归一化后取
+      前 ``C`` 行（答案类）；末位「不相关」行**单独报**，不并入总体均值；
+    * 另外报告 4.1 要求的两个**对齐目标量**（都取"表示 vs 目标"的余弦均值）：
+      目标 (i) ``self_encoder_feature`` = 本样本的编码器原始特征；
+      目标 (ii) ``class_centroid`` = 本样本所属类**由训练样本特征算出的**质心。
+
+    参数
+    ----
+    model : N3DQA
+        模型（内部切 ``eval()``）。
+    data : TrainingData
+        数据装配结果。
+    device : torch.device
+        设备。
+
+    返回
+    ----
+    Dict[str, Any]
+        ``{"applicable", "reason", "pool_size", "dim", "projection_head",
+        "cos_class_centroid", "cos_irrelevant_key", "cos_self_encoder_feature",
+        "cos_own_class_centroid", "align_targets_reported", "index_convention"}``。
+        ``applicable=False``（``head_input_mode="raw"``）时只返回 ``applicable`` /
+        ``reason``：raw 档下 ``adapter.features`` **从不被调用**（现场登记的结构事实），
+        此时"N3D 输出的对齐度"无定义，如实记 ``None`` 而不是拿 raw 特征冒充。
+    """
+    if str(model.config.head_input_mode) == "raw":
+        return {
+            "applicable": False,
+            "reason": (
+                "head_input_mode='raw'：adapter.features 从不被调用（结构性事实），"
+                "不存在 N3D 输出，故对齐度无定义"
+            ),
+            "align_targets_reported": list(ALIGN_TARGETS),
+        }
+    model.eval()
+    C = int(data.corpus.n_classes)
+    idx = data.corpus.key_to_index()
+    pool = list(data.splits.train_known) + list(data.splits.test_known)
+    pool_feats = _feats(data.vectorizer, pool, device)
+    lab = torch.tensor(
+        [idx[r.answer_key] for r in pool], dtype=torch.long, device=device
+    )
+    rep = F.normalize(model.n3d_branch(pool_feats), dim=1)
+    keys = F.normalize(model.answer_table.detach(), dim=1)  # [C+1, D]
+    scores = rep @ keys[:C].transpose(0, 1)                 # [n, C]
+    per_class: Dict[str, float] = {}
+    for c in range(C):
+        mask = lab == c
+        if int(mask.sum().item()) == 0:
+            continue
+        per_class[str(data.corpus.answer_keys[c])] = float(scores[mask, c].mean().item())
+    own = scores[torch.arange(int(lab.shape[0]), device=device), lab]
+    irr = float((rep @ keys[C]).mean().item()) if int(keys.shape[0]) > C else None
+    raw = F.normalize(pool_feats, dim=1)
+    cent = torch.zeros(C, int(raw.shape[1]), device=device)
+    for c in range(C):
+        mask = lab == c
+        if int(mask.sum().item()) == 0:
+            continue
+        cent[c] = F.normalize(raw[mask].mean(dim=0), dim=0)
+    return {
+        "applicable": True,
+        "reason": None,
+        "pool_size": int(len(pool)),
+        "dim": int(rep.shape[1]),
+        "projection_head": bool(model.proj is not None),
+        "index_convention": (
+            "各类质心取 answer_table 的前 C 行（答案类，逐类质心、冻结 buffer）；"
+            "末位「不相关」行单独报，不并入总体均值"
+        ),
+        "cos_class_centroid": {
+            "per_class": per_class,
+            "mean": float(own.mean().item()),
+            "min": float(own.min().item()),
+            "max": float(own.max().item()),
+        },
+        "cos_irrelevant_key": irr,
+        "cos_self_encoder_feature": float(
+            (rep * raw).sum(dim=1).mean().item()
+        ),
+        "cos_own_class_centroid": float(
+            (rep * cent[lab]).sum(dim=1).mean().item()
+        ),
+        "align_targets_reported": list(ALIGN_TARGETS),
+    }
+
+
+@torch.no_grad()
+def spectral_diagnostics(model: N3DQA, data: TrainingData,
+                         device: torch.device) -> Dict[str, Any]:
+    """**有效秩 / 参与比 / 占比**：对 N3D 输出矩阵（与"投影后"表示）做 SVD。
+
+    口径（显式固定）
+    ---------------
+    * 评估池 = ``train_known + test_known``（与 :func:`representation_geometry` /
+      :func:`alignment_degree` **同池**）；
+    * 两套矩阵**都报**：
+      ``readout`` = :meth:`BackendAdapter.features` 的**原始 N3D 读出**（未 LayerNorm、
+      未投影；现场实测的"纯线性读出"口径），
+      ``aligned`` = :meth:`N3DQA.n3d_branch` 的输出（``concat`` 档已过无仿射 LayerNorm，
+      机制 B 下再经投影头）；
+    * 容差口径见 :func:`effective_rank`（``σ > σ_max · 1e-6``），**不中心化**；
+    * ``head_input_mode="raw"`` 时不适用（raw 档下 ``adapter.features`` 不被调用），
+      返回 ``applicable=False`` 与可读原因，**不用 raw 文本特征冒充 N3D 输出**。
+
+    参数
+    ----
+    model, data, device : 同 :func:`alignment_degree`。
+
+    返回
+    ----
+    Dict[str, Any]
+        ``{"applicable", "reason", "pool_size", "dim", "readout", "aligned",
+        "rel_tol", "note"}``；``readout`` / ``aligned`` 为 :func:`effective_rank` 的输出。
+    """
+    if str(model.config.head_input_mode) == "raw":
+        return {
+            "applicable": False,
+            "reason": (
+                "head_input_mode='raw'：adapter.features 从不被调用（结构性事实），"
+                "不存在 N3D 输出矩阵，故有效秩无定义"
+            ),
+            "rel_tol": float(EFFECTIVE_RANK_REL_TOL),
+        }
+    model.eval()
+    pool = list(data.splits.train_known) + list(data.splits.test_known)
+    pool_feats = _feats(data.vectorizer, pool, device)
+    readout = model.adapter.features(pool_feats)
+    aligned = model.n3d_branch(pool_feats, readout=readout)
+    return {
+        "applicable": True,
+        "reason": None,
+        "pool_size": int(len(pool)),
+        "dim": int(readout.shape[1]),
+        "projection_head": bool(model.proj is not None),
+        "rel_tol": float(EFFECTIVE_RANK_REL_TOL),
+        "readout": effective_rank(readout),
+        "aligned": effective_rank(aligned),
+        "note": (
+            "readout = adapter.features 的原始 N3D 读出（未 LayerNorm / 未投影）；"
+            "aligned = n3d_branch（concat 档含无仿射 LayerNorm，机制 B 再含投影头）；"
+            "两套都不中心化，容差 σ > σ_max·1e-6"
         ),
     }
 
@@ -1637,6 +2234,25 @@ def run_group(
     trainable_names: List[str] = []
     ungrouped: List[str] = []
     epoch_no = 0
+    # ---- 对齐项的批级累计（G7 用：对齐损失有限性 + 跳过计数可见）----
+    align_on = bool(str(cfg.align_mode) != "off")
+    align_stats: Dict[str, Any] = {
+        "mode": str(cfg.align_mode),
+        "lambda": float(cfg.align_lambda),
+        "batches_total": 0,
+        "batches_with_align": 0,
+        "batches_align_skipped": 0,      # 对齐项本 batch 不适用（如批内无同类正样本）
+        "batches_loss_skipped": 0,       # 基础损失本 batch 不适用（整个 batch 被跳过）
+        "align_sum": 0.0,
+        "align_max": None,
+        "align_min": None,
+        "align_nonfinite": 0,
+        "supcon_sum": 0.0,
+        "distill_self_sum": 0.0,
+        "distill_centroid_sum": 0.0,
+        "distill_terms": 0,
+        "skipped_reasons": {},
+    }
     for phase_name, n_epochs, train_repr, train_scale, loss_kind in plan:
         apply_freeze(model, group.freeze_scope, train_repr, train_scale)
         optimizer, names = make_optimizer(model, cfg)
@@ -1657,11 +2273,55 @@ def run_group(
                 tgt = torch.tensor(targets, dtype=torch.long, device=device)
                 weight = _sample_weights(targets, data, cfg, device)
                 optimizer.zero_grad(set_to_none=True)
-                q = model.query(feats)
+                # 对齐开启时先算一次 N3D 支路表示，供 `query` 与对齐损失**共用**
+                # （避免两次骨干前向；关闭对齐时该变量恒为 None，路径逐字符不变）。
+                branch = model.n3d_branch(feats) if align_on else None
+                q = model.query(feats) if branch is None else model.query(
+                    feats, n3d_branch=branch
+                )
                 logits = model.logits(feats, None, q=q)
-                loss = batch_loss(model, loss_kind, logits, q, tgt, weight, C)
+                outcome = batch_loss(
+                    model, loss_kind, logits, q, tgt, weight, C,
+                    feats=feats if align_on else None,
+                    n3d_branch=branch,
+                )
+                parts = outcome["parts"]
+                align_stats["batches_total"] += 1
+                if align_on:
+                    if bool(parts["align_applicable"]):
+                        align_stats["batches_with_align"] += 1
+                        value = float(parts["align"])
+                        if not math.isfinite(value):
+                            align_stats["align_nonfinite"] += 1
+                        align_stats["align_sum"] += value
+                        align_stats["align_max"] = (
+                            value if align_stats["align_max"] is None
+                            else max(float(align_stats["align_max"]), value)
+                        )
+                        align_stats["align_min"] = (
+                            value if align_stats["align_min"] is None
+                            else min(float(align_stats["align_min"]), value)
+                        )
+                        if parts["align_supcon"] is not None:
+                            align_stats["supcon_sum"] += float(parts["align_supcon"])
+                        if parts["align_distill_self"] is not None:
+                            align_stats["distill_self_sum"] += float(
+                                parts["align_distill_self"]
+                            )
+                            align_stats["distill_centroid_sum"] += float(
+                                parts["align_distill_centroid"]
+                            )
+                            align_stats["distill_terms"] += 1
+                    else:
+                        align_stats["batches_align_skipped"] += 1
+                        reason = str(parts["align_skipped_reason"])
+                        align_stats["skipped_reasons"][reason] = (
+                            int(align_stats["skipped_reasons"].get(reason, 0)) + 1
+                        )
+                loss = outcome["loss"]
                 if loss is None:
                     n_skipped += 1
+                    align_stats["batches_loss_skipped"] += 1
                     continue
                 if not bool(torch.isfinite(loss).item()):
                     raise RuntimeError(
@@ -1685,6 +2345,34 @@ def run_group(
                     phase=phase_name, epoch=epoch_no,
                 )
             )
+    # 对齐项的批级均值（只对「适用」的 batch 求均值，分母显式登记，避免把跳过当 0）
+    n_align = int(align_stats["batches_with_align"])
+    align_stats["align_mean"] = (
+        float(align_stats["align_sum"]) / float(n_align) if n_align > 0 else None
+    )
+    align_stats["supcon_mean"] = (
+        float(align_stats["supcon_sum"]) / float(n_align) if n_align > 0 else None
+    )
+    n_distill = int(align_stats["distill_terms"])
+    align_stats["distill_self_mean"] = (
+        float(align_stats["distill_self_sum"]) / float(n_distill) if n_distill else None
+    )
+    align_stats["distill_centroid_mean"] = (
+        float(align_stats["distill_centroid_sum"]) / float(n_distill)
+        if n_distill else None
+    )
+    # G7：开启对齐时，**实际参与过**的对齐项必须全部有限；否则该组判无效（抛错）
+    if align_on and n_align > 0 and int(align_stats["align_nonfinite"]) > 0:
+        raise RuntimeError(
+            f"组 {group.name} 的对齐损失出现非有限值 "
+            f"（{align_stats['align_nonfinite']} / {n_align} 个 batch）；该组判无效"
+        )
+    if align_on and n_align == 0:
+        raise RuntimeError(
+            f"组 {group.name} 开启了对齐（align_mode={cfg.align_mode}）但"
+            f"**没有任何 batch** 的对齐项适用（跳过原因计数 = "
+            f"{align_stats['skipped_reasons']}）；该组判无效"
+        )
 
     model.eval()
     deltas = param_deltas(model, head_state0, backbone_state0)
@@ -1707,6 +2395,21 @@ def run_group(
     step1 = evaluate_step1(model, data, k=3, device=str(device))
     refusal = evaluate_refusal(model, data, device=str(device))
     geo = representation_geometry(model, data, device)
+    # ---- 本轮新增的两个诊断量（4.1 对齐度 / 4.2 有效秩·参与比）----
+    align_deg = alignment_degree(model, data, device)
+    spectrum = spectral_diagnostics(model, data, device)
+    # ---- 结构代价（逐组现场枚举；不假设存在 W_in / W_out）----
+    backbone_named = {n: int(p.numel()) for n, p in model.adapter.model.named_parameters()}
+    structure_stats = {
+        "structure": group.structure().as_dict(),
+        "structure_is_default": bool(group.structure_is_default()),
+        "topology": {k: float(v) for k, v in model.adapter.topology_stats().items()},
+        "backbone_parameter_names": sorted(backbone_named.keys()),
+        "backbone_parameters": backbone_named,
+        "backbone_total": int(sum(backbone_named.values())),
+        "head_total": int(sum(p.numel() for p in model.parameters())),
+        "answer_table_shape": [int(x) for x in model.answer_table.shape],
+    }
     step2_metric: Optional[Dict[str, Any]] = None
     if step2_bundle is not None:
         step2_metric = step2_recall_of_model(
@@ -1734,6 +2437,12 @@ def run_group(
             "stage2_epochs": int(stage2_epochs),
             "supcon_temperature": float(SUPCON_TEMPERATURE),
             "device": str(device),
+            # ---- 结构 / 对齐开关（本轮新增；默认档值即既有口径）----
+            "structure": group.structure().as_dict(),
+            "align_mode": str(group.align_mode),
+            "align_lambda": float(group.align_lambda),
+            "proj_dim": int(group.proj_dim),
+            "proj_init": str(cfg.proj_init),
         },
         "split": data.splits.summary(),
         "split_qids": split_qids(data),
@@ -1753,6 +2462,11 @@ def run_group(
         "metric_step1": step1.as_dict(),
         "refusal": {k: float(v) for k, v in refusal.items()},
         "geo": geo,
+        # ---- 本轮新增：对齐度 / 有效秩·参与比 / 对齐项批级统计 / 结构代价 ----
+        "alignment_degree": align_deg,
+        "spectrum": spectrum,
+        "align_stats": align_stats,
+        "structure_stats": structure_stats,
         "step2": step2_metric,
         "history": history,
         "gate": gate,
@@ -1811,18 +2525,139 @@ def anchor_comparison(geo: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def construction_probe(group: ReprGroup, dim: int) -> Dict[str, Any]:
+    """**单组可构造性预检**（正式跑之前现场构造一次，失败原因原样登记）。
+
+    检查内容（全部走**只读**上游 ``config`` / ``model`` 与代理层的
+    :func:`recommended_config`，不使用任何记忆中的能力边界）：
+
+    1. 结构开关经代理层装配成上游 ``Config`` 是否成功（非法组合由上游构造期抛错）；
+    2. 上游 ``ThreeDNeuronSpace`` 是否可构造（连通性下限 / 尺寸窗口 / FCC 点数等校验）；
+    3. ``N3DQAConfig`` 的对齐开关组合是否合法（``heads`` 的构造期不变量）。
+
+    参数
+    ----
+    group : ReprGroup
+        组定义。
+    dim : int
+        连接参数 ``D``。
+
+    返回
+    ----
+    Dict[str, Any]
+        ``{"group", "ok", "exc_type", "reason", "topology", "parameters",
+        "backbone_parameter_names", "align_mode", "structure"}``；
+        ``ok=False`` 时 ``exc_type`` / ``reason`` 必给出（可读原因）。
+    """
+    from .backends import BACKEND_NAMES, recommended_config
+
+    payload: Dict[str, Any] = {
+        "group": str(group.name),
+        "ok": False,
+        "exc_type": None,
+        "reason": None,
+        "structure": group.structure().as_dict(),
+        "align_mode": str(group.align_mode),
+        "align_lambda": float(group.align_lambda),
+        "proj_dim": int(group.proj_dim),
+        "dim": int(dim),
+        "backend": "n3d_shape",
+        "topology": None,
+        "parameters": None,
+        "backbone_parameter_names": None,
+    }
+    try:
+        if "n3d_shape" not in BACKEND_NAMES:
+            raise RuntimeError("后端 n3d_shape 未登记（BACKEND_NAMES 现场枚举异常）")
+        cfg = recommended_config("n3d_shape", int(dim), group.structure())
+        from n3d_shape.model import ThreeDNeuronSpace as _ShapeModel
+
+        backbone = _ShapeModel(cfg)
+        # 拓扑量**直接在现场构造出来的骨架上取**（不再二次构造，避免重复建图）
+        axis = backbone.neuron_pos[:, int(backbone.flow_axis_index)]
+        payload["topology"] = {
+            "E": float(int(getattr(backbone, "num_edges"))),
+            "K": float(torch.unique(axis).numel()),
+            "S_in": float(int(getattr(backbone, "num_in_scope"))),
+            "S_out": float(int(getattr(backbone, "num_out_scope"))),
+        }
+        payload["parameters"] = int(sum(p.numel() for p in backbone.parameters()))
+        payload["backbone_parameter_names"] = sorted(
+            n for n, _ in backbone.named_parameters()
+        )
+        # 对齐开关的构造期不变量（heads 侧）；不构造完整 N3DQA，避免多花一次拓扑构造
+        N3DQAConfig(
+            dim=int(dim),
+            output_mode="index",
+            head_input_mode=str(group.head_input_mode),
+            answer_table_mode="centroid",
+            align_mode=str(group.align_mode),
+            align_lambda=float(group.align_lambda),
+            proj_dim=int(group.proj_dim),
+        )
+        payload["ok"] = True
+        return payload
+    except Exception as exc:  # noqa: BLE001 - 失败原因必须原样登记，不得吞掉
+        payload["exc_type"] = type(exc).__name__
+        payload["reason"] = str(exc)
+        return payload
+
+
+def precheck_constructibility(
+    groups: Sequence[ReprGroup], dim: int
+) -> Dict[str, Any]:
+    """**全组可构造性预检**：逐组现场构造，返回可跑集合与失败清单。
+
+    口径（对应「构造失败 -> 判该组无效并跳过 + 报告显式登记失败原因」）
+    --------------------------------------------------------------
+    * **不硬失败终止**：任一组构造失败只把该组挡在 ``runnable`` 之外；
+    * **绝不以成功状态落账**：失败组的信息（``exc_type`` + 可读 ``reason``）原样放进
+      ``failures``，并由调用侧（``run_experiment`` / CLI）在报告与退出码中显式体现。
+
+    参数
+    ----
+    groups : Sequence[ReprGroup]
+        待预检的组。
+    dim : int
+        连接参数 ``D``。
+
+    返回
+    ----
+    Dict[str, Any]
+        ``{"dim", "probed", "runnable", "failures", "all_runnable"}``；
+        ``failures`` 每项 = :func:`construction_probe` 的 ``ok=False`` 输出。
+    """
+    probed = [construction_probe(g, int(dim)) for g in groups]
+    failures = [p for p in probed if not p["ok"]]
+    return {
+        "dim": int(dim),
+        "probed": probed,
+        "runnable": [p["group"] for p in probed if p["ok"]],
+        "failures": failures,
+        "all_runnable": bool(not failures),
+        "rule": (
+            "构造失败 -> 判该组无效并跳过（不硬失败终止），失败原因（异常类型 + 可读原因）"
+            "在 construction_failures 中显式登记，绝不以成功状态落账"
+        ),
+    }
+
+
 def run_experiment(
     *,
     group_names: Optional[Sequence[str]] = None,
+    groups: Optional[Sequence[ReprGroup]] = None,
     progress: Optional[Callable[[str], None]] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """顺序跑完整矩阵（或指定子集），并执行**切分一致性断言**。
+    """顺序跑完整矩阵（或指定子集），执行**可构造性预检**与**切分一致性断言**。
 
     参数
     ----
     group_names : Optional[Sequence[str]]
-        只跑这些组（``None`` = 全部 8 组）。
+        只跑这些组（``None`` = :data:`MATRIX` 的全部组）。
+    groups : Optional[Sequence[ReprGroup]]
+        **显式组定义**（本轮新增；用于 CLI 的"逐轴单换"自定义组）。
+        给出时**优先于** ``group_names``。
     progress : Optional[Callable[[str], None]]
         进度回调（只接收一行文本；本模块自身不打印任何东西）。
     kwargs
@@ -1831,21 +2666,42 @@ def run_experiment(
     返回
     ----
     Dict[str, Any]
-        报告字典（含 ``profile`` / ``groups`` / ``split_identical`` /
-        ``anchor_comparison`` / ``cost``）。
+        报告字典（含 ``profile`` / ``groups`` / ``construction_failures`` /
+        ``split_identical`` / ``anchor_comparison`` / ``cost`` /
+        ``axis_attribution``）。
     """
-    names = list(group_names) if group_names else [g.name for g in MATRIX]
-    wanted = [group_by_name(n) for n in names]
+    if groups is not None:
+        wanted = list(groups)
+    else:
+        names = list(group_names) if group_names else [g.name for g in MATRIX]
+        wanted = [group_by_name(n) for n in names]
     prof = profile_by_name(str(kwargs.get("profile", DEFAULT_PROFILE)))
+    # ---- 前置门禁：可构造性预检（G6；失败组跳过并显式登记）----
+    precheck = precheck_constructibility(wanted, int(prof.expect_dim))
+    if progress is not None:
+        progress(
+            f"[precheck] 可构造性预检：{len(precheck['runnable'])} / {len(wanted)} 组可构造"
+            f"（失败 {len(precheck['failures'])} 组）"
+        )
+        for item in precheck["failures"]:
+            progress(
+                f"[precheck] 构造失败 -> 跳过：{item['group']} "
+                f"({item['exc_type']}: {str(item['reason'])[:160]})"
+            )
+    runnable = [g for g in wanted if g.name in set(precheck["runnable"])]
     results: List[Dict[str, Any]] = []
     reference: Optional[Dict[str, List[str]]] = None
     ref_name = ""
-    for group in wanted:
+    for group in runnable:
         if progress is not None:
             progress(
                 f"[start] {group.name} (profile={prof.name}, "
                 f"freeze_scope={group.freeze_scope}, "
-                f"head_input_mode={group.head_input_mode}, loss_mode={group.loss_mode})"
+                f"head_input_mode={group.head_input_mode}, loss_mode={group.loss_mode}, "
+                f"shape={group.shape}, fc_dim={group.fc_dim}, N={group.N}, "
+                f"geo_field={group.geo_field}, align_mode={group.align_mode}"
+                + (f", λ={group.align_lambda}" if group.align_mode != "off" else "")
+                + ")"
             )
         t0 = time.time()
         res = run_group(group, **kwargs)
@@ -1864,10 +2720,14 @@ def run_experiment(
                 f" step2R@1={(s2.get('q_path') or {}).get('recall_at_1'):.4f}"
                 if s2 else ""
             )
+            ad = res.get("alignment_degree") or {}
+            er = ((res.get("spectrum") or {}).get("aligned") or {}).get("rank")
             progress(
                 f"[done ] {group.name} gap/σ={res['geo']['gap_over_sigma']:.4f} "
                 f"macro={res['metric_step1']['macro_acc']:.4f}{s2_txt} "
                 f"refusal={res['refusal']['refusal_rate']:.4f} "
+                f"align_cos={(ad.get('cos_class_centroid') or {}).get('mean')} "
+                f"eff_rank={er} "
                 f"gate={'PASS' if gate['passed'] else 'FAIL'} "
                 f"({res['seconds']:.1f}s)"
             )
@@ -1881,6 +2741,7 @@ def run_experiment(
             n_train_unknown=int(baseline["split"]["train_unknown"]),
             n_classes=int(baseline["n_classes"]),
         )
+    by_name = {r["group"]["name"]: r for r in results}
     return {
         "experiment": "n3d_qa_learn/exp_repr",
         "profile": prof.as_dict(),
@@ -1889,11 +2750,28 @@ def run_experiment(
         "anchor": dict(ANCHOR),
         "anchor_tolerance": dict(ANCHOR_TOL),
         "groups": results,
+        "single_seed": {
+            "split_seed": int(kwargs.get("split_seed", BASE_SPLIT_SEED)),
+            "train_seed": int(kwargs.get("train_seed", BASE_TRAIN_SEED)),
+            "statement": (
+                "所有 Δ 均为单点差（同一切分、同一训练 seed 下两组之差），"
+                "**不含跨 seed 训练随机性区间、无跨 seed 极差**"
+            ),
+        },
+        "construction_precheck": {
+            "dim": int(precheck["dim"]),
+            "n_requested": int(len(wanted)),
+            "n_runnable": int(len(precheck["runnable"])),
+            "runnable": list(precheck["runnable"]),
+            "rule": precheck["rule"],
+        },
+        "construction_failures": list(precheck["failures"]),
         "split_reference_group": str(ref_name),
         "split_identical": True,
         "split_digest": split_qids_digest(reference) if reference else {},
         "anchor_comparison": anchor_comparison(baseline["geo"]) if baseline else None,
         "cost": cost,
+        "axis_attribution": axis_attribution(by_name),
         "step2_protocol": (
             dict(kwargs["step2_bundle"].evidence)
             if kwargs.get("step2_bundle") is not None else None
@@ -1907,11 +2785,19 @@ def summarize(report: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for res in report["groups"]:
         geo = res["geo"]
+        g = res["group"]
+        st = g.get("structure") or {}
         out.append({
-            "group": res["group"]["name"],
-            "freeze_scope": res["group"]["freeze_scope"],
-            "head_input_mode": res["group"]["head_input_mode"],
-            "loss_mode": res["group"]["loss_mode"],
+            "group": g["name"],
+            "freeze_scope": g["freeze_scope"],
+            "head_input_mode": g["head_input_mode"],
+            "loss_mode": g["loss_mode"],
+            "shape": st.get("shape"),
+            "fc_dim": st.get("fc_dim"),
+            "N": st.get("N"),
+            "geo_field": st.get("geo_field"),
+            "align_mode": g.get("align_mode"),
+            "align_lambda": g.get("align_lambda"),
             "gap": round(float(geo["gap"]), 4),
             "sigma": round(float(geo["within_sigma"]), 4),
             "gap_over_sigma": round(float(geo["gap_over_sigma"]), 4),
@@ -1924,6 +2810,16 @@ def summarize(report: Dict[str, Any]) -> List[Dict[str, Any]]:
             "answer_table_shift_l2": float(res["shifts"]["answer_table_shift_l2"]),
             "argmax_changed_frac": float(res["shifts"]["argmax_changed_frac"]),
             "gate_passed": bool(res["gate"]["passed"]),
+            # ---- 本轮新增诊断量的摘要列 ----
+            "align_mode": g.get("align_mode"),
+            "align_lambda": g.get("align_lambda"),
+            "align_cos_mean": ((res.get("alignment_degree") or {}).get(
+                "cos_class_centroid") or {}).get("mean"),
+            "eff_rank_aligned": ((res.get("spectrum") or {}).get("aligned") or {}).get("rank"),
+            "eff_rank_readout": ((res.get("spectrum") or {}).get("readout") or {}).get("rank"),
+            "participation_ratio_aligned": ((res.get("spectrum") or {}).get(
+                "aligned") or {}).get("participation_ratio"),
+            "backbone_total": (res.get("structure_stats") or {}).get("backbone_total"),
         })
     return out
 
@@ -1933,6 +2829,11 @@ def _metric_row(res: Dict[str, Any]) -> Dict[str, Any]:
     s2 = res.get("step2") or None
     qpath = (s2 or {}).get("q_path") or {}
     det = (s2 or {}).get("deterministic") or {}
+    ad = res.get("alignment_degree") or {}
+    spec = res.get("spectrum") or {}
+    aligned = spec.get("aligned") or {}
+    readout = spec.get("readout") or {}
+    cent = ad.get("cos_class_centroid") or {}
     return {
         "macro_acc": float(res["metric_step1"]["macro_acc"]),
         "top1_acc": float(res["metric_step1"]["top1_acc"]),
@@ -1949,6 +2850,25 @@ def _metric_row(res: Dict[str, Any]) -> Dict[str, Any]:
         "argmax_changed_frac": float(res["shifts"]["argmax_changed_frac"]),
         "gate_passed": bool(res["gate"]["passed"]),
         "seconds": float(res.get("seconds", 0.0)),
+        # ---- 本轮新增的四个诊断量（对齐度 / 有效秩 / 参与比；raw 档如实记 None）----
+        "align_cos_mean": (float(cent["mean"]) if "mean" in cent else None),
+        "align_cos_self_encoder_feature": (
+            float(ad["cos_self_encoder_feature"])
+            if ad.get("cos_self_encoder_feature") is not None else None
+        ),
+        "align_cos_own_class_centroid": (
+            float(ad["cos_own_class_centroid"])
+            if ad.get("cos_own_class_centroid") is not None else None
+        ),
+        "eff_rank_readout": (int(readout["rank"]) if "rank" in readout else None),
+        "eff_rank_aligned": (int(aligned["rank"]) if "rank" in aligned else None),
+        "participation_ratio_aligned": (
+            float(aligned["participation_ratio"]) if "participation_ratio" in aligned else None
+        ),
+        "rank_ratio_dim_aligned": (
+            float(aligned["rank_ratio_dim"]) if "rank_ratio_dim" in aligned else None
+        ),
+        "spectrum_applicable": bool(spec.get("applicable", False)),
     }
 
 
@@ -1959,10 +2879,18 @@ def _delta(a: Optional[float], b: Optional[float]) -> Optional[float]:
     return float(b) - float(a)
 
 
+def _rel(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    """相对增量 ``(b - a) / |a|``（``a`` 缺失或为 0 时返回 ``None``，**不编造分母**）。"""
+    if a is None or b is None or float(a) == 0.0:
+        return None
+    return (float(b) - float(a)) / abs(float(a))
+
+
 def run_comparison(
     *,
     profiles: Sequence[str] = (PROFILE_LEXICAL, PROFILE_SEMANTIC),
     group_names: Optional[Sequence[str]] = None,
+    groups: Optional[Sequence[ReprGroup]] = None,
     step2_product_dir: str = "",
     step2_pool_cap: int = 0,
     step2_topk: int = 5,
@@ -2024,7 +2952,7 @@ def run_comparison(
                 f"纯特征 Recall@1={bundle.det_baseline['recall_at_1']:.4f}"
             )
         runs[prof.name] = run_experiment(
-            group_names=group_names, progress=progress,
+            group_names=group_names, groups=groups, progress=progress,
             profile=prof.name, step2_bundle=bundle, **kwargs,
         )
 
@@ -2102,6 +3030,87 @@ def run_comparison(
     # ---- 归因分解（**换特征** 与 **打开表示训练** 不得合并）-------------
     attribution = _attribution(by_profile, profs)
 
+    # ---- 逐轴归因（本轮新增：形状 / FC / N / geo / 对齐 / 载体 六节分开，不合并）----
+    axis_by_profile = {
+        p.name: runs[p.name]["axis_attribution"] for p in profs
+    }
+    # 每条轴变体在**每一档**是否都相对本档的公共基线同时更优（主判据口径）
+    axis_rows: List[Dict[str, Any]] = []
+    axis_names = list((axis_by_profile[ref_name].get("axes") or {}).keys())
+    for dim_name in axis_names:
+        ref_axis = (axis_by_profile[ref_name]["axes"] or {}).get(dim_name) or {}
+        for ref_row in ref_axis.get("rows", []):
+            gname = str(ref_row["group"])
+            per_profile = {ref_name: {
+                "all_both_better": bool(ref_row["both_better"]),
+                "delta_macro_acc": ref_row["delta_macro_acc"],
+                "delta_macro_acc_rel": ref_row["delta_macro_acc_rel"],
+                "delta_step2_recall_at_1": ref_row["delta_step2_recall_at_1"],
+                "delta_step2_recall_at_1_rel": ref_row["delta_step2_recall_at_1_rel"],
+                "delta_step2_det_recall_at_1": ref_row["delta_step2_det_recall_at_1"],
+                "delta_gap_over_sigma": ref_row["delta_gap_over_sigma"],
+                "delta_refusal_rate": ref_row["delta_refusal_rate"],
+                "delta_align_cos_mean": ref_row["delta_align_cos_mean"],
+                "delta_eff_rank_aligned": ref_row["delta_eff_rank_aligned"],
+                "present": True,
+            }}
+            missing: List[str] = []
+            for prof in profs[1:]:
+                ax = (axis_by_profile[prof.name].get("axes") or {}).get(dim_name) or {}
+                hit = next((r for r in ax.get("rows", []) if r["group"] == gname), None)
+                if hit is None:
+                    missing.append(prof.name)
+                    per_profile[prof.name] = {"present": False}
+                    continue
+                per_profile[prof.name] = {
+                    "all_both_better": bool(hit["both_better"]),
+                    "delta_macro_acc": hit["delta_macro_acc"],
+                    "delta_macro_acc_rel": hit["delta_macro_acc_rel"],
+                    "delta_step2_recall_at_1": hit["delta_step2_recall_at_1"],
+                    "delta_step2_recall_at_1_rel": hit["delta_step2_recall_at_1_rel"],
+                    "delta_step2_det_recall_at_1": hit["delta_step2_det_recall_at_1"],
+                    "delta_gap_over_sigma": hit["delta_gap_over_sigma"],
+                    "delta_refusal_rate": hit["delta_refusal_rate"],
+                    "delta_align_cos_mean": hit["delta_align_cos_mean"],
+                    "delta_eff_rank_aligned": hit["delta_eff_rank_aligned"],
+                    "present": True,
+                }
+            axis_rows.append({
+                "axis": dim_name,
+                "varying_field": ref_axis.get("varying_field"),
+                "group": gname,
+                "per_profile": per_profile,
+                "missing_profiles": missing,
+                "all_profiles_both_better": bool(
+                    not missing
+                    and all(v.get("all_both_better") for v in per_profile.values())
+                ),
+            })
+    axis_attribution_report = {
+        "sep": (
+            "逐轴归因：形状 / FC / 容量 N / 几何权重场 / 对齐 / 载体 六节分开报，"
+            "**禁止合并归因**；每节都相对同一档内的公共基线 "
+            f"{STRUCT_BASELINE_GROUP}（逐轴单换，非全交叉）"
+        ),
+        "baseline": STRUCT_BASELINE_GROUP,
+        "per_profile": axis_by_profile,
+        "rows": axis_rows,
+        "criterion": (
+            "主判据 = 同档内 步骤 1 macro 与 步骤 2 自检索 Recall@1 **同时**优于公共基线"
+            f"（{STRUCT_BASELINE_GROUP}）；以相对 Δ 为主，绝对量作可用性附加判定"
+        ),
+        "groups_axis_both_better_all_profiles": sorted(
+            {r["group"] for r in axis_rows if r["all_profiles_both_better"]}
+        ),
+        "groups_axis_not_both_better": sorted(
+            {r["group"] for r in axis_rows if not r["all_profiles_both_better"]}
+        ),
+    }
+    # 构造失败清单（逐档聚合；**不允许**被吞掉）
+    construction_failures = {
+        p.name: list(runs[p.name].get("construction_failures") or []) for p in profs
+    }
+
     verdict = {
         "criterion": "步骤 1 macro 与步骤 2 自检索 Recall@1 **同时**高于参照档",
         "reference_profile": ref_name,
@@ -2132,6 +3141,8 @@ def run_comparison(
         },
         "comparison": rows,
         "attribution": attribution,
+        "axis_attribution": axis_attribution_report,
+        "construction_failures": construction_failures,
         "verdict": verdict,
         "cost": {p.name: runs[p.name]["cost"] for p in profs},
         "seconds": {
@@ -2148,7 +3159,132 @@ def run_comparison(
             "epochs": int(kwargs.get("epochs", BASE_EPOCHS)),
             "batch_size": int(kwargs.get("batch_size", BASE_BATCH_SIZE)),
         },
+        "single_seed": {
+            "split_seed": int(kwargs.get("split_seed", BASE_SPLIT_SEED)),
+            "train_seed": int(kwargs.get("train_seed", BASE_TRAIN_SEED)),
+            "statement": (
+                "所有 Δ 均为单点差（同一切分、同一训练 seed 下两组之差），"
+                "**不含跨 seed 训练随机性区间、无跨 seed 极差**"
+            ),
+        },
     }
+
+
+def axis_attribution(by_group: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """把本轮**五条轴**的贡献逐条分开量化（**禁止合并归因**）。
+
+    口径
+    ----
+    * 参照系 = :data:`STRUCT_BASELINE_GROUP`（``S0_base``：``concat`` +
+      ``head_backbone`` + 结构默认 + 对齐关闭）；
+    * 每条轴 = :data:`DIMENSIONS` 里本轮的 ``d_shape`` / ``e_fc_dim`` /
+      ``f_capacity_N`` / ``g_geo_field`` / ``h_align`` / ``i_carrier`` 之一，
+      **逐轴单换**（每次只动该轴字段，其余等于 ``S0_base``）；
+    * 每条变体给出与 ``S0_base`` 的 Δ（macro / 步骤 2 自检索 R@1 / 纯特征 detR@1 /
+      ``gap/σ`` / refusal / 对齐度 / 有效秩 / 骨干参数量），``None`` 表示缺项
+      （如实记 ``None``，**不填 0 冒充**）。
+
+    参数
+    ----
+    by_group : Dict[str, Dict[str, Any]]
+        组名 -> 该组结果。
+
+    返回
+    ----
+    Dict[str, Any]
+        ``{"sep", "baseline", "axes": {...}, "sections": ["形状", "FC", "N", "geo",
+        "对齐", "载体"]}``。
+    """
+    base = by_group.get(STRUCT_BASELINE_GROUP)
+    out: Dict[str, Any] = {
+        "sep": (
+            "形状 / FC / 容量 N / 几何权重场 / 对齐 / 载体 —— 六节分开报，"
+            "**禁止合并归因**；每节都相对同一个公共基线 "
+            f"{STRUCT_BASELINE_GROUP}（逐轴单换，非全交叉）"
+        ),
+        "baseline": str(STRUCT_BASELINE_GROUP),
+        "axes": {},
+    }
+    if base is None:
+        out["note"] = f"公共基线组 {STRUCT_BASELINE_GROUP} 不在本次运行内，无法给出逐轴 Δ"
+        return out
+    b_row = _metric_row(base)
+    for dim in DIMENSIONS:
+        dim_name = str(dim["dim"])
+        if str(dim["base"]) != STRUCT_BASELINE_GROUP:
+            continue
+        rows: List[Dict[str, Any]] = []
+        for gname in dim["groups"]:
+            if gname == STRUCT_BASELINE_GROUP:
+                continue
+            other = by_group.get(str(gname))
+            if other is None:
+                continue
+            o_row = _metric_row(other)
+            rows.append({
+                "group": str(gname),
+                "varying_field": str(dim["varying_field"]),
+                "structure": other["group"].get("structure"),
+                "align_mode": other["group"].get("align_mode"),
+                "align_lambda": other["group"].get("align_lambda"),
+                "delta_macro_acc": _delta(b_row["macro_acc"], o_row["macro_acc"]),
+                # 「相对 Δ 为主」：主判据以相对增量为主，绝对量只作可用性附加判定
+                "delta_macro_acc_rel": _rel(
+                    b_row["macro_acc"], o_row["macro_acc"]
+                ),
+                "delta_step2_recall_at_1": _delta(
+                    b_row["step2_recall_at_1"], o_row["step2_recall_at_1"]
+                ),
+                "delta_step2_recall_at_1_rel": _rel(
+                    b_row["step2_recall_at_1"], o_row["step2_recall_at_1"]
+                ),
+                "delta_step2_det_recall_at_1": _delta(
+                    b_row["step2_det_recall_at_1"], o_row["step2_det_recall_at_1"]
+                ),
+                "delta_gap_over_sigma": _delta(
+                    b_row["gap_over_sigma"], o_row["gap_over_sigma"]
+                ),
+                "delta_refusal_rate": _delta(
+                    b_row["refusal_rate"], o_row["refusal_rate"]
+                ),
+                "delta_align_cos_mean": _delta(
+                    b_row["align_cos_mean"], o_row["align_cos_mean"]
+                ),
+                "delta_eff_rank_aligned": _delta(
+                    b_row["eff_rank_aligned"], o_row["eff_rank_aligned"]
+                ),
+                "delta_eff_rank_readout": _delta(
+                    b_row["eff_rank_readout"], o_row["eff_rank_readout"]
+                ),
+                "delta_participation_ratio_aligned": _delta(
+                    b_row["participation_ratio_aligned"],
+                    o_row["participation_ratio_aligned"],
+                ),
+                "backbone_total": (other.get("structure_stats") or {}).get("backbone_total"),
+                "macro_better": bool(
+                    (d := _delta(b_row["macro_acc"], o_row["macro_acc"])) is not None and d > 0.0
+                ),
+                "step2_recall_better": bool(
+                    (d := _delta(b_row["step2_recall_at_1"], o_row["step2_recall_at_1"]))
+                    is not None and d > 0.0
+                ),
+                "both_better": bool(
+                    (_delta(b_row["macro_acc"], o_row["macro_acc"]) or 0.0) > 0.0
+                    and (_delta(b_row["step2_recall_at_1"], o_row["step2_recall_at_1"])
+                         or 0.0) > 0.0
+                ),
+                "gate_passed": bool(o_row["gate_passed"]),
+                "base_metrics": b_row,
+                "variant_metrics": o_row,
+            })
+        out["axes"][dim_name] = {
+            "varying_field": str(dim["varying_field"]),
+            "base": str(dim["base"]),
+            "groups": list(dim["groups"]),
+            "rows": rows,
+        }
+    out["sections"] = ["形状", "FC", "容量 N", "几何权重场", "对齐", "载体"]
+    return out
 
 
 def _attribution(
@@ -2307,18 +3443,21 @@ def render_comparison_markdown(report: Dict[str, Any]) -> str:
     lines.append("## 逐组对照（主判据：macro 与 步骤 2 自检索 Recall@1 同时更优）")
     lines.append("")
     prof_names = [p["name"] for p in report.get("profiles", [])]
-    hdr = "| 组 | freeze_scope | head_input_mode | loss_mode |"
+    hdr = "| 组 | freeze_scope | head_input_mode | loss_mode | shape | fc_dim | N | geo | 对齐(λ) |"
     for p in prof_names:
         hdr += f" macro({p}) | R@1({p}) | detR@1({p}) | refusal({p}) | gap/σ({p}) | s({p}) |"
     hdr += " Δmacro | ΔR@1 | ΔdetR@1 | 同时更优 |"
     lines.append(hdr)
-    sep = "| --- | --- | --- | --- |" + " --- |" * (6 * len(prof_names)) + " --- | --- | --- | --- |"
+    sep = "| --- | --- | --- | --- | --- | --- | --- | --- | --- |" + \
+          " --- |" * (6 * len(prof_names)) + " --- | --- | --- | --- |"
     lines.append(sep)
     ref = report["verdict"]["reference_profile"]
+    run_by_profile = report.get("runs") or {}
     for row in report.get("comparison", []):
         m = row["reference"]
+        meta = _structure_cell((run_by_profile.get(ref, {}) or {}).get("groups"), row["group"])
         line = (f"| {row['group']} | {row['freeze_scope']} | {row['head_input_mode']} | "
-                f"{row['loss_mode']} |")
+                f"{row['loss_mode']} | {meta} |")
         line += (f" {m['macro_acc']:.4f} | {_fmt(m['step2_recall_at_1'])} | "
                  f"{_fmt(m['step2_det_recall_at_1'])} | {m['refusal_rate']:.4f} | "
                  f"{m['gap_over_sigma']:.4f} | {m['seconds']:.1f} |")
@@ -2343,6 +3482,102 @@ def render_comparison_markdown(report: Dict[str, Any]) -> str:
         f"`any_group_both_better = {v.get('any_group_both_better')}`；"
         f"`all_groups_both_better = {v.get('all_groups_both_better')}`。"
     )
+    lines.append("")
+
+    # ---- 构造失败清单（绝不吞掉；没有失败时也显式写"0 项"）----
+    lines.append("## 可构造性预检与失败清单（G6）")
+    lines.append("")
+    lines.append(
+        "预检规则：构造失败 -> 判该组无效并跳过（不硬失败终止），"
+        "失败原因（异常类型 + 可读原因）在 `construction_failures` 中显式登记，"
+        "**绝不以成功状态落账**"
+    )
+    lines.append("")
+    lines.append("| 档 | 请求组数 | 可构造 | 构造失败 |")
+    lines.append("| --- | --- | --- | --- |")
+    for pname, fails in (report.get("construction_failures") or {}).items():
+        run = (report.get("runs") or {}).get(pname) or {}
+        pre = run.get("construction_precheck") or {}
+        lines.append(
+            f"| {pname} | {pre.get('n_requested')} | {pre.get('n_runnable')} | "
+            f"{len(fails)} |"
+        )
+    lines.append("")
+    any_fail = False
+    for pname, fails in (report.get("construction_failures") or {}).items():
+        for item in fails:
+            any_fail = True
+            lines.append(
+                f"* **{pname} / {item['group']}**：`{item['exc_type']}` —— "
+                f"{str(item['reason'])[:400]}"
+            )
+    if not any_fail:
+        lines.append("* 本批**无**构造失败组（0 项）。")
+    lines.append("")
+
+    # ---- 逐轴归因（形状 / FC / N / geo / 对齐 / 载体，六节分开）----
+    ax = report.get("axis_attribution") or {}
+    lines.append("## 逐轴归因（**形状 / FC / 容量 N / 几何权重场 / 对齐 / 载体** 六节分开，禁止合并）")
+    lines.append("")
+    lines.append(str(ax.get("sep", "")))
+    lines.append("")
+    lines.append("| 轴 | 组 | 档 | Δmacro | Δmacro(相对) | ΔR@1 | ΔR@1(相对) | ΔdetR@1 | Δgap/σ | Δrefusal | Δ对齐度 | Δ有效秩 | 同时更优 |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for r in ax.get("rows", []):
+        for pname, cell in (r.get("per_profile") or {}).items():
+            if not cell.get("present"):
+                lines.append(f"| {r['axis']} | {r['group']} | {pname} | — | — | — | — | — | — | — | — | — | 缺失 |")
+                continue
+            lines.append(
+                f"| {r['axis']} | {r['group']} | {pname} | "
+                f"{_fmt_d(cell['delta_macro_acc'])} | {_fmt_pct(cell['delta_macro_acc_rel'])} | "
+                f"{_fmt_d(cell['delta_step2_recall_at_1'])} | "
+                f"{_fmt_pct(cell['delta_step2_recall_at_1_rel'])} | "
+                f"{_fmt_d(cell.get('delta_step2_det_recall_at_1'))} | "
+                f"{_fmt_d(cell.get('delta_gap_over_sigma'))} | "
+                f"{_fmt_d(cell.get('delta_refusal_rate'))} | "
+                f"{_fmt_d(cell.get('delta_align_cos_mean'))} | "
+                f"{_fmt_d(cell.get('delta_eff_rank_aligned'))} | "
+                f"{'是' if cell['all_both_better'] else '否'} |"
+            )
+    lines.append("")
+    lines.append(
+        "逐轴主判据（各档都相对公共基线同时更优）："
+        f"通过 = `{ax.get('groups_axis_both_better_all_profiles')}`；"
+        f"未通过 = `{ax.get('groups_axis_not_both_better')}`。"
+    )
+    lines.append("")
+
+    # ---- 对齐度 / 有效秩（本轮新增的两个诊断量）----
+    lines.append("## 对齐度与有效秩（G4：两个新诊断量，逐档给出）")
+    lines.append("")
+    lines.append(
+        "对齐度口径：N3D 支路表示（机制 B 下为**投影后**）与答案表各类质心的平均余弦；"
+        "有效秩口径：``σ > σ_max·1e-6`` 的奇异值个数（不中心化），池 = train_known + test_known。"
+    )
+    lines.append("")
+    lines.append("| 档 | 组 | 对齐度(各类质心均值) | 对齐目标(i) 自特征 | 对齐目标(ii) 类质心 | 有效秩(readout) | 有效秩(aligned) | 参与比(aligned) | 占 R^D | 适用 |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for pname, run in (report.get("runs") or {}).items():
+        for res in run.get("groups", []):
+            ad = res.get("alignment_degree") or {}
+            spec = res.get("spectrum") or {}
+            al = spec.get("aligned") or {}
+            ro = spec.get("readout") or {}
+            if not ad.get("applicable"):
+                lines.append(
+                    f"| {pname} | {res['group']['name']} | n/a | n/a | n/a | n/a | n/a | "
+                    f"n/a | n/a | 否（{str(ad.get('reason'))[:40]}） |"
+                )
+                continue
+            lines.append(
+                f"| {pname} | {res['group']['name']} | "
+                f"{(ad.get('cos_class_centroid') or {}).get('mean', float('nan')):.4f} | "
+                f"{ad['cos_self_encoder_feature']:.4f} | {ad['cos_own_class_centroid']:.4f} | "
+                f"{ro.get('rank')} | {al.get('rank')} | "
+                f"{al.get('participation_ratio', float('nan')):.2f} | "
+                f"{al.get('rank_ratio_dim', float('nan')) * 100:.2f}% | 是 |"
+            )
     lines.append("")
 
     lines.append("## 归因分解（**换特征** / **打开表示训练** / 两者叠加，不合并）")
@@ -2390,17 +3625,30 @@ def render_comparison_markdown(report: Dict[str, Any]) -> str:
     for pname, cost in (report.get("cost") or {}).items():
         if not cost:
             continue
+        # [!] `fc_dim != 0` 时骨干参数名被替换（W_in / W_out 消失），故一律 `.get` +
+        #     显式渲染 `n/a`，不得假设键一定存在。
         wi = cost["backbone_shapes"].get("W_in")
         wo = cost["backbone_shapes"].get("W_out")
+        wi_n = cost["backbone_parameters"].get("W_in")
+        wo_n = cost["backbone_parameters"].get("W_out")
         lines.append(
             f"| {pname} | {cost['dim']} | {cost['backbone_total']} | "
-            f"{wi} / {cost['backbone_parameters'].get('W_in')} | "
-            f"{wo} / {cost['backbone_parameters'].get('W_out')} | {cost['head_total']} | "
+            f"{'n/a' if wi is None else f'{wi} / {wi_n}'} | "
+            f"{'n/a' if wo is None else f'{wo} / {wo_n}'} | {cost['head_total']} | "
             f"{cost['total_parameters']} | {cost['params_per_sample']:.1f} | "
             f"{cost['trainable_frozen_embedding']['n_trainable']} | "
             f"{cost['trainable_open_representation']['n_trainable_head']} | "
             f"{cost['answer_table_buffer']['shape']} |"
         )
+    lines.append("")
+    lines.append("现场枚举的骨干参数名（**不假设存在 `W_in` / `W_out`**）：")
+    lines.append("")
+    lines.append("| 档 | 骨干参数名（现场枚举） |")
+    lines.append("| --- | --- |")
+    for pname, cost in (report.get("cost") or {}).items():
+        if not cost:
+            continue
+        lines.append(f"| {pname} | `{cost.get('backbone_parameter_names')}` |")
     lines.append("")
 
     sec = report.get("seconds", {})
@@ -2413,6 +3661,19 @@ def render_comparison_markdown(report: Dict[str, Any]) -> str:
         lines.append(f"| {pname} | {total:.1f} | {per} |")
     lines.append(f"| **总计** | {sec.get('grand_total', 0.0):.1f} | — |")
     lines.append("")
+
+    # ---- 单 seed 声明（离朱 R48 D1 修复：对照版此前漏渲染本节，与单档版对齐）----
+    lines.append("## 单 seed 声明（口径）")
+    lines.append("")
+    ss = report.get("single_seed") or {}
+    lines.append(
+        f"本轮固定 `split_seed={ss.get('split_seed', BASE_SPLIT_SEED)}`、"
+        f"`train_seed={ss.get('train_seed', BASE_TRAIN_SEED)}`；"
+        "报告中**所有 Δ 均为单点差**（同一切分、同一训练 seed 下两组之差），"
+        "**不含跨 seed 的训练随机性区间**，**无跨 seed 极差**。"
+        "跨 seed 的均值 ± 极差不属本批口径，不得由本报告推断。"
+    )
+    lines.append("")
     return "\n".join(lines) + "\n"
 
 
@@ -2421,9 +3682,33 @@ def _fmt(value: Any) -> str:
     return "n/a" if value is None else f"{float(value):.4f}"
 
 
+def _structure_cell(groups: Any, name: str) -> str:
+    """从某档的组结果里取出该组的「结构 + 对齐」单元格文本（缺失写 ``n/a``）。"""
+    if not groups:
+        return "n/a | n/a | n/a | n/a | n/a"
+    for res in groups:
+        if res["group"]["name"] != name:
+            continue
+        g = res["group"]
+        st = g.get("structure") or {}
+        align = str(g.get("align_mode", "off"))
+        if align != "off":
+            align = f"{align}(λ={g.get('align_lambda')})"
+        return (
+            f"{st.get('shape')} | {st.get('fc_dim')} | {st.get('N')} | "
+            f"{st.get('geo_field')} | {align}"
+        )
+    return "n/a | n/a | n/a | n/a | n/a"
+
+
 def _fmt_d(value: Any) -> str:
     """可空增量的表格渲染（带符号）。"""
     return "n/a" if value is None else f"{float(value):+.4f}"
+
+
+def _fmt_pct(value: Any) -> str:
+    """可空**相对增量**的表格渲染（按百分比带符号；缺失写 ``n/a``，不填 0）。"""
+    return "n/a" if value is None else f"{float(value) * 100.0:+.1f}%"
 
 
 def write_comparison_report(report: Dict[str, Any], out_dir: str = "") -> Dict[str, str]:
@@ -2486,20 +3771,27 @@ def render_markdown(report: Dict[str, Any]) -> str:
         lines.append("")
     lines.append("## 全矩阵结果")
     lines.append("")
-    lines.append("| 组 | freeze_scope | head_input_mode | loss_mode | gap | σ(within) | "
+    lines.append("| 组 | freeze_scope | head_input_mode | loss_mode | shape | fc_dim | N | geo | "
+                 "对齐(λ) | gap | σ(within) | "
                  "gap/σ | 1-NN(raw) | 1-NN(repr) | macro | top1 | refusal | q 位移 | "
                  "答案表位移 | argmax 变化率 | 门禁 |")
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | "
-                 "--- | --- | --- | --- | --- |")
+                 "--- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for res in report["groups"]:
         g = res["group"]
+        st = g.get("structure") or {}
+        align = str(g.get("align_mode", "off"))
+        if align != "off":
+            align = f"{align}(λ={g.get('align_lambda')})"
         geo = res["geo"]
         m = res["metric_step1"]
         sh = res["shifts"]
         gate = "PASS" if res["gate"]["passed"] else "**FAIL**"
         lines.append(
             f"| {g['name']} | {g['freeze_scope']} | {g['head_input_mode']} | "
-            f"{g['loss_mode']} | {geo['gap']:.4f} | {geo['within_sigma']:.4f} | "
+            f"{g['loss_mode']} | {st.get('shape')} | {st.get('fc_dim')} | {st.get('N')} | "
+            f"{st.get('geo_field')} | {align} | "
+            f"{geo['gap']:.4f} | {geo['within_sigma']:.4f} | "
             f"{geo['gap_over_sigma']:.4f} | {geo['nn1_top1_raw']:.4f} | "
             f"{geo['nn1_top1_repr']:.4f} | {m['macro_acc']:.4f} | {m['top1_acc']:.4f} | "
             f"{res['refusal']['refusal_rate']:.4f} | {sh['q_shift_mean_l2']:.4e} | "
@@ -2563,6 +3855,106 @@ def render_markdown(report: Dict[str, Any]) -> str:
             "  * requires_grad 但未进入优化器（现场枚举）："
             f"`{res['ungrouped_trainable_names']}`"
         )
+        ast = res.get("align_stats") or {}
+        if str(ast.get("mode", "off")) != "off":
+            lines.append(
+                f"  * 对齐项（G7）：mode={ast.get('mode')}，λ={ast.get('lambda')}，"
+                f"适用 batch {ast.get('batches_with_align')} / 跳过 "
+                f"{ast.get('batches_align_skipped')} / 总 batch {ast.get('batches_total')}，"
+                f"align 均值={ast.get('align_mean')}、最大={ast.get('align_max')}、"
+                f"最小={ast.get('align_min')}、非有限计数={ast.get('align_nonfinite')}"
+            )
+            if ast.get("skipped_reasons"):
+                lines.append(f"  * 对齐跳过原因计数：`{ast.get('skipped_reasons')}`")
+    lines.append("")
+
+    # ---- 可构造性预检 / 失败清单（G6）----
+    lines.append("## 可构造性预检与失败清单（G6）")
+    lines.append("")
+    pre = report.get("construction_precheck") or {}
+    lines.append(
+        f"请求 {pre.get('n_requested')} 组，可构造 `{pre.get('n_runnable')}` 组；"
+        f"预检规则：{pre.get('rule')}"
+    )
+    lines.append("")
+    fails = report.get("construction_failures") or []
+    if fails:
+        lines.append("| 组 | 异常类型 | 可读原因 |")
+        lines.append("| --- | --- | --- |")
+        for item in fails:
+            lines.append(
+                f"| {item['group']} | `{item['exc_type']}` | {str(item['reason'])[:400]} |"
+            )
+    else:
+        lines.append("* 本批**无**构造失败组（0 项）。")
+    lines.append("")
+
+    # ---- 逐轴归因（形状 / FC / N / geo / 对齐 / 载体，六节分开）----
+    ax = report.get("axis_attribution") or {}
+    lines.append("## 逐轴归因（**形状 / FC / 容量 N / 几何权重场 / 对齐 / 载体** 六节分开，禁止合并）")
+    lines.append("")
+    lines.append(str(ax.get("sep", "")))
+    lines.append("")
+    lines.append("| 轴 | 组 | Δmacro | Δmacro(相对) | ΔR@1 | ΔR@1(相对) | ΔdetR@1 | Δgap/σ | Δrefusal | Δ对齐度 | Δ有效秩 | 同时更优 |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for dim_name, pack in (ax.get("axes") or {}).items():
+        for r in pack.get("rows", []):
+            lines.append(
+                f"| {dim_name} | {r['group']} | "
+                f"{_fmt_d(r['delta_macro_acc'])} | {_fmt_pct(r.get('delta_macro_acc_rel'))} | "
+                f"{_fmt_d(r['delta_step2_recall_at_1'])} | "
+                f"{_fmt_pct(r.get('delta_step2_recall_at_1_rel'))} | "
+                f"{_fmt_d(r.get('delta_step2_det_recall_at_1'))} | "
+                f"{_fmt_d(r.get('delta_gap_over_sigma'))} | "
+                f"{_fmt_d(r.get('delta_refusal_rate'))} | "
+                f"{_fmt_d(r.get('delta_align_cos_mean'))} | "
+                f"{_fmt_d(r.get('delta_eff_rank_aligned'))} | "
+                f"{'是' if r.get('both_better') else '否'} |"
+            )
+    lines.append("")
+
+    # ---- 对齐度 / 有效秩（新诊断量）----
+    lines.append("## 对齐度与有效秩（G4：两个新诊断量）")
+    lines.append("")
+    lines.append(
+        "对齐度 = N3D 支路表示（机制 B 下为**投影后**）与答案表各类质心的平均余弦；"
+        "有效秩 = ``σ > σ_max·1e-6`` 的奇异值个数（**不中心化**），"
+        "池 = `train_known + test_known`。"
+    )
+    lines.append("")
+    lines.append("| 组 | 对齐度 | 目标(i) 自特征 | 目标(ii) 类质心 | 有效秩(readout) | 有效秩(aligned) | 参与比(aligned) | 占 R^D | 适用 |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for res in report["groups"]:
+        ad = res.get("alignment_degree") or {}
+        spec = res.get("spectrum") or {}
+        al = spec.get("aligned") or {}
+        ro = spec.get("readout") or {}
+        if not ad.get("applicable"):
+            lines.append(
+                f"| {res['group']['name']} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | "
+                f"否（{str(ad.get('reason'))[:44]}） |"
+            )
+            continue
+        lines.append(
+            f"| {res['group']['name']} | "
+            f"{(ad.get('cos_class_centroid') or {}).get('mean', float('nan')):.4f} | "
+            f"{ad['cos_self_encoder_feature']:.4f} | {ad['cos_own_class_centroid']:.4f} | "
+            f"{ro.get('rank')} | {al.get('rank')} | "
+            f"{al.get('participation_ratio', float('nan')):.2f} | "
+            f"{al.get('rank_ratio_dim', float('nan')) * 100:.2f}% | 是 |"
+        )
+    lines.append("")
+
+    # ---- 单 seed 声明（口径必须显式）----
+    lines.append("## 单 seed 声明（口径）")
+    lines.append("")
+    lines.append(
+        f"本轮固定 `split_seed={report.get('single_seed', {}).get('split_seed', BASE_SPLIT_SEED)}`、"
+        f"`train_seed={report.get('single_seed', {}).get('train_seed', BASE_TRAIN_SEED)}`；"
+        "报告中**所有 Δ 均为单点差**（同一切分、同一训练 seed 下两组之差），"
+        "**不含跨 seed 的训练随机性区间**，**无跨 seed 极差**。"
+        "跨 seed 的均值 ± 极差不属本批口径，不得由本报告推断。"
+    )
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -2608,6 +4000,13 @@ __all__ = [
     "EXP_REPR_DIR",
     "FREEZE_SCOPES",
     "LOSS_MODES",
+    "SHAPES",
+    "GEO_FIELDS",
+    "ALIGN_MODE_CHOICES",
+    "PROJ_INIT_CHOICES",
+    "ALIGN_TARGETS",
+    "STRUCTURE_DEFAULTS",
+    "BackendStructure",
     "SUPCON_TEMPERATURE",
     "STAGE1_EPOCHS",
     "STAGE2_EPOCHS",
@@ -2628,9 +4027,13 @@ __all__ = [
     "MATRIX",
     "DIMENSIONS",
     "BASELINE_GROUP",
+    "STRUCT_BASELINE_GROUP",
     "ALLOWED_UNGROUPED_TRAINABLE",
     "ReprGroup",
     "group_by_name",
+    "CARRIER_GROUPS",
+    "AXIS_FIELDS",
+    "custom_group",
     "FeatureProfile",
     "FEATURE_PROFILES",
     "PROFILE_LEXICAL",
@@ -2655,6 +4058,13 @@ __all__ = [
     "param_deltas",
     "update_gate",
     "representation_geometry",
+    "effective_rank",
+    "EFFECTIVE_RANK_REL_TOL",
+    "alignment_degree",
+    "spectral_diagnostics",
+    "construction_probe",
+    "precheck_constructibility",
+    "axis_attribution",
     "epoch_diagnostics",
     "phase_plan",
     "run_group",

@@ -32,6 +32,24 @@ backend               N3D 侧 ``output_dim``        ``[B, D]`` 特征来源
 "把 ``D`` 接到 ``input_dim`` / ``output_dim`` 上"。
 若某个后端的原生特征维与 ``D`` 不匹配，``assert_feature_dim`` 会在**首次前向时**
 显式报错，而不是静默返回错维度（拒绝静默错配）。
+
+结构开关的透传（本轮新增，仍属"连接参数"职责）
+--------------------------------------------
+:class:`BackendStructure` 把**后端自身的结构开关**（``shape`` / ``cyl_aspect`` /
+``fc_dim`` / ``N`` / ``y_in`` / ``y_out`` / ``geo_field``）从实验编排侧搬到
+``recommended_config`` 的构造入参上。代理层对它们的纪律：
+
+* **不设默认值以外的"调参"逻辑**：这 7 个字段原样透传给上游 ``Config``，代理层
+  不换算、不裁剪、不猜默认；
+* **不吞异常、不静默降级**：非法组合一律由上游 ``Config.__post_init__`` 在**构造期**
+  抛出（现场实测：``y_in=y_out=2`` 触发连通性下限校验、``cyl_aspect=0.15/4.0`` 触发
+  尺寸窗口校验、``geo_field="class_tied"`` 触发"未实现档"拒绝）；代理层**不做**
+  二次校验、也不把它降级成默认档；
+* **能力边界显式**：只有 :data:`STRUCTURE_AWARE_BACKENDS`（现场枚举 = ``n3d_shape``）
+  的 ``Config`` 具备这些字段。对不具备该能力的后端，``structure`` 非默认时
+  **显式报错**（``ValueError``），而不是静默丢弃结构覆盖参数；
+* ``structure=None``（或全默认）时，三个后端的 ``Config`` 构造实参与改动前**逐字符
+  相同**，``describe()`` 与参数量因此**逐位一致**。
 """
 
 from __future__ import annotations
@@ -52,6 +70,131 @@ from .features import VectorizerConfig
 
 #: 三个已登记的后端名（注册表的**唯一**合法键集合）。
 BACKEND_NAMES: Tuple[str, ...] = ("n3d_shape", "n3d_sphere", "n3d_proto")
+
+#: 具备「结构开关」字段（``shape`` / ``cyl_aspect`` / ``fc_dim`` / ``geo_field``）的后端。
+#: **现场枚举口径**：``n3d_shape.config.Config`` 的字段集合里同时存在这 4 个字段；
+#: ``n3d_sphere.config.Config`` 与 ``n3d_proto.config.Config`` 的字段集合里**都没有**
+#: 它们（现场读 ``dataclasses.fields`` 确认）。对不在本名单里的后端传非默认 ``structure``
+#: 一律显式报错，禁止静默丢弃。
+STRUCTURE_AWARE_BACKENDS: Tuple[str, ...] = ("n3d_shape",)
+
+#: 形状取值（与上游 ``n3d_shape.config`` 的枚举一致；代理层不做二次校验）。
+SHAPE_CHOICES: Tuple[str, ...] = ("sphere", "cube", "cylinder")
+
+#: 几何权重场取值（``none`` 默认关闭 / ``additive`` 唯一已实现档；
+#: ``class_tied`` / ``mlp`` 枚举已接受但上游构造期显式拒绝）。
+GEO_FIELD_CHOICES: Tuple[str, ...] = ("none", "additive", "class_tied", "mlp")
+
+#: 结构开关的**默认值**（= 改动前的硬编码取值；见 ``recommended_config``）。
+STRUCTURE_DEFAULTS: Dict[str, Any] = {
+    "shape": "sphere",
+    "cyl_aspect": 1.0,
+    "fc_dim": 0,
+    "N": 64,
+    "y_in": 4,
+    "y_out": 4,
+    "geo_field": "none",
+}
+
+
+@dataclass(frozen=True)
+class BackendStructure:
+    """后端结构开关（**连接参数**的一部分：把数据侧/实验侧的结构选择接到上游 Config）。
+
+    属性
+    ----
+    shape : str
+        空间形状（``sphere`` / ``cube`` / ``cylinder``），见 :data:`SHAPE_CHOICES`。
+    cyl_aspect : float
+        圆柱长径比 ``λ = c / r``；**仅** ``shape == "cylinder"`` 时允许非 1.0。
+    fc_dim : int
+        两端全连接包裹：``0`` 关闭 / ``-1`` 跟随 ``N`` / ``> 0`` 显式宽度。
+    N : int
+        神经元规模。
+    y_in / y_out : int
+        输入 / 输出突触数（本框架现场固定为 4：``y = 2`` 会被上游连通性下限校验拒绝）。
+    geo_field : str
+        几何权重场（``none`` / ``additive``），见 :data:`GEO_FIELD_CHOICES`。
+
+    关键不变量
+    ----------
+    * 字段集合恒等于 :data:`STRUCTURE_DEFAULTS` 的键集合（现场断言，防止"加了字段忘了
+      透传"这类静默失配）；
+    * 本类是**不可变**的（``frozen=True``），因为它是产物 meta 的一部分。
+    """
+
+    shape: str = "sphere"
+    cyl_aspect: float = 1.0
+    fc_dim: int = 0
+    N: int = 64
+    y_in: int = 4
+    y_out: int = 4
+    geo_field: str = "none"
+
+    def __post_init__(self) -> None:
+        if self.shape not in SHAPE_CHOICES:
+            raise ValueError(
+                f"BackendStructure.shape 仅允许 {list(SHAPE_CHOICES)}，"
+                f"当前 {self.shape!r}"
+            )
+        if self.geo_field not in GEO_FIELD_CHOICES:
+            raise ValueError(
+                f"BackendStructure.geo_field 仅允许 {list(GEO_FIELD_CHOICES)}，"
+                f"当前 {self.geo_field!r}"
+            )
+        if int(self.N) < 1:
+            raise ValueError(f"BackendStructure.N 必须 >= 1，当前 {self.N}")
+        if int(self.y_in) < 1 or int(self.y_out) < 1:
+            raise ValueError(
+                f"BackendStructure.y_in / y_out 必须 >= 1，当前 "
+                f"{self.y_in} / {self.y_out}"
+            )
+        if not (float(self.cyl_aspect) > 0.0):
+            raise ValueError(
+                f"BackendStructure.cyl_aspect 必须 > 0，当前 {self.cyl_aspect}"
+            )
+
+    def is_default(self) -> bool:
+        """是否逐字段等于 :data:`STRUCTURE_DEFAULTS`（默认档 = 改动前的行为）。"""
+        return all(
+            getattr(self, key) == value for key, value in STRUCTURE_DEFAULTS.items()
+        )
+
+    def to_kwargs(self) -> Dict[str, Any]:
+        """转成上游 ``Config`` 的关键字实参（字段与 :data:`STRUCTURE_DEFAULTS` 同集合）。"""
+        return {key: getattr(self, key) for key in STRUCTURE_DEFAULTS}
+
+    def as_dict(self) -> Dict[str, Any]:
+        """JSON 化（写进报告 / 产物 meta）。"""
+        return {
+            "shape": str(self.shape),
+            "cyl_aspect": float(self.cyl_aspect),
+            "fc_dim": int(self.fc_dim),
+            "N": int(self.N),
+            "y_in": int(self.y_in),
+            "y_out": int(self.y_out),
+            "geo_field": str(self.geo_field),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "BackendStructure":
+        """从（可能缺字段的）字典重建；缺字段取默认值（向后兼容旧产物）。"""
+        payload = dict(data or {})
+        return cls(
+            shape=str(payload.get("shape", STRUCTURE_DEFAULTS["shape"])),
+            cyl_aspect=float(payload.get("cyl_aspect", STRUCTURE_DEFAULTS["cyl_aspect"])),
+            fc_dim=int(payload.get("fc_dim", STRUCTURE_DEFAULTS["fc_dim"])),
+            N=int(payload.get("N", STRUCTURE_DEFAULTS["N"])),
+            y_in=int(payload.get("y_in", STRUCTURE_DEFAULTS["y_in"])),
+            y_out=int(payload.get("y_out", STRUCTURE_DEFAULTS["y_out"])),
+            geo_field=str(payload.get("geo_field", STRUCTURE_DEFAULTS["geo_field"])),
+        )
+
+
+#: 结构字段集合的**现场自检**：``BackendStructure`` 的字段必须与默认值表逐键对齐。
+assert set(BackendStructure.__dataclass_fields__) == set(STRUCTURE_DEFAULTS), (
+    "BackendStructure 字段集合与 STRUCTURE_DEFAULTS 不一致（新增结构开关时必须同步）"
+)
 
 
 @dataclass(frozen=True)
@@ -78,7 +221,9 @@ class BackendSpec:
 # ---------------------------------------------------------------------------
 
 
-def recommended_config(name: str, input_dim: int) -> Any:
+def recommended_config(
+    name: str, input_dim: int, structure: Optional[BackendStructure] = None
+) -> Any:
     """返回某后端在 QA 任务上的**推荐构型**（只设置连接参数 + 该后端原生结构参数）。
 
     参数
@@ -87,6 +232,11 @@ def recommended_config(name: str, input_dim: int) -> Any:
         后端名（``BACKEND_NAMES`` 之一）。
     input_dim : int
         连接参数：特征维 ``D``（同时作为该后端的 ``input_dim`` 与 ``output_dim``）。
+    structure : Optional[BackendStructure]
+        **结构开关覆盖**（本轮新增）。为 ``None`` 时取全默认
+        （``shape="sphere"`` / ``cyl_aspect=1.0`` / ``fc_dim=0`` / ``N=64`` /
+        ``y_in=y_out=4`` / ``geo_field="none"``），此时三个后端构造出的 ``Config``
+        与改动前**逐位一致**。
 
     返回
     ----
@@ -102,18 +252,41 @@ def recommended_config(name: str, input_dim: int) -> Any:
       才允许自定义 ``input_dim`` / ``output_dim``（现场实测：用 ``mnist`` 会抛
       ``ValueError: input_dim 与数据集规格不一致``）。此处只借用其"占位维"语义，
       不加载任何数据。
+    * **非法组合交由上游构造期报错**（代理层不吞异常、不静默降级）。现场实测的
+      上游拒绝：``y_in=y_out=2`` -> 连通性下限校验失败；``shape="cylinder"`` 且
+      ``cyl_aspect ∈ {0.15, 4.0}`` -> 尺寸窗口 / FCC 点数不足；``geo_field="class_tied"``
+      -> "本批未实现"；``shape != "cylinder"`` 且 ``cyl_aspect != 1.0`` -> 静默无效参数拒绝。
+    * 对**不具备结构开关能力**的后端（:data:`STRUCTURE_AWARE_BACKENDS` 之外）传
+      非默认 ``structure`` 时**显式报错**，禁止静默丢弃。
     """
     dim = int(input_dim)
     if dim < 1:
         raise ValueError(f"input_dim 必须 >= 1，当前 {dim}")
+    spec = BackendStructure() if structure is None else structure
+    if not isinstance(spec, BackendStructure):
+        raise TypeError(
+            "recommended_config 的 structure 必须是 BackendStructure 或 None，"
+            f"当前 {type(spec).__name__}"
+        )
+    override = spec.to_kwargs()
+    if name not in STRUCTURE_AWARE_BACKENDS and not spec.is_default():
+        raise ValueError(
+            f"后端 {name!r} 不支持结构开关覆盖（能力名单 = "
+            f"{list(STRUCTURE_AWARE_BACKENDS)}）；收到的非默认结构 = "
+            f"{spec.as_dict()}。拒绝静默丢弃结构参数；请改用支持结构开关的后端，"
+            "或把结构恢复为默认档。"
+        )
     if name == "n3d_shape":
         from n3d_shape.config import Config as _ShapeConfig
 
         return _ShapeConfig(
-            N=64, y_in=4, y_out=4, H=0.15, D=0.15,
+            N=int(override["N"]), y_in=int(override["y_in"]), y_out=int(override["y_out"]),
+            H=0.15, D=0.15,
             input_dim=dim, output_dim=dim,
             input_scope="any_isolated", readout_scope="any_isolated",
-            shape="sphere", dataset="npz", seed=42,
+            shape=str(override["shape"]), cyl_aspect=float(override["cyl_aspect"]),
+            fc_dim=int(override["fc_dim"]), geo_field=str(override["geo_field"]),
+            dataset="npz", seed=42,
         )
     if name == "n3d_sphere":
         from n3d_sphere.config import Config as _SphereConfig
@@ -156,10 +329,20 @@ class BackendAdapter:
     * 适配器**不持有**任何可学习参数（``self.model`` 的参数属于后端，不属代理层）。
     """
 
-    def __init__(self, spec: BackendSpec, model: nn.Module, input_dim: int) -> None:
+    def __init__(
+        self,
+        spec: BackendSpec,
+        model: nn.Module,
+        input_dim: int,
+        structure: Optional[BackendStructure] = None,
+    ) -> None:
         self.spec = spec
         self.model = model
         self.input_dim = int(input_dim)
+        #: 构造该后端时使用的**结构开关**（``None`` 视为全默认档）。
+        self.structure: BackendStructure = (
+            BackendStructure() if structure is None else structure
+        )
 
     # -- 连接参数 ---------------------------------------------------------
     @property
@@ -240,7 +423,11 @@ class BackendAdapter:
         return stats
 
     def describe(self) -> Dict[str, Any]:
-        """适配器自描述（写进产物 meta，供事后复核连接参数）。"""
+        """适配器自描述（写进产物 meta，供事后复核连接参数）。
+
+        **键集合与改动前逐位一致**（新增的结构开关信息走
+        :meth:`structure_manifest`，不混进这里，避免改动默认档的 describe 内容）。
+        """
         return {
             "backend": self.name,
             "evolution": self.spec.evolution,
@@ -249,6 +436,21 @@ class BackendAdapter:
             "output_dim": int(self.input_dim),
             "topology_stats": {k: float(v) for k, v in self.topology_stats().items()},
             "parameters": int(self.count_parameters()),
+        }
+
+    def structure_manifest(self) -> Dict[str, Any]:
+        """构造该适配器所用的结构开关（现场枚举，供报告登记）。
+
+        返回
+        ----
+        Dict[str, Any]
+            ``{"structure": {...7 字段...}, "is_default": bool,
+            "structure_aware": bool}``。
+        """
+        return {
+            "structure": self.structure.as_dict(),
+            "is_default": bool(self.structure.is_default()),
+            "structure_aware": bool(self.name in STRUCTURE_AWARE_BACKENDS),
         }
 
 
@@ -283,6 +485,10 @@ class BackendRegistry:
     ----
     input_dim : int
         连接参数 ``D``（所有登记后端共享同一 ``D``）。
+    structure : Optional[BackendStructure]
+        **结构开关**（本轮新增；``None`` = 全默认档，行为与改动前逐位一致）。
+        该结构对注册表内**全部**后端生效：对不具备结构能力的后端，非默认结构会在
+        :meth:`register` 内显式报错（不静默丢弃）。
 
     关键不变量
     ----------
@@ -292,10 +498,15 @@ class BackendRegistry:
       （名 / 类 / 参数量 / ``E`` 四元组两两不同）。
     """
 
-    def __init__(self, input_dim: int) -> None:
+    def __init__(
+        self, input_dim: int, structure: Optional[BackendStructure] = None
+    ) -> None:
         if int(input_dim) < 1:
             raise ValueError(f"BackendRegistry.input_dim 必须 >= 1，当前 {input_dim}")
         self.input_dim = int(input_dim)
+        self.structure: BackendStructure = (
+            BackendStructure() if structure is None else structure
+        )
         self._adapters: Dict[str, BackendAdapter] = {}
         self._unavailable: Dict[str, str] = {}
 
@@ -320,7 +531,7 @@ class BackendRegistry:
         if name in self._adapters:
             return self._adapters[name]
         model = self._build_model(name)
-        adapter = BackendAdapter(BACKEND_SPECS[name], model, self.input_dim)
+        adapter = BackendAdapter(BACKEND_SPECS[name], model, self.input_dim, self.structure)
         self._adapters[name] = adapter
         return adapter
 
@@ -341,7 +552,7 @@ class BackendRegistry:
 
     def _build_model(self, name: str) -> nn.Module:
         """按后端名构造模型（只读 import 上游 ``model`` / ``config``）。"""
-        cfg = recommended_config(name, self.input_dim)
+        cfg = recommended_config(name, self.input_dim, self.structure)
         if name == "n3d_shape":
             from n3d_shape.model import ThreeDNeuronSpace as _M
 
@@ -377,11 +588,18 @@ class BackendRegistry:
         return dict(self._unavailable)
 
     def manifest(self) -> Dict[str, Any]:
-        """注册表清单（供 P0 探针报告与产物 meta）。"""
+        """注册表清单（供 P0 探针报告与产物 meta）。
+
+        新增键 ``structure``：现场登记本注册表所用的结构开关（默认档也照实写出，
+        便于事后回答"这份数字是哪一组结构跑出来的"）。
+        """
         return {
             "input_dim": int(self.input_dim),
             "available": self.available,
             "unavailable": self.unavailable,
+            "structure": self.structure.as_dict(),
+            "structure_is_default": bool(self.structure.is_default()),
+            "structure_aware_backends": list(STRUCTURE_AWARE_BACKENDS),
             "specs": {
                 n: {
                     "evolution": s.evolution,
@@ -446,7 +664,9 @@ class BackendRegistry:
 
 
 def build_registry(
-    vectorizer_config: Optional[VectorizerConfig] = None, input_dim: Optional[int] = None
+    vectorizer_config: Optional[VectorizerConfig] = None,
+    input_dim: Optional[int] = None,
+    structure: Optional[BackendStructure] = None,
 ) -> BackendRegistry:
     """按向量化口径构造注册表（``D`` 的唯一来源，避免两处各写一个维度）。
 
@@ -457,6 +677,8 @@ def build_registry(
         为唯一来源，见下）。
     input_dim : Optional[int]
         显式覆盖 ``D``；与向量化口径**同时给出**且冲突时立即报错。
+    structure : Optional[BackendStructure]
+        **结构开关**（本轮新增；``None`` = 全默认档，行为与改动前逐位一致）。
 
     返回
     ----
@@ -479,7 +701,7 @@ def build_registry(
                 f"显式 input_dim={input_dim} 与向量化口径维度 {dim} 冲突；"
                 "连接参数 D 只有唯一来源（向量化口径），拒绝两处各写一个维度"
             )
-    reg = BackendRegistry(dim)
+    reg = BackendRegistry(dim, structure=structure)
     reg.register_all()
     return reg
 
@@ -493,7 +715,12 @@ def dim_fingerprint(input_dim: int, backend: str) -> str:
 __all__ = [
     "BACKEND_NAMES",
     "BACKEND_SPECS",
+    "STRUCTURE_AWARE_BACKENDS",
+    "STRUCTURE_DEFAULTS",
+    "SHAPE_CHOICES",
+    "GEO_FIELD_CHOICES",
     "BackendSpec",
+    "BackendStructure",
     "BackendAdapter",
     "BackendRegistry",
     "recommended_config",

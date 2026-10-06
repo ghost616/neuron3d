@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from .backends import BackendAdapter, BackendRegistry, build_registry
+from .backends import BackendAdapter, BackendRegistry, BackendStructure, build_registry
 from .data import (  # noqa: F401 - QACorpus 等类型在签名中使用
     DEFAULT_QA_CACHE_DIR,
     DEFAULT_TEXT_DIR,
@@ -62,7 +62,7 @@ from .encoders import (
     vectorizer_from_meta,
 )
 from .features import TextVectorizer, VectorizerConfig
-from .heads import N3DQA, N3DQAConfig
+from .heads import ALIGN_MODES, N3DQA, N3DQAConfig
 
 #: 产物目录（正式）。
 DEFAULT_ARTIFACT_DIR: str = os.path.join("checkpoints", "qa_learn")
@@ -137,6 +137,19 @@ class TrainConfig:
         这正是"冻结 q 头但仍有真实可训练参数、真实跑训练循环"所需要的口径。
     answer_table_mode : str
         答案表来源口径（``centroid`` 默认 / ``free``）。
+    structure_shape / structure_cyl_aspect / structure_fc_dim / structure_N /
+    structure_y_in / structure_y_out / structure_geo_field
+        **后端结构开关**（本轮新增；默认值 = 改动前的硬编码口径，逐位不变）。
+        它们经 :func:`structure_of` 装配成 :class:`BackendStructure` 后透传给代理层
+        :func:`n3d_qa_learn.backends.recommended_config`。非法组合由**上游** ``Config``
+        在构造期报错（代理层与本层都不吞异常、不静默降级）。
+    align_mode / align_lambda / proj_dim / proj_init
+        **对齐机制开关**（本轮新增；默认 ``align_mode="off"`` + ``align_lambda=0.0`` +
+        ``proj_dim=0`` = 关闭，逐位复现历史行为）。语义与构造期约束见
+        :class:`n3d_qa_learn.heads.N3DQAConfig` 同名参数。注意：**模块自带训练循环
+        （:func:`run_training`）只优化交叉熵**；对齐项的实现与训练落点在
+        :mod:`n3d_qa_learn.exp_repr`（本轮对齐对照实验的专用循环），此处只负责把开关
+        透传给 ``N3DQA`` 并让投影头进入可训参数集合。
     """
 
     train_backbone: bool = False
@@ -166,6 +179,23 @@ class TrainConfig:
     text_threshold: float = 0.28
     qa_cache_dir: str = DEFAULT_QA_CACHE_DIR
     text_dir: str = DEFAULT_TEXT_DIR
+
+    # ---- 后端结构开关（本轮新增；默认 = 改动前的硬编码口径）----
+    # 现场实测的能力边界（详见报告）：只有 `n3d_shape` 的 Config 具备 shape / cyl_aspect /
+    # fc_dim / geo_field 四个字段；`n3d_sphere` / `n3d_proto` 传非默认结构会被代理层显式拒绝。
+    structure_shape: str = "sphere"
+    structure_cyl_aspect: float = 1.0
+    structure_fc_dim: int = 0
+    structure_N: int = 64
+    structure_y_in: int = 4
+    structure_y_out: int = 4
+    structure_geo_field: str = "none"
+
+    # ---- 对齐机制开关（本轮新增；默认全关 = 改动前口径）----
+    align_mode: str = "off"
+    align_lambda: float = 0.0
+    proj_dim: int = 0
+    proj_init: str = "xavier_uniform"
 
     def __post_init__(self) -> None:
         if int(self.epochs) < 1:
@@ -200,6 +230,48 @@ class TrainConfig:
             raise ValueError(f"output_mode 仅允许 index / pointer，当前 {self.output_mode!r}")
         if not (float(self.backbone_lr) > 0.0):
             raise ValueError(f"backbone_lr 必须 > 0，当前 {self.backbone_lr}")
+        if self.align_mode not in ALIGN_MODES:
+            raise ValueError(
+                f"align_mode 仅允许 {list(ALIGN_MODES)}，当前 {self.align_mode!r}"
+            )
+        if int(self.proj_dim) < -1:
+            raise ValueError(
+                f"proj_dim 只允许 -1（跟随 D）或 >= 0（0 = 关闭），当前 {self.proj_dim}"
+            )
+        if self.align_mode == "off":
+            if float(self.align_lambda) != 0.0:
+                raise ValueError(
+                    "align_mode='off' 时 align_lambda 必须为 0.0，"
+                    f"当前 {self.align_lambda}"
+                )
+            if int(self.proj_dim) != 0:
+                raise ValueError(
+                    "align_mode='off' 时不得启用投影头（proj_dim 必须为 0），"
+                    f"当前 {self.proj_dim}"
+                )
+        elif not (float(self.align_lambda) > 0.0):
+            raise ValueError(
+                f"align_mode={self.align_mode!r} 时 align_lambda 必须 > 0，"
+                f"当前 {self.align_lambda}"
+            )
+        # 结构开关的**可读前置校验**：与代理层的显式拒绝口径保持一致（在这里就报出
+        # 可读原因，避免只有到 Config 构造期才炸）。非法组合仍由上游构造期裁决。
+        if str(self.structure_shape) not in ("sphere", "cube", "cylinder"):
+            raise ValueError(
+                "structure_shape 仅允许 sphere / cube / cylinder，"
+                f"当前 {self.structure_shape!r}"
+            )
+        if int(self.structure_N) < 1:
+            raise ValueError(f"structure_N 必须 >= 1，当前 {self.structure_N}")
+        if int(self.structure_y_in) < 1 or int(self.structure_y_out) < 1:
+            raise ValueError(
+                "structure_y_in / structure_y_out 必须 >= 1，当前 "
+                f"{self.structure_y_in} / {self.structure_y_out}"
+            )
+        if not (float(self.structure_cyl_aspect) > 0.0):
+            raise ValueError(
+                f"structure_cyl_aspect 必须 > 0，当前 {self.structure_cyl_aspect}"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON 化（写进产物 meta）。"""
@@ -229,7 +301,48 @@ class TrainConfig:
             "logit_scale_init": float(self.logit_scale_init),
             "learn_logit_scale": bool(self.learn_logit_scale),
             "answer_table_mode": str(self.answer_table_mode),
+            # ---- 结构开关与对齐开关（本轮新增；必须进 to_dict，否则 meta 往返丢字段）----
+            "structure_shape": str(self.structure_shape),
+            "structure_cyl_aspect": float(self.structure_cyl_aspect),
+            "structure_fc_dim": int(self.structure_fc_dim),
+            "structure_N": int(self.structure_N),
+            "structure_y_in": int(self.structure_y_in),
+            "structure_y_out": int(self.structure_y_out),
+            "structure_geo_field": str(self.structure_geo_field),
+            "align_mode": str(self.align_mode),
+            "align_lambda": float(self.align_lambda),
+            "proj_dim": int(self.proj_dim),
+            "proj_init": str(self.proj_init),
         }
+
+
+def structure_of(cfg: TrainConfig) -> BackendStructure:
+    """把 :class:`TrainConfig` 的 7 个结构字段装配成 :class:`BackendStructure`。
+
+    参数
+    ----
+    cfg : TrainConfig
+        训练配置。
+
+    返回
+    ----
+    BackendStructure
+        结构开关（默认档等于改动前的硬编码口径）。
+
+    说明
+    ----
+    这是**唯一装配点**：``_build_model`` 与 ``rebuild_model`` 都走它，避免两处各写一套
+    字段映射（历史纠正记录 #9：标识符口径必须唯一）。
+    """
+    return BackendStructure(
+        shape=str(cfg.structure_shape),
+        cyl_aspect=float(cfg.structure_cyl_aspect),
+        fc_dim=int(cfg.structure_fc_dim),
+        N=int(cfg.structure_N),
+        y_in=int(cfg.structure_y_in),
+        y_out=int(cfg.structure_y_out),
+        geo_field=str(cfg.structure_geo_field),
+    )
 
 
 def set_deterministic_seed(seed: int) -> None:
@@ -344,8 +457,13 @@ def build_training_data(
 
 
 def _build_model(data: TrainingData, cfg: TrainConfig) -> Tuple[N3DQA, BackendAdapter, BackendRegistry]:
-    """构造注册表并取指定后端，再组装 ``N3DQA`` 模型（代理层不参与超参调优）。"""
-    registry = build_registry(data.vectorizer.config)
+    """构造注册表并取指定后端，再组装 ``N3DQA`` 模型（代理层不参与超参调优）。
+
+    结构开关经 :func:`structure_of` 透传到 :func:`n3d_qa_learn.backends.build_registry`；
+    对齐开关透传到 :class:`N3DQAConfig`。默认档（结构全默认 + ``align_mode="off"``）下
+    构造实参与改动前**逐字符相同**。
+    """
+    registry = build_registry(data.vectorizer.config, structure=structure_of(cfg))
     if cfg.backend not in registry.available:
         raise RuntimeError(
             f"后端 {cfg.backend!r} 不可用；已登记 = {registry.available}，"
@@ -363,6 +481,10 @@ def _build_model(data: TrainingData, cfg: TrainConfig) -> Tuple[N3DQA, BackendAd
             logit_scale_init=float(cfg.logit_scale_init),
             learn_logit_scale=bool(cfg.learn_logit_scale),
             answer_table_mode=str(cfg.answer_table_mode),
+            align_mode=str(cfg.align_mode),
+            align_lambda=float(cfg.align_lambda),
+            proj_dim=int(cfg.proj_dim),
+            proj_init=str(cfg.proj_init),
         ),
     )
     return model, adapter, registry
@@ -541,8 +663,15 @@ def run_training(
         # 冻结 q 头（见 TrainConfig.train_head 的实测理由）；logit 尺度按配置单独处置
         for p in model.q_head.parameters():
             p.requires_grad_(False)
+        # 投影头（若启用）随 q 头一起冻结：它同属"头侧"表示参数
+        for p in model.alignment_parameters():
+            p.requires_grad_(False)
         model.logit_scale.requires_grad_(bool(cfg.learn_logit_scale))
     head_params = [p for p in model.q_head.parameters() if p.requires_grad]
+    # 对齐机制引入的投影头（机制 B）也属于"头"侧参数；默认关闭时该列表为空。
+    head_params.extend(
+        [p for p in model.alignment_parameters() if p.requires_grad]
+    )
     # 答案表只在 free 口径下才是可学习参数（centroid 口径下是绑定 buffer，不入优化器）
     if isinstance(getattr(model, "answer_table", None), nn.Parameter):
         head_params.append(model.answer_table)
@@ -693,6 +822,8 @@ def build_meta(
         "irrelevant_index": int(data.corpus.n_classes),
         "output_mode": str(cfg.output_mode),
         "backend": adapter.describe(),
+        # 后端结构开关的现场登记（本轮新增；`describe()` 的键集合保持不变）
+        "backend_structure": adapter.structure_manifest(),
         "model": describe,
         "vectorizer_config": data.vectorizer.config.to_dict(),
         "vectorizer_fingerprint": data.vectorizer.fingerprint(),
@@ -930,9 +1061,15 @@ def rebuild_model(meta: Dict[str, Any], state_dict: Dict[str, Any]) -> N3DQA:
         状态字典与重建模型结构不一致（``strict=True``）。
     """
     vectorizer = vectorizer_from_meta(meta)
-    registry = build_registry(vectorizer.config)
+    # 结构开关一律用 `.get(..., 默认)` 读取：旧产物 meta 里没有 `backend_structure`，
+    # 取其默认档即可逐位复现历史（新增字段不得让旧产物无法重建）。
+    structure = BackendStructure.from_dict(
+        (meta.get("backend_structure") or {}).get("structure")
+    )
+    registry = build_registry(vectorizer.config, structure=structure)
     backend = str(meta["backend"]["backend"])
     adapter = registry.get(backend)
+    train_cfg = dict(meta.get("train_config") or {})
     model = N3DQA(
         adapter,
         int(meta["n_answers"]),
@@ -948,6 +1085,11 @@ def rebuild_model(meta: Dict[str, Any], state_dict: Dict[str, Any]) -> N3DQA:
             logit_scale_init=REBUILD_LOGIT_SCALE_INIT,
             learn_logit_scale=False,
             answer_table_mode=str(meta["model"].get("answer_table_mode", "centroid")),
+            # ---- 对齐开关同样向后兼容读取（旧产物无这两个键 -> 关闭档）----
+            align_mode=str(meta["model"].get("align_mode", "off")),
+            align_lambda=float(meta["model"].get("align_lambda", 0.0)),
+            proj_dim=int(meta["model"].get("proj_dim", 0)),
+            proj_init=str(meta["model"].get("proj_init", "xavier_uniform")),
         ),
     )
     model.load_state_dict(state_dict, strict=True)
@@ -967,6 +1109,7 @@ __all__ = [
     "TrainingResult",
     "set_deterministic_seed",
     "split_seed_of",
+    "structure_of",
     "build_training_data",
     "run_training",
     "build_meta",

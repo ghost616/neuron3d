@@ -98,6 +98,49 @@ def _kwargs(args: argparse.Namespace, *, epochs: int) -> Dict[str, Any]:
     }
 
 
+def _axis_overrides(args: argparse.Namespace) -> Dict[str, Any]:
+    """收集 CLI 上显式给出的**轴覆盖**（``None`` = 未给出，不覆盖）。
+
+    这些参数是本轮新增的「逐轴单换」入口：只要给出任意一个，本次运行就**只跑**由
+    :func:`exp_repr.custom_group` 从公共基线构造出来的那一个自定义组；一个都不给时，
+    行为与历史**逐位一致**（跑 ``--group`` 指定的矩阵组，或整张矩阵）。
+    """
+    mapping = {
+        "carrier": getattr(args, "carrier", None),
+        "shape": getattr(args, "shape", None),
+        "cyl_aspect": getattr(args, "cyl_aspect", None),
+        "fc_dim": getattr(args, "fc_dim", None),
+        "N": getattr(args, "structure_N", None),
+        "y_in": getattr(args, "y_in", None),
+        "y_out": getattr(args, "y_out", None),
+        "geo_field": getattr(args, "geo_field", None),
+        "align_mode": getattr(args, "align_mode", None),
+        "align_lambda": getattr(args, "align_lambda", None),
+        "proj_dim": getattr(args, "proj_dim", None),
+    }
+    return {k: v for k, v in mapping.items() if v is not None}
+
+
+def _resolve_groups(args: argparse.Namespace) -> tuple:
+    """解析本次要跑的组（返回 ``(groups_or_None, names_or_None, note)``）。
+
+    * 给出了任意轴覆盖 -> 只跑一个 :func:`exp_repr.custom_group` 造出的自定义组；
+    * 否则 -> 沿用 ``--groups`` 子集（空 = 整张矩阵），与历史行为一致。
+    """
+    overrides = _axis_overrides(args)
+    if overrides:
+        # 逐轴单换的起点默认是**公共基线**（S0_base）；显式给了 --group 时以它为准。
+        base = str(getattr(args, "group", None) or exp_repr.STRUCT_BASELINE_GROUP)
+        group = exp_repr.custom_group(base=base, **overrides)
+        return [group], [group.name], (
+            f"检测到轴覆盖 {overrides}；本次**只跑 1 个自定义组**（自 {base} 逐轴单换）："
+            f"{group.name}"
+        )
+    groups = getattr(args, "groups", "")
+    names = [s for s in str(groups).split(",") if s.strip()] if groups else None
+    return None, names, "未给出轴覆盖：按矩阵组运行（与历史行为逐位一致）"
+
+
 def cmd_drill(args: argparse.Namespace) -> int:
     """单条端到端演练（1 组 1 epoch）+ 与模块自带训练循环的等价性对账。
 
@@ -112,13 +155,41 @@ def cmd_drill(args: argparse.Namespace) -> int:
     """
     logger = Logger(str(args.log_file))
     try:
-        group = exp_repr.group_by_name(str(args.group))
+        groups, names, note = _resolve_groups(args)
+        if groups is not None:
+            group = groups[0]
+        else:
+            group = exp_repr.group_by_name(
+                str(names[0]) if names else str(args.group or exp_repr.BASELINE_GROUP)
+            )
         kwargs = _kwargs(args, epochs=1)
         t0 = time.time()
         logger.log(
             f"[drill] 组 = {group.name}，"
             f"epochs = 1（演练口径，非矩阵档；矩阵档见 `run --epochs`），"
             f"split_seed = {kwargs['split_seed']}"
+        )
+        logger.log(f"[drill] {note}")
+        logger.log(
+            f"[drill] 结构：{group.structure().as_dict()}；"
+            f"对齐：mode={group.align_mode}, λ={group.align_lambda}, "
+            f"proj_dim={group.proj_dim}"
+        )
+        # ---- 前置门禁：可构造性预检（构造失败 -> 可读原因 + 退码 1，不硬崩）----
+        probe = exp_repr.construction_probe(group, int(exp_repr.profile_by_name(
+            kwargs["profile"]).expect_dim))
+        if not probe["ok"]:
+            logger.log(
+                f"[FAIL] 可构造性预检失败：{probe['exc_type']}: {probe['reason']}"
+            )
+            print(
+                f"[FAIL] drill 失败：该组不可构造（{probe['exc_type']}）：{probe['reason']}",
+                file=sys.stderr,
+            )
+            return 1
+        logger.log(
+            f"[drill] 可构造性预检通过：骨干参数 {probe['parameters']} 个，"
+            f"拓扑 {probe['topology']}，参数名 {probe['backbone_parameter_names']}"
         )
         res = exp_repr.run_group(group, **kwargs)
         logger.log(f"[drill] 本实验循环完成（{time.time() - t0:.1f}s）")
@@ -134,32 +205,72 @@ def cmd_drill(args: argparse.Namespace) -> int:
             return 1
 
         # ---- 等价性对账：同一配置跑模块自带训练循环（save=False，不落盘） ----
-        # build_group_config 只负责「组定义 -> TrainConfig」，不认识阶段划分参数与
-        # 特征档，故显式剔除这三个键，避免把实验编排参数泄漏进配置装配。
-        cfg_kwargs = {k: v for k, v in kwargs.items()
-                      if k not in ("stage1_epochs", "stage2_epochs", "profile")}
-        cfg = exp_repr.build_group_config(group, **cfg_kwargs)
-        prof = exp_repr.profile_by_name(str(kwargs["profile"]))
-        ref = run_training(cfg, max_batches=0, artifact_path="", save=False,
-                           encoder_config=prof.question)
-        ref_metrics = evaluate_step1(ref.model, ref.data, k=3, device=ref.device)
-        ref_refusal = evaluate_refusal(ref.model, ref.data, device=ref.device)
-        mine = res["metric_step1"]
-        checks: List[Dict[str, Any]] = [
-            {"item": "final_loss", "mine": float(res["history"][-1]["loss"]),
-             "reference": float(ref.final_loss())},
-            {"item": "top1_acc", "mine": float(mine["top1_acc"]),
-             "reference": float(ref_metrics.top1_acc)},
-            {"item": "macro_acc", "mine": float(mine["macro_acc"]),
-             "reference": float(ref_metrics.macro_acc)},
-            {"item": "refusal_rate", "mine": float(res["refusal"]["refusal_rate"]),
-             "reference": float(ref_refusal["refusal_rate"])},
-            {"item": "logit_scale_after", "mine": float(res["shifts"]["logit_scale_after"]),
-             "reference": float(ref.model.logit_scale.detach().item())},
-        ]
-        for row in checks:
-            row["match"] = bool(abs(float(row["mine"]) - float(row["reference"])) <= 1e-9)
-        all_match = bool(all(row["match"] for row in checks))
+        # 口径说明（本轮新增）：`run_training` **只优化交叉熵**，不施加对齐附加项；
+        # 因此当 align_mode != "off" 时，"与 run_training 逐位等价"这条对账**不适用**
+        # （不是失败），如实登记 applicable=False 并改由**对齐专项门禁**替代：
+        # align 项必须参与过 >= 1 个 batch、且全部有限。
+        align_on = str(group.align_mode) != "off"
+        checks: List[Dict[str, Any]] = []
+        all_match = True
+        align_gate: Dict[str, Any] = {"applicable": bool(align_on)}
+        if align_on:
+            ast = res.get("align_stats") or {}
+            align_gate.update({
+                "mode": ast.get("mode"),
+                "lambda": ast.get("lambda"),
+                "batches_total": int(ast.get("batches_total", 0)),
+                "batches_with_align": int(ast.get("batches_with_align", 0)),
+                "batches_align_skipped": int(ast.get("batches_align_skipped", 0)),
+                "align_mean": ast.get("align_mean"),
+                "align_max": ast.get("align_max"),
+                "align_min": ast.get("align_min"),
+                "align_nonfinite": int(ast.get("align_nonfinite", 0)),
+                "passed": bool(
+                    int(ast.get("batches_with_align", 0)) > 0
+                    and int(ast.get("align_nonfinite", 0)) == 0
+                    and ast.get("align_mean") is not None
+                    and abs(float(ast.get("align_mean"))) != float("inf")
+                ),
+                "reason": (
+                    "align_mode != 'off'：run_training 只优化交叉熵、不施加对齐附加项，"
+                    "该对账不适用；改由「对齐项有限性 + 至少参与 1 个 batch」替代判定"
+                ),
+            })
+            logger.log(
+                "[drill] 对齐专项门禁（G7）：适用 batch {batches_with_align} / "
+                "跳过 {batches_align_skipped} / 总 {batches_total}，align 均值 "
+                "{align_mean}，非有限计数 {align_nonfinite} -> {verdict}".format(
+                    verdict="PASS" if align_gate["passed"] else "FAIL", **align_gate
+                )
+            )
+            if not align_gate["passed"]:
+                print("[FAIL] 对齐专项门禁未通过（对齐损失有限性）", file=sys.stderr)
+                return 1
+        else:
+            cfg_kwargs = {k: v for k, v in kwargs.items()
+                          if k not in ("stage1_epochs", "stage2_epochs", "profile")}
+            cfg = exp_repr.build_group_config(group, **cfg_kwargs)
+            prof = exp_repr.profile_by_name(str(kwargs["profile"]))
+            ref = run_training(cfg, max_batches=0, artifact_path="", save=False,
+                               encoder_config=prof.question)
+            ref_metrics = evaluate_step1(ref.model, ref.data, k=3, device=ref.device)
+            ref_refusal = evaluate_refusal(ref.model, ref.data, device=ref.device)
+            mine = res["metric_step1"]
+            checks = [
+                {"item": "final_loss", "mine": float(res["history"][-1]["loss"]),
+                 "reference": float(ref.final_loss())},
+                {"item": "top1_acc", "mine": float(mine["top1_acc"]),
+                 "reference": float(ref_metrics.top1_acc)},
+                {"item": "macro_acc", "mine": float(mine["macro_acc"]),
+                 "reference": float(ref_metrics.macro_acc)},
+                {"item": "refusal_rate", "mine": float(res["refusal"]["refusal_rate"]),
+                 "reference": float(ref_refusal["refusal_rate"])},
+                {"item": "logit_scale_after", "mine": float(res["shifts"]["logit_scale_after"]),
+                 "reference": float(ref.model.logit_scale.detach().item())},
+            ]
+            for row in checks:
+                row["match"] = bool(abs(float(row["mine"]) - float(row["reference"])) <= 1e-9)
+            all_match = bool(all(row["match"] for row in checks))
         _dump({
             "group": group.as_dict(),
             "split": res["split"],
@@ -168,10 +279,17 @@ def cmd_drill(args: argparse.Namespace) -> int:
             "gate": res["gate"],
             "ungrouped_trainable_names": res["ungrouped_trainable_names"],
             "geo": res["geo"],
-            "metric_step1": mine,
+            "align_stats": res.get("align_stats"),
+            "alignment_degree": res.get("alignment_degree"),
+            "spectrum": res.get("spectrum"),
+            "structure_stats": res.get("structure_stats"),
+            "metric_step1": res["metric_step1"],
             "refusal": res["refusal"],
             "shifts": res["shifts"],
-            "equivalence_with_run_training": {"checks": checks, "all_match": all_match},
+            "equivalence_with_run_training": {
+                "applicable": not align_on, "checks": checks, "all_match": all_match,
+                "align_gate": align_gate,
+            },
         })
         out_dir = str(args.out_dir) if args.out_dir else exp_repr.EXP_REPR_DIR
         os.makedirs(out_dir, exist_ok=True)
@@ -180,17 +298,25 @@ def cmd_drill(args: argparse.Namespace) -> int:
             handle.write(json.dumps(
                 {"group": group.as_dict(), "gate": res["gate"],
                  "ungrouped_trainable_names": res["ungrouped_trainable_names"],
-                 "geo": res["geo"], "metric_step1": mine, "refusal": res["refusal"],
+                 "geo": res["geo"],
+                 "align_stats": res.get("align_stats"),
+                 "alignment_degree": res.get("alignment_degree"),
+                 "spectrum": res.get("spectrum"),
+                 "structure_stats": res.get("structure_stats"),
+                 "metric_step1": res["metric_step1"], "refusal": res["refusal"],
                  "shifts": res["shifts"],
-                 "equivalence_with_run_training": {"checks": checks,
-                                                   "all_match": all_match}},
+                 "equivalence_with_run_training": {
+                     "applicable": not align_on, "checks": checks,
+                     "all_match": all_match, "align_gate": align_gate,
+                 }},
                 ensure_ascii=False, indent=1, default=str))
         if not all_match:
             print("[FAIL] 与 run_training 的等价性对账不一致", file=sys.stderr)
             return 1
         logger.log(
             "[OK] drill 通过：1 组 1 epoch 通路成立，门禁 PASS，"
-            "且与 run_training(save=False) 的 5 项训练后量逐位一致"
+            + ("且对齐专项门禁（有限性）PASS" if align_on
+               else "且与 run_training(save=False) 的 5 项训练后量逐位一致")
         )
         return 0
     except Exception as exc:  # noqa: BLE001 - 演练失败必须退码 1 并给出原因
@@ -201,21 +327,22 @@ def cmd_drill(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """放全量对照矩阵，执行切分一致性断言并写报告。"""
+    """放全量对照矩阵，执行可构造性预检与切分一致性断言并写报告。"""
     logger = Logger(str(args.log_file))
     try:
-        names = [s for s in str(args.groups).split(",") if s.strip()] if args.groups else None
+        groups, names, note = _resolve_groups(args)
         kwargs = _kwargs(args, epochs=int(args.epochs))
         t0 = time.time()
         logger.log(
             "[run] 组 = " + repr(names if names else [g.name for g in exp_repr.MATRIX])
         )
+        logger.log(f"[run] {note}")
         logger.log(
             "[run] 固定切分：split_seed={split_seed}；训练 seed={train_seed}；"
             "epochs={epochs}；batch_size={batch_size}".format(**kwargs)
         )
         report = exp_repr.run_experiment(
-            group_names=names, progress=logger.log, **kwargs
+            group_names=names, groups=groups, progress=logger.log, **kwargs
         )
         logger.log(f"[run] 全部组完成（{time.time() - t0:.1f}s）")
         logger.log("[run] 切分一致性断言：通过（qid 有序序列逐位相同）")
@@ -225,12 +352,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         logger.log(f"[run] 报告：{paths['markdown']}")
         _dump({"summary": exp_repr.summarize(report),
                "anchor_comparison": report["anchor_comparison"],
+               "construction_precheck": report.get("construction_precheck"),
                "split_identical": report["split_identical"]})
         failed = [r["group"]["name"] for r in report["groups"] if not r["gate"]["passed"]]
         if failed:
             logger.log(f"[FAIL] 以下组门禁未通过（结果判无效）：{failed}")
             return 1
-        logger.log("[OK] run 完成：全部组门禁 PASS，切分一致性断言通过")
+        cf = report.get("construction_failures") or []
+        if cf:
+            # 「构造失败 -> 判该组无效并跳过」，但**绝不以成功状态落账**：显式列出并退码 1
+            logger.log(
+                "[FAIL] 以下组构造失败（已判无效并跳过，结果不落成功账）："
+                + repr([{"group": x["group"], "exc_type": x["exc_type"],
+                         "reason": str(x["reason"])[:160]} for x in cf])
+            )
+            return 1
+        logger.log("[OK] run 完成：全部组门禁 PASS，切分一致性断言通过，无构造失败组")
         return 0
     except KeyError as exc:
         # 未知组名：给出可读原因与可用组名列表，避免只抛裸 KeyError
@@ -298,7 +435,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     """**同切分**下逐组对照两个特征档（词面 D=88 vs bge-m3 D=1024）并写报告。"""
     logger = Logger(str(args.log_file))
     try:
-        names = [s for s in str(args.groups).split(",") if s.strip()] if args.groups else None
+        groups, names, note = _resolve_groups(args)
         profiles = [s for s in str(args.profiles).split(",") if s.strip()]
         kwargs = _kwargs(args, epochs=int(args.epochs))
         # profile 由 --profiles 决定，逐档注入；这里先剔除单档写法
@@ -306,6 +443,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         step2_topk = int(args.step2_topk)
         t0 = time.time()
         logger.log("[compare] 组 = " + repr(names if names else [g.name for g in exp_repr.MATRIX]))
+        logger.log(f"[compare] {note}")
         logger.log(f"[compare] 特征档 = {profiles}")
         logger.log(
             "[compare] 固定切分：split_seed={split_seed}；训练 seed={train_seed}；"
@@ -326,6 +464,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         report = exp_repr.run_comparison(
             profiles=profiles,
             group_names=names,
+            groups=groups,
             step2_product_dir=str(args.step2_product_dir),
             step2_pool_cap=int(args.step2_pool_cap),
             step2_topk=step2_topk,
@@ -356,19 +495,41 @@ def cmd_compare(args: argparse.Namespace) -> int:
             + ("通过" if report["split"]["identical_across_profiles"] else "未通过")
             + f"（{len(report['split']['cross_profile_checks'])} 项）"
         )
+        cf = report.get("construction_failures") or {}
+        n_cf = sum(len(v) for v in cf.values())
+        logger.log(
+            f"[compare] G6 构造失败清单：{n_cf} 项"
+            + ("" if n_cf == 0 else f" -> {cf}")
+        )
+        ax = report.get("axis_attribution") or {}
+        logger.log(
+            "[compare] 逐轴主判据（各档都相对公共基线同时更优，"
+            f"基线={ax.get('baseline')}）：通过 = {ax.get('groups_axis_both_better_all_profiles')}；"
+            f"未通过 = {ax.get('groups_axis_not_both_better')}"
+        )
         logger.log(f"[compare] CPU 耗时（秒）：{report['seconds']['per_profile_total']}；"
                    f"总计 {report['seconds']['grand_total']:.1f}")
         _dump({
             "verdict": v,
+            "axis_attribution_summary": {
+                "baseline": ax.get("baseline"),
+                "criterion": ax.get("criterion"),
+                "both_better_all_profiles": ax.get("groups_axis_both_better_all_profiles"),
+                "not_both_better": ax.get("groups_axis_not_both_better"),
+            },
             "attribution_feature_only": report["attribution"]["feature_only"],
             "attribution_training_only": report["attribution"]["training_only"],
+            "construction_failures": {k: len(v) for k, v in cf.items()},
             "split_identical_across_profiles": report["split"]["identical_across_profiles"],
             "seconds": report["seconds"]["per_profile_total"],
         })
         if bad:
             logger.log(f"[FAIL] 以下组门禁未通过（结果判无效）：{bad}")
             return 1
-        logger.log("[OK] compare 完成：全部组门禁 PASS，跨档切分一致性断言通过")
+        if n_cf:
+            logger.log("[FAIL] 存在构造失败组（已判无效并跳过，结果不落成功账）")
+            return 1
+        logger.log("[OK] compare 完成：全部组门禁 PASS，跨档切分一致性断言通过，无构造失败组")
         return 0
     except KeyError as exc:
         print(f"[FAIL] compare 失败：组名/档名不可用 —— {exc}", file=sys.stderr)
@@ -387,6 +548,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="n3d_qa_learn.exp_repr_run",
         description="n3d_qa_learn 表示训练对照实验（只写 checkpoints/qa_learn/_verify/exp_repr/）",
+        epilog=(
+            "结构 / 对齐轴开关（挂在 drill / run / compare 三个子命令上；"
+            "给出任一即只跑 1 个从公共基线 S0_base 逐轴单换出来的自定义组）："
+            " --carrier / --shape / --cyl-aspect / --fc-dim / --struct-N（别名 --N）"
+            " / --y-in / --y-out / --geo-field / --align-mode / --align-lambda / --proj-dim。"
+            "详见 `exp_repr_run <子命令> --help`。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -412,6 +581,33 @@ def build_parser() -> argparse.ArgumentParser:
                        help="特征档：lexical-88（词面，现状）或 bge-m3-1024（语义）")
         p.add_argument("--out-dir", type=str, default="", help="输出目录（默认验证目录）")
         p.add_argument("--log-file", type=str, default="", help="UTF-8 无 BOM 日志文件")
+        # ---- 本轮新增：结构 / 对齐轴（逐轴单换；给出任意一个即只跑 1 个自定义组）----
+        p.add_argument("--carrier", type=str, default=None,
+                       choices=sorted(exp_repr.CARRIER_GROUPS),
+                       help="载体组：base（head_backbone+concat）/ B1_concat / B2_n3d")
+        p.add_argument("--shape", type=str, default=None,
+                       choices=list(exp_repr.SHAPES),
+                       help="空间形状：sphere / cube / cylinder")
+        p.add_argument("--cyl-aspect", type=float, default=None,
+                       help="圆柱长径比 λ（仅 shape=cylinder 生效；本轮矩阵用 1.0）")
+        p.add_argument("--fc-dim", type=int, default=None,
+                       help="两端全连接包裹：0 关闭 / -1 跟随 N / >0 显式宽度")
+        p.add_argument("--struct-N", "--N", dest="structure_N", type=int, default=None,
+                       help="神经元规模 N（本轮边界 64 / 256）")
+        p.add_argument("--y-in", dest="y_in", type=int, default=None,
+                       help="输入突触数（默认 4；y=2 会被上游连通性下限校验拒绝）")
+        p.add_argument("--y-out", dest="y_out", type=int, default=None,
+                       help="输出突触数（默认 4）")
+        p.add_argument("--geo-field", type=str, default=None,
+                       choices=list(exp_repr.GEO_FIELDS),
+                       help="几何权重场：none / additive")
+        p.add_argument("--align-mode", type=str, default=None,
+                       choices=list(exp_repr.ALIGN_MODE_CHOICES),
+                       help="对齐机制：off / proj_supcon（机制 B）/ distill（机制 C）")
+        p.add_argument("--align-lambda", dest="align_lambda", type=float, default=None,
+                       help="对齐损失权重 λ（总损失 = ce + λ·align）")
+        p.add_argument("--proj-dim", dest="proj_dim", type=int, default=None,
+                       help="投影头宽度：0 关闭 / -1 跟随 D（D→D，机制 B）")
 
     p = sub.add_parser(
         "drill",
@@ -423,7 +619,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     add_common(p)
-    p.add_argument("--group", type=str, default=exp_repr.BASELINE_GROUP)
+    p.add_argument("--group", type=str, default=None,
+                   help=f"组名（默认 {exp_repr.BASELINE_GROUP}；给了轴覆盖时起点默认 "
+                        f"{exp_repr.STRUCT_BASELINE_GROUP}）")
     p.set_defaults(func=cmd_drill)
 
     p = sub.add_parser("run", help="全量对照矩阵")
