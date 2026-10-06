@@ -28,6 +28,7 @@ import numpy as np
 import torch
 
 from . import encoders as E
+from . import robust_eval as R
 from . import step2 as S
 from .route import QuestionRouter
 from .train import ZIP_EPOCH
@@ -855,6 +856,345 @@ def cmd_eval(args: argparse.Namespace) -> int:
     return 0
 
 
+def _robust_dir(args: argparse.Namespace) -> str:
+    """robust 子命令的报告目录（**验证类运行一律写 ``_verify/robust/``**）。"""
+    for attr in ("verify_dir", "out_dir"):
+        value = str(getattr(args, attr, "") or "")
+        if value:
+            return value
+    return str(R.ROBUST_DIR)
+
+
+def _csv_names(raw: str, allowed: Sequence[str], label: str) -> Tuple[str, ...]:
+    """解析逗号分隔的名字列表并**在 CLI 边界做可读校验**。
+
+    存在理由（离朱 R49 条目 33）：`--profiles bogus` / `--perturb bogus` 原先由
+    ``RobustConfig.__post_init__`` 抛出的 ``KeyError`` / ``ValueError`` **穿透到解释器**，
+    用户可见的是 30 行裸 Traceback。底层校验本身是对的（报文已带可用值清单），缺的是
+    CLI 边界的捕获与可读呈现 —— 本函数把它前移到参数解析层，与 ``--side`` 的
+    ``choices=`` 行为一致（退码 2、单行可读报文、无 Traceback）。
+
+    参数
+    ----
+    raw : str
+        逗号分隔的原始串（空串 = 用 ``allowed`` 全量）。
+    allowed : Sequence[str]
+        允许的名字集合（顺序敏感，空串回退时原样使用）。
+    label : str
+        参数名（仅用于报文）。
+
+    返回
+    ----
+    Tuple[str, ...]
+        解析后的名字元组。
+
+    异常
+    ------
+    ValueError
+        存在未登记的名字（报文含可用值清单）。
+    """
+    items = tuple(x.strip() for x in str(raw or "").split(",") if x.strip())
+    if not items:
+        return tuple(str(x) for x in allowed)
+    unknown = [x for x in items if x not in set(str(a) for a in allowed)]
+    if unknown:
+        raise ValueError(
+            f"{label} 含未登记的值 {unknown}；可用 = {sorted(str(a) for a in allowed)}"
+        )
+    return items
+
+
+def _robust_config(args: argparse.Namespace, *, dry_run: bool = False) -> R.RobustConfig:
+    """由 CLI 参数装配 robust 的冻结配置（不传新参数时等于默认档）。"""
+    side = str(getattr(args, "side", "both") or "both")
+    sides: Tuple[str, ...] = (
+        tuple(R.SIDES) if side == "both" else (side,)
+    )
+    profiles = _csv_names(
+        str(getattr(args, "profiles", "") or ""), R.ET.profile_names(), "--profiles"
+    )
+    kinds = _csv_names(
+        str(getattr(args, "perturb", "") or ""), R.PERTURB_TYPES, "--perturb"
+    )
+    if dry_run:
+        # 单组合演练：只跑「词面档 × 文本侧 × noise 三档」，把全量放到演练通过之后
+        profiles = (R.ET.PROFILE_LEXICAL,)
+        sides = ("text",)
+        kinds = ("noise",)
+    return R.RobustConfig(
+        seed=int(getattr(args, "seed", R.ROBUST_SEED)),
+        sides=sides,
+        profiles=profiles,
+        perturb_types=kinds,
+        variants=int(getattr(args, "variants", R.ROBUST_VARIANTS)),
+        stability_k=int(getattr(args, "stability_k", R.ROBUST_STABILITY_K)),
+        topk=int(getattr(args, "topk", R.TOPK)),
+        batch_size=int(getattr(args, "batch_size", R.BATCH_SIZE)),
+        out_dir=_robust_dir(args),
+    )
+
+
+def _robust_run_json(args: argparse.Namespace) -> str:
+    """``calibrate`` / ``report`` 要读的 run 产物路径。"""
+    explicit = str(getattr(args, "run_json", "") or "")
+    return explicit if explicit else os.path.join(_robust_dir(args), "robust_run.json")
+
+
+def _robust_calibration_json(args: argparse.Namespace) -> str:
+    """``report`` 要读的标定产物路径。"""
+    explicit = str(getattr(args, "calibration_json", "") or "")
+    return explicit if explicit else os.path.join(_robust_dir(args), "robust_calibration.json")
+
+
+def cmd_robust_probe(args: argparse.Namespace) -> int:
+    """``robust probe``：表构造与口径取证（**不评测**）。"""
+    cfg = _robust_config(args)
+    out_dir = cfg.resolved_out_dir()
+    _log(f"[robust probe] 输出目录 = {out_dir}；种子 = {cfg.seed}；"
+         f"编码器档 = {list(cfg.profiles)}；侧 = {list(cfg.sides)}")
+    payload = R.summarize_probe(cfg, log=_log)
+    for key, meta in sorted(payload["entry_tables"].items()):
+        norm = meta["norm_range"]
+        bl = meta["bitwise_lookup"]
+        _log(f"[robust probe] {key}: keys={meta['n_entries']}×{meta['dim']} / "
+             f"范数 [{norm['min']:.8f}, {norm['max']:.8f}] / "
+             f"键表 SHA256 = {str(meta['key_table_sha256'])[:16]}... / "
+             f"编码器指纹 = {str(meta['encoder_fingerprint'])[:16]}... / "
+             f"逐位精确查表 {bl['n_exact']}/{bl['n_checked']}（exact_frac={bl['exact_frac']}）")
+    for err in payload["probe_errors"]:
+        _log(f"[robust probe] 失败（如实登记）：{err}")
+    for row in payload["perturb_self_check"]:
+        _log(f"[robust probe] 扰动自检 {row['kind']}/{row['level']}: "
+             f"ε={row.get('eps')} formula={row.get('formula')!r} "
+             f"shape={row['shape']} finite={row['finite']} "
+             f"零范数={row['n_zero_norm']} 位移={row['mean_row_displacement']:.6f} "
+             f"seed={row['generator_seed']}（随机数={row.get('uses_generator')}）")
+    g7 = payload.get("bitwise_formula_assertions", {})
+    if g7:
+        _log(f"[robust probe] G7 扰动公式逐位断言：{g7.get('n_bitwise_equal')}/"
+             f"{g7.get('n_cases')} 例逐字节相等，全通过 = {g7.get('all_bitwise_equal')}")
+        for case in g7.get("cases", []):
+            _log(f"[robust probe]   G7 {case['kind']}/{case['level']}: "
+                 f"未归一化={case['raw_bitwise_equal']} 归一化后={case['bitwise_equal']} "
+                 f"（{case['recompute']}）")
+    path = os.path.join(out_dir, "robust_probe.json")
+    digest = R.write_json(path, payload)
+    _log(f"[robust probe] 取证报告 -> {path} (sha256={digest[:16]}...)")
+    if payload["probe_errors"]:
+        _log("[robust probe] 存在失败项（退码 1，不以成功状态落账）")
+        return 1
+    if g7 and not bool(g7.get("all_bitwise_equal")):
+        _log("[robust probe] G7 扰动公式逐位断言未通过（退码 1，不以成功状态落账）")
+        return 1
+    _log("[robust probe] OK")
+    return 0
+
+
+def cmd_robust_run(args: argparse.Namespace) -> int:
+    """``robust run``：分档全量评测（三档 × 三扰动 × 两侧 × 两编码器档）。"""
+    dry_run = bool(getattr(args, "dry_run", False))
+    cfg = _robust_config(args, dry_run=dry_run)
+    out_dir = cfg.resolved_out_dir()
+    _log(f"[robust run] 输出目录 = {out_dir}；种子 = {cfg.seed}；"
+         f"编码器档 = {list(cfg.profiles)}；侧 = {list(cfg.sides)}；"
+         f"扰动 = {list(cfg.perturb_types)}；变体 = {cfg.variants}；K = {cfg.stability_k}")
+    if dry_run:
+        _log("[robust run] **演练口径**：单组合（词面档 × 文本侧 × noise 三档）")
+    result = R.run_evaluation(cfg, log=_log)
+    name = "robust_run_dry.json" if dry_run else "robust_run.json"
+    path = os.path.join(out_dir, name)
+    digest = R.write_json(path, result)
+    inv = result["invariants"]
+    _log(f"[robust run] 不变量：{inv['n_checks']} 条 / 失败 {inv['n_failed']} 条 / "
+         f"全通过 = {inv['all_passed']}")
+    g7 = result.get("bitwise_formula_assertions", {})
+    _log(f"[robust run] G7 扰动公式逐位断言：{g7.get('n_bitwise_equal')}/"
+         f"{g7.get('n_cases')} 例逐字节相等，全通过 = {g7.get('all_bitwise_equal')}")
+    # [!] 耗时只进日志：产物必须逐字节可复现（见 robust_eval.run_evaluation 的纪律注释）
+    _log(f"[robust run] 产物 -> {path} (sha256={digest[:16]}...)")
+    if int(inv["n_failed"]) > 0:
+        _log("[robust run] 存在失败的不变量检查（退码 1，不以成功状态落账）")
+        return 1
+    _log("[robust run] OK")
+    return 0
+
+
+def _validate_robust_selector_args(args: argparse.Namespace) -> None:
+    """校验 ``robust`` 的选择类参数（``--side`` / ``--profiles`` / ``--perturb``）。
+
+    存在理由（审查 W4）：``probe`` / ``run`` 经 ``_robust_config`` 会校验 ``--profiles`` /
+    ``--perturb``；而 ``calibrate`` / ``report`` **不构造** ``RobustConfig``，此前会把这些
+    参数**静默忽略**（`robust calibrate --profiles bogus` 退码 0），与 README 里
+    「非法值给可读报文 + 退码 2」的表述不符。本函数把这层校验显式前移到四个子命令的入口，
+    使「不适用」变成**显式校验**而不是静默忽略。
+
+    异常
+    ------
+    ValueError
+        存在未登记取值（由 :func:`_csv_names` 抛出，报文含可用值清单）。
+    """
+    _csv_names(
+        str(getattr(args, "profiles", "") or ""), R.ET.profile_names(), "--profiles"
+    )
+    _csv_names(
+        str(getattr(args, "perturb", "") or ""), R.PERTURB_TYPES, "--perturb"
+    )
+    side = str(getattr(args, "side", "both") or "both")
+    if side not in ("qa", "text", "both"):
+        raise ValueError(f"--side 含未登记的值 {side!r}；可用 = ['qa', 'text', 'both']")
+
+
+def cmd_robust_calibrate(args: argparse.Namespace) -> int:
+    """``robust calibrate``：阈值现场标定（读 run 结果，产出标定阈值与依据）。
+
+    **参数校验**（审查 W4）：本子命令虽然不消费 ``--profiles`` / ``--perturb``，但
+    为了与 probe/run 行为一致（不给用户「输错了却静默通过」的错觉），仍在此显式校验。
+    """
+    t0 = time.time()
+    _validate_robust_selector_args(args)
+    run_path = _robust_run_json(args)
+    out_dir = _robust_dir(args)
+    if not os.path.isfile(run_path):
+        _log(
+            f"[robust calibrate] 缺少 run 产物：{run_path!r}；"
+            "请先执行 `robust run`（或显式给 --run-json 指向实际产物）"
+        )
+        return 1
+    _log(f"[robust calibrate] 读 run 产物 = {run_path}")
+    run_result = R.load_run(run_path)
+    calibration = R.calibrate_thresholds(
+        run_result,
+        factor=float(getattr(args, "factor", R.THRESHOLD_FACTOR)),
+        primary_side=str(getattr(args, "primary_side", "text") or "text"),
+    )
+    _log(f"[robust calibrate] 噪声底上界 = {calibration['noise_floor_max']:.6f}；"
+         f"标定阈值 τ = {calibration['tau_calibrated']:.6f}（factor = {calibration['factor']}）")
+    for e in calibration["entries"]:
+        _log(f"[robust calibrate]   {e['side']}/{e['profile']}/{e['kind']}: "
+             f"档0={e['clean_hit_rate']:.6f} 弱={e['level_hit_rate'].get('weak', 0.0):.6f} "
+             f"强={e['level_hit_rate'].get('strong', 0.0):.6f} 落差={e['gap_weak_to_strong']:.6f} "
+             f"噪声底={e['noise_floor']:.6f} τ={e['tau']:.6f} -> "
+             f"{'有效' if e['effective'] else '无效'}")
+    # 把标定阈值登记进未识别档的**参照**字段（**不重跑评测、不改特征口径**）
+    tau_text = calibration["tau_calibrated"]
+    acknowledged: List[Json] = [
+        {
+            "side": u.get("side"),
+            "profile": u.get("profile"),
+            "tau_reference": float(tau_text),
+            "note": u["report"].get("rate_note", ""),
+        }
+        for u in run_result.get("unrecognized", [])
+    ]
+    calibration["unrecognized_tau_reference"] = float(tau_text)
+    calibration["unrecognized_note"] = (
+        "未识别档的 τ 口径：本批**不标定**该档阈值（属第二步变体 B）；报告里已给"
+        "不依赖 τ 的分位数。此处记录 calibrate 现场得到的 τ 仅作参照，不作为判定依据。"
+    )
+    calibration["unrecognized_acknowledged"] = acknowledged
+    path = os.path.join(out_dir, "robust_calibration.json")
+    digest = R.write_json(path, calibration)
+    _log(f"[robust calibrate] 标定产物 -> {path} (sha256={digest[:16]}...)")
+    _log(f"[robust calibrate] 耗时 {time.time() - t0:.1f}s（只进日志，不入产物）")
+    _log("[robust calibrate] OK")
+    return 0
+
+
+def cmd_robust_report(args: argparse.Namespace) -> int:
+    """``robust report``：报告渲染（JSON + Markdown）。
+
+    **参数校验**（审查 W4）：同 ``calibrate``，对本子命令不适用的 ``--profiles`` /
+    ``--perturb`` 仍显式校验并给出可读报文（退码 2），不静默忽略。
+    """
+    _validate_robust_selector_args(args)
+    run_path = _robust_run_json(args)
+    out_dir = _robust_dir(args)
+    if not os.path.isfile(run_path):
+        _log(
+            f"[robust report] 缺少 run 产物：{run_path!r}；"
+            "请先执行 `robust run`（或显式给 --run-json 指向实际产物）"
+        )
+        return 1
+    calibration: Optional[Json] = None
+    cal_path = _robust_calibration_json(args)
+    _log(f"[robust report] 读 run 产物 = {run_path}")
+    if os.path.isfile(cal_path):
+        _log(f"[robust report] 读标定产物 = {cal_path}")
+        calibration = R.load_run(cal_path)
+    else:
+        _log(f"[robust report] 标定产物不存在（{cal_path}）-> 报告「阈值现场标定」一节标「尚未标定」")
+    run_result = R.load_run(run_path)
+    md = R.render_markdown(run_result, calibration)
+    md_path = os.path.join(out_dir, "robust_report.md")
+    digest = R.write_text(md_path, md)
+    json_path = os.path.join(out_dir, "robust_report.json")
+    # [!] 产物**确定性纪律**（G3 / 审查 W3）：不再写 created_utc / seconds_run —— 它们会让
+    # 同命令重复运行的 report 产物字节不同，并使内嵌的 *_artifact_sha256 重跑即失效。
+    # 生成时间与耗时只进运行日志。此处内嵌的两个 SHA256 全部来自**确定性产物**
+    # （run / calibration 本身已不含非确定字段），故重跑后仍然闭环。
+    report_json = {
+        "artifact_schema": "robust-report-v1",
+        "deterministic": True,
+        "excluded_fields_note": (
+            "本产物不含 created_utc / seconds / 绝对路径等非确定字段；生成时间与耗时、"
+            "输入产物的**绝对路径**只写运行日志（此处只留 basename）。内嵌的 "
+            "run_artifact_sha256 / calibration_artifact_sha256 均来自确定性产物，"
+            "故同命令重复运行（含换输出目录）可逐字节复现"
+        ),
+        ### 只留 basename：绝对路径依赖 cwd/输出目录，会把「同命令重跑」的产物字节带偏
+        "run_artifact_basename": os.path.basename(run_path),
+        "run_artifact_sha256": S.sha256_file(run_path),
+        "calibration_artifact_basename": (
+            os.path.basename(cal_path) if calibration is not None else ""
+        ),
+        "calibration_artifact_sha256": S.sha256_file(cal_path) if calibration is not None else "",
+        "grid": run_result.get("grid", {}),
+        "tiers": run_result.get("tiers", {}),
+        "entry_tables": run_result.get("entry_tables", {}),
+        "euclidean_axis": run_result.get("euclidean_axis", {}),
+        "cells": run_result.get("cells", []),
+        "stability": run_result.get("stability", []),
+        "unrecognized": run_result.get("unrecognized", []),
+        "invariants": run_result.get("invariants", {}),
+        "bitwise_formula_assertions": run_result.get("bitwise_formula_assertions", {}),
+        "calibration": calibration or {},
+        "honest_notes": run_result.get("honest_notes", []),
+        "markdown_basename": os.path.basename(md_path),
+        "markdown_sha256": digest,
+    }
+    json_digest = R.write_json(json_path, report_json)
+    _log(f"[robust report] 输入：run = {run_path}；calibration = {cal_path if calibration else '（缺）'}")
+    _log(f"[robust report] Markdown -> {md_path} (sha256={digest[:16]}...)")
+    _log(f"[robust report] JSON     -> {json_path} (sha256={json_digest[:16]}...)")
+    _log("[robust report] 注：绝对路径只进日志，产物内只留 basename（保证换目录重跑逐字节一致）")
+    _log("[robust report] OK")
+    return 0
+
+
+def cmd_robust(args: argparse.Namespace) -> int:
+    """``robust`` 子命令分派：probe / run / calibrate / report。
+
+    **CLI 错误边界**（离朱 R49 条目 33）：非法的 ``--profiles`` / ``--perturb`` /
+    ``--side`` 等配置项在此被转换为**单行可读报文 + 退码 2**，不再抛裸 Traceback；
+    捕获范围**只包住 robust 子命令族**，既有子命令的分发逻辑逐字符未改。
+    """
+    sub = str(getattr(args, "robust_cmd", "") or "run")
+    handlers = {
+        "probe": cmd_robust_probe,
+        "run": cmd_robust_run,
+        "calibrate": cmd_robust_calibrate,
+        "report": cmd_robust_report,
+    }
+    if sub not in handlers:
+        _log(f"[robust] 未知子命令 {sub!r}；可用 = {sorted(handlers)}")
+        return 2
+    try:
+        return int(handlers[sub](args))
+    except (ValueError, KeyError) as exc:
+        _log(f"[robust] 非法参数：{exc}")
+        return 2
+
+
 def cmd_verify_vectorizer(args: argparse.Namespace) -> int:
     """步骤 2 的**验证口径（第 2 轮重建）**：指纹对账 / 重复编码 / 落盘缓存逐位比对。
 
@@ -989,6 +1329,45 @@ def build_parser() -> argparse.ArgumentParser:
                       help="① 项基准指纹（空 = 读 encoders_run 的落盘取证）")
     p_vv.add_argument("--encoders-dir", default="", help="encoders_run 取证目录")
     p_vv.set_defaults(func=cmd_verify_vectorizer)
+
+    p_rb = sub.add_parser(
+        "robust",
+        help="分档鲁棒性考卷（第一步 1a）：条目特征表 / 逐位精确查表 / 分档评测 / KNN 基线",
+        description=(
+            "分档鲁棒性考卷（不改网络结构、不做训练）：probe（表构造与口径取证）/ "
+            "run（三档 × 三扰动 × 两侧 × 两编码器档全量评测）/ calibrate（阈值现场标定）/ "
+            "report（JSON + Markdown 渲染）。报告写 checkpoints/qa_learn/_verify/robust/，"
+            "不落盘扰动后的特征矩阵。"
+        ),
+    )
+    common(p_rb)
+    p_rb.add_argument("--side", default="both", choices=["qa", "text", "both"],
+                      help="评测侧（both = 两侧都跑）")
+    p_rb.add_argument("--profiles", default=",".join(R.ROBUST_PROFILES),
+                      help="编码器档列表（逗号分隔；见 entry_table.profile_names()）")
+    p_rb.add_argument("--perturb", default=",".join(R.PERTURB_TYPES),
+                      help="扰动类型列表（逗号分隔；noise / mask / nmag）")
+    p_rb.add_argument("--seed", type=int, default=R.ROBUST_SEED,
+                      help="扰动种子（局部 torch.Generator，不消耗全局 RNG）")
+    p_rb.add_argument("--variants", type=int, default=R.ROBUST_VARIANTS,
+                      help="每档每条目的变体数（主判据 = 1）")
+    p_rb.add_argument("--stability-k", type=int, default=R.ROBUST_STABILITY_K,
+                      help="稳定性佐证变体数 K（均值 ± 极差）")
+    p_rb.add_argument("--topk", type=int, default=R.TOPK, help="归一化余弦 top-k 的 k")
+    p_rb.add_argument("--batch-size", type=int, default=R.BATCH_SIZE, help="检索批大小")
+    p_rb.add_argument("--verify-dir", default="", help="报告目录（与 --out-dir 同义）")
+    p_rb.add_argument("--run-json", default="", help="run 产物路径（calibrate/report 读它）")
+    p_rb.add_argument("--calibration-json", default="", help="标定产物路径（report 读它）")
+    p_rb.add_argument("--factor", type=float, default=R.THRESHOLD_FACTOR,
+                      help="阈值标定倍数（观测噪声的约 2 倍）")
+    p_rb.add_argument("--primary-side", default="text", choices=["qa", "text"],
+                      help="主判据侧（默认 text；QA 侧只作辅助）")
+    p_rb.add_argument("--dry-run", action="store_true",
+                      help="run 的演练口径：只跑「单个组合」（local-hash × 文本侧 × noise 三档）")
+    p_rb.add_argument("robust_cmd", nargs="?", default="run",
+                      choices=["probe", "run", "calibrate", "report"],
+                      help="robust 子命令（缺省 run）")
+    p_rb.set_defaults(func=cmd_robust)
     return parser
 
 

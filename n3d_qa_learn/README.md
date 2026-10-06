@@ -1578,3 +1578,791 @@ SHA256 / 字节数 / mtime 在本轮**逐项不变**（`run` / `compare` 路径*
 `exp_repr_report.{json,md}` / `exp_repr_compare.{json,md}` / `drill.json` 的副本），
 以及 `_verify/exp_repr/_probe_struct_align/` 下的现场探针与日志；
 `checkpoints/qa_learn/` **顶层**除既有条目外**无新增文件**。
+
+## 十五、分档鲁棒性考卷（`entry_table.py` / `robust_eval.py`，第一步 1a）
+
+> **本节的定位（务必先读）**：本轮**不改任何网络结构、不做任何训练**，只建一把
+> 「考卷」并**验证这把尺子真的有区分度**。上一轮 18 组结构改动**全为 Δ0**，根因是
+> **评价口径饱和**（干净输入下 KNN 的步骤 2 自检索 R@1 已达 0.9835，无提升空间）。
+> 因此本轮的成功标准是「**分档后能分出高下**」，**不是**「指标变好」。
+
+### 15.1 统一条目特征表（`EntryKeyTable`）
+
+| 字段 | 类型 | 语义 |
+| --- | --- | --- |
+| `keys` | `torch.Tensor [N, D] float32` | 逐行 **L2 归一化**（构造期校验范数） |
+| `entry_ids` | `List[str]` | 条目 id（唯一、顺序敏感） |
+| `outputs` | `List[str]` | 绑定输出：QA 侧 = 答案展示文本；文本侧 = 行原文 |
+| `kind` / `dim` / `norm_spec` | `str` / `int` / `str` | 构造来源 / 连接参数 D / 归一化口径 |
+| `encoder_profile` / `encoder_fingerprint` | `str` | 编码器档名 / 口径指纹 |
+
+**构造期不变量（违反即抛）**：① 二维、`dtype == torch.float32`、C 连续；
+② 行范数 ∈ `[1-1e-6, 1+1e-6]`；③ `len(entry_ids) == len(outputs) == N` 且
+`entry_ids` 无重复；④ `keys.shape[1] == dim`。
+
+**两侧构造器（现场实测）**
+
+| 表 | N | D | 行范数区间 | 键表 SHA256（前 16） | 编码器口径指纹（前 16） | 逐位精确查表 |
+| --- | ---: | ---: | --- | --- | --- | --- |
+| `text:lexical-88` | 2665 | 88 | `[0.99999988, 1.00000012]` | `a4b6d9dda0852b2e` | `d4a4881aaa8dfa8c` | **2665/2665（1.0）** |
+| `text:bge-m3-1024` | 2665 | 1024 | `[0.99999982, 1.00000012]` | `b973d07bfc56fabb` | `75220c7dcb922315` | **2665/2665（1.0）** |
+| `qa:lexical-88` | 149 | 88 | `[0.99999994, 1.00000012]` | `d5a3cf991036f9c9` | `d4a4881aaa8dfa8c` | **149/149（1.0）** |
+| `qa:bge-m3-1024` | 149 | 1024 | `[0.99999982, 1.00000000]` | `9fe268a53d046158` | `1877d80dbef3ece4` | **149/149（1.0）** |
+
+* **QA 侧**：只读 `n3d_qa` 冻结 QA 缓存，经 `data.build_answer_space` +
+  `data.make_splits` 复现切分（与 `exp_repr` 基线档同口径：`max_classes=10` /
+  `min_questions=8` / `test_every=3` / `test_per_class=2` / `unknown_train_cap=500` /
+  `split_seed=42`），现场实测 **`train_known 149` / `test_known 20` /
+  `train_unknown 500` / `test_unknown 2393` / `C = 10`** —— 与任务书登记的边界逐项一致。
+  `outputs` = 答案展示文本（`QARecord.answer_display`）。
+* **文本侧**：**包装**既有 `step2.TextRowKeyTable`（键表字节与 `sha256()` 原样透传，
+  **落盘格式零改动**、本模块不写任何文件），检索池 = 冻结行表全量 2665
+  （`n3d_qa` 的 `label_rule`：candidate library row IS the query row），
+  查询集 = 冻结划分出的 query 行 666；并现场断言包装视图第 0 行裸字节 ==
+  既有键表第 0 行裸字节。
+* **指纹守卫** `entry_table.fingerprint_guard`：键表 SHA256 + 编码器口径指纹，
+  任一与期望不一致**立即报错**（拒绝在错配的特征空间上做检索）。
+
+### 15.2 逐位精确查表（G1）
+
+`EntryKeyTable.lookup(i)` 返回该行的 **float32 裸字节**；
+`entry_table.verify_bitwise_lookup(table)` 断言它与 `keys[i]` 的裸字节**逐字节相等**
+（不是"接近"）。现场实测四张表 **`exact_frac` 全部 = 1.0**（2665/2665、149/149 × 两档），
+`mismatch_head` 为空。报告第 1.1 节即由它产出。
+
+### 15.3 扰动构造（三种 × 三档，确定性）
+
+> **⚠️ 本节公式为皋陶审查 W1 修复后的版本**；修复前后的差异与对结论的影响见 15.11。
+
+| 扰动 | 弱 | 中 | 强 | 实现（唯一来源：`robust_eval.PERTURB_FORMULAS`） |
+| --- | --- | --- | --- | --- |
+| `noise` 高斯噪声 | σ = 0.05 | σ = 0.10 | σ = 0.15 | `x ← x + σ·ξ`，`ξ ~ N(0, I)` |
+| `mask` 随机维度遮蔽 | r = 0.10 | r = 0.30 | r = 0.50 | `x ← x ⊙ m`，逐行 `randperm` 保留 `floor(D·(1−r))` 维、其余置 0 |
+| `nmag` 幅度缩放+平移 | ε = 0.10 | ε = 0.15 | ε = 0.20 | `x ← x·NMAG_SHARED_SCALE + ε·(−1)^(i+j+1)`，`NMAG_SHARED_SCALE = 0.5` |
+
+* **三种扰动都只有唯一的标量强度参数**：`noise`/`mask` 是 σ / r；`nmag` 的 ε **同时**是
+  缩放幅度与平移幅度（平移由 `robust_eval.nmag_shift_matrix` 给出的棋盘式符号矩阵决定）。
+  **`nmag` 的 middle 档在原计划口径里未定义**，本实现取 `ε = 0.15`（落于弱 0.10 与强 0.20
+  之间）并登记在 `PERTURB_GRID` 注释与产物 `grid.nmag_middle_note`。
+* **`nmag` 是闭式、无随机数** ⇒ 其 `variant` **不生效**（不假装有变体差异，已在产物
+  `bitwise_formula_assertions` 与 README 15.11 显式登记）。
+* **扰动后一律重新 L2 归一化**，唯一实现 = `entry_table.l2_normalize_rows`；
+  零范数行**显式报错**（`ValueError`，不静默产出 NaN / 全零）。
+* **确定性**：`noise` / `mask` 的随机数由**局部** `torch.Generator` 驱动，**不消耗全局 RNG**；
+  派生种子公式 `seed*1000 + 100*type_index + 10*level_index + variant`
+  （现场实测 weak/middle/strong 的 `noise` 生成器种子 = `42000 / 42010 / 42020`）。
+* **G7 扰动公式逐位断言（本轮新增门禁）**：用固定已知输入矩阵 + 三种 × 三档共 9 例，
+  独立按公式重算后比 float32 裸字节（未归一化与归一化后两路），现场实测 **9/9 全通过**；
+  详细口径见 15.11。
+* 每档每条目生成 1 条变体（主判据）；另提供 **K=5** 个**真实不同**变体
+  （`variant=0..4`）的均值 ± 极差作稳定性佐证 —— 现场实测 36 行中 **32 行极差 > 0**
+  （如文本侧 / `lexical-88` / `noise` / 强：均值 0.780480、极差 **0.049550**、
+  命中数区间 501~534）。
+  **踩坑登记**：首版把稳定性表从主判据 cell 里按 `variant` 筛选，而主判据只跑
+  `variant=0`，导致 K=5 的 36 行极差**全部为 0.000000**（假稳定性）；已改为显式重跑
+  K 个变体并如实登记该修复。
+
+### 15.4 去掉欧氏基线轴（现场实测依据）
+
+对 L2 归一化向量 `‖a−b‖² = 2 − 2·cos(a,b)`，故 `argmin` 距离与 `argmax` 余弦必然同解。
+现场实测（`robust_eval.euclidean_equivalence_evidence`）：
+
+| 表 | 检查查询数 | 余弦/欧氏 top-1 **不一致条数** | 键表行范数区间 | 恒等式最大残差 |
+| --- | ---: | ---: | --- | --- |
+| `text:lexical-88` | 666 | **0** | `[0.99999988, 1.00000012]` | 4.768e-07 |
+| `text:bge-m3-1024` | 666 | **0** | `[0.99999982, 1.00000012]` | 4.768e-07 |
+| `qa:lexical-88` | 512 | **0** | `[0.99999994, 1.00000012]` | 4.768e-07 |
+| `qa:bge-m3-1024` | 512 | **0** | `[0.99999982, 1.00000000]` | 4.768e-07 |
+
+⇒ 设计文档 §3.1 与 §7.3 在此处自相张力；**不把「余弦/欧氏对比」当作有信息量的对照**，
+欧氏基线轴已从本次考卷中移除。基线轴 = **归一化余弦 top-1 / top-5 × 两档编码器**。
+
+### 15.5 逐档 × 逐扰动 × 逐侧命中率（现场实测，主表）
+
+**编码器档 `lexical-88`（词面）**
+
+| 侧 | 扰动 | 档 0 R@1 | 弱 R@1 | 中 R@1 | 强 R@1 | 弱→强落差 | 档 0 R@5 | 强 R@5 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 文本侧 | 高斯噪声 | 1.000000 | 1.000000 | 0.984985 | **0.789790** | **0.210210** | 1.000000 | 0.918919 |
+| 文本侧 | 随机维度遮蔽 | 1.000000 | 0.990991 | 0.947447 | **0.770270** | **0.220721** | 1.000000 | 0.903904 |
+| 文本侧 | 幅度缩放+平移 | 1.000000 | **0.391892** | **0.099099** | **0.049550** | **0.342342** | 1.000000 | 0.560060 |
+| QA 侧 | 高斯噪声 | 0.300000 | 0.250000 | 0.150000 | 0.150000 | 0.100000 | 0.650000 | 0.400000 |
+| QA 侧 | 随机维度遮蔽 | 0.300000 | 0.200000 | 0.150000 | 0.300000 | **−0.100000** | 0.650000 | 0.600000 |
+| QA 侧 | 幅度缩放+平移 | 0.300000 | 0.100000 | 0.150000 | 0.050000 | 0.050000 | 0.650000 | 0.250000 |
+
+**编码器档 `bge-m3-1024`（语义）**
+
+| 侧 | 扰动 | 档 0 R@1 | 弱 R@1 | 中 R@1 | 强 R@1 | 弱→强落差 | 档 0 R@5 | 强 R@5 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 文本侧 | 高斯噪声 | 1.000000 | 0.998498 | 0.980480 | **0.758258** | **0.240240** | 1.000000 | 0.924925 |
+| 文本侧 | 随机维度遮蔽 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | **0.000000** | 1.000000 | 1.000000 |
+| 文本侧 | 幅度缩放+平移 | 1.000000 | **0.481982** | **0.144144** | **0.043544** | **0.438438** | 1.000000 | 0.537538 |
+| QA 侧 | 高斯噪声 | 0.650000 | 0.450000 | 0.350000 | 0.350000 | 0.100000 | 0.700000 | 0.800000 |
+| QA 侧 | 随机维度遮蔽 | 0.650000 | 0.600000 | 0.550000 | 0.500000 | 0.100000 | 0.700000 | 0.700000 |
+| QA 侧 | 幅度缩放+平移 | 0.650000 | 0.200000 | 0.200000 | 0.150000 | 0.050000 | 0.700000 | 0.300000 |
+
+**评测单元结构（必须先看，否则会误读）**
+
+| 侧 | 单元角色 | 条目数 | 查询数 | 金标集合为空的查询 | 档 0 R@1 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 文本侧 | `main`（自检索） | 2665 | 666 | 0 | 1.000000 |
+| QA 侧 | `main`（未识别负样本） | 149 | 2893 | **2893** | 0.000000 |
+| QA 侧 | `qa_known`（`test_known`） | 149 | 20 | 0 | 0.300000（词面）/ 0.650000（语义） |
+
+* **`qa/main` 的档 0 R@1 恒为 0 是构造决定的**：现场实测这 2893 条的 1770 个答案键与
+  条目表的 10 个类**零重叠**，金标集合恒为空 ⇒ 无法定义命中（**不是**"该口径下模型很差"）。
+* QA 侧已知查询只有 **20 条**（单个样本 = 0.05），**统计意义弱**，**不得**作为主判据。
+* 文本侧档 0 的 1.000000 是**逐位自匹配**的结构结果（查询行与键表行 `tobytes()` 逐位相同），
+  与 `step2_run` 报的纯特征参照下限 `0.9834834834834835` **是两种口径**
+  （后者为「库 = 1999 / 查询 = 666 的留出划分 + `zh-bag` D=192」）。
+
+### 15.6 阈值现场标定（两阶段）
+
+> **⚠️ 本节为皋陶审查 W2/W3 修复后的版本**（噪声底按 cell 角色逐格标定 + 粒度守卫）；
+> 修复前后的差异与对结论的影响见 15.11。
+
+**第一阶段（实测噪声底）**：`noise_floor` = 「**在与主判据同一 cell 角色（同一批查询）**上，
+用可忽略强度（该扰动**弱档** ε 的 `NOISE_LEVEL_RATIO = 0.02`，即 noise σ=0.001 /
+mask r=0.002 / nmag 只做 δ=1e-3 的可忽略平移、**不缩放**）扰动查询与键表
+（变体 0 / 变体 1）时相对档 0 的最大掉点」。
+
+* **W2 修复要点（曾经最严重的一处）**：噪声底必须与主判据**同角色同总体**生成。
+  改前 QA 侧 `qa_known`（20 条 `test_known`）的噪声底取自 `main`（2893 条**未识别**负样本），
+  两个总体的粒度差 145 倍，把 QA 侧噪声底抬到 0.141667~0.325；改后同总体噪声底为
+  **0.0 / 0.066667**。产物里写入 `population_role` 与
+  `population{cell_role, query_n, table_n, min_granularity}` 溯源。
+* **为什么必须「两次独立随机绘制」**：同一个噪声向量施加于查询与键表时，**自检索是恒等变换**
+  （同一行被同一向量扰动后仍与自身完全一致），命中率恒 1.0 —— 现场实测该构造下文本侧
+  三档 R@1 **全为 `1.000000`**，会把噪声底误标成 1.0（τ = 2.0，任何落差都判无效）。
+  独立绘制则如实暴露「同一内容两次编码不可能逐位相同」这一可观测差异。
+  例外：`nmag` 无随机数，其噪声底退化为「同一确定性平移作用于两侧」，
+  已在 cell 的 `independent_draw` 字段**显式登记为 `false`**。
+* **该量的平直性（如实登记）**：文本侧 / `lexical-88` / `noise` 在 ε=0.001 与 ε=0.01 下
+  **同为 R@1 = 0.983483** —— 说明它反映的是键表中**近重复行**导致的自匹配歧义
+  （换一次随机绘制就换一条近重复行胜出），**不随 ε 连续增长**。
+
+**第二阶段（标定与判定）**：`robust calibrate` 读 run 结果，现场给出
+
+* 公式：`τ = factor × max_over(侧×扰动×编码器)[noise_floor]`（逐格另有自己的 τ），
+  主倍数 `factor = THRESHOLD_FACTOR = 2.0`（观测噪声的约 2 倍）；
+* 判据（**严格**）：`弱档 − 强档 > τ` ⇒ 该扰动对考卷**有效**；否则判该扰动对本数据
+  **无效**并如实登记（**不得带着坏尺子进第二步**）。
+  **注意用「>」而不是「≥」**：τ 在无近重复行的格上可能为 0，`≥` 会把「零落差」误判为有效。
+* **档序列非单调时的口径切换**：当某格的三档命中率**不是单调不增**时，
+  「弱−强」会低估该扰动的实际破坏力 ⇒ 改用「整段落差 `max(档) − min(档)`」，
+  并在产物中以 `gap_used_basis` 显式标注用的是哪一种。
+* **粒度守卫（边界含等号；口径见 15.11 的 W5 小节）**：令
+  `ratio = abs(gap_used) / min_granularity`（`min_granularity = 1 / n_queries`；
+  QA 侧 20 条 ⇒ **0.05**），则 **`ratio <= 1 + GRANULARITY_REL_TOL`（= 1e-9）一律判无效**；
+  其中 `|ratio − 1| <= 1e-9` 的格额外置 `at_granularity = True`，判定表标注
+  **「落差 = 粒度（1 样本）」**、verdict 写「**不构成判定依据**」。
+  **必须在比值空间比较**（不是浮点字面相等）：命中率由 `hits / n` 相减得到，
+  `0.20 − 0.15 = 0.05000000000000002` 与 `1/20 = 0.05` 数值相等但**非逐位相等**，
+  纯字面比较会把「恰好 1 个样本」这一格漏判为「高于粒度」。
+  该规则的唯一文本来源是 `robust_eval.GRANULARITY_GUARD_RULE`，被
+  `MIN_GRANULARITY_NOTE` 与产物 `criterion` **同时包含**（四处口径同源）。
+* **辅助视图（仅登记、不参与判定）**：`weak_minus_strong_ratio` /
+  `weak_minus_strong_at_granularity` 把「弱档 − 强档」口径也单独按粒度判定；
+  当档序列非单调时 operative 判据是整段落差，用**未被采用**的弱−强去否决会过度保守，
+  故只登记不否决 —— 但该脆弱情形必须可见，否则审查者无法核对。
+
+**主判据侧（`text`）逐格判定（现场实测）**
+
+| 编码器档 | 扰动 | 落差（口径） | 噪声底 | τ | 判定 |
+| --- | --- | ---: | ---: | ---: | --- |
+| `lexical-88` | 高斯噪声 | 0.210210（弱−强） | 0.015015 | 0.030030 | **有效** |
+| `lexical-88` | 随机维度遮蔽 | 0.220721（弱−强） | 0.009009 | 0.018018 | **有效** |
+| `lexical-88` | 幅度缩放+平移 | 0.342342（弱−强） | 0.006006 | 0.012012 | **有效** |
+| `bge-m3-1024` | 高斯噪声 | 0.240240（弱−强） | 0.018018 | 0.036036 | **有效** |
+| `bge-m3-1024` | 随机维度遮蔽 | 0.000000（弱−强） | 0.015516 | 0.031031 | **无效** |
+| `bge-m3-1024` | 幅度缩放+平移 | 0.438438（弱−强） | 0.006006 | 0.012012 | **有效** |
+
+⇒ **主判据 = 5/6 有效**（仅 `bge-m3-1024` 的「随机维度遮蔽」因三档 R@1 全为 1.000000、
+落差为 0 而判无效）。**全局** τ = 0.133333（= 2 × 噪声底上界 0.066667，后者出现在
+QA 侧 / `lexical-88` / `mask` 的 20 条查询上），仅作最保守参照；
+判定一律用**逐格 τ**。
+
+### 15.7 「未识别」档（负样本，**不标定阈值**）
+
+以 `train_unknown` 500 + `test_unknown` 2393 = **2893 条**作负样本，
+对条目表取最高余弦（现场实测，干净表）：
+
+| 侧 | 编码器档 | 负样本数 | 最高余弦均值 | 中位数 | 90% 分位 | 99% 分位 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| QA 侧 | `lexical-88` | 2893 | 0.742432 | 0.746753 | 0.807588 | 0.855186 |
+| QA 侧 | `bge-m3-1024` | 2893 | 0.450777 | 0.435551 | 0.554938 | 0.670910 |
+
+* 未识别 ⇔ 最高余弦 `< τ`；误召回 ⇔ 最高余弦 `>= τ`；**τ 未标定时该两率如实标
+  「不适用」**（不臆造阈值）—— 阈值标定属**第二步变体 B** 的范围。
+* 空问题 / 仅空白：**已在构造期显式过滤**（`entry_table._drop_blank_questions`，沿用
+  `features.normalize_text` 口径，进 `evidence.blank_question_filter`）—— 本批真实数据
+  **0 条被过滤**（149 / 2893 / 20 全部保留），故下游规模与全部指标不变；
+  契约由「靠下游 `ValueError` 兜底失败」变为「显式不计入分母」（审查 I2）。
+
+### 15.8 CLI（`python -m n3d_qa_learn.step2_run robust {probe|run|calibrate|report}`）
+
+```text
+# 1) 表构造与口径取证（不评测）：keys 形状 / 范数 / entry 数 / 指纹 / 编码器口径 / 扰动自检
+python -m n3d_qa_learn.step2_run robust probe --out-dir checkpoints/qa_learn/_verify/robust
+
+# 2) 分档全量评测（三档 × 三扰动 × 两侧 × 两编码器档）
+python -m n3d_qa_learn.step2_run robust run --out-dir checkpoints/qa_learn/_verify/robust
+
+#    先做「单组合演练」再放全量（历史纠正记录 #10）
+python -m n3d_qa_learn.step2_run robust run --dry-run --out-dir checkpoints/qa_learn/_verify/robust
+
+# 3) 阈值现场标定（读 run 结果）    4) 报告渲染（JSON + Markdown）
+python -m n3d_qa_learn.step2_run robust calibrate --out-dir checkpoints/qa_learn/_verify/robust
+python -m n3d_qa_learn.step2_run robust report    --out-dir checkpoints/qa_learn/_verify/robust
+```
+
+`robust` 子命令参数（`--help` 可见）：`--side {qa,text,both}`（默认 `both`）、
+`--profiles`（默认 `lexical-88,bge-m3-1024`；「沿用现有 `--enc-*` 口径」指
+**同样的可插拔编码器注册表**由 `entry_table.encoder_config_for` 取值，而非复用
+`step2_run` 文本行侧的 `--encoder` 默认值）、`--perturb`、`--seed`（默认 42）、
+`--variants`、`--stability-k`、`--topk`、`--batch-size`、`--verify-dir` / `--out-dir`、
+`--run-json` / `--calibration-json`、`--factor`、`--primary-side`、`--dry-run`，
+以及 `common()` 带来的 `--product-dir` / `--backend` / `--log-file`。
+**全部子命令支持 `--log-file`**（Python 以 UTF-8 无 BOM 自写；禁用 PowerShell `Tee-Object`）。
+
+**CLI 错误边界（离朱 R49 条目 33 修复 + 皋陶 W4 扩展）**：`--side` / `--profiles` /
+`--perturb` 的取值校验由 `step2_run._validate_robust_selector_args` 统一执行，
+在 **`probe` / `run` / `calibrate` / `report` 四个子命令**入口都生效（W4：此前
+`calibrate` / `report` 会把这些参数**静默忽略**），并在 `cmd_robust` 内兜底 ——
+非法值给出**单行可读报文 + 退码 2**，**不再抛裸 Traceback**；
+`calibrate` / `report` 在 run 产物缺失时给出可读报文 + 退码 1。现场实测：
+
+```text
+$ ... robust probe     --profiles bogus
+$ ... robust run       --profiles bogus
+$ ... robust calibrate --profiles bogus
+$ ... robust report    --profiles bogus
+[robust] 非法参数：--profiles 含未登记的值 ['bogus']；可用 = ['bge-m3-1024', 'lexical-88']    # 四条全部退码 2
+$ ... robust report --perturb bogus
+[robust] 非法参数：--perturb 含未登记的值 ['bogus']；可用 = ['mask', 'nmag', 'noise']          # 退码 2
+$ ... robust report --run-json C:\nonexistent\x.json
+[robust report] 缺少 run 产物：'C:\\nonexistent\\x.json'；请先执行 `robust run`（或显式给 --run-json 指向实际产物）  # 退码 1
+```
+
+捕获范围**只包住 `robust` 子命令族**（`cmd_robust` 内 `try/except (ValueError, KeyError)`），
+既有子命令的分发逻辑逐字符未改。
+
+**实测耗时**：`run` 全量（2 档 × 2 侧 × 3 扰动 × 3 档 + 噪声底 36 格 + 稳定性 36 格）
+= **459.6s**（含两档编码器与嵌入缓存预热；耗时只进日志，**不进产物**）。
+
+**同命令重复运行逐字节一致（G3，含本轮新增项）**：同一命令在**两个不同输出目录**各跑一遍，
+四个产物逐字节相同 —— 见 15.11 的对照表。**这一项在修复前为「否」**：
+改前产物内嵌 `created_utc` / `seconds` / `calibrated_at_utc` / 绝对路径，同命令两次落盘字节不同。
+改后这些字段一律移出产物（只进日志），产物内新增 `deterministic: true` 与
+`excluded_fields_note` 显式说明排除清单。
+
+### 15.9 门禁 G1~G7 现场结果
+
+| 门禁 | 结果 |
+| --- | --- |
+| **G1** 逐位精确查表 100% | 四张表 `exact_frac = 1.0`（2665/2665、149/149 × 两档），已写进 drill 与报告第 1.1 节 |
+| **G2** 零回归 | 不传新参数时既有子命令行为不变（见 15.10）；顶层 9 个 `qa_*.pt.zip` SHA256/字节/mtime 逐项不变、顶层无新增文件；上游四目录 `git status` 为空；根 `requirements.txt` 未改 |
+| **G3** 可复现 | 固定 seed；**同命令在两个不同输出目录各跑一遍，四个产物 + `probe` + `run --dry-run` 全部逐字节一致**（见 15.11）；被排除字段已在产物内显式登记 |
+| **G4** 三档 × 三扰动全组合 | 全组合可构造、无异常、**无 NaN**；`n_zero_norm` 全 0（遮蔽 50% 仍留 50% 非零维） |
+| **G5** 全组如实报告 | 报告含「该扰动对本数据无效」（`bge-m3-1024` 的 `mask`：三档 R@1 全 1.000000）与「QA 侧证据强度弱（n=20、粒度 0.05、5 格噪声底为 0）」这类**负结果/限制** |
+| **G6** 先 drill 再全量 | 先跑 `run --dry-run`（单组合：词面档 × 文本侧 × noise 三档）退码 0，再放全量 |
+| **G7（本轮新增）** 扰动公式逐位断言 | 三种扰动 × 三档共 **9 例**，每例独立按公式重算后比 float32 裸字节（未归一化 + 归一化后两路），**9/9 全通过**；不通过则 `probe` / `run` 退码 1 |
+
+**现场不变量检查 24 条全通过**（`all_passed = True`），含：文本侧档 0 自检索 = 1.0 且
+`n_no_gold = 0`；QA 侧已知查询「金标可定义」（非空金标查询数 = 20 > 0，**不断言初值**）；
+QA 侧未识别负样本「金标恒空」（`n_no_gold == n == 2893` 且 `hit_at_1 == 0`）；
+四张表的 `exact_frac == 1.0` 与行范数在允差内；**G7 的 1 条汇总 + 9 条逐例**。
+
+### 15.10 零回归现场核对与如实登记
+
+* **既有子命令数字逐位不变**：本轮对 `step2_run.py` 的改动是**纯新增** —— 新增
+  `from . import robust_eval as R`、`cmd_robust*` 四个处理函数、`build_parser()` 里的
+  `p_rb = sub.add_parser("robust", ...)` 与 `--side/--profiles/--perturb/...` 参数；
+  **`common()` 与既有 6 个子命令的参数表逐字符未改**（`robust` 的参数只挂在它自己的
+  parser 上，不污染既有子命令的 `namespace`）。现场复跑 `step2_run probe` 退码 0，
+  数字与登记值一致：文本行 2665 / D=192 / `spec_hash = 8f2523e41484adf3...` /
+  库 1999 / 查询 666 / 交集 0 / 特征重算最大偏差 5.066e-07 超容差 0 行 /
+  统一答案表 298 类 / 按任务分层留出 68 类 → C=230 / 合并 12727 记录。
+* **产物纪律**：`robust` 全部输出写 `checkpoints/qa_learn/_verify/robust/`
+  （`robust_probe.json` / `robust_run.json` / `robust_calibration.json` /
+  `robust_report.{json,md}` / 日志），**不落盘扰动后的特征矩阵**（只落报告与指纹）。
+* **零新增依赖**：仅 torch / numpy + 标准库；`bge-m3` 走**可选 HF 路径**
+  （本地 `models/bge-m3`，需 `transformers`，已在 `requirements-qa.txt` 登记）。
+  **如实登记一句环境边界**：本机**系统 Python 缺 `transformers`**，
+  现场用仓库自带 `.venv\Scripts\python.exe` 跑含语义档的全量；
+  用系统 Python 跑时该档会抛 `EncoderUnavailableError`（**可读报错，不静默跳过**）。
+* **如实登记的负面/未达标项（不得包装）**（**已按 15.11 的修复轮重新判定**）：
+  1. **主判据 5/6 有效**（修复前为 3/6）：`bge-m3-1024` 的「随机维度遮蔽」三档 R@1
+     全为 1.000000、落差 0.000000，判**无效**；
+  2. **QA 侧 12 格虽全部有效，但证据强度弱**（修复前为「全 12 格无效」，那是**噪声底总体
+     错配**造成的误判）：n = 20 ⇒ R@1 粒度 0.05，其中 5 格噪声底恰为 0，此时 τ = 0，
+     「落差 > 0」的门槛在统计上很薄；报告与产物已显式写出粒度与
+     「粒度 ≥ 落差者不得作为判定依据」；
+  3. **文本侧掉点含「近重复行自匹配歧义」成分**（噪声底 0.006~0.018），
+     **不得**把 0.21/0.22/0.34 的落差直接读成「语义理解被破坏」；
+  4. **文本侧「弱档」多为天花板效应**（`bge-m3-1024` 在 50% 遮蔽下仍 1.000000），
+     该性质只属于「该编码器 + 该 ID 检索协议」，不可外推；
+  5. **未识别档不标定阈值**（属第二步变体 B）；本批只给不依赖 τ 的分位数；
+  6. **旧轮的 `nmag` 结论全部作废**（旧机制是加性噪声，与 `noise` 几乎同轴），
+     不得与 15.11 的数字混用。
+
+> **术语顺序说明**：本节（15.10）与 15.11 记录的是**上一轮（离朱 R49 轮）**（离朱 R49 轮）的验收与零回归；
+> **15.11 是紧接着的皋陶审查修复轮**，它**覆盖**了 15.5 / 15.6 中 `nmag` 与 QA 侧的全部数字。
+> 引用时请以 15.11（皋陶修复轮）为准。
+
+### 15.11 皋陶审查修复轮（4 warning + 3 info）
+
+上一轮交付被皋陶判 `approved=false`。本轮**只做修复与重新取证**，不扩大范围。以下是
+**口径差异清单**（改了什么 / 为什么改 / 对结论的影响）。
+
+#### W1 · `nmag` 扰动机制与口径不符（**已修，结论方向因此改变**）
+
+* **改前**：`nmag` 的实现是 `base + ε·NMAG_SCALE_FACTOR·randn`（`NMAG_SCALE_FACTOR = 0.5`），
+  即**加性高斯噪声** —— 代码里没有任何 `s·x + b` 形式的幅度缩放/平移项，而报告表头、
+  `render_markdown`、README 15.5 全都按「幅度缩放+平移」呈现 ⇒ **静默替换扰动机制**。
+* **改后**（真正的幅度缩放+平移，闭式、无随机数）：
+  `x ← x·NMAG_SHARED_SCALE + ε·(−1)^(i+j+1)`，`NMAG_SHARED_SCALE = 0.5`（三档恒定），
+  平移矩阵由 `robust_eval.nmag_shift_matrix` 给出。**公式与取值已写进
+  `robust_eval.perturb_matrix` 的 docstring、`PERTURB_FORMULAS` 常量与 README 本节。**
+* **middle 档的显式登记**（原计划口径未定义）：`ε_middle = 0.15`，落于弱 0.10 与强 0.20 之间，
+  已写进 `PERTURB_GRID` 注释与产物 `grid.perturb_grid` / `grid.nmag_middle_note`。
+* **对结论的影响（方向改变）**：文本侧 `nmag` 由「**无效**」（旧机制落差 0.007508 / 0.016517）
+  变为「**有效**」（新机制落差 0.342342 / 0.438438）—— 旧机制下 `nmag` 与 `noise` 高度相关
+  （弱档位移 0.1886 vs 0.2040），根本不是独立的一根轴。
+* **`nmag` 无随机数 ⇒ `variant` 不生效**：该事实已在报告与 `bitwise_formula_assertions` 中
+  显式登记，不假装有变体差异。
+
+#### W2 · QA 侧噪声底总体错配（**已修，QA 侧结论整体反转**）
+
+* **改前**：`calibrate_thresholds` 的噪声底只按 `(side, profile, cell_role='noise_floor', kind)`
+  过滤，而 `noise_floor` cell 只由 `cell_role='main'` 的那次调用产出 ⇒ **QA 侧 `qa_known`
+  （20 条 `test_known`）的噪声底取自 `main`（2893 条未识别负样本）这个完全不同的总体**。
+  现场证据：旧产物里 `qa/bge-m3-1024` 的噪声底 0.325、`qa/lexical-88` 的 0.141667/0.183333
+  全部来自那 2893 条那一格，而 20 条查询的 R@1 粒度只有 0.05。
+* **改后**：`_run_side_cells` 按 `cell_role` 各自生成 `noise_floor` cell，并写入
+  `population_role` 与 `population{cell_role, query_n, table_n, min_granularity}` 溯源字段；
+  `calibrate_thresholds` 的过滤条件加上 `population_role == 该侧主判据角色`。
+* **粒度守卫（审查要求，已实现）**：标定产物与报告显式写出「最小可分辨粒度 =
+  1 / n_queries（QA 侧 20 条 ⇒ **0.05**）」与「**粒度 ≥ 落差的指标不得作为判定依据**」；
+  判定逻辑中，落差小于该格粒度者**一律判无效**并标注「落差 < 粒度」。
+* **对结论的影响（方向反转）**：QA 侧 12 格由旧产物的「**全 12 格无效**」变为
+  **「12 格全部有效」**（新噪声底 0.0 / 0.066667，τ 0.0 / 0.133333）。**必须连带阅读下面的
+  限制**：n = 20 时 R@1 只能取 0.05 的整数倍；QA 侧 6 格中 5 格噪声底恰为 0
+  （即「可忽略强度下 20 条全中」），此时「落差 > 0」只表示「本批数据上可观测到差异」，
+  **不表示该差异在统计上稳健**；`qa/main`（2893 条）口径的落差因金标恒空仍恒为 0。
+
+#### W3 · 标定产物非确定性（**已修，并给出双跑逐字节证据**）
+
+* **改前**：`calibrate_thresholds` 内嵌 `calibrated_at_utc`、`run_evaluation` 内嵌
+  `created_utc` / `seconds`、`cmd_robust_report` 内嵌 `created_utc` / `seconds_run` /
+  绝对路径 ⇒ 同命令两次落盘字节不同（现场复现 `c01c2d62…` vs `f5333cf4…`），
+  且 `robust_report.json` 内嵌的 `calibration_artifact_sha256` 重跑即失效。
+* **改后**：**这些字段一律移出产物**（生成时间、耗时、输入产物绝对路径只写运行日志），
+  `robust_report.json` 只保留 `*_basename` 与 `*_sha256`。产物内新增 `deterministic: true`
+  与 `excluded_fields_note`（显式说明排除了什么、为什么）。
+* **被排除的字段清单（显式）**：`created_utc`、`seconds`、`seconds_run`、
+  `calibrated_at_utc`、`markdown_path` / `run_artifact` / `calibration_artifact`（绝对路径）。
+* **双跑逐字节现场证据（G3 新增项）**：同一命令在不同输出目录各跑一遍，产物**逐字节相同**：
+
+  | 产物 | 字节 | SHA256（前 24） |
+  | --- | ---: | --- |
+  | `robust_run.json` | 419102 | `173942833ae979e90b19615b` |
+  | `robust_calibration.json` | 24328 | `5736b859f78e5ec6b9ca8483` |
+  | `robust_report.md` | 23483 | `250be2fe7cbd33e8dad6edc8` |
+  | `robust_report.json` | 444783 | `bf6167a2fb24caa13edbbe4f` |
+
+  `robust_probe.json` 同样双跑逐字节一致（23706 字节，`6436f0569a428359…`），
+  `run --dry-run` 亦然。`robust_report.json` 内嵌的 `run_artifact_sha256` /
+  `calibration_artifact_sha256` 与磁盘实际文件**闭环**且**重跑后仍然成立**
+  （被指纹对象本身已无时间字段）。
+  （上表为本节修复全部收口后的最终值；F1/F2/F3 修复过程中产生的中间值
+  `2ec4df9f…` / `8408460e…` / `734b7fb3…` / `9387b156…` / `b293b778…` / `cee33a85…`
+  已作废，不再引用。）
+
+#### W4 · `calibrate` / `report` 参数校验缺失（**已修**）
+
+* **改前**：`--profiles bogus` 的校验只对 `probe` / `run` 生效；`robust calibrate --profiles bogus`
+  与 `--profiles lexical-88,bogus` 均**静默接受并退码 0**，与 15.11 的范围表述不符。
+* **改后**：新增 `step2_run._validate_robust_selector_args`（校验 `--side` / `--profiles` /
+  `--perturb`），在 `calibrate` / `report` 入口调用。**现场实测四个子命令一致**：`probe` /
+  `run` / `calibrate` / `report` 的 `--profiles bogus` 与 `report --perturb bogus` 全部为
+  **单行可读报文 + 退码 2**，无裸 Traceback。
+
+#### I1 / I2 / I3（**已修**）
+
+* **I1 死参数/死计算**：删除 `euclidean_equivalence_evidence` 从未使用的形参 `neg_top1`
+  （两处调用方同步改为不传）；删除 `unrecognized_report` 中算完未用的 `best_idx`。
+* **I2 空问题契约未落实**：新增 `entry_table.question_is_blank`（沿用 `features.normalize_text`
+  口径）与 `_drop_blank_questions`，在 `build_qa_entry_tables` 中**显式过滤**「空问题 / 仅空白」
+  并登记 `n_in / n_kept / n_dropped / dropped_ids_head`（进 `evidence.blank_question_filter`）。
+  现场实测本批真实数据 **0 条被过滤**（149 / 2893 / 20 全部保留），故下游规模与全部指标不变 ——
+  但契约从「靠下游 `ValueError` 兜底失败」变为「显式不计入分母」。
+* **I3 注释与实现同步**：`PERTURB_GRID` 上方注释改写为「三种扰动都只有**一个标量**参数」，
+  并把三种公式分别写清（旧注释写「`nmag` = (eps, scale, shift)」而实现里全是标量）。
+
+#### G7（本轮新增门禁）：扰动公式逐位断言
+
+`robust_eval.assert_perturb_formulas_bitwise` 用**固定已知输入矩阵**（`FORMULA_CHECK_MATRIX`，
+3×8）+ 三种扰动 × 三档共 **9 例**，每一例都**独立按公式重算**且手算侧**不复用任何生产
+helper/常量**（`nmag` 手写缩放系数 `0.5` 与棋盘符号矩阵、`noise`/`mask` 手写派生种子后重放
+`randn` / `randperm`）。判定分**两路**（把「公式」与「归一化」两类偏差分开定位）：
+① 扰动后**未归一化**矩阵的 float32 裸字节 SHA256 相等（`raw_bitwise_equal`）；
+② 重新 L2 归一化后的裸字节逐字节相等（`bitwise_equal`）。
+**现场实测 9/9 例两路全通过**（`n_bitwise_equal = 9`、`all_bitwise_equal = True`、
+`manual_side_isolated = True`），并已进 `run` / `probe` 产物与 `invariants`（不通过则退码 1）。
+`probe` 亦逐例打印。
+
+#### 离朱 R50 三项失败的修复（本轮收口）
+
+离朱 R50 现场 329 项检查 **326 通过 / 3 失败**，三项均**不影响数值结论**，但 F1 涉及门禁
+可信度，必须修：
+
+* **F1（中）· G7 断言对手算侧共享层无区分度（已修）**：改前手算侧调用与被测实现**同一份**
+  `nmag_shift_matrix` / `derived_seed` / `NMAG_SHARED_SCALE`，破坏这些共享层时两侧同步变化
+  ⇒ 断言对该层**恒真**。离朱实测：monkeypatch `nmag_shift_matrix`（×2）、
+  `NMAG_SHARED_SCALE = 0.25`、`derived_seed + 1` 三种破坏**都检不出来**。
+  **改后**手算侧把型别下标、派生种子、缩放系数 `0.5`、棋盘符号矩阵**全部内联手写**，
+  并新增 `manual_side_isolated: True` 与 `manual_side_note`。
+  **修复后反向验证（现场实测）**：上述三种破坏现在**全部令 `all_bitwise_equal` 变 False**，
+  恢复后回到 `True` —— 该门禁对共享层**已有区分度**。
+* **F2（低-中）· `noise_floor_of_cell` 的 `scale_override` 取证字段与实际口径不符（已修）**：
+  改前该字段写的是 `eps`（0.001），而实际传给 `perturb_matrix` 的是 `1.0`（`nmag` 噪声底
+  **不缩放、只做可忽略平移**）。**改后** `evidence["scale_override"]` 记录**实际传入值**，
+  并新增 `evidence["scale_used"]`；`negligible_eps` 的 docstring 中「把 `s` 一起压到同量级」
+  这句自相矛盾的表述已改为「不缩放、只做 `NMAG_NEGLIGIBLE_SHIFT` 的可忽略平移」。
+  现场核对：`nmag` 的 `eps_used = 0.001`、`scale_override = 1.0`、`scale_used = 1.0`。
+* **F3（低）· `noise_floor_population["cell_role"]` 与 `entry["cell_role"]` 口径不同（已修）**：
+  改前该字段写 `EvalCell.role`（`self_retrieval` / `known_queries`），entry 用的则是运行级
+  角色（`main` / `qa_known`）。**改后** `noise_floor_of_cell` 新增 `cell_role` 形参（由
+  `_run_side_cells` 传入运行级角色），`population["cell_role"]` 记录运行级角色、
+  `population["eval_cell_role"]` 另存 `EvalCell.role`，两种口径都留痕。
+  现场核对：QA 侧 `cell_role = qa_known` / `population.cell_role = qa_known` / `query_n = 20` /
+  `min_granularity = 0.05`；文本侧 `main` / `main` / `666` / `0.0015`。
+  **实质的同总体约束在改前就已成立**（离朱用假 run 交叉验证：QA 侧 3 条的噪声底与
+  `query_n = 20` 同总体吻合、文本侧与 `666` 吻合，未跨总体借用）；本项修的是**字段口径对齐**。
+
+**修复后的数值结论（只有取证字段变化、无任何指标变化）**：全局 τ 仍为 `0.133333`、
+主判据仍 **5/6 有效**（`bge-m3-1024` 的 `mask` 落差 0.000000、`below_granularity = true`）、
+`invariants` 仍 24 条全通过、G7 仍 9/9；`noise` / `mask` / `nmag` 三轴与 QA 侧全部 R@1 数字
+与修复前**逐位相同**。四个产物因新增取证字段而字节数变化（已在上表更新），
+**跨目录双跑逐字节一致**这一条在修复后**重新验证通过**。
+
+#### 离朱 R51 复测（182 项检查 181 通过 / 1 失败）与字面项收口
+
+离朱 R51 复测确认 **F1/F2/F3 三处修复全部收口**：
+
+* **F1**：R50 检不出的三种共享层破坏现在**全部被检出**为 `all_bitwise_equal is False`
+  （符号矩阵 helper ×2、共享缩放常量 → 0.25、派生种子 +1），恢复后回到 `True`；
+  且断言仍非恒真 —— 「只改实现侧公式」与「只改归一化链」两类破坏分别被正确检出 / 分离。
+* **F2**：`scale_override` 如实报 `1.0`、`scale_used` 为 `1.0`；离朱用**独立位移验证**
+  （不看自述字段）确认实际口径确为「不缩放 + 可忽略平移」；docstring 已同步。
+* **F3**：现场 `robust_run.json` 驱动的 `calibrate_thresholds` 中**全部 6 条**满足
+  `population["cell_role"] == entry["cell_role"]`（R50 的字面断言现已成立）。
+
+**唯一失败项（R51 条目 5.3，信息级 / 纯文案）**：静态扫描要求
+`assert_perturb_formulas_bitwise` **函数体内**不出现三个共享层标识符。
+`nmag_shift_matrix(` 与 `derived_seed(`（含尾括号）零命中，但 `NMAG_SHARED_SCALE`
+在**函数体内的 docstring / 注释 / `manual_side_note` 文案**中命中 6 处 ——
+即命中的是**描述「已去共享化」这件事的文字本身**。离朱给出三条实质证据表明修复到位
+（AST 代码层引用为零、手算侧确已内联、行为证据三种破坏全被检出）。
+**本轮已按最小改动把该字面项清零**：把函数体内这三处文案中的裸常量名改写为
+「共享缩放常量」「符号矩阵 helper」「派生种子 helper」等描述性表述，
+现在**函数体内四个共享层标识符（`nmag_shift_matrix` / `derived_seed` /
+`NMAG_SHARED_SCALE` / `_perturb_type_index`）文本命中数与 AST 引用数均为 0**，
+G7 仍 9/9 全通过。产物因 `manual_side_note` 文案变化重建（上表已更新最终 SHA）。
+
+#### 修复前后完整对照（结论层面的差异清单）
+
+| 项 | 改前 | 改后 | 差异来源 |
+| --- | --- | --- | --- |
+| `nmag` 公式 | `x + 0.5ε·ξ`（加性噪声） | `x·0.5 + ε·(−1)^(i+j+1)` | W1 |
+| 文本侧 `nmag` R@1（lexical）弱/中/强 | 1.000000 / 0.998498 / 0.992492 | **0.391892 / 0.099099 / 0.049550** | W1 |
+| 文本侧 `nmag` R@1（bge）弱/中/强 | 1.000000 / 0.996997 / 0.983483 | **0.481982 / 0.144144 / 0.043544** | W1 |
+| 文本侧 `nmag` 判定（两档） | 无效 | **有效** | W1 |
+| `noise` / `mask` 全部数字 | — | **逐位不变**（1.000000 / 0.984985 / 0.789790 等） | 无（未触碰该轴） |
+| 档 0 全部 | R@1 = 1.000000 | **不变** | 无 |
+| QA 侧噪声底 | 0.141667 / 0.183333 / 0.325（取自 2893 条总体） | **0.0 / 0.066667**（取自 20 条同总体） | W2 |
+| QA 侧 12 格判定 | 全 12 格无效 | **12 格全部有效**（含粒度守卫） | W2 |
+| 产物时间字段 | 内嵌（重跑即变） | **移除**（只进日志） | W3 |
+| 双跑字节一致 | 否 | **是**（四产物 + probe + dry-run 全部一致） | W3 |
+| `calibrate` / `report` 非法参数 | 静默退码 0 | **可读报文 + 退码 2** | W4 |
+| 全局 τ | 0.650000 | **0.133333**（噪声底上界 0.066667 的 2 倍） | W1 + W2 |
+| 主判据侧有效数 | `3/6` | **`5/6`**（仅 `bge-m3-1024` 的 `mask` 判无效） | W1 + W2 |
+
+#### 重新标定后的主判据逐格结果（现场实测）
+
+| 编码器档 | 扰动 | 档 0 | 弱 | 中 | 强 | 落差（口径） | 噪声底（ε 依据） | τ | 判定 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `lexical-88` | 高斯噪声 | 1.000000 | 1.000000 | 0.984985 | 0.789790 | 0.210210（弱−强） | 0.015015（σ=0.001） | 0.030030 | **有效** |
+| `lexical-88` | 维度遮蔽 | 1.000000 | 0.990991 | 0.947447 | 0.770270 | 0.220721（弱−强） | 0.009009（r=0.002） | 0.018018 | **有效** |
+| `lexical-88` | 幅度缩放+平移 | 1.000000 | 0.391892 | 0.099099 | 0.049550 | 0.342342（弱−强） | 0.006006（δ=1e-3 平移、不缩放） | 0.012012 | **有效** |
+| `bge-m3-1024` | 高斯噪声 | 1.000000 | 0.998498 | 0.980480 | 0.758258 | 0.240240（弱−强） | 0.018018（σ=0.001） | 0.036036 | **有效** |
+| `bge-m3-1024` | 维度遮蔽 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000（弱−强） | 0.015516（r=0.002） | 0.031031 | **无效**（落差 0 < 粒度 0.0015 之外仍为 0） |
+| `bge-m3-1024` | 幅度缩放+平移 | 1.000000 | 0.481982 | 0.144144 | 0.043544 | 0.438438（弱−强） | 0.006006 | 0.012012 | **有效** |
+
+QA 侧（`qa_known`，20 条，**统计意义弱**；噪声底已按同总体重标）：
+
+| 编码器档 | 扰动 | 档 0 | 弱 | 中 | 强 | 落差（口径） | 噪声底 | τ | 判定 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `lexical-88` | 高斯噪声 | 0.300000 | 0.250000 | 0.150000 | 0.150000 | 0.100000（弱−强） | 0.000000 | 0.000000 | 有效 |
+| `lexical-88` | 维度遮蔽 | 0.300000 | 0.200000 | 0.150000 | 0.300000 | 0.150000（整段落差，档序列**非单调**） | 0.066667 | 0.133333 | 有效 |
+| `lexical-88` | 幅度缩放+平移 | 0.300000 | 0.100000 | 0.150000 | 0.050000 | 0.100000（整段落差，**非单调**） | 0.000000 | 0.000000 | 有效 |
+| `bge-m3-1024` | 高斯噪声 | 0.650000 | 0.450000 | 0.350000 | 0.350000 | 0.100000（弱−强） | 0.000000 | 0.000000 | 有效 |
+| `bge-m3-1024` | 维度遮蔽 | 0.650000 | 0.600000 | 0.550000 | 0.500000 | 0.100000（弱−强） | 0.000000 | 0.000000 | 有效 |
+| `bge-m3-1024` | 幅度缩放+平移 | 0.650000 | 0.200000 | 0.200000 | 0.150000 | 0.050000（弱−强） | 0.000000 | 0.000000 | **无效**（落差 = 粒度，1 样本） |
+
+* **判据口径的显式补充**：主口径仍是「弱档 − 强档 严格大于 τ」；当档序列**非单调不增**时
+  （QA 侧两格出现）改用「整段落差 `max(档) − min(档)`」并在产物里以 `gap_used_basis` 标注。
+  这**不是**放宽判据，而是避免用「弱−强」低估一个有序性已被破坏的扰动的实际破坏力 ——
+  两格改用整段落差后仍分别超过 τ（0.15 > 0.1333、0.10 > 0.0）。
+* **`nmag` 的单调性风险已单独登记**：`nmag` 是缩放+平移复合变换，其位移量级与 ε **不保证单调对应**
+  （例如文本侧 lexical 的 R@1 随档位下降很快，理论上存在非单调的可能）；本批 9 格档序列中
+  有 2 格非单调，已全部标注 `monotone_nonincreasing = false`。
+
+#### 15.11 的如实登记（负面/限制，不得包装）
+
+1. **主判据 5/6 有效**，仍未全通过：`bge-m3-1024` 的「随机维度遮蔽」三档 R@1 全为 1.000000
+   （落差 0），判**无效**；
+2. **QA 侧 12 格中 1 格因粒度守卫改判无效**（W5 修复）：n = 20 ⇒ R@1 粒度 0.05
+   （= 1 个样本），其中 5 格噪声底恰为 0（可忽略强度下 20 条全中），此时 τ = 0；
+   `qa/bge-m3-1024/nmag` 的 `gap_used` 恰 = 1 个样本 ⇒ 按含等号的粒度守卫判**无效**
+   并标「落差 = 粒度（1 样本）」，verdict 写「不构成判定依据」。其余 5 格落差为 2~3 个样本。
+   报告与产物已显式写出粒度与含等号的守卫规则（四处口径同源）；
+3. **文本侧基线近饱和**（档 0 R@1 结构性 = 1.000000）：`bge-m3-1024` 对遮蔽的鲁棒性极强，
+   使该轴在本数据上**无区分度**；
+4. **文本侧掉点仍含「近重复行自匹配歧义」成分**（噪声底 0.006~0.018），不得直接读成
+   「语义理解被破坏」；
+5. **未识别档仍不标定阈值**（属第二步变体 B）；
+6. **`bge-m3-1024` 档的端到端路径**未做专项测试（只覆盖声明维度 / 配置构造 / 未知名报错 /
+   维度错配拒绝），与 15.11 登记的未覆盖范围一致；
+7. **`gap_used_basis` 口径切换**：QA 侧 2 格因档序列非单调而改用整段落差，属**判据实现细节**
+   的显式登记，不改变「主口径为弱−强」这一约定；两格改用后仍超过各自 τ。
+8. **本轮 `nmag` 的改动使 `nmag` 轴与 `noise` 轴真正解耦**（旧机制下二者弱档位移
+   0.1886 vs 0.2040，几乎同轴），但**旧轮的 `nmag` 全部结论已作废**，不得与本节数字混用。
+
+#### 皋陶第二次审查修复轮（1 warning + 3 info）
+
+**W5（唯一 warning）· 粒度守卫的等号边界漏判与四处口径不一致**
+
+* **问题**：文档侧（`MIN_GRANULARITY_NOTE`、产物 `criterion`、README 正文）写的是
+  「**粒度 ≥ 落差**者不得作为判定依据」（**含等号**），而实现侧是 `abs(gap) < min_granularity`
+  （**严格小于**）⇒ **最脆弱的「落差恰为 1 个样本」情形反而没被守卫覆盖**。
+* **修复（① 守卫条件含等号 + ② 新增 `at_granularity` 标记）**：
+  * 守卫改为在**比值空间**判定：`ratio = abs(gap_used) / min_granularity`，
+    `ratio <= 1 + GRANULARITY_REL_TOL`（`GRANULARITY_REL_TOL = 1e-9`）⇒ 判无效；
+    `|ratio − 1| <= 1e-9` ⇒ 额外置 `at_granularity = True`；
+  * **为什么必须用比值空间而不是浮点字面相等**（现场实测的坑）：命中率由 `hits / n` 相减得到，
+    `qa/bge-m3-1024/nmag` 的 `gap_used = 0.050000000000000017`、`min_granularity = 1/20 =
+    0.050000000000000003`，**数值相等但不是逐位相等** ——
+    先用字面 `==`/`<=` 的第一版**仍然把它漏判为「高于粒度」**（现场实测 `at_granularity = 0`），
+    改用比值空间后才正确命中（`ratio = 1.0000000000000002`）；
+  * 该格 verdict 已显式改为「**落差 = 粒度（= 1 个样本），不构成判定依据**」，
+    判定表新增「粒度标记」列（`落差 = 粒度（1 样本）` / `落差 < 粒度` / `—`）。
+* **四处口径同源（本轮硬要求）**：新增常量 `GRANULARITY_GUARD_RULE` 作为**唯一规则文本来源**，
+  它被 `MIN_GRANULARITY_NOTE` **与** 产物 `criterion` **同时包含**；`probe` / `run` / `calibrate`
+  三处产物都带该文本。现场 `granularity_boundary_evidence.checks` 的五项一致性判定全 True：
+
+  | 检查 | 现场结果 |
+  | --- | --- |
+  | `synthetic_boundary_matches_rule` | **True** |
+  | `boundary_instances_are_ineffective_and_annotated` | **True** |
+  | `all_below_granularity_are_ineffective` | **True** |
+  | `rule_text_in_artifact_criterion` | **True** |
+  | `rule_text_in_min_granularity_note` | **True** |
+
+* **G8 边界用例证据（现场终端 + 产物字段）**：
+  * **合成边界**（不依赖现场数据是否恰好命中）：`gap == 粒度`（恰好 1 样本）→
+    `below=True, at=True`；`gap == 0.20−0.15`（真实浮点值）→ `below=True, at=True`；
+    `gap = 粒度·(1−1e-6)` → `below=True, at=False`；`gap = 粒度·(1+1e-6)` → `below=False`；
+    四例 `match=True`；
+  * **现场实例（operative 视图 `gap_used`）**：**1 格** ——
+    `qa/bge-m3-1024/nmag`（`ratio = 1.0000000000000002`、`below_granularity=True`、
+    `effective=False`、verdict 含「不构成判定依据」）；
+  * **辅助视图（`弱档−强档` 口径）**：另有 **1 格** `qa/lexical-88/nmag` 的
+    `gap_weak_to_strong` 恰 = 1 个样本（`ratio = 1`），但该格档序列**非单调**、
+    operative 判据是整段落差（= 2 个样本），故**不据此判无效**、只在
+    `granularity_boundary_evidence.auxiliary_boundary_instances` 中**登记**供审查核对。
+* **与审查描述的差异（如实登记，不附和也不隐瞒）**：审查称 QA 侧有 **3 格** `gap_used` 恰等于
+  `min_granularity`（列出 `qa/lexical-88/nmag`、`qa/bge-m3-1024/nmag`、`qa/bge-m3-1024/noise`），
+  但**现场枚举当前产物**只有 **1 格**在 `gap_used` 空间命中（下表为全部 12 格的比值，现场枚举）：
+  `qa/bge-m3-1024/nmag` 比值 = 1；`qa/lexical-88/nmag` 的 `gap_used` 比值 = 2
+  （其 `gap_weak_to_strong` 比值为 1，已按上条登记为辅助视图）；
+  `qa/bge-m3-1024/noise` 的 `gap_used` 比值 = 2（弱 0.45 → 强 0.35，等于 2 个样本）。
+  即「3 格」这一计数与**当前产物状态**不符；本轮的处置覆盖了**该 review 指出的机制本身**
+  （含等号 + 比值空间 + 辅助视图登记），不依赖对格数的口径一致性。
+
+**I4 · `question_is_blank` docstring 措辞误导（已改）**：原文写「沿用 `data.check_question` 的口径」，
+但该函数的 docstring 明确是「超长 -> 立即报错；**空 / 空白放行**」，**不做**空问题过滤。
+已改为「沿用 `features.normalize_text` 的口径（`data.check_question` 本身对空/空白放行，
+不做过滤）」。**过滤行为不变**，仅措辞。
+
+**I5 · README 笔误（已改）**：`* **`qm` 的单调性风险已单独登记**` → **`nmag`**。
+
+**I6 · `nmag` 公式与任务书口径差异的机器可读锚点（已补）**：新增常量
+`NMAG_FORMULA_SPEC_DEVIATION`（357 字），随产物落盘于
+`run` / `probe` 的 `grid.nmag_formula_deviation`，明确登记「任务书选甲为
+`x <- x*(1+eps) + b`，本实现为 `x <- x*0.5 + eps*(-1)**(i+j+1)`，缩放系数取**三档恒定的 0.5**
+而非 `1+eps`」及其三条设计理由（量纲单一性 / 唯一自变量可归因 / 恒定正缩放对余弦检索不敏感）。
+
+**本轮产物重建与逐字段对账（G5 / 零回归硬要求）**：因守卫规则文本与新增字段变化，
+5 个产物全部重建。**逐字段对账**：`cells`（114 格）**逐位未变**（只有 `honest_notes[8]`
+引用的粒度守卫规则文本随 W5 更新）、`entry_tables` / `euclidean_axis` / `invariants` /
+`stability`（36 行） / `unrecognized` **全部逐位未变**；`calibration` 新增
+`at_granularity` / `granularity_ratio` / `weak_minus_strong_*` /
+`granularity_boundary_evidence` / `n_at_granularity_*` 等字段，并把
+`qa/bge-m3-1024/nmag` 由「有效」改判为「**无效（落差 = 粒度）**」。
+
+| 产物 | 旧（R51 收口） | 新（本轮） | 差异来源 |
+| --- | --- | --- | --- |
+| `robust_probe.json` | 23706 B `6436f0569a428359…` | 24515 B `3e8c5aefed85d1b0…` | I6 锚点入 `grid` |
+| `robust_run.json` | 419102 B `173942833ae979e9…` | 420416 B `4adb290e8e3fcea4…` | I6 锚点 + W5 规则文本入 `honest_notes` |
+| `robust_calibration.json` | 24328 B `5736b859f78e5ec6…` | 33685 B `9ca6a422b7a076ac…` | W5 新字段 + G8 证据 + 1 格判定 + 字段改名 |
+| `robust_report.md` | 23483 B `250be2fe7cbd33e8…` | 26109 B `39d981b3b80a4e39…` | W5 判定表新列 + 粒度标记 + 计数口径分列 |
+| `robust_report.json` | 444783 B `bf6167a2fb24caa1…` | 455650 B `817359b3a94c0b46…` | 同上 + 内嵌 calibration |
+
+**跨目录双跑逐字节一致（G3）**：五个产物在**两个不同输出目录**下重新验证
+`bytes_equal=True`（上一版因 `honest_notes` 内嵌规则文本与旧 run 产物不同步而短暂不一致，
+**已通过「用当前源码重建整条链」消除**，不再有跨版本混用的产物）。
+
+#### 离朱 R53 新发现项与清理（本轮收口）
+
+离朱 R53 现场 **194 项检查 193 通过 / 1 失败**（说明条目 1–24 全部通过）；失败项是
+**R53 新发现的一处「同名字段不同义」**，另有 1 项签名格式残留：
+
+* **N1（低，同名字段不同义，已修）**：`n_at_granularity_primary` 在**顶层**按
+  `primary_side`（= `text` 侧）统计（现场 0），在 **`granularity_boundary_evidence`** 内
+  按「**两测主判据角色**」`PRIMARY_CELL_ROLE.values()`（= `main` + `qa_known`）统计（现场 1）
+  —— 同名但口径不同，易被误读。**已修**：G8 内那个字段改名为
+  **`n_at_granularity_primary_roles`**（保留「两测主判据角色」语义），顶层字段名与口径不变；
+  报告渲染同步分列两个计数并各自标注口径（「按 `primary_side = text` 侧」 vs
+  「按两测主判据角色 `main`+`qa_known`」）。现场核对：G8 内**已无**旧名、有新名；
+  顶层**两者都在**且值分别为 `0`（侧）与 `1`（角色）。
+* **N1-b（同轮二次收口：口径来源唯一化）**：R54 复测指出「顶层镜像角色口径计数」与
+  「报告须分列两口径」之间存在**规格张力**（说明里的 1.4 与 4.4 互斥）。
+  该张力属**说明侧**问题，但为彻底消除歧义，本轮做了**工程收口**：
+  ① **顶层不再镜像**角色口径计数 —— `n_at_granularity_primary_roles`
+  **只存在于** `granularity_boundary_evidence`（其权威来源）；
+  ② `render_markdown` 的「角色口径」一行改为**固定从 G8 块取数**
+  （新增内部函数 `_g8_roles_count`，缺失时渲染 `None`，**不静默编造 0**）；
+  ③ 新增顶层字段 **`granularity_count_scopes`**（机器可读的口径标签字典），
+  逐字段写明「该计数是什么口径、在哪一层」。现场核对：顶层**已无**
+  `n_at_granularity_primary_roles`、G8 内有且值为 `1`；报告两行计数分别标注来源。
+* **N1-c（R55 可选加固：把口径唯一性升级为构造期不变量）**：R55 复测
+  **160 项检查全部通过（0 失败、0 遗留、无新发现问题）**，并提出一条可选加固 ——
+  「权威来源 = G8 块」目前只由代码约定 + 文档保障，建议加一条构造期断言做**结构性**保障。
+  已实施（1 行断言 + 1 个常量）：
+  * 新增常量 **`GRANULARITY_ROLES_COUNT_KEY = "n_at_granularity_primary_roles"`**
+    作为该字段名的**唯一来源**（G8 块构造 / `_g8_roles_count` 取数 / `granularity_count_scopes`
+    标签 / 构造期断言四处共用，消除手写字符串漂移）；
+  * `calibrate_thresholds` 返回前新增
+    `assert GRANULARITY_ROLES_COUNT_KEY not in result`，把「顶层不得镜像该计数」
+    从约定升级为**构造期不变量**（违反即抛 `AssertionError`，报文指向口径标签与规则常量）。
+  * **加固是零产物影响**（强证据）：加固前后四个由 calibration 派生的产物
+    **逐字节完全相同**（`robust_calibration.json` / `robust_report.md` /
+    `robust_report.json` 与 `robust_probe.json` / `robust_run.json` 的 SHA256 全部不变）；
+    正常路径不触发断言，而把该键复制到顶层后断言**如期触发**（现场分别验证）。
+* **N2（信息级，签名格式残留，已清理）**：`robust_eval.calibrate_thresholds` 的 `def` 行
+  曾残留为 `def calibrate_thresholds(    run_result: ...`（参数与左括号同行），
+  已规整为标准多行签名（每个参数单独一行）。
+
+**本轮产物重建对账（N1/N2 影响面）**：`robust_probe.json` 与 `robust_run.json`
+**字节未变**（N1/N2 都不触及它们，SHA256 与前一轮相同）；`calibration` / `report.md` /
+`report.json` 因字段改名与报告分列而重建：
+
+| 产物 | 上一轮 | 本轮（最终） | 差异来源 |
+| --- | --- | --- | --- |
+| `robust_probe.json` | 24515 B `3e8c5aefed85d1b0…` | **24515 B `3e8c5aefed85d1b0…`（未变）** | — |
+| `robust_run.json` | 420416 B `4adb290e8e3fcea4…` | **420416 B `4adb290e8e3fcea4…`（未变）** | — |
+| `robust_calibration.json` | 33641 B `349e61e28267e404…` | **34312 B `ce7c6278da7124f2…`** | N1 字段改名 + N1-b 口径来源唯一化（顶层去镜像 + `granularity_count_scopes`） |
+| `robust_report.md` | 25898 B `38fb583915ad42fd…` | **26262 B `b7929e5a8fb25dbc…`** | N1 计数分列 + N1-b 取数来源标注 |
+| `robust_report.json` | 455605 B `4a7668dcffd9227e…` | **456283 B `e39b74b6afb51731…`** | 同上 + 内嵌 calibration |
+
+**数值结论零变化**：`n_effective / n_entries_primary` 仍 `5 / 6`、全局 τ 仍 `0.133333`、
+36 格 R@1 与判定（含 `qa/bge-m3-1024/nmag` 判无效、`bge-m3-1024` 的 `mask` 判无效）
+**逐位未变**、`invariants` 仍 24/0/True、G7 仍 9/9、`all_consistent` 仍 True；
+跨目录双跑重新验证 **5/5 `bytes_equal=True`**。
+
+### 15.12 离朱 R49 验收与缺陷修复
+
+**离朱 R49 现场结果**：**316 项检查，314 通过、2 失败**（同一处缺陷）。逐组：
+编译 2/2、A 组（`entry_table.py` 单元/契约）56/56、B 组（`robust_eval.py` 单元/契约）115/115、
+C 组（生产数据侧构造契约 22–24）31/31、C 组续（小规模 `run_evaluation` 25）11/11、
+D 组（接口/CLI 26–33）66/**68**、E 组（零回归 + 产物纪律 34–36）35/35。
+**未覆盖范围（如实登记）**：`bge-m3-1024` 档的**端到端编码路径**未执行（按测试说明建议只用
+`lexical-88`，冷缓存数分钟）；该档的声明维度、配置构造、未知名报错、维度错配拒绝均已覆盖。
+E2E（Playwright）不适用：本轮无任何前台 UI 交互。测试期间**正式取证目录零改动**
+（`_verify/robust/` 下 5 个交付产物 + 6 个日志文件的名称与字节数逐项无变化，
+`checkpoints/qa_learn/` 顶层亦零差异）。
+
+**离朱 R49-v2 复测结果（修复后）**：**129 项检查全部通过**（A 修复项 52/52、
+B 零回归 + 产物纪律 40/40、C 不变量复验 25/25、补充边界 12/12）。补充边界覆盖面优于要求：
+`--variants 0` / `--stability-k 0`（整数下界非法）、`--profiles " "`（纯空白回退全量）、
+`--profiles lexical-88,bogus`（混合）、`--run-json <损坏 JSON>`（`JSONDecodeError ⊂ ValueError`）、
+`--run-json <目录>` 六种场景均给出可读报文（退码 2 或 1），**无 Traceback**。
+修复前后对照：`--profiles bogus` 由「退码 1 + 33 行裸 Traceback」→「退码 2 + 单行可读报文」；
+`--perturb bogus` 由「退码 1 + 30 行裸 Traceback」→ 同上。
+零回归复验通过：既有 6 个子命令、`compileall`、9 项关键数字、9 个 zip 的 SHA256、
+`git status --porcelain -- n3d_qa n3d_shape n3d_sphere n3d_proto requirements.txt` 全部与登记值一致。
+
+**离朱在复测中发生的一次产物覆盖事故（如实披露，已闭环）**：其一条计划外用例
+`cmd_robust(Namespace(robust_cmd=""))` 触发了源码中「空串 → 缺省回退 `run`」的既定设计，
+且该 Namespace 未给 `out_dir`，于是 `_robust_dir()` 回退到正式目录、执行了一次完整默认全量评测
+并覆盖了 `robust_run.json`（仅此 1 个文件；其余 10 个文件未被触碰）。
+离朱用**未受影响**的 `robust_report.json`（内嵌原 run 全字段）按 `R.write_json` 的同一序列化口径
+**逐字节还原**（还原后 SHA256 与登记值一致：`36dd384d9722fd3c…0462`），
+并另跑一轮**全新全量评测**到临时目录做独立对账：除 `created_utc` / `seconds` 外
+**逐字段完全一致**、全部格子的 R@1 逐格一致 ⇒ 该覆盖对数值与结论**零影响**。
+`robust_run.json` 的 mtime 保留为事故时间（真实标记，未伪造）。
+
+**该事故暴露的残留已由力牧处置（本轮收口）**：离朱对账时发现正式产物的 `honest_notes` 第 6 条
+（0-based 索引 5）用的是**更早一版 `robust_eval.py`** 的旧措辞
+（`…见噪声底一栏…` vs 当前源码 `…见第 3 节的「噪声底」一栏…`）—— 与事故无关，属源码版本差。
+为消除「正式产物能否由当前源码复现」的歧义，力牧**用当前源码把整条产物链重建到正式目录**
+（`robust run` → `robust calibrate` → `robust report`）：现场核对 cells 归一化 JSON SHA256 与
+重建前**完全相同**（`cells` 114 格逐位一致），仅 `created_utc` / `seconds` / `honest_notes[5]` 三项不同。
+重建后交付产物（SHA256 前 24 位）：
+
+| 文件 | 字节 | SHA256（前 24） |
+| --- | ---: | --- |
+| `robust_run.json` | 358399 | `6b85617905e25823345cbe3e` |
+| `robust_calibration.json` | 12567 | `c01c2d62aa8492963ff08ec6` |
+| `robust_report.md` | 18501 | `42a1afcbaab798ab0425e868` |
+| `robust_report.json` | 371887 | `5d16a85d386ed04672b12cc1` |
+
+`robust_report.json` 记录的 `run_artifact_sha256`（`6b856179…`）与 `calibration_artifact_sha256`
+（`c01c2d62…`）已与磁盘实际文件**闭环**；`n_effective = 3/6`、`tau_calibrated = 0.65`、
+`invariants.all_passed = True` 三项均与重建前一致（数值零变化）。
+
+**失败项（1 处真实缺陷，已修复）**：`--profiles bogus` / `--perturb bogus` 原先由
+`RobustConfig.__post_init__` 抛出的 `KeyError` / `ValueError` **穿透到解释器**，用户看到
+30 行裸 Traceback（`--side bogus` 因 argparse `choices=` 提前拦截而正常）。
+**根因**：`main()` 直接 `return int(args.func(args))`，robust 子命令族没有 CLI 错误边界。
+**修复**（对既有子命令零影响的最小改动）：
+① 新增 `_csv_names(raw, allowed, label)`，把 `--profiles` / `--perturb` 的取值校验前移到
+参数解析；② `cmd_robust` 改为分派表 + `try/except (ValueError, KeyError)` 兜底，
+捕获范围**只包住 robust 子命令族**；③ 顺带补上 `calibrate` / `report` 在 run 产物缺失时的
+可读报文（原先也会抛 `FileNotFoundError` 的裸 Traceback）。
+**修复后现场实测**：`--profiles bogus` → 单行可读报文、**退码 2**、无 Traceback；
+`--perturb bogus` → 同上；`report`/`calibrate` 指向不存在的 run 产物 → 可读报文 + **退码 1**；
+四条正常路径（`probe` / `run --dry-run` / `calibrate` / `report`）仍**退码 0**，
+且本轮**未重跑全量、数字未变**（改动只涉及参数校验与错误呈现层）。
+
+**离朱提出的 5 条观察项（不判缺陷，如实登记）**：
+1. `drill` 的现场文案是 `[drill] 参与前向但零梯度 = []；不在计算图上 = []`，
+   与测试说明里引用的「未学到的参数梯度 = []」措辞不同 —— **实质要求已满足**
+   （两类未学到参数均为空、零梯度参数 0 个），属文案差异；
+2. `guard` 的 JSON 字段名是 `all_tampered_rejected`（`all_rejected=True` 只出现在 stdout）——
+   自动比对的消费方须按 JSON 字段名取；
+3. `entry_table.encode_statements` 对空 / 纯空白文本会产出零范数行（`local-hash` 返回全零向量），
+   该函数**不返回取证字典**，调用方无法在不重算的情况下知情；下游
+   `build_key_table_from_statements` 会以 `ValueError` 兜底（符合「零范数显式处置」的声明），
+   真实数据未触发；
+4. `topk_search(k > N)` 时 `scores`/`indices` 的尾部静默零填充（`k_eff = min(k, N)`）——
+   当前所有路径 `k = 5 ≪ N`，无实际影响；
+5. `bge-m3-1024` 档未做端到端编码（见上）。
+
+**离朱登记的环境限制（不属于被测代码）**：本仓库 `E:` 卷为 **exFAT**，不支持硬链接，
+而 `write`/`edit` 工具以后端「临时文件 + 硬链接」方式原子落盘，故在此卷上报
+`EISDIR: illegal operation on a directory, link ...`（本轮力牧侧同样遇到：所有新文件先用
+`New-Item` 建空文件再写入即可绕过）。离朱改用 `pwsh` + `UTF8Encoding($false)` 落盘脚本，
+测试执行与结论不受影响。

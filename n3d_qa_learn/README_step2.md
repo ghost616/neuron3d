@@ -329,3 +329,20 @@ python -m n3d_qa_learn.step2_run replay --product-dir checkpoints/qa_learn/datas
 | R42-2 README 与测试规格的 W 编号错位 | 已在第 7 节表头注明「编号沿用审查原文」 | 本条 |
 | R42-3 `if True:` 仅按字面检查 | 如实说明：本项目该项为**字面级**检查（`train.py` 已无该字面行），未做恒真分支的语义等价证明 | 本条 |
 | I2 README.md 精确性 | ① drill 行改为「不写死 2/2，判据只看零梯度集合为空」；② CLI 列表补充 `step2_run` 五入口交叉引用 | `README.md` |
+
+## 8. 与「分档鲁棒性考卷」的关系（交叉引用，本轮新增）
+
+`python -m n3d_qa_learn.step2_run robust {probe|run|calibrate|report}` 是本轮新增的第六组
+入口（第一步 1a），它**复用**本文档描述的文本侧冻结件（行表 2665、冻结划分 query 666、
+`step2.build_key_table` 与 `TextRowKeyTable.sha256()`），把它包装成统一的
+`entry_table.EntryKeyTable` 视图（`kind="text"`），再叠三种 × 三档特征扰动做分档评测。
+
+* **不改落盘格式**：`robust` 路径**不写任何文件**到 `checkpoints/qa_learn/step2/`，
+  也不触碰既有 `TextRowKeyTable` 的字节与 `sha256()`；全部输出写
+  `checkpoints/qa_learn/_verify/robust/`。
+* **口径差异必须显式区分（勿混读）**：本文档的 `② 步骤 2 Recall@1` 是「库 = 1999 /
+  查询 = 666 的**留出划分**」（命中自身行）；`robust` 的文本侧是「检索池 = 全量 2665 /
+  查询 = 666 的**自检索**」。前者档 0 参照下限 = `0.9834834834834835`（`zh-bag` D=192），
+  后者档 0 = `1.000000`（local-hash / bge-m3，查询行与键表行逐位相同 ⇒ 对角项恒 1.0）。
+  **两者不可直接比较。**
+* **详细口径、实测数字与如实登记的负结果**见 `README.md` 第十五节。
