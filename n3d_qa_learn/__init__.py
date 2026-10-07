@@ -27,6 +27,17 @@
 * :mod:`n3d_qa_learn.cli`：纯 CLI 入口（``probe`` / ``drill`` / ``train`` / ``ask`` /
   ``eval`` / ``guard`` / ``selftest``）。
 
+设计文档三步走的两个落地模块
+----------------------------
+* :mod:`n3d_qa_learn.entry_table` / :mod:`n3d_qa_learn.robust_eval`：**第一步 1a** ——
+  统一条目特征表 + 逐位精确查表 + 分档鲁棒性考卷 + KNN 基线台账（**不改结构、不做训练**），
+  入口 ``python -m n3d_qa_learn.step2_run robust {probe|run|calibrate|report}``；
+* :mod:`n3d_qa_learn.variant_b`：**第二步 变体 B** —— 单层 ``D→D`` 可学变换（恒等初始化）
+  + **冻结特征库**内积评分（「表内嵌输出层、权重即特征库」，**只变换、不生成**），
+  扰动自监督训练 + 恒等门禁 + 逐格 变体 B vs KNN 对照，
+  入口 ``python -m n3d_qa_learn.step2_run variantb {probe|drill|train|eval|report}``，
+  产物一律写 ``checkpoints/qa_learn/_verify/variant_b/``（不落盘特征矩阵、不产 zip）。
+
 上游边界
 --------
 本包**只读** import ``n3d_shape`` / ``n3d_sphere`` / ``n3d_proto`` 的 ``model`` 与
@@ -48,6 +59,11 @@ __all__ = [
     "evaluate",
     "exp_repr",
     "exp_repr_run",
+    "encoders",
+    "encoders_run",
+    "entry_table",
+    "robust_eval",
+    "variant_b",
     "cli",
 ]
 

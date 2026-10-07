@@ -30,6 +30,7 @@ import torch
 from . import encoders as E
 from . import robust_eval as R
 from . import step2 as S
+from . import variant_b as VB
 from .route import QuestionRouter
 from .train import ZIP_EPOCH
 
@@ -1195,6 +1196,425 @@ def cmd_robust(args: argparse.Namespace) -> int:
         return 2
 
 
+def _variantb_dir(args: argparse.Namespace) -> str:
+    """``variantb`` 子命令的产物目录（**验证类运行一律写 ``_verify/variant_b/``**）。"""
+    for attr in ("verify_dir", "out_dir"):
+        value = str(getattr(args, attr, "") or "")
+        if value:
+            return value
+    return str(VB.VARIANT_B_DIR)
+
+
+def _variantb_profiles(args: argparse.Namespace) -> Tuple[str, ...]:
+    """解析 ``--profiles``（与 ``robust`` 共用同一套可读校验）。
+
+    非法值在**参数解析层**即抛 ``ValueError``（报文含可用值清单），由 :func:`cmd_variantb`
+    统一转成「单行可读报文 + 退码 2」，**不**让它穿透到 ``variant_b`` 内部变成退码 1
+    （离朱 R49 对 robust 族提出的同类边界，这里一次做对）。
+    """
+    return _csv_names(
+        str(getattr(args, "profiles", "") or ""),
+        (VB.ET.PROFILE_LEXICAL, VB.ET.PROFILE_SEMANTIC),
+        "--profiles",
+    )
+
+
+def _variantb_selector_args(args: argparse.Namespace) -> None:
+    """校验 ``variantb`` 的选择类参数（``--profiles`` / ``--train-mode``）。
+
+    ``report`` 不消费这两个参数，但**仍必须校验** —— 否则非法值会被静默忽略
+    （与 ``robust calibrate`` 改前的同型缺陷一致）。
+    """
+    _variantb_profiles(args)
+    mode = str(getattr(args, "train_mode", "") or "perturb")
+    if mode not in VB.TRAIN_MODES:
+        raise ValueError(
+            f"--train-mode 含未登记的值 {mode!r}；可用 = {list(VB.TRAIN_MODES)}"
+        )
+
+
+def _variantb_cfg(args: argparse.Namespace, *, train_mode: str = "") -> VB.TrainConfig:
+    """由 CLI 参数装配变体 B 的训练配置（不传新参数时等于默认档）。"""
+    return VB.TrainConfig(
+        seed=int(getattr(args, "seed", VB.VARIANT_B_SEED)),
+        epochs=int(getattr(args, "epochs", VB.DEFAULT_EPOCHS)),
+        batch_size=int(getattr(args, "batch_size", VB.DEFAULT_BATCH_SIZE)),
+        lr=float(getattr(args, "lr", VB.DEFAULT_LR)),
+        weight_decay=float(getattr(args, "weight_decay", VB.DEFAULT_WEIGHT_DECAY)),
+        train_mode=(
+            str(train_mode)
+            if str(train_mode)
+            else str(getattr(args, "train_mode", "perturb"))
+        ),
+        log_every=int(getattr(args, "log_every", 20)),
+    )
+
+
+def cmd_variantb_probe(args: argparse.Namespace) -> int:
+    """``variantb probe``：口径取证（键表 / 划分 / 恒等门禁），**不训练**。"""
+    _variantb_selector_args(args)
+    profiles = _variantb_profiles(args)
+    out_dir = _variantb_dir(args)
+    _log(
+        f"[variantb probe] 输出目录 = {out_dir}；特征档 = {list(profiles)}；"
+        f"种子 = {int(getattr(args, 'seed', VB.VARIANT_B_SEED))}"
+    )
+    payload = VB.summarize_probe(
+        profiles, product_dir=str(getattr(args, "product_dir", "") or ""), log=_log
+    )
+    for profile, per in sorted(payload["profiles"].items()):
+        data = per["data"]
+        table = data["table"]
+        gate = per["identity_gate"]
+        _log(
+            f"[variantb probe] {profile}: 键表 {table['n_entries']}×{table['dim']} / "
+            f"库行 {data['n_library']} / 查询行 {data['n_query']} / "
+            f"键表 SHA256 = {str(table['key_table_sha256'])[:16]}... / "
+            f"编码器指纹 = {str(table['encoder_fingerprint'])[:16]}..."
+        )
+        _log(
+            f"[variantb probe]   {profile}: 恒等门禁 {gate['n_cells_all_equal']}/"
+            f"{gate['n_cells']} 格逐条一致 / 范数逐位相等 "
+            f"{gate['bitwise_norm_equality']['bitwise_equal_frac']} / "
+            f"显式路径(评测态) {gate['explicit_path']['bitwise_equal']} / "
+            f"显式路径(训练态) {gate['explicit_path_train_mode']['bitwise_equal']} / "
+            f"梯度非零 {gate['gradient_flow']['all_params_have_grad']} / "
+            f"评测侧走变换层(自洽判据) {gate['score_path']['bitwise_equal']} / "
+            f"通过 {gate['passed']}"
+        )
+    for err in payload["errors"]:
+        _log(
+            f"[variantb probe] 失败（如实登记，不静默跳过）：{err['profile']} -> "
+            f"{err['error_type']}: {err['error']}"
+        )
+    path = os.path.join(out_dir, "variantb_probe.json")
+    digest = VB.write_json(path, payload)
+    _log(f"[variantb probe] 取证报告 -> {path} (sha256={digest[:16]}...)")
+    if payload["n_error"] > 0:
+        _log("[variantb probe] 存在失败档（退码 1，不以成功状态落账）")
+        return 1
+    if not all(p["identity_gate"]["passed"] for p in payload["profiles"].values()):
+        _log("[variantb probe] 恒等门禁未通过（退码 1，不以成功状态落账）")
+        return 1
+    _log("[variantb probe] OK")
+    return 0
+
+
+def cmd_variantb_drill(args: argparse.Namespace) -> int:
+    """``variantb drill``：单条端到端演练（含恒等门禁与梯度非零硬门禁）。"""
+    _variantb_selector_args(args)
+    profiles = _variantb_profiles(args)
+    out_dir = _variantb_dir(args)
+    cfg = _variantb_cfg(args, train_mode="perturb")
+    drill_cfg = VB.TrainConfig(
+        seed=cfg.seed,
+        epochs=1,
+        batch_size=cfg.batch_size,
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+        train_mode=cfg.train_mode,
+        log_every=cfg.log_every,
+    )
+    _log(
+        f"[variantb drill] 输出目录 = {out_dir}；特征档 = {list(profiles)}；"
+        f"epochs = 1（**演练口径，非矩阵档**；矩阵档见 `variantb train`）"
+    )
+    results: Dict[str, Any] = {}
+    t0 = time.time()
+    for profile in profiles:
+        results[str(profile)] = VB.drill(
+            str(profile),
+            cfg=drill_cfg,
+            product_dir=str(getattr(args, "product_dir", "") or ""),
+            log=_log,
+        )
+    payload: Json = {
+        "module": VB.MODULE_NAME,
+        "artifact_schema": "variant-b-drill-v1",
+        "deterministic": True,
+        "profiles": [str(p) for p in profiles],
+        "drill_epochs_note": (
+            "演练固定 1 个 epoch（只验通路与门禁，不代表矩阵档表现）；"
+            "矩阵档轮数由 `variantb train --epochs` 承担"
+        ),
+        "results": results,
+        "all_passed": bool(all(r["passed"] for r in results.values())),
+    }
+    path = os.path.join(out_dir, "variantb_drill.json")
+    digest = VB.write_json(path, payload)
+    _log(f"[variantb drill] 演练取证 -> {path} (sha256={digest[:16]}...)")
+    _log(f"[variantb drill] 耗时 {time.time() - t0:.1f}s（只进日志，不入产物）")
+    if not payload["all_passed"]:
+        _log("[variantb drill] 存在未通过档（退码 1，不以成功状态落账）")
+        return 1
+    _log("[variantb drill] OK")
+    return 0
+
+
+def cmd_variantb_train(args: argparse.Namespace) -> int:
+    """``variantb train``：全量「门禁 → 扰动自监督训练 → 逐格对照」（含 A 组对照档）。"""
+    _variantb_selector_args(args)
+    profiles = _variantb_profiles(args)
+    out_dir = _variantb_dir(args)
+    cfg = _variantb_cfg(args)
+    _log(
+        f"[variantb train] 输出目录 = {out_dir}；特征档 = {list(profiles)}；"
+        f"seed = {cfg.seed}；epochs = {cfg.epochs}；batch = {cfg.batch_size}；"
+        f"lr = {cfg.lr}；train_mode = {cfg.train_mode}"
+    )
+    t0 = time.time()
+    report, _weights = VB.run_variant_b(
+        profiles=profiles,
+        cfg=cfg,
+        product_dir=str(getattr(args, "product_dir", "") or ""),
+        include_clean_control=not bool(getattr(args, "no_clean_control", False)),
+        log=_log,
+    )
+    path = os.path.join(out_dir, "variantb_run.json")
+    digest = VB.write_json(path, report)
+    primary = report["primary"]
+    _log(
+        f"[variantb train] 主判据：通过 = {primary['passed']}；格数 {primary['n_cells']} / "
+        f"不劣于 KNN {primary['n_not_worse']} / 严格更高 {primary['n_strictly_better']} / "
+        f"严格更低 {primary['n_strictly_worse']}"
+    )
+    for row in primary["per_cell"]:
+        if not row.get("applicable"):
+            _log(f"[variantb train]   {row['profile']}/{row['cell']}: 不适用（{row.get('note')}）")
+            continue
+        _log(
+            f"[variantb train]   {row['profile']}/{row['cell']}: KNN {row['knn']:.6f} -> "
+            f"变体B {row['variant_b']:.6f}（Δ {row['delta']:+.6f}，"
+            f"命中 {row['variant_b_hit']}/{row['knn_hit']}）"
+        )
+    _log(f"[variantb train] 产物 -> {path} (sha256={digest[:16]}...)")
+    _log(
+        f"[variantb train] 耗时 {time.time() - t0:.1f}s（只进日志，不入产物）；"
+        f"产物指纹 = {report.get('artifact_fingerprint', '')[:16]}..."
+    )
+    _log("[variantb train] OK")
+    return 0
+
+
+def cmd_variantb_eval(args: argparse.Namespace) -> int:
+    """``variantb eval``：全量入口 + 断言（与 ``train`` 同一实现，失败即退码 1）。
+
+    与 ``train`` 的差别**只在断言与退码语义**：``eval`` 是验收入口 —— 训练后必须过
+    「可训参数更新量 > 0」与「恒等门禁（未跳过时）」两条硬门禁，任一不过即退码 1；
+    主判据**不**作为退码依据（否证条款要求如实报负结论，而不是把负结论当成执行失败）。
+    """
+    _variantb_selector_args(args)
+    profiles = _variantb_profiles(args)
+    out_dir = _variantb_dir(args)
+    cfg = _variantb_cfg(args)
+    skip_gate = bool(getattr(args, "skip_identity_gate", False))
+    _log(
+        f"[variantb eval] 输出目录 = {out_dir}；特征档 = {list(profiles)}；"
+        f"seed = {cfg.seed}；epochs = {cfg.epochs}；train_mode = {cfg.train_mode}；"
+        f"跳过恒等门禁 = {skip_gate}"
+    )
+    t0 = time.time()
+    per_profile: Dict[str, Any] = {}
+    perturb_weights: Dict[str, Any] = {}
+    for profile in profiles:
+        res = VB.train_and_eval_profile(
+            str(profile),
+            cfg=cfg,
+            product_dir=str(getattr(args, "product_dir", "") or ""),
+            skip_identity_gate=skip_gate,
+            log=_log,
+        )
+        # [!] 训练后权重（张量）只在进程内传递：弹出后交给决定性对照臂复用，
+        # **不进产物**（JSON 无法序列化张量；产物必须保持纯 JSON + 确定性）。
+        perturb_weights[str(profile)] = dict(res.pop("_weights"))
+        per_profile[str(profile)] = res
+    arms: Dict[str, Any] = {}
+    if not bool(getattr(args, "no_clean_control", False)):
+        arm_cfg = VB.TrainConfig(
+            seed=cfg.seed,
+            epochs=cfg.epochs,
+            batch_size=cfg.batch_size,
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            train_mode="clean",
+            log_every=cfg.log_every,
+        )
+        for profile in profiles:
+            _log(f"[variantb eval] A 组（干净自监督）对照档：{profile} ...")
+            arm_res = VB.train_and_eval_profile(
+                str(profile),
+                cfg=arm_cfg,
+                product_dir=str(getattr(args, "product_dir", "") or ""),
+                skip_identity_gate=skip_gate,
+                log=_log,
+            )
+            arm_res.pop("_weights", None)
+            arms[str(profile)] = arm_res
+    primary = VB.primary_criterion(per_profile)
+    # **决定性对照臂**：扰动自监督训练的模型 × clean 评测（否证条款要求的方向依据）
+    clean_eval_arm: Dict[str, Any] = {}
+    for profile in profiles:
+        _log(
+            f"[variantb eval] 决定性对照臂：档 {profile} —— "
+            "扰动自监督训练的模型 × **clean 评测** ..."
+        )
+        clean_eval_arm[str(profile)] = VB.clean_eval_of_perturb_arm(
+            str(profile),
+            cfg=cfg,
+            product_dir=str(getattr(args, "product_dir", "") or ""),
+            perturb_train=per_profile.get(str(profile)),
+            perturb_weights=perturb_weights.get(str(profile)),
+            log=_log,
+        )
+    gate_pass = bool(
+        all(
+            (r["identity_gate"].get("skipped") or r["identity_gate"].get("passed"))
+            for r in per_profile.values()
+        )
+    )
+    update_pass = bool(all(r["update_gate"]["passed"] for r in per_profile.values()))
+    payload: Json = {
+        "module": VB.MODULE_NAME,
+        "artifact_schema": "variant-b-eval-v1",
+        "deterministic": True,
+        "excluded_fields_note": (
+            "本产物不含 created_utc / seconds / 主机名等非确定字段；耗时只进日志"
+        ),
+        "single_seed_note": (
+            "**单 seed 42**；所有 Δ 为**单点差、无跨 seed 极差**"
+        ),
+        "config": cfg.as_dict(),
+        "profiles": [str(p) for p in profiles],
+        "per_profile": per_profile,
+        "arms": {
+            "clean_self_supervised": arms,
+            "perturb_train_clean_eval": clean_eval_arm,
+        },
+        "cells": VB._flatten_cells(per_profile, arms),
+        "primary": primary,
+        "identity_gate_passed": bool(gate_pass),
+        "update_gate_passed": bool(update_pass),
+    }
+    payload["honest_notes"] = VB._honest_notes(per_profile, arms, primary, clean_eval_arm)
+    payload["third_step"] = VB.third_step_evidence(payload)
+    payload["anchor_1a_check"] = VB.anchor_1a_check(payload)
+    payload["artifact_fingerprint"] = VB.artifact_fingerprint(payload)
+    path = os.path.join(out_dir, "variantb_eval.json")
+    digest = VB.write_json(path, payload)
+    _log(
+        f"[variantb eval] 恒等门禁通过 = {gate_pass}；可训参数更新量门禁通过 = {update_pass}"
+    )
+    _log(
+        f"[variantb eval] 主判据：通过 = {primary['passed']}；"
+        f"严格更高 {primary['n_strictly_better']} / 不劣于 {primary['n_not_worse']} / "
+        f"严格更低 {primary['n_strictly_worse']}（格数 {primary['n_cells']}）"
+    )
+    _log(f"[variantb eval] Δ 直方图 = {payload['third_step']['delta_histogram']}")
+    _log(
+        f"[variantb eval] 决定性对照臂（扰动训练 × clean 评测）ΔR@1 = "
+        f"{payload['third_step']['perturb_train_clean_eval_delta']}"
+    )
+    _log(
+        f"[variantb eval] 1a 基线对账：在容差内 {payload['anchor_1a_check']['n_within_tol']}/"
+        f"{payload['anchor_1a_check']['n_rows']}，全部在容差内 = "
+        f"{payload['anchor_1a_check']['all_within_tol']}"
+    )
+    _log(
+        f"[variantb eval] 产物 -> {path} (sha256={digest[:16]}...)；"
+        f"耗时 {time.time() - t0:.1f}s（只进日志）"
+    )
+    if not gate_pass:
+        _log("[variantb eval] 恒等门禁未通过（退码 1，不以成功状态落账）")
+        return 1
+    if not update_pass:
+        _log("[variantb eval] 可训参数更新量门禁未通过（退码 1，不以成功状态落账）")
+        return 1
+    _log("[variantb eval] OK（主判据不参与退码：否证条款要求如实报负结论）")
+    return 0
+
+
+def cmd_variantb_report(args: argparse.Namespace) -> int:
+    """``variantb report``：读 ``eval``（或 ``train``）产物渲染 JSON + Markdown。"""
+    _variantb_selector_args(args)
+    out_dir = _variantb_dir(args)
+    explicit = str(getattr(args, "eval_json", "") or "")
+    candidates = (
+        [explicit]
+        if explicit
+        else [
+            os.path.join(out_dir, "variantb_eval.json"),
+            os.path.join(out_dir, "variantb_run.json"),
+        ]
+    )
+    src = ""
+    for cand in candidates:
+        if os.path.isfile(cand):
+            src = cand
+            break
+    if not src:
+        _log(
+            f"[variantb report] 缺少输入产物：{' 或 '.join(candidates)!r}；"
+            "请先执行 `variantb eval`（或 `variantb train`，或用 --eval-json 指定）"
+        )
+        return 1
+    _log(f"[variantb report] 读输入产物 = {src}")
+    payload = VB.load_json(src)
+    if "cells" not in payload or "primary" not in payload:
+        _log(
+            "[variantb report] 输入产物缺少 `cells` / `primary` 字段（不是 variantb 的"
+            " eval/run 产物）；拒绝渲染"
+        )
+        return 1
+    md_path = os.path.join(out_dir, "variantb_report.md")
+    json_path = os.path.join(out_dir, "variantb_report.json")
+    md = VB.render_markdown(payload)
+    md_digest = VB.write_text(md_path, md)
+    report = dict(payload)
+    with open(src, "rb") as handle:
+        src_sha = R.ET.sha256_bytes(handle.read())
+    report["render"] = {
+        "source_basename": os.path.basename(src),
+        "source_sha256": str(src_sha),
+        "markdown_basename": os.path.basename(md_path),
+        "markdown_sha256": str(md_digest),
+        "note": "绝对路径只进日志，产物内只留 basename（保证换目录重跑逐字节一致）",
+    }
+    json_digest = VB.write_json(json_path, report)
+    _log(f"[variantb report] Markdown -> {md_path} (sha256={md_digest[:16]}...)")
+    _log(f"[variantb report] JSON     -> {json_path} (sha256={json_digest[:16]}...)")
+    _log("[variantb report] OK")
+    return 0
+
+
+def cmd_variantb(args: argparse.Namespace) -> int:
+    """``variantb`` 子命令分派：probe / drill / train / eval / report。
+
+    **CLI 错误边界**：非法的 ``--profiles`` 等由 :func:`_csv_names` 在参数层给出可读报文；
+    运行期的 ``ValueError`` / ``KeyError`` / ``FileNotFoundError`` 在此转成**单行可读报文 +
+    退码 2**（依赖缺失等 ``EncoderUnavailableError`` 属 ``RuntimeError``，会带可读报文退码 1）。
+    捕获范围**只包住 variantb 子命令族**，既有子命令的分发逻辑逐字符未改。
+    """
+    sub = str(getattr(args, "variantb_cmd", "") or "probe")
+    handlers = {
+        "probe": cmd_variantb_probe,
+        "drill": cmd_variantb_drill,
+        "train": cmd_variantb_train,
+        "eval": cmd_variantb_eval,
+        "report": cmd_variantb_report,
+    }
+    if sub not in handlers:
+        _log(f"[variantb] 未知子命令 {sub!r}；可用 = {sorted(handlers)}")
+        return 2
+    try:
+        return int(handlers[sub](args))
+    except FileNotFoundError as exc:
+        _log(f"[variantb] 输入产物缺失：{exc}")
+        return 1
+    except (ValueError, KeyError) as exc:
+        _log(f"[variantb] 非法参数：{exc}")
+        return 2
+
+
 def cmd_verify_vectorizer(args: argparse.Namespace) -> int:
     """步骤 2 的**验证口径（第 2 轮重建）**：指纹对账 / 重复编码 / 落盘缓存逐位比对。
 
@@ -1368,6 +1788,46 @@ def build_parser() -> argparse.ArgumentParser:
                       choices=["probe", "run", "calibrate", "report"],
                       help="robust 子命令（缺省 run）")
     p_rb.set_defaults(func=cmd_robust)
+
+    p_vb = sub.add_parser(
+        "variantb",
+        help="变体 B（第二步）：单层 D→D 可学变换 + 冻结特征库（只变换、不生成）",
+        description=(
+            "变体 B：**只变换、不生成** —— 单层 D→D 可学变换 T（恒等初始化）+ 冻结特征库"
+            "内积评分，只学变换层。probe（口径与恒等门禁取证，不训练）/ drill（单条端到端"
+            "演练，含梯度非零硬门禁）/ train（扰动自监督训练 + 逐格 变体B vs KNN 对照 + A 组"
+            "干净训练对照）/ eval（同 train 并加硬门禁断言，失败退码 1）/ report（读产物渲染"
+            "JSON + Markdown）。产物一律写 checkpoints/qa_learn/_verify/variant_b/，"
+            "不落盘特征矩阵、不产 zip 产物。"
+        ),
+    )
+    common(p_vb)
+    p_vb.add_argument("--profiles", default=",".join(VB.ET.profile_names()),
+                      help="特征档列表（逗号分隔；仅 lexical-88 / bge-m3-1024）")
+    p_vb.add_argument("--seed", type=int, default=VB.VARIANT_B_SEED,
+                      help="训练 seed（**冻结单 seed 口径**；只驱动局部 generator）")
+    p_vb.add_argument("--epochs", type=int, default=VB.DEFAULT_EPOCHS,
+                      help="训练轮数（drill 固定 1 轮，不受此项影响）")
+    p_vb.add_argument("--batch-size", type=int, default=VB.DEFAULT_BATCH_SIZE,
+                      help="训练批大小（同时影响训练侧批内扰动的行号基准）")
+    p_vb.add_argument("--lr", type=float, default=VB.DEFAULT_LR, help="Adam 学习率")
+    p_vb.add_argument("--weight-decay", type=float, default=VB.DEFAULT_WEIGHT_DECAY,
+                      help="Adam 权重衰减")
+    p_vb.add_argument("--train-mode", default="perturb", choices=list(VB.TRAIN_MODES),
+                      help="perturb = 扰动自监督（主方案）；clean = 干净自监督（A 组口径）")
+    p_vb.add_argument("--log-every", type=int, default=20,
+                      help="每多少训练步打印一次（只进日志）")
+    p_vb.add_argument("--skip-identity-gate", action="store_true",
+                      help="**显式跳过**恒等门禁（仅允许在已单独跑过 drill 门禁后使用）")
+    p_vb.add_argument("--no-clean-control", action="store_true",
+                      help="不跑 A 组（干净自监督）对照档")
+    p_vb.add_argument("--verify-dir", default="", help="产物目录（与 --out-dir 同义）")
+    p_vb.add_argument("--eval-json", default="",
+                      help="report 的输入产物路径（缺省按 eval -> run 顺序自动探测）")
+    p_vb.add_argument("variantb_cmd", nargs="?", default="probe",
+                      choices=["probe", "drill", "train", "eval", "report"],
+                      help="variantb 子命令（缺省 probe）")
+    p_vb.set_defaults(func=cmd_variantb)
     return parser
 
 
