@@ -34,8 +34,10 @@
   入口 ``python -m n3d_qa_learn.step2_run robust {probe|run|calibrate|report}``；
 * :mod:`n3d_qa_learn.variant_b`：**第二步 变体 B** —— 单层 ``D→D`` 可学变换（恒等初始化）
   + **冻结特征库**内积评分（「表内嵌输出层、权重即特征库」，**只变换、不生成**），
-  扰动自监督训练 + 恒等门禁 + 逐格 变体 B vs KNN 对照，
-  入口 ``python -m n3d_qa_learn.step2_run variantb {probe|drill|train|eval|report}``，
+  扰动自监督训练 + 恒等门禁 + 逐格 变体 B vs KNN 对照 + **恒等参照锚点（T=I × 训练行 1999）**
+  + 训练无害下限 + ``train_scorer``（``normalized`` 默认 / ``raw`` 对照档）+
+  **训练前提校准轮**（``train_scorer × lr × weight_decay`` 最小网格 + 机器可读归因结论），
+  入口 ``python -m n3d_qa_learn.step2_run variantb {probe|drill|train|eval|calibrate|report}``，
   产物一律写 ``checkpoints/qa_learn/_verify/variant_b/``（不落盘特征矩阵、不产 zip）。
 
 上游边界

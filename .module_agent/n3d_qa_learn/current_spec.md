@@ -273,3 +273,394 @@ R51 确认 **F1/F2/F3 三处修复全部收口**：F1 —— R50 检不出的三
 - **I6（补机器可读口径锚点，已补）**：新增常量 `NMAG_FORMULA_SPEC_DEVIATION`（357 字），随产物落盘于 `run` / `probe` 的 `grid.nmag_formula_deviation`，明确登记「任务书选甲为 `x <- x*(1+eps) + b`，本实现为 `x <- x*0.5 + eps*(-1)**(i+j+1)`，缩放系数取**三档恒定的 0.5** 而非 `1+eps`」及三条设计理由（量纲单一性 / 唯一自变量可归因 / 恒定正缩放对余弦检索不敏感）。
 
 **产物逐字段对账（G5 / 零回归硬要求）**：`cells`（114 格）**逐位未变**、`entry_tables` / `euclidean_axis` / `invariants` / `stability`（36 行） / `unrecognized` **全部逐位未变**；`calibration` 新增 `at_granularity` / `granularity_ratio` / `weak_minus_strong_*` / `granularity_boundary_evidence` / `n_at_granularity_*` 等字段，并把 `qa/bge-m3-1024/nmag` 由「有效」改判为「**无效（落差 = 粒度）**」；**主判据侧仍 5/6**、全部 36 格 R@1 未变、`invariants` 仍 24 条全通过、G7 仍 9/9、全局 τ 仍 `0.133333`。旧→新 SHA256（前 24）：`robust_probe.json` 23706/`6436f0569a428359…` → 24515/`3e8c5aefed85d1b0…`；`robust_run.json` 419102/`173942833ae979e9…` → 420416/`4adb290e8e3fcea4…`；`robust_calibration.json` 24328/`5736b859f78e5ec6…` → 33641/`349e61e28267e404…`；`robust_report.md` 23483/`250be2fe7cbd33e8…` → 25898/`38fb583915ad42fd…`；`robust_report.json` 444783/`bf6167a2fb24caa1…` → 455605/`4a7668dcffd9227e…`。**跨目录双跑逐字节一致（G3）**在重建整条链后重新验证 **5/5 `bytes_equal=True`**（上一版曾因 `honest_notes` 内嵌规则文本与旧 `run` 产物不同步而短暂不一致，已用「当前源码重建整条链」消除）。`README.md` 15.6 与 15.11 已同步修订。
+## 变体 B：可学变换与冻结特征库（第二步）
+
+设计文档三步走的**第二步**：正面检验「**表内嵌输出层、权重即特征库**」这一架构能否让 `argmax` 真正可学。由 `n3d_qa_learn/variant_b.py` 承载，入口 `python -m n3d_qa_learn.step2_run variantb {probe|drill|train|eval|report}`（与 `robust` 平级，既有子命令与参数表逐字符未改）。**只变换、不生成**：单层 `D→D` 变换 `T` + **冻结**特征库内积评分，只学变换层。
+
+**模型（`variant_b.DToDTransform` / `VariantBModel`）**：`T(x) = x @ W.T + b`，`W` 初值 = 单位阵、`b` 初值 = 全零（`torch.eye`/`zeros`，**不消耗 RNG**）；可训参数现场枚举恒为 `['weight','bias']`（元素数 `[D², D]`）。**恒等快路径**：`torch.equal(W, I) and (b == 0).all()`（**逐位判定、非容差**）时走**零加性**写法 `x + x@(W−I).T + (b − mean(b))` —— 两项在恒等时逐位为 `+0.0`，故 `T(x)` 与 `x` **逐位相同**、`norm(T(x)) ≡ norm(x) = 1` 在 float32 下逐位成立，且两项**可微**（`∂/∂W = x`、`∂/∂b = 1 − 1/D`）。**`normalize_query`** 是查询侧**唯一**归一化实现（float64 求范数；逐元素 float32 求和恰等于其 float64 精确值 ⇒ 与 `entry_table.l2_normalize_rows` **逐位一致**；零范数行显式抛 `ValueError`）。
+
+**恒等门禁（硬门禁，五条现场证据）**：训练前 `T = I` 时，clean + 9 个扰动档的 top-1 必须与**余弦最近邻逐条一致**。证据 = ① 逐格 `n_mismatch == 0`；② `norm(T(x))` 与 `norm(x)` 逐位相等比例（现场 `1.0`）；③ `T(x)` vs 显式 `x @ W.T + b`（**训练态与评测态各一次**，现场均逐位相同）；④ 恒等态仍在计算图上且两参数梯度非零（`gradient_flow_evidence`）；⑤ **自洽判据** `score_path_evidence`：`model.score(q)` 必须逐位等于 `normalize_query(transform(q)) @ keys.T`。**现场实测两档均 10/10 格通过、五条证据全 True**（`lexical-88` 与 `bge-m3-1024`）。
+
+**训练器（`variant_b.train_transform`）**：**扰动自监督** —— 训练查询 = 库行 **1999**（由「全量下标 − 查询行下标」求**补集**，不修改 1a 代码），标签 = 该行在**全量键表 2665** 中的行下标，`CrossEntropyLoss(logits = T(q) @ keys.T)`，Adam（**唯一优化器**，只优化 `T`），每步轮转 **9 个扰动格**；打乱用**局部** `torch.Generator(seed=SHUFFLE_SEED=4242)`，扰动走 1a 的 `derived_seed`，**不消耗全局 RNG**；同参重跑**逐位一致**（跨目录双跑产物逐字节相同，现场已验证）。**`train_mode="clean"`** 为 A 组（干净自监督）对照档。**可训参数更新量门禁** `update_gate`：逐参数裸字节 SHA256 前后比对，**只要有任一变化即通过**（不设阈值）。**训练侧零范数行边界（现场真实触发 1 次）**：批内某行被扰动后整行归零（`mask/strong` 遮蔽 44/88 维且该行仅 9 个非零维），处置为「原样保留为全零向量 + **在损失中掩码**（其 logits 恒为 0）+ 逐批计数进产物；整批全零则显式报错」；取回「扰动后未归一化矩阵」的路径是 `_perturb_allow_zero` —— 仅在 1a 抛「零范数」错时启用，用 **1a 自己产出的 `raw_perturbed_sha256` 逐字节反查**候选矩阵，**命中不了即 fail-closed 抛出 1a 的原始报错**，**1a 的 `perturb_matrix` 契约未改动**。
+
+**评测（`eval_cell` / `cell_grid`）**：逐（特征档 × 扰动类型 × 档位）比较变体 B 与 **KNN**（= 冻结键表上的归一化余弦，与训练完全无关），报 `R@1`/`R@5`/Δ/命中条数/分档落差（弱 − 强）；名次口径与 1a 逐字一致（`rank = 1 + #{j : cos > 金标余弦}`；top-1 用 `argmax`，并列取最小下标，故逐条一致性判定是确定性的）。**决定性对照臂 `clean_eval_of_perturb_arm`**（扰动训练 × **clean 评测**，复用主臂**同一个训练后模型**，权重只在进程内传递、**不进产物**）把「`T` 本身的方向偏移」与「扰动泛化落差」分开。**主判据 `primary_criterion`**：在 1a 判**有效**的 15 格上 R@1 均不低于 KNN 且至少 1 格严格更高；1a 判无效的格（`bge-m3-1024` 的 mask 三档）仍报数字但**不参与**。**`anchor_1a_check`** 与 1a 的 `robust_run.json` 文本侧主判据格逐格对账（容差 `1e-6`，现场 **18/18** 全在容差内）。
+
+**现场实测（单 seed 42，`epochs=30` / `batch=256` / `lr=1e-2`）**：**主判据通过 = False** —— 15 格中**严格更高 2 / 不劣于 2 / 严格更低 13**，Δ 区间 `[−0.794294, +0.133634]`（仅 `lexical-88` 的 `nmag/middle` +0.133634 与 `nmag/strong` +0.060060 为正）。**决定性对照臂**：`lexical-88` clean 格 `0.519520` vs KNN `1.000000`（**Δ −0.480480**，346/666）、`bge-m3-1024` `0.986486`（Δ −0.013514，657/666）⇒ **掉点主因是变换层本身**，不是扰动泛化落差。**A 组（干净自监督）**同量级为负（clean 格 −0.484985 / −0.006006）⇒「干净训练 ≈ 无变化」在本架构下被实测否证。训练侧自命中 top-1 = `0.342171`（lexical）/ `0.632816`（bge），说明线性 `D→D` 的表达力/优化前提尚未落实。**第三步方向依据**（`third_step`）：先落实「为什么连训练集都拟合不到 1」，再改**候选粒度**（逐行键 → 类/簇级候选，或让键表随表示重算）—— clean 格是**逐位自匹配**（`cos = 1.0`，结构性不可超越），故任何非恒等变换在该粒度上**只能变差**；**不要**继续加大变换层容量。**空间不足格**单列（`bge-m3-1024` 的 clean/noise-weak/三档 mask 的 KNN 错误条数 = 0/1/0/0/0；`lexical-88` 的 clean = 0、mask/weak = 6）。
+
+**两条踩坑登记（均已修，写入代码注释与 README 16.2）**：① 恒等快路径首版写成 `return x` ⇒ 输入脱离计算图，训练第一步 `backward()` 报 `element 0 of tensors does not require grad`；② **`score` 首版漏掉 `self.transform(x)`** ⇒ 评测侧退化成「未训练模型 = 余弦 KNN」、全部 Δ **结构性恒为 0**，而恒等门禁**照样通过**；由新增的自洽判据 ⑤ 现场抓出并修复，本节全部数字为**修复后**的现场值。
+
+**产物纪律与零回归**：一律写 `checkpoints/qa_learn/_verify/variant_b/`（`variantb_probe.json` 13098 B `537814d95d933227…`、`variantb_drill.json` 107049 B `5fe2e2f31e7feab7…`、`variantb_eval.json` 340526 B `ad7d90c2fefc5c2d…`、`variantb_report.md` 14237 B `0bd4b2fde9dbfd67…`、`variantb_report.json` 340913 B `233838e81a1e9c3d…` + 三个 UTF-8 无 BOM 日志），**不落盘特征矩阵、不产 zip 产物**，产物内不含挂钟时间/耗时；**跨目录双跑逐字节一致**（probe 与 eval 均现场验证）。`variantb` 四个子命令入口统一校验 `--profiles` / `--train-mode`（非法值单行可读报文 + **退码 2**，无裸 Traceback）；`eval` 是验收入口，**恒等门禁**与**可训参数更新量门禁**任一不过即**退码 1**，而**主判据不参与退码**（否证条款要求如实报负结论）。`entry_table.py` / `robust_eval.py` **零改动**；顶层 9 个 `qa_*.pt.zip` 的 SHA256/字节/mtime 逐项不变、顶层无新增文件；上游四目录与根 `requirements.txt` 的 `git status` 为空；**零新增依赖**；既有入口 `step2_run probe` 与 `cli probe` 退码 0。**如实登记的自我更正**：`ROBUST_1A_KNN_REFERENCE` 初版按 README 15.5 正文抄了 `bge-m3-1024` 的 `nmag` 三格（`1.000000/0.996997/0.983483`），与 1a **run 产物**（`0.481982/0.144144/0.043544`）不同源；本模块一律以**产物为唯一现场来源**并已按产物更正，**不静默对齐**、不改动 1a 任何文件。**未做项**：多 seed、λ/轮数/lr 扫描、对齐/SupCon 辅助损失（口径明确排除）、类/簇级候选（属第三步）。
+**离朱 R57 验收（第 1 轮）**：7 个套件、**101 项断言 101 通过 / 0 失败 / 0 跳过**。关键现场证据：① **`score` 自洽判据有负向区分度** —— 现场构造「`score` 只归一化、不走变换层」的假模型 ⇒ `bitwise_equal is False`（证明它不是恒真空断言，能拦住首版那类回归）；② `is_identity()` 是**逐位**判定（`weight[0,0]` 加 1 个 ULP、`bias[3]` 取最小次正规数 `1.4e-45` 都判 False）；③ 恒等门禁负向用例：`bias += 0.5` ⇒ `0/10` 格一致，非等比 `weight[0,0] *= 3` ⇒ `3/10` 格一致；④ **零范数真实触发点被复现**（`n_steps=240`、`epoch 21 / step 168`、`mask/strong`、`table_rows=[23]`、`zero_norm_rows.total=1`）；⑤ `_perturb_allow_zero` fail-closed 反向用例成立；⑥ 测试前后 8 个正式产物逐字节一致（未污染）。**R57 提出的 6 条观察项收口**：**F2（warning，已修）** 把「一处不同源」的登记补进 `ANCHOR_RULE`，使该文本同时进入 `evidence.knn_reference_rule`（`train` 产物）与 `anchor_1a_check.rule`（`eval`/`report` 产物），并重建 `variantb_eval.json` / `variantb_report.json`（**数值零变化**）；**F5（info，已修）** 出处更正 —— 旧值 `1.000000/0.996997/0.983483` 实际出自 README **§15.10「修复前后完整对照」表的「改前」列**（W1 修复前历史值），而 §15.5 主表已是产物值 `0.481982/0.144144/0.043544`；**F1/F3/F4/F6 如实登记不改代码**（F1 属说明措辞；F3 的 `weight *= 2` 是保序缩放、门禁靠另两条拦下；F4 的 drill 登记指纹对应**两档**命令；F6 的 `anchor_1a_check` 为 18 行口径、不含 clean 格，另做含 clean 格的 20/20 对账）。README 新增 16.7（一处「不同源」的登记）与 16.8（R57 验收与观察项收口）。
+
+**离朱 R58 复测（收口轮）**：7 个套件、**105 项断言 105 通过 / 0 失败 / 0 跳过**（新增 `t9_closure.py` 专项 14 项）。逐项确认：F2 收口**可见**（`ANCHOR_RULE` 485 字符同时逐字符出现在 `anchor_1a_check.rule` 与 `evidence.knn_reference_rule`，文本含新值 3 个 + 旧值 3 个 + 出处 `§15.10`/「改前」+「唯一现场来源」+「不静默对齐」）；F2 收口**不改数值**（`anchor_1a_check` 18/18 在 1e-6 内、最大 `abs_diff` `4.984984984801599e-07`，现场两档重算与产物逐位一致）；F2 收口**不改 probe 产物**（仍 13098 B / `537814d95d933227`，且不含该规则文本）；F5 收口（常量注释 / `ANCHOR_RULE` / README 三处均不再把旧值出处写成「§15.5 正文」，全文对该词组的提及全部处于「更正说明」语境）；回归全绿（恒等门禁五条证据、`score` 自洽判据负向区分度、`TrainConfig` 校验、不消耗全局 RNG、同参重跑逐位一致、`update_gate`、划分与键表指纹、主判据 2/2/13、决定性对照臂 −0.480480 / −0.013514、CLI 错误边界、零回归）。**R58 新发现 F7（info，已修）**：README §16.8 初稿把 `train_top1_self` 写成 `0.34217108554277193`，产物实际为 `0.34217108554277137`（差 5.55e-16），已按产物更正并把「与产物逐位一致」改写为可核对形式（写明取自哪个产物的哪个字段），**不涉及代码、口径与数值结论**。README 新增 16.9（R58 复测与 F7 更正）。
+
+**产物最终指纹**（`checkpoints/qa_learn/_verify/variant_b/`，8 个文件）：`variantb_probe.json` 13098 B `537814d95d933227`、`variantb_drill.json` 107049 B `5fe2e2f31e7feab7`（**两档** drill 命令）、`variantb_eval.json` 341179 B `d094c9bd9200120d`、`variantb_report.md` 14237 B `0bd4b2fde9dbfd67`、`variantb_report.json` 341566 B `33874ccd128fd221` + 三个 UTF-8 无 BOM 日志。`ANCHOR_RULE` 变更前的 `variantb_eval.json` `ad7d90c2fefc5c2d…`（340526 B）与 `variantb_report.json` `233838e81a1e9c3d…`（340913 B）**已作废**不再引用。
+
+**训练前提校准轮（第二步的后续诊断轮）**
+
+> 判定对象 = 第二步否证的**归因**：是「优化前提未落实」还是「线性 `D→D` 表达力不足」。
+> **不以提升指标为成功标准。** 触发点 = 第二步的冲突证据（恒等初始化训练行干净自命中 100%，
+> 训练 30 epoch 后训练侧自命中只剩 `0.342171` ⇒「训练在自己的目标上就失败了」，否证不干净）。
+
+**口径（用户已确认，不得擅自变更）**：① 本轮特征档**只跑 `lexical-88`**（诊断轮成本优先），
+`bge-m3-1024` 未跑、其归因**待补**；② 划分不变（键表全量 2665 / 训练行 1999 / 查询行 666 /
+交集 0）；③ 单 seed 42、确定性、局部 RNG；④ **1a 考卷零改动**（`entry_table.py` /
+`robust_eval.py` 未修改，扰动与归一化一律复用）；⑤ 产物一律写
+`checkpoints/qa_learn/_verify/variant_b/`，不落盘特征矩阵、不产 zip、无挂钟字段；
+⑥ 产物内所有数字必须现场真实执行；⑦ 观测量粒度：训练行 1999 ⇒ 1/1999 ≈ 5.0e-4。
+
+**新增对外接口**
+- **训练侧打分口径开关** `TRAIN_SCORERS = ("normalized", "raw")`、`DEFAULT_TRAIN_SCORER = "normalized"`、
+  `TRAIN_SCORER_RULE`（唯一规则文本，进 `TrainConfig.as_dict()`、产物 `evidence` 与 Markdown）；
+  `TrainConfig.train_scorer`（构造期校验；CLI `--train-scorer`）；
+  `VariantBModel.train_score(x, scorer)`（训练侧**唯一**打分入口）与
+  `VariantBModel.normalize_query_allow_zero(x)`（零范数行保持全零、不报错，**仅训练侧**；
+  与严格的 `normalize_query` 在无零行时逐位相同，由 `train_scorer_evidence` 现场断言）。
+  `normalized` = `normalize_query(T(x)) @ keys.T`（**与评测侧 `score` 同一口径**）；
+  `raw` = `transform(x) @ keys.T`（现状未归一化口径，**逐位复现第二步**）。
+  **评测侧口径不变**；**零范数行掩码口径不变**（保留全零 + 损失掩码 + 逐批计数，整批归零显式报错）。
+- **恒等参照锚点** `TRAIN_ANCHOR_RULE` / `identity_anchor_grid(model, data)`：未训练（`T = I`）在
+  **训练行 1999** 上 clean + 9 格的 top-1（含 R@5 与 KNN 对照），即「训练必须至少不劣于此」的
+  硬性下限；调用前硬断言模型处于恒等态。`VariantBData.features_of(rows)` / `row_label(rows)`
+  为其唯一取值与口径标签点；`eval_cell` / `cell_grid` 新增 `rows=` 形参
+  （`None` = 查询行 666，历史行为逐位不变）使锚点与评测**共用同一条代码路径**。
+- **训练无害下限** `TRAIN_HARMLESSNESS_RULE` / `TRAIN_HARMLESSNESS_EXCLUDED_CELLS = ("clean",)` /
+  `train_harmlessness(anchor, post)`：训练后同口径**逐格不低于**锚点；`clean` 格**不纳入判据**
+  （逐位自匹配、锚点结构性 1.000000）但仍在表中报出；另给 `aggregate_reading`（整段平均读法，
+  **不参与判定**）与 `per_cell_including_clean` / `all_not_worse_including_clean`。
+- **训练前提校准** `CalibrateCombo`（`scorer:lr:wd`，含 `label` / `parse`）、
+  `build_calibration_grid`（`CALIBRATE_LR_GRID = (1e-3, 1e-2)`、`CALIBRATE_WD_GRID = (0.0, 1e-2)`、
+  `CALIBRATE_SCORERS = TRAIN_SCORERS`，顺序 = scorer 外层 / lr 中层 / wd 内层）、
+  `select_best_combo`（按 `CALIBRATE_SELECTION_RULE` 选最优超参，只在 `normalized` 内选）、
+  `attribution_verdict`、`run_calibration(..., on_progress=...)`（每完成一个组合回调一次
+  ⇒ 扫描可中断、可单组合复跑）、`render_calibrate_markdown`、常量 `CALIBRATION_SCOPE_NOTE`。
+- **机器可读归因** `ATTRIBUTION_REQUIRED_CONDITIONS = ("a_train_harmless", "b_eval_not_worse")`、
+  `ATTRIBUTION_CONDITION_TEXT`、`ATTRIBUTION_RULE`（由前两者经 `_build_attribution_rule()` **派生**，
+  与判定实现同源）、`ATTRIBUTION_VERDICTS = {optimization_premise, linear_expressivity, mixed_per_profile}`。
+  结论单点来源 = `selection.<档>.selected` 指向的组合的 `train_harmlessness` 与 `eval_primary`。
+- **W2 修复（取回路径）** `RETRIEVAL_RULE` / `RETRIEVAL_ZERO_TOKEN` / `RETRIEVAL_MAX_ROUNDS` /
+  `_zero_rows_from_error` / `_sentinel_row` / `_with_sentinel_rows` / `_manual_perturb_inlined` /
+  `perturb_retrieval_evidence` / `perturb_retrieval_reverse_check`；`_perturb_allow_zero` 重写为
+  「成功分支 = 1a 本尊（`direct_1a`）／失败分支 = 替换零范数行输入后**重新调用 1a 本尊** + 按下发
+  约定置零（`repaired_via_1a`）+ 两个哨兵的行独立性逐字节交叉验证」；**删除**按公式重放的
+  `_detail_from_failed_perturb`（其 docstring 承诺未实现）。
+- **W1 修复（字段改名）** `TOP1_DISCREPANCY_KEY = "top1_discrepancy_vs_knn"`：`cell_grid` 内嵌的
+  top-1 逐条差异**统计量**改名并显式标注 `model_is_identity` / `computed_after_training`；
+  `identity_gate` 侧新增 `computed_on` / `discrepancy_key` 与第 ⑥ 条自洽判据（`train_scorer`）。
+- **范数诊断** `train_transform` 新增 `norm_diagnostics`（逐 epoch：`mean_logit_abs`、
+  `mean_row_norm_x` / `mean_row_norm_Tx`、`weight_fro` / `weight_minus_identity_fro` / `bias_norm`，
+  探针 = 库行前 256 行的干净特征，固定无随机）与 `norm_diagnostics_summary`
+  （含 `norm_ratio_last_over_first`；**只作机制取证、不参与任何判定**）。
+
+**CLI（`step2_run` 的 variantb 子命令族，与 probe/drill/train/eval/report 平级，纯新增）**：
+`variantb calibrate` + `--calibrate-scorers/--calibrate-lr/--calibrate-wd/--grid-combo/--dry-run`
+（`--dry-run` 只跑网格第一个组合；`--grid-combo "scorer:lr:wd"` 单组合复跑）；新增
+`--train-scorer`（`choices`）；`_float_list` 解析数值网格（空串回退默认）；非法值一律
+**单行可读报文 + 退码 2**。`calibrate` 的恒等门禁 / 更新量门禁 / 取回路径（正向 + 反向验证）
+任一不过退码 1，**归因结论不参与退码**。
+
+**现场实测（单 seed 42，`epochs=30`，`batch=256`，`lexical-88`，全量耗时 56.5s）**
+- **恒等锚点表**（训练行 1999，top-1）：`clean 1.000000`、`noise/weak 1.000000`、
+  `noise/middle 0.986993`、`noise/strong 0.774887`、`mask/weak 0.992996`、`mask/middle 0.956978`、
+  `mask/strong 0.763382`、`nmag/weak 0.355178`、`nmag/middle 0.101051`、`nmag/strong 0.037519`；
+  锚点与 KNN 逐格一致 **10/10**；恒等门禁 **10/10 格逐条一致、通过 = True**（六条证据全 True，
+  含新增的训练侧打分口径自洽判据）。
+- **扫描表（8 组合）**：`训练侧自命中 / 训练无害格数 / ‖T(x)‖末首比 / 评测侧不劣`：
+  `normalized|lr=0.001|wd=0` **0.887444 / 3-9 / 1.0009 / 3-9（严格更高 3）**；
+  `normalized|lr=0.001|wd=0.01` 0.885943 / 3-9 / 0.8076 / 3-9；
+  `normalized|lr=0.01|wd=0` 0.608804 / 0-9 / 1.9477 / 0-9；
+  `normalized|lr=0.01|wd=0.01` 0.437219 / 0-9 / 0.5208 / 0-9；
+  `raw|lr=0.001|wd=0` 0.517259 / 3-9 / 2.3116 / 3-9；
+  `raw|lr=0.001|wd=0.01` 0.587794 / 2-9 / 1.1136 / 2-9；
+  `raw|lr=0.01|wd=0`（**第二步现状档**）**0.342171 / 3-9 / 8.4166 / 2-9**；
+  `raw|lr=0.01|wd=0.01` 0.199600 / 0-9 / 0.8319 / 0-9。更新量门禁 8/8 通过。
+- **口径对齐前后（同 lr/wd 配对）**：`Δ训练侧自命中 = +0.370185 / +0.298149 / +0.266633 / +0.237619`；
+  `raw|lr=0.01|wd=0` 的训练侧自命中 = `0.34217108554277137`，与第二步产物字段**逐位相同**
+  ⇒ 重构**未改动 `raw` 档行为**；同档 `‖T(x)‖` 末/首 = **8.4166**、`mean|logit|` 末值 1.5046
+  ⇒ **范数膨胀退化解通道现场证实**（`normalized` 同超参下 1.9477、最优组合 1.0009）。
+- **最优超参**（按先声明的选取规则）＝ `normalized|lr=0.001|wd=0`（`raw` 四组合标
+  `eligible = false`、只作对照）。
+- **归因结论**：`a_train_harmless = False`（不劣 3/9、最差余量 −0.125063）、
+  `b_eval_not_worse = False`（不劣 3/9、严格更高 3、严格更低 6）
+  ⇒ **`verdict_key = "linear_expressivity"`**（线性 `D→D` 表达力 / 架构不足成立）。
+  逐格取舍：`nmag` 三格 `+0.644822 / +0.898949 / +0.962481`，`noise`/`mask` 六格
+  `−0.000500 ~ −0.125063`；取舍与锚点高度相关（锚点最低的三格正是唯一变好的三格）。
+  **整段平均读法**（不参与判定）：训练侧 `mean_margin +0.242232`、评测侧 `+0.232733`，
+  该读法会翻成 `optimization_premise`，产物以 `alternative_reading.agrees_with_primary = false`
+  并列登记，**不得只引用其中一种**。
+- **W2 反向验证**：四类共享层破坏（`derived_seed(+1)` / `NMAG_SHARED_SCALE=0.25` /
+  `nmag_shift_matrix→全零` / `PERTURB_GRID["mask"]["strong"]=0.25`）**4/4 全部被检出**，
+  基线 True、恢复后 True、总判定 True；手算侧 `manual_side_isolated = True`。
+- **W1 现场核对**：同一产物内 `identity_gate.passed = True`（`computed_on = fresh_model(T=I)`）
+  与 `cell_grid_discrepancy.*.top1_discrepancy_vs_knn.all_cells_equal = False`
+  （`computed_after_training = True`）并存且**不同名**（同名冲突存在 = False）。
+- **确定性与产物**：两次不同输出目录的全量跑 `variantb_calibrate.json`（478975 B
+  `669bef989008f44f`）与 `variantb_calibrate.md`（22915 B `04ee69123b3e11c4`）**逐字节相同**；
+  增量落盘 8 次（每组合一次）；`calibrate_dry/variantb_calibrate.json` 111579 B
+  `21a1ebb8ea0e2a0a`、`calibrate_drill/variantb_drill.json` 64021 B `4feec1283da3e438`。
+- **零回归**：`entry_table.py` / `robust_eval.py` 零改动；顶层 9 个 `qa_*.pt.zip` 的
+  SHA256/字节/mtime 逐项不变、顶层无新增文件；上游四目录与根 `requirements.txt` 的
+  `git status` 为空；零新增依赖；第二步的 4 件既有产物
+  （`variantb_probe.json` 13098 B `537814d95d933227`、`variantb_drill.json` 107049 B
+  `5fe2e2f31e7feab7`、`variantb_eval.json` 341179 B `d094c9bd9200120d`、
+  `variantb_report.json` 341566 B `33874ccd128fd221`、`variantb_report.md` 14237 B
+  `0bd4b2fde9dbfd67`）**未重跑、逐字节不变**，且仍可被新版 `report` 渲染（现场退码 0）。
+- **如实登记（不得包装）**：① 本轮**没有**通过「训练无害」下限（最优组合仍 3/9），
+  如实报「**训练仍有害**」；② 判据读法（逐格 vs 整段平均）会**翻转**结论，产物已并列登记；
+  ③ `bge-m3-1024` 的归因**待补**；④ 单 seed、无跨 seed 极差；⑤ 网格为最小网格，
+  未扫 epochs / batch_size / 优化器。
+
+**离朱 R59 验收与 F1~F4 收口（训练前提校准轮）**
+
+**R59 结果**：8 套件 / **357 项断言全部通过（0 失败）**，另发现 2 个真实缺陷 + 2 处文案不符。
+- **F1（严重·回归·已修）**：本机 `sys.stdout.encoding = cp936`（GBK），而 GBK **没有**
+  `U+2212`（`−`）与 `U+21D2`（`⇒`）。本轮新增的 **3 处运行时日志字面量**含这些字符
+  （`variant_b.py` 的 epoch 日志、`step2_run.py` 的两条 `calibrate` 日志），使 `print` 抛
+  `UnicodeEncodeError`；该异常**继承 `ValueError`**，被 `cmd_variantb` 的
+  `except (ValueError, KeyError)` 兜住 ⇒ 报成「非法参数 + 退码 2」、**一次跑完的长跑成果被整条丢弃**
+  （`train` / `eval` / `calibrate` 均受影响）。**修法三层**：① 字面量改 ASCII（`−`→`-`、`⇒`→`=>`）
+  并新增常量 `step2_run._ASCII_SAFE_LOG_NOTE` 固化编码纪律；② `step2_run._log` 对不可表示字符做
+  `backslashreplace` 转义后再输出（兜底，不改数值与产物）；③ `cmd_variantb` 新增
+  `except UnicodeEncodeError`（**置于 `(ValueError, KeyError)` 之前**）报「输出编码错误 + 退码 1」。
+  **修复后现场实测（不设 `PYTHONIOENCODING`）**：`calibrate` / `train --epochs 1` / `eval --epochs 1`
+  / `drill` **全部退码 0**，取证产物在 `_verify/variant_b/gbk_runtime_check/`（`--epochs 1`，非矩阵档）。
+- **F2（中等·健壮性·已修）**：`--calibrate-scorers raw` / `--grid-combo "raw:..."`（合法：`raw ∈
+  TRAIN_SCORERS`）原先在**训练全部完成之后**由 `select_best_combo` 抛 `ValueError` ⇒ 误报
+  「非法参数 + 退码 2」、`selection` / `attribution` / 指纹缺失、`.md` 不渲染、只留 `status="partial"`。
+  **修法**：`select_best_combo` **不再抛异常**，改为返回 `applicable = False` + 可读 `reason`
+  （`candidates` 全量保留）；新增 `attribution_not_applicable(reason, candidates)` 与
+  `ATTRIBUTION_VERDICTS["not_applicable"]`；`run_calibration` 写
+  `selection.<档>.applicable = false` / `attribution.<档>.verdict_key = "not_applicable"`，**退码 0**。
+  **现场实测**：`--calibrate-scorers raw` 退码 0（102949 B `445211c1a98b65df`）、
+  `--grid-combo "raw:0.01:0"` 退码 0（102949 B `692116c1e6ad62e7`，`train_top1 = 0.342171`）。
+- **F3（文案·已修）**：「既有子命令参数表逐字符未改」不准确 —— parser 另触及 `--epochs` 的 help
+  与 `variantb_cmd` 的 `choices`（旧选项集合 ⊆ 新选项集合，语义未变）。已改为精确表述。
+- **F4（文案·已修）**：「零范数行 logits 恒为 0」只在 `T = I` 时成立（训练后 `T(0)=b≠0`，
+  实测 logits 量级 0.3487 / 0.2163）。功能无缺陷（掩码取自**变换前**的 `q`，该行一律不参与损失与梯度）；
+  `zero_norm_mask` / `train_transform` docstring、产物 `zero_norm_rows.rule`、`_honest_notes`
+  与 README 措辞统一更正为「该行一律被掩码、与 logits 取值无关」。
+- **产物指纹变化（如实登记）**：F2 使 `selection.<档>` 新增 `applicable` / `reason` 两键 ⇒ 校准类产物重建：
+  `variantb_calibrate.json` **478975 B `669bef989008f44f` → 479903 B `981ee3cbfaa15c92`**、
+  `calibrate_dry/variantb_calibrate.json` **111579 B `21a1ebb8ea0e2a0a` → 111730 B `cf5d97c3dc7a7371`**；
+  `variantb_calibrate.md`（22915 B `04ee69123b3e11c4`）与 `calibrate_drill/variantb_drill.json`
+  （64021 B `4feec1283da3e438`）字节未变。**数值与结论零变化**（8 组合自命中、锚点 10 格、
+  最优组合 `normalized|lr=0.001|wd=0`、`verdict = linear_expressivity`、跨目录逐字节一致）。
+- **R59 独立复现的规格事实（全部通过）**：锚点 10 格逐值一致；8 组合自命中逐值一致；
+  `raw|lr=0.01|wd=0 == 0.34217108554277137` 逐位相同；W2 正向 True / 反向 4-4 detected /
+  `_detail_from_failed_perturb` 确已删除 / 手算侧 AST 零共享层引用 / 行独立性用自建哨兵独立复核；
+  门禁第 ⑥ 条确实接入 `passed`（强制 False 后门禁失败）；非恒等态锚点 fail-closed 且不改模型、
+  不耗全局 RNG；归因不参与退码（`verdict = linear_expressivity` 仍退码 0）。
+
+**离朱 R60 复测与 3 项 info 级观察项（收口轮）**
+
+**R60 结果**：10 套件 / **469 项断言 / 0 失败**，未发现新缺陷；R59 的 F1~F4 **全部独立复现为已修复**。
+- **F1 三层全验**：AST 全模块扫描 **0 处**非 cp936 可编码的运行时日志字面量（R59 为 3 处）；
+  `_log` 在 cp936 / ascii 严格档下注入 `U+2212` / `U+21D2` 均**不抛异常**（转义为 `\u2212` / `\u21d2`，
+  其余文本保全，纯 ASCII 输入与 `print` 逐字节相同）；AST 确认 `except UnicodeEncodeError` 排在
+  `(ValueError, KeyError)` **之前**，注入时**退码 1 + 「输出编码错误」**、不含「非法参数」，
+  普通 `ValueError` / `KeyError` 仍退码 2。**不设 `PYTHONIOENCODING`（本机 cp936）下**
+  `calibrate` / `train --epochs 1` / `eval --epochs 1` / `drill` **全部退码 0 并产出产物**。
+- **F2**：`select_best_combo` 无 `normalized` 时不再抛（`applicable=False` + `reason` + `candidates` 全留，
+  空列表同样不抛）；`--calibrate-scorers raw`（4 组合）与 `--grid-combo "raw:0.01:0"` 均**退码 0**、
+  `status=complete`、含 selection/attribution/fingerprint、`.md` 已渲染、扫描数字全保留
+  （0.517259 / 0.587794 / 0.342171 / 0.199600；单组合 `0.34217108554277137` 逐位），
+  且与作者现场产物 `calibrate_rawonly/`、`calibrate_rawonly_single/` **逐字节相同**；
+  `not_applicable` **不驱动退码**。
+- **F3 / F4**：目标位置表述已改为精确版（选项集合 = 旧集合 ⊂ 新集合；零范数行「一律被掩码、
+  与其 logits 取值无关」），且「恒为 0」的任何出现均带更正语境。**F4 功能实质亦被验证**：
+  掩码取自**变换前**的输入 `q`；训练后 `T(0)=b≠0`（探针实测该行 logits `0.9219`）；
+  把该行 logits 改写为任意值后**损失逐位不变**。
+- **规格现场事实逐项一致**：`variantb_calibrate.json` 479903 B `981ee3cbfaa15c92`（F2 新增
+  `applicable`/`reason` 两键所致）、`variantb_calibrate.md` 22915 B `04ee69123b3e11c4`、
+  `calibrate_repro/` 与主产物逐字节相同、`calibrate_dry/` 111730 B `cf5d97c3dc7a7371`、
+  `calibrate_drill/variantb_drill.json` 64021 B `4feec1283da3e438`；恒等锚点 10 格与 8 组合自命中
+  逐值一致；最优组合 `normalized|lr=0.001|wd=0`；`verdict = linear_expressivity`；
+  耗时 55.5/59.6/60.3s；增量落盘 8 次；R59 旧指纹 478975 B `669bef989008f44f` **已作废**。
+- **零回归（R60 复核 + 测试后二次「临时目录外零漂移」）**：1a 考卷两文件零改动；
+  顶层 9 个 `qa_*.pt.zip` 的字节/SHA256/mtime 三项不变、顶层无新增（本轮新增的
+  `calibrate_*/`、`gbk_runtime_check/` 均在 `_verify/variant_b/` 子目录内）；第二步 5 件既有产物
+  逐字节不变且指纹逐项吻合；4 条 `git status` 路径为空；`compileall` 退码 0；零新增依赖；
+  仅声明 4 个文件被修改；CLI 错误边界与向后兼容保持。
+
+**3 项 info 级观察项（非缺陷；本轮如实登记、不修改）**：
+- **O1**：`step2_run._ASCII_SAFE_LOG_NOTE` **自身**以 `−` / `⇒` 作反例插图 ⇒ 该常量**不可 cp936 编码**，
+  且 AST 核验**当前无任何引用**。因它**从不进日志路径**（`_log` 兜底层也不会崩）故不影响运行，
+  但「固化 ASCII 纪律」的常量自身违反纪律属实。**建议（未执行，避免再次变更已验收源码）**：
+  插图改用 `U+2212` / `U+21D2` 文字描述或标注「仅供文档」。
+- **O2**：两件**冻结产物** `variantb_eval.json` / `variantb_report.json` 仍含 F4 修复前的旧措辞
+  （零范数行 logits「恒为 0」一类）—— **零回归要求逐字节不变**，故不得改动。
+  本模块「**零回归 ↔ 统一措辞**」的固有张力，**明确接受残留并登记**；该句**只在 `T = I` 时成立**。
+- **O3**：「逐字符未改」在**非目标位置**仍有残留（`step2_run.py` 的 `cmd_variantb` docstring 说的是
+  「分发逻辑」、robust 族两处，其中一处与 HEAD 逐字符相同、属本轮范围外）；**目标位置已按 F3 更正**。
+
+**口径收口修复轮（皋陶 approved=false：2 error / 2 warning / 2 info；只修文本与口径，不改数值结论）**
+
+**硬约束（现场断言，全部满足）**：`attribution_summary.verdict_key == "linear_expressivity"`、
+`selection.<档>.selected == "normalized|lr=0.001|wd=0"`、`candidates_ranked` 顺序不变、
+`alternative_reading.agrees_with_primary == false`、恒等锚点 10 格逐值不变、
+8 组合批内滚动平均逐值不变、逐组合无害格数 / `min_margin` / 评测侧三项计数逐值不变。
+**未重跑超参搜索**；重建产物用的是同参复跑（seed 42 / epochs 30 / batch 256 / lexical-88）。
+
+**逐条落地**
+1. **error 1（已作废的 W2 机制描述）**：README §16.3 的「训练侧用 `raw_perturbed_sha256` 反查取回
+   1a 的中间矩阵，命中不了即 fail-closed 抛出 1a 的原始报错」——该路径已在 §16.11.7 删除
+   （反查恒命中、`raise` 分支不可达）。现就地改写为**现实现**（成功分支 = 1a 本尊 `direct_1a`；
+   失败分支 = 哨兵替换零范数行输入 → **重新调用 1a 本尊** → 只丢弃被替换行并置零
+   `repaired_via_1a` → **两个不同哨兵的行独立性逐字节交叉验证**），并显式标注旧描述**已作废**、
+   指向 §16.11.7 与 `RETRIEVAL_RULE`（唯一口径来源）。
+2. **error 2（归因写反）**：`_calibration_honest_notes` 的逐格取舍 note 面向被选中的
+   `normalized` 组合却写成「`raw` 口径下的『训练失败』」，且「弱扰动格被强扰动格牺牲」与现场相反。
+   **修法**：note 改为**按组合归属** —— 本最优组合下**变好 = `nmag` 三格**（锚点最低，
+   `+0.644822 / +0.898949 / +0.962481`）、**变差 = `noise`/`mask` 六格**（锚点最高，
+   `−0.000500 ~ −0.125063`），并显式否证「弱被强牺牲」；`raw` 的结论**下移为独立一条**，
+   只引用 `raw` 组合自己的逐格读数（按 `min_margin` 取 `raw|lr=0.001|wd=0.01`：
+   变好 = `nmag/weak +0.249125`、`nmag/middle +0.057529`；变差 = `noise`×3 + `mask`×3
+   与 `nmag/strong −0.001001`）。README §16.11.6 同段更正并标注更正来源（皋陶 error 2）。
+3. **warning 3（主报量口径）**：原先把「训练行 1999 上 clean + 9 格的 top-1」当作训练侧观测量，
+   但产物主打的 `train_top1_self` 实为**批内滚动平均**（每步单格轮转、批内 256 行、
+   用该步**更新前** logits），与锚点不是同一观测量（同组合 `0.887444` vs 逐格均值 `0.905453`）。
+   **修法**：① `TRAIN_HARMLESSNESS_RULE` / `TRAIN_ANCHOR_RULE` / `ATTRIBUTION_CONDITION_TEXT`
+   改为明确「**逐格 R@1**（跑一次完整 10 格网格）」并声明**不得**代入批内滚动平均；
+   ② 报告主表（`render_calibrate_markdown` §2）与 README §16.11.3/§16.11.4 表头改为
+   **逐格 R@1 为主报量**、批内滚动平均显式标注「**仅诊断**」；
+   ③ 新增产物字段 `train.running_vs_grid`（现场差值 + **逐格一致性硬校验**：
+   `train_side_cells[].variant_b_recall_at_1` 与 `train_harmlessness.per_cell[].post_top1`
+   必须逐格相等，不等即抛 `ValueError` 拒绝出数；现场 8/8 组合 `per_cell_consistent = true`）。
+   逐格 R@1 **直接取自产物既有字段，未重算**。
+4. **warning 4（选取规则自相矛盾）**：`CALIBRATE_SELECTION_RULE` 既写「clean + 9 格中…」又写
+   「同 10 格的平均值」，而 `train_harmlessness()` 已排除 `clean` ⇒ 格数与数字两义。
+   **修法**：规则文本改写为**与实现逐字对齐** —— ① 明确「**9 个扰动格**（`clean` 已按
+   `TRAIN_HARMLESSNESS_EXCLUDED_CELLS` 排除）」；② 明确「整段平均的格集合 = **10 格
+   （`clean` 计入）**，与 ① 不同」；③ 新增常量 `CALIBRATE_CANDIDATE_CELL_SET` 并逐项写入
+   `selection.<档>.candidates[].train_post_top1_mean_cell_set`。
+   **如实登记一处与皋陶建议的差异**：皋陶给出两条等价修法（统一为 9 格 / 声明 ② 同样排除 clean），
+   二者都要求**改实现**（② 的值会从 `0.914907` 变成 `0.905453`）；本轮硬约束是
+   「只修文本与口径、不得改变任何数值」，故选择**把文本对齐到实现**（② 保持 10 格并显式标注），
+   **不修改任何数值**。
+5. **info 5（行集合不可互校 + calibrate 缺 1a 对账）**：新增常量 `ANCHOR_ROW_SET_NOTE`
+   （唯一来源）并写入 `identity_anchor.row_set_note` 与 `anchor_1a_check_row_source`；
+   **`calibrate` 现在也产出查询行 666 侧的 `anchor_1a_check`**（取第一组合的评测网格；
+   KNN 与模型无关，现场新增不变量 `knn_invariance_across_combos.all_equal = true`，
+   `n_distinct_knn_vectors = 1` / 8 组合）；现场对账 `9/9` 行在 1e-6 内。
+   README 锚点表加行集合警告（`nmag/weak` 训练行 `0.355178` vs 查询行 `0.391892`）。
+6. **info 6（同名概念互串）**：`train_top1_self` → **`train_batch_running_top1`**
+   （`history[]` 与 `train` 两处；现场 `'train_top1_self' in combos[0]['train'] == False`）；
+   新增唯一口径文本 `TRAIN_TOP1_SELF_RULE` 并在 `train_harmlessness` / 锚点 / 选取规则 /
+   `third_step_evidence`（`train_self_top1_rule` / `train_self_top1_note`）四处**互相交叉引用**；
+   `render_markdown` 与 CLI 日志标签同步为「批内滚动平均（仅诊断）」；
+   报告新增 §2.2「批内滚动平均 vs 逐格 R@1（两个观测量，不得互相代入）」逐组合差值表。
+
+**产物（同参重建；判定量逐项未变）**：`variantb_calibrate.json` **508313 B `9ed2d843cafbf389`**、
+`variantb_calibrate.md` **29850 B `5f73285c0cd53204`**、`calibrate_repro/` 与之**逐字节相同**、
+`calibrate_dry/` 121479 B `525f7ef833f4f1ff`、`calibrate_drill/variantb_drill.json`
+64021 B `4feec1283da3e438`（**字节未变**）、`calibrate_rawonly/` 278761 B `73230bafc072ba64`、
+`calibrate_rawonly_single/` 112400 B `84f6f5389c0c6983`、`gbk_runtime_check/` 两份按新 schema 重建；
+`render_calibrate_markdown(json)` 与磁盘 `.md` **逐字符相同**。
+**旧值作废（如实登记）**：`variantb_calibrate.json` 479903 B `981ee3cbfaa15c92`（R60）与
+509151 B `3161259bc6e2567f`（本轮中间态）、`.md` 22915 B `04ee69123b3e11c4` / 30688 B
+`1f58486031eb3fe2`、`calibrate_dry/` 111730 B `cf5d97c3dc7a7371`、`calibrate_rawonly/`
+102949 B `445211c1a98b65df`、`calibrate_rawonly_single/` 102949 B `692116c1e6ad62e7`、
+`gbk_runtime_check/variantb_run.json` 195782 B `14d700d2a1f9b746`、`variantb_eval.json`
+186624 B `85847d4938424103` —— 均产生于字段改名与口径文本更正之前。
+**零回归**：1a 考卷零改动；顶层 9 个 `qa_*.pt.zip` 的 SHA256/字节/mtime 逐项不变、顶层仍 9 个文件；
+上游四目录与根 `requirements.txt` 的 `git status` 为空；第二步 5 件既有产物逐字节不变；
+`compileall` 退码 0；零新增依赖；GBK 控制台下 `calibrate` / `train` / `eval` / `drill` 全部退码 0。
+
+**离朱 R61 复测与收口（1 处 F1 残留 + 4 项 info 观察；只改渲染层与文本，判定量逐项未变）**
+
+**R61 结果**：15 套件 / **550 项断言 / 549 通过 / 1 失败**；唯一失败为 F1 的**一处未标记残留**；
+其余 5 条修复、全部硬约束与零回归逐项通过。离朱的独立复现（不看文字自述）：F2 取舍列表与
+`per_cell` 正负号逐格相等；F3 `train_side_cells` 与 `per_cell` 逐位相等、**注入不一致后
+`run_calibration` 如期抛 `ValueError`**（证明硬校验比较的是两个独立视图）；F4 ① 复算 = 9 格判据计数、
+② 复算 = 10 格均值且**仍精确为 `0.9149074537268633`**；F5 `row_set_note` 逐字符等于常量、
+666 侧 `anchor_1a_check` 逐行与 1a 登记值精确相等；F6 6 件新产物旧名出现 **0** 次、
+`TRAIN_TOP1_SELF_RULE` 四处交叉引用、§2.2 表 8 行回产物（5e-7 内）。
+
+**收口处置**
+1. **F1 残留（唯一失败）**：README **§16.8**（R57 收口节）仍以现在时把**已删除**的指纹反查机制
+   当作现行 fail-closed 行为（「候选指纹对不上 ⇒ `ValueError`；零范数路径返回的未归一化矩阵
+   裸字节 SHA256 == `raw_perturbed_sha256`」）。**就地更正**：加「口径收口修复轮就地更正
+   （离朱 R61 F1 残留）」标记，写明该机制**已删除**（`detail` 是 1a 函数内局部变量 ⇒ 反查恒命中、
+   `raise` 分支不可达），列出**现行为**（报文不可解析 / 已替换行集合一致仍报错 / 超轮次 /
+   行独立性交叉验证不一致）与 `RETRIEVAL_RULE` 的两分支 + 4/4 反向验证；
+   同段补注 `train_top1_self` 为历史字段名（现名 `train_batch_running_top1`）。
+2. **O1（标签字面量）**：训练循环日志 / `_honest_notes` / 校准报告 §2 表头 / §2.2 表头 / CLI 日志
+   五处统一为**逐字**「**批内滚动平均（仅诊断）**」；`批内滚动平均 top-1` 全仓出现次数 = **0**。
+3. **O2（评测侧条件用词）**：`ATTRIBUTION_CONDITION_TEXT["b_eval_not_worse"]` 补为
+   「**逐格 R@1** **全部不低于** KNN 基线」，与条件 a 的用词对齐。
+4. **O3（md 表格未转义 `|`）**：新增渲染层助手 `_md_table_cell()`（`|` → `\|`），
+   用于校准报告 §2 / §2.2 / §3 三张表的组合标签列；**JSON 键名不受影响**。
+   现场核对：三张表无任何表格行残留未转义标签；示例行「转义竖线 2 / 真实分隔 12」与 11 列表头一致。
+5. **O4（冻结产物旧文本）**：与 §16.11.11 的 O2 同源，**明确接受残留并登记**
+   （两件受冻结保护的产物仍含旧字段名 186 次 + R59 F4 旧句；不得据此推断旧口径仍现行）。
+
+**判定量前后对照（R60 → R61，逐项一致）**：`verdict_key = linear_expressivity`；
+`selected = normalized|lr=0.001|wd=0`；`candidates_ranked` 四组顺序不变；
+`alternative_reading.agrees_with_primary = false`；条件 a 不劣 `3/9`、最差余量 `−0.125063`；
+条件 b `(3, 3, 6)`；锚点 10 格与 8 组合批内滚动平均逐值不变；取回路径正向 True / 反向 4-4 / passed True；
+恒等门禁 10/10；更新量门禁 8/8。
+
+**产物（R61 收口后重建）**：`variantb_calibrate.json` **508585 B `ca0b1135dabc5f6a`**、
+`.md` **30059 B `ad47440cc688934f`**、`calibrate_repro/` 与之**逐字节相同**、
+`calibrate_dry/` 121548 B `6c8796ec950bceaa`、`calibrate_drill/variantb_drill.json`
+64021 B `4feec1283da3e438`（**始终未变**）、`calibrate_rawonly/` 278917 B `17bf4f6223b26d00`、
+`calibrate_rawonly_single/` 112469 B `8015a8141192ec36`、`gbk_runtime_check/` 重建为
+200820 B `3903db3b78fab699` / 191424 B `8c48c6b0f72de012`；`render_calibrate_markdown(json)`
+与磁盘 `.md` **逐字符相同**。**旧值作废**：R61 收口前的 508385 B `eafdcd5e187cb2e0` /
+29850 B `5f73285c0cd53204` 及更早各批（见 README §16.11.2 的倒序清单）。
+**零回归**：1a 考卷零改动；顶层 9 个 `qa_*.pt.zip` 的 SHA256/字节/mtime 逐项不变、顶层仍 9 个文件；
+上游四目录与根 `requirements.txt` 的 `git status` 为空；第二步 5 件既有产物逐字节不变；
+`compileall` 退码 0；零新增依赖；GBK 控制台下 `calibrate` / `train` / `eval` / `drill` 全部退码 0。
+
+**字段改名的向后兼容回归修复轮（旧键回退）与离朱 R64 验收**
+
+**缺陷（皋陶唯一 error）**：口径收口修复轮把 `train.train_top1_self` 改名为
+`train.train_batch_running_top1` 时，**读取侧只写** `.get(新键, 0.0)`；而**冻结的第二步产物**
+（只有旧键、按零回归要求不得重建）⇒ `third_step_evidence()` / `_honest_notes()` 在旧产物上
+**静默返回 `0.0`**。**修法：最小改动、只加回退，不改变任何判定量。**
+
+**单点取值实现（新增，导出）**：常量 `TRAIN_TOP1_KEY = "train_batch_running_top1"`（现行键名唯一来源）、
+`LEGACY_TRAIN_TOP1_KEY = "train_top1_self"`（旧键名）、`TRAIN_TOP1_KEY_FALLBACK_RULE`（回退规则文本）；
+函数 `train_batch_running_top1_of(block) -> (值, 命中的键名)`：优先级 **新键 → 旧键 → `0.0`**，
+**回退只在旧键存在且新键缺失时生效**（⇒ 新产物路径读数逐位不变），**两键同时存在 ⇒ 新键优先**，
+两键都缺失 ⇒ `(0.0, "missing")`（键名可判断真值不可得），**非映射输入不抛异常**。
+`third_step_evidence()` 与 `_honest_notes()` 均改用该助手；前者在 `third_step` 块内新增
+`train_self_top1_key_used`（逐档键名）、`train_self_top1_legacy_fallback_profiles`、
+`train_self_top1_key_fallback_rule`，并扩写 `train_self_top1_note`；后者**新键路径文本逐字不变**，
+仅新键缺失时追加「（取值键 = `train_top1_self`：旧产物沿用旧键名…本值经**回退**取到真值）」注记。
+
+**R64 现场验收（20 套件 / 703 断言 / 703 通过 / 0 失败）**
+- **双向验证 4/4**：① 冻结 `variantb_eval.json`（341179 B `d094c9bd9200120d`，每档 `train` 块**只有旧键**）
+  ⇒ `train_self_top1 == {bge-m3-1024: 0.632816408204102, lexical-88: 0.34217108554277137}` **逐位相等**
+  （修复前同输入为 `0.0`/`0.0`）；② 新 schema `gbk_runtime_check/variantb_eval.json` ⇒
+  `0.6803401700850426` **逐位相等**且与 `train.train_batch_running_top1` 一致、`legacy_fallback_profiles = []`；
+  ③ 对旧产物重跑 `variantb report`（隔离目录）**退码 0**，输出 `third_step.train_self_top1` 不再为 `0.0`；
+  ④ 旧产物路径 `_honest_notes` 不再出现「= 0.000000」。
+- **边界**：两键并存 ⇒ 新键优先；两键都缺 ⇒ `(0.0,"missing")`（键名已断言）；8 类非映射输入均不抛异常；
+  新产物路径注记**逐字不变**（以改动前的归档产物做前后对照）。
+- **两项如实登记经核实均属实**：① 皋陶所述「产物层面对旧产物重跑 `report` 会写出 `0.0`」**现场不成立**
+  —— 冻结产物**自身内嵌**的 `third_step.train_self_top1` 已是真值（产生于改名前的代码），
+  且 `cmd_variantb_report` **不重算** `third_step`（输出块与输入块逐字段相同）⇒ **CLI 路径从未受影响**，
+  真实受影响面只有按 README 去**复算该块**的两条 API 路径，本轮已修；
+  ② 「JSON 键集合为封闭集」**非现场事实** —— 对模块 `.py` + **全部历轮 `lizhu_r*_scripts/*.py`** +
+  `.module_agent/**` 定向扫描（行内同时含 `third_step`、`==` 与 `keys()/set(/sorted(`）**0 处**
+  等号固定键集合的断言（历轮均为存在性检查）；新增 3 键**只出现在重算块**（重建产物 `third_step` 10 键，
+  冻结两件仍 **5 键**且逐字节不变）⇒ **未放宽/删除任何断言**。
+- **硬约束逐项零变化**（`verdict_key` / `selected` / `candidates_ranked` 顺序 / `agrees_with_primary=false` /
+  条件 a `3/9`·`min_margin −0.125063` / 条件 b `(3,3,6)` / 锚点 10 格逐值 / 8 组合批内滚动平均逐值 /
+  `candidates[0].train_post_top1_mean = 0.9149074537268633`）。
+- **产物**：冻结 5 件**逐字节不变**；**本轮唯一重建** = `gbk_runtime_check/` 两件
+  （`variantb_run.json` **202194 B `121ce3b6eaae5fc5`**、`variantb_eval.json` **192798 B `fefbb213ef2c9de1`**，
+  各 +1374 B 恰为 3 个新键体量）；校准族产物未被触碰；渲染器逐字符复现 md；E2E 逐字节复现；
+  零回归（1a 考卷零改动、顶层 9 个 zip 三项不变、顶层无新增、`git status` 为空、`compileall` 退码 0、
+  零新增依赖、GBK 不设 `PYTHONIOENCODING` 下 `train/eval --epochs 1` 退码 0、CLI 边界与向后兼容保持）。
+- **离朱登记的 3 项 info（非缺陷，未再改动以保持「已验收状态 = 交付状态」）**：
+  **O-a** 新键存在但值为 `None` 时会回退到旧键（规格未规定；若要求严格「仅按键是否存在」可只判 `key in data`）；
+  **O-b** 模块内仍有一处 `.get('train_batch_running_top1', 0.0)`（校准报告 §2.2 渲染 `rvg.get(...)`），
+  它读的是校准报告自身的 `running_vs_grid` 块（与改名同轮引入、**不存在旧 schema 版本**，不可能静默归零）；
+  **O-c** 重建产物内嵌 `honest_notes` 与朴素重算在其他注记上有**调用约定差异**（被测的那一条逐字相同），
+  建议在 README 标注 gbk 产物的生成命令以便复算对齐。
+- **离朱方法学自纠（测试代码侧，已如实登记）**：R61 期「产物文本旧名出现 0 次」在本轮**必然不成立**
+  （旧键名按设计出现在 `third_step` 登记字段）⇒ 该断言按 R64 规格收窄为**可核对的作用域形式**
+  （每个 `train` 块不得含旧键 + 旧名只能出现在 `third_step` 登记字段，用「全文计数 == `third_step`
+  序列化计数」断言，现场每件 2 次恰在两处登记字段），并已核验不存在被放宽/删除的等号式键集合断言。

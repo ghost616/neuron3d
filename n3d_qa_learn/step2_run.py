@@ -115,8 +115,37 @@ class _Tee:
 
 
 def _log(msg: str) -> None:
-    """打印一行进度（带刷新，便于长跑观察）。"""
-    print(msg, flush=True)
+    """打印一行进度（带刷新，便于长跑观察）。
+
+    **控制台编码容错（R59 F1 修复）**：本机 Windows 控制台默认编码为 ``cp936``
+    （GBK），而 GBK **没有** ``U+2212``（真减号 ``−``）/ ``U+21D2``（``⇒``）等字符。
+    日志里出现这类字符时 ``print`` 会抛 ``UnicodeEncodeError``；由于该异常**继承
+    ``ValueError``**，它会被 CLI 的 ``except (ValueError, KeyError)`` 兜住并**误报成
+    「非法参数」+ 退码 2**，一次成功的长跑被整条丢弃。
+
+    两道修复（缺一不可，口径不同）：
+    1. **字面量层面**：运行时日志一律只用可被目标控制台编码表示的字符（见
+       ``_ASCII_SAFE_LOG_NOTE``）—— 这是主修复；
+    2. **本函数层面**：对不可表示的字符做 ``backslashreplace`` 转义后再输出
+       —— 兜底，保证「日志永远不能让程序崩」，且**不改变任何数值与产物**。
+    """
+    text = str(msg)
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        enc = str(getattr(sys.stdout, "encoding", "") or "ascii")
+        safe = text.encode(enc, errors="backslashreplace").decode(enc, errors="replace")
+        print(safe, flush=True)
+
+
+#: 日志字面量的编码纪律（R59 F1 的唯一口径文本）。
+_ASCII_SAFE_LOG_NOTE: str = (
+    "运行时日志字面量必须能被 Windows 控制台默认编码 cp936（GBK）表示："
+    "`U+2212`（`−`）与 `U+21D2`（`⇒`）等字符 **不在 GBK 内**，出现即让 `print` 抛 "
+    "`UnicodeEncodeError`（它继承 `ValueError`，会被 CLI 兜住并误报成「非法参数」）。"
+    "本模块一律用 ASCII 替代：减号用 `-`、蕴含箭头用 `=>`。"
+    "docstring / 注释 / 产物 JSON（UTF-8）不受此限。"
+)
 
 
 def _write_json(path: str, obj: Any) -> str:
@@ -1220,9 +1249,9 @@ def _variantb_profiles(args: argparse.Namespace) -> Tuple[str, ...]:
 
 
 def _variantb_selector_args(args: argparse.Namespace) -> None:
-    """校验 ``variantb`` 的选择类参数（``--profiles`` / ``--train-mode``）。
+    """校验 ``variantb`` 的选择类参数（``--profiles`` / ``--train-mode`` / ``--train-scorer``）。
 
-    ``report`` 不消费这两个参数，但**仍必须校验** —— 否则非法值会被静默忽略
+    ``report`` 不消费这些参数，但**仍必须校验** —— 否则非法值会被静默忽略
     （与 ``robust calibrate`` 改前的同型缺陷一致）。
     """
     _variantb_profiles(args)
@@ -1230,6 +1259,11 @@ def _variantb_selector_args(args: argparse.Namespace) -> None:
     if mode not in VB.TRAIN_MODES:
         raise ValueError(
             f"--train-mode 含未登记的值 {mode!r}；可用 = {list(VB.TRAIN_MODES)}"
+        )
+    scorer = str(getattr(args, "train_scorer", "") or VB.DEFAULT_TRAIN_SCORER)
+    if scorer not in VB.TRAIN_SCORERS:
+        raise ValueError(
+            f"--train-scorer 含未登记的值 {scorer!r}；可用 = {list(VB.TRAIN_SCORERS)}"
         )
 
 
@@ -1246,8 +1280,47 @@ def _variantb_cfg(args: argparse.Namespace, *, train_mode: str = "") -> VB.Train
             if str(train_mode)
             else str(getattr(args, "train_mode", "perturb"))
         ),
+        train_scorer=str(getattr(args, "train_scorer", "") or VB.DEFAULT_TRAIN_SCORER),
         log_every=int(getattr(args, "log_every", 20)),
     )
+
+
+def _float_list(raw: str, default: Sequence[float], label: str) -> Tuple[float, ...]:
+    """解析逗号分隔的浮点列表（空串 = 用 ``default``）；非法值给**单行可读报文**。
+
+    为什么不用 :func:`_csv_names`：它做的是「枚举名单」校验，而 lr / weight_decay 是**数值网格**，
+    ``1e-3`` 与 ``0.001`` 是同一个值、不应因字面量不同被判非法。
+    """
+    items = tuple(x.strip() for x in str(raw or "").split(",") if x.strip())
+    if not items:
+        return tuple(float(x) for x in default)
+    try:
+        return tuple(float(x) for x in items)
+    except ValueError as exc:
+        raise ValueError(f"{label} 含非浮点值：{list(items)}") from exc
+
+
+def _variantb_calibrate_grid(args: argparse.Namespace) -> List[VB.CalibrateCombo]:
+    """解析 ``calibrate`` 的扫描网格（``--grid-combo`` 优先；``--dry-run`` 只跑第一个组合）。
+
+    校验在**参数解析层**完成（非法值 → 单行可读报文 + 退码 2），与 variantb 其余子命令同一口径。
+    """
+    scorers = _csv_names(
+        str(getattr(args, "calibrate_scorers", "") or ""), VB.TRAIN_SCORERS, "--calibrate-scorers"
+    )
+    lrs = _float_list(
+        str(getattr(args, "calibrate_lr", "") or ""), VB.CALIBRATE_LR_GRID, "--calibrate-lr"
+    )
+    wds = _float_list(
+        str(getattr(args, "calibrate_wd", "") or ""), VB.CALIBRATE_WD_GRID, "--calibrate-wd"
+    )
+    grid = VB.build_calibration_grid(scorers=scorers, lrs=lrs, weight_decays=wds)
+    single = str(getattr(args, "grid_combo", "") or "")
+    if single:
+        return [VB.CalibrateCombo.parse(single)]
+    if bool(getattr(args, "dry_run", False)):
+        return grid[:1]
+    return grid
 
 
 def cmd_variantb_probe(args: argparse.Namespace) -> int:
@@ -1280,8 +1353,25 @@ def cmd_variantb_probe(args: argparse.Namespace) -> int:
             f"显式路径(训练态) {gate['explicit_path_train_mode']['bitwise_equal']} / "
             f"梯度非零 {gate['gradient_flow']['all_params_have_grad']} / "
             f"评测侧走变换层(自洽判据) {gate['score_path']['bitwise_equal']} / "
+            f"训练侧打分口径(自洽判据) {gate['train_scorer']['all_bitwise_equal']} / "
             f"通过 {gate['passed']}"
         )
+        anchor = per["identity_anchor"]
+        _log(
+            f"[variantb probe]   {profile}: 恒等锚点（T=I × 训练行 {anchor['n_rows']}，"
+            f"clean + 9 格）top-1 = {[round(float(v), 6) for v in anchor['top1_self'].values()]}"
+            f"（锚点与 KNN 逐格一致 "
+            f"{anchor['identity_equivalence']['n_cells_all_equal_vs_knn']}/"
+            f"{anchor['identity_equivalence']['n_cells']}）"
+        )
+    rv = dict(payload.get("perturb_retrieval") or {})
+    fwd = dict(rv.get("forward") or {})
+    rev = dict(rv.get("reverse") or {})
+    _log(
+        f"[variantb probe] 扰动取回路径（W2 修复）：正向逐位一致 = {fwd.get('all_bitwise_equal')}；"
+        f"反向验证 = {rev.get('passed')}"
+        f"（逐项 {[(c['case'], c['detected']) for c in rev.get('cases', [])]}）"
+    )
     for err in payload["errors"]:
         _log(
             f"[variantb probe] 失败（如实登记，不静默跳过）：{err['profile']} -> "
@@ -1295,6 +1385,9 @@ def cmd_variantb_probe(args: argparse.Namespace) -> int:
         return 1
     if not all(p["identity_gate"]["passed"] for p in payload["profiles"].values()):
         _log("[variantb probe] 恒等门禁未通过（退码 1，不以成功状态落账）")
+        return 1
+    if not (bool(fwd.get("all_bitwise_equal")) and bool(rev.get("passed"))):
+        _log("[variantb probe] 扰动取回路径未通过（正向 / 反向验证；退码 1，不以成功状态落账）")
         return 1
     _log("[variantb probe] OK")
     return 0
@@ -1360,7 +1453,7 @@ def cmd_variantb_train(args: argparse.Namespace) -> int:
     _log(
         f"[variantb train] 输出目录 = {out_dir}；特征档 = {list(profiles)}；"
         f"seed = {cfg.seed}；epochs = {cfg.epochs}；batch = {cfg.batch_size}；"
-        f"lr = {cfg.lr}；train_mode = {cfg.train_mode}"
+        f"lr = {cfg.lr}；train_mode = {cfg.train_mode}；train_scorer = {cfg.train_scorer}"
     )
     t0 = time.time()
     report, _weights = VB.run_variant_b(
@@ -1411,7 +1504,7 @@ def cmd_variantb_eval(args: argparse.Namespace) -> int:
     _log(
         f"[variantb eval] 输出目录 = {out_dir}；特征档 = {list(profiles)}；"
         f"seed = {cfg.seed}；epochs = {cfg.epochs}；train_mode = {cfg.train_mode}；"
-        f"跳过恒等门禁 = {skip_gate}"
+        f"train_scorer = {cfg.train_scorer}；跳过恒等门禁 = {skip_gate}"
     )
     t0 = time.time()
     per_profile: Dict[str, Any] = {}
@@ -1437,6 +1530,7 @@ def cmd_variantb_eval(args: argparse.Namespace) -> int:
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
             train_mode="clean",
+            train_scorer=cfg.train_scorer,
             log_every=cfg.log_every,
         )
         for profile in profiles:
@@ -1533,6 +1627,144 @@ def cmd_variantb_eval(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_variantb_calibrate(args: argparse.Namespace) -> int:
+    """``variantb calibrate``：**训练前提校准轮**（恒等锚点 + 口径/超参网格 + 归因结论）。
+
+    与 ``train`` / ``eval`` 的差别：本子命令**不以提升指标为成功标准**，它判定的是一条前提 ——
+    「第二步的否证是否干净」。流程 = 每档恒等门禁 → 恒等锚点（T=I × 训练行 1999）→
+    ``train_scorer × lr × weight_decay`` 网格逐组合训练并在**两套行集合**上各跑一次 10 格网格 →
+    按显式规则选最优超参 → 机器可读归因结论。
+
+    **退码语义**：恒等门禁、更新量门禁、取回路径正向证据与反向验证任一不过即退码 1；
+    **归因结论不参与退码**（表达力不足是结论、不是执行失败）。
+    扫描**可中断**：每完成一个组合即增量落盘 ``variantb_calibrate.json``（``status = "partial"``）；
+    ``--grid-combo "scorer:lr:wd"`` 可单组合复跑，``--dry-run`` 只跑网格第一个组合。
+    """
+    _variantb_selector_args(args)
+    profiles = _variantb_profiles(args)
+    out_dir = _variantb_dir(args)
+    combos = _variantb_calibrate_grid(args)
+    seed = int(getattr(args, "seed", VB.VARIANT_B_SEED))
+    epochs = int(getattr(args, "epochs", VB.DEFAULT_EPOCHS))
+    batch_size = int(getattr(args, "batch_size", VB.DEFAULT_BATCH_SIZE))
+    skip_gate = bool(getattr(args, "skip_identity_gate", False))
+    json_path = os.path.join(out_dir, "variantb_calibrate.json")
+    md_path = os.path.join(out_dir, "variantb_calibrate.md")
+    _log(
+        f"[variantb calibrate] 输出目录 = {out_dir}；特征档 = {list(profiles)}；"
+        f"seed = {seed}；epochs = {epochs}；batch = {batch_size}；"
+        f"组合数 = {len(combos)} = {[c.label for c in combos]}；跳过恒等门禁 = {skip_gate}"
+    )
+    t0 = time.time()
+    flush_state: Dict[str, Any] = {}
+
+    def _on_progress(partial: Json) -> None:
+        """每完成一个组合即增量落盘（支撑「扫描可中断、可单组合复跑」）。"""
+        payload = dict(partial)
+        payload["progress_note"] = (
+            "**部分产物**：扫描进行中，每完成一个组合即覆盖写本文件；"
+            "`status = complete` 时才含 `selection` / `attribution` / `artifact_fingerprint`"
+        )
+        try:
+            VB.write_json(json_path, payload)
+        except OSError as exc:  # noqa: BLE001 —— 落盘失败不掩盖，但也不打断扫描
+            _log(f"[variantb calibrate] 增量落盘失败（如实报告，不静默）：{exc}")
+        flush_state["n_flushed"] = int(flush_state.get("n_flushed", 0)) + 1
+
+    report = VB.run_calibration(
+        profiles,
+        seed=seed,
+        epochs=epochs,
+        batch_size=batch_size,
+        combos=combos,
+        product_dir=str(getattr(args, "product_dir", "") or ""),
+        skip_identity_gate=skip_gate,
+        on_progress=_on_progress,
+        log=_log,
+    )
+    digest = VB.write_json(json_path, report)
+    md = VB.render_calibrate_markdown(report)
+    md_digest = VB.write_text(md_path, md)
+    _log(f"[variantb calibrate] 增量落盘次数 = {int(flush_state.get('n_flushed', 0))}")
+    # 门禁汇总（归因结论**不**参与退码）
+    gate_pass = bool(
+        all(
+            (r["identity_gate"].get("skipped") or r["identity_gate"].get("passed"))
+            for r in report["per_profile"].values()
+        )
+    )
+    update_pass = bool(
+        all(
+            rec["update_gate"]["passed"]
+            for r in report["per_profile"].values()
+            for rec in r["combos"]
+        )
+    )
+    retrieval_pass = bool(
+        all(
+            (
+                bool(r["perturb_retrieval"]["forward"]["all_bitwise_equal"])
+                and bool(r["perturb_retrieval"]["reverse"]["passed"])
+            )
+            for r in report["per_profile"].values()
+        )
+    )
+    for profile, per in sorted(report["per_profile"].items()):
+        anchor = per["identity_anchor"]
+        _log(
+            f"[variantb calibrate] 档 {profile}：恒等锚点（训练行 {anchor['n_rows']}，逐格 R@1，"
+            f"clean + 9 格）= {[round(float(v), 6) for v in anchor['top1_self'].values()]}"
+        )
+        for rec in per["combos"]:
+            harm = rec["train_harmlessness"]
+            prim = rec["eval_primary"]
+            rvg = dict(rec["train"].get("running_vs_grid") or {})
+            _log(
+                f"[variantb calibrate]   {rec['combo']['label']}: "
+                f"逐格 R@1 均值(9 格，判定量)="
+                f"{float(rvg.get('grid_r1_mean_9_perturb_cells', 0.0)):.6f} / "
+                f"批内滚动平均（仅诊断）="
+                f"{float(rec['train']['train_batch_running_top1']):.6f} / 训练无害 "
+                f"{harm['n_not_worse']}/{harm['n_cells']}（最差余量 {harm['min_margin']:+.6f}）/ "
+                f"评测侧不劣 {prim['n_not_worse']}/{prim['n_cells']}（严格更高 "
+                f"{prim['n_strictly_better']}）/ 更新量门禁 {rec['update_gate']['passed']}"
+            )
+        sel = report["selection"][profile]
+        _log(
+            f"[variantb calibrate] 档 {profile}：最优超参 = {sel['selected']}；"
+            f"排序 = {sel['candidates_ranked']}"
+        )
+        att = report["attribution"][profile]
+        _log(
+            f"[variantb calibrate] 档 {profile}：归因条件 = {att['conditions']}"
+            f"（必需 {att['conditions_required']}）=> **{att['verdict_key']}**"
+        )
+    summary = report["attribution_summary"]
+    _log(f"[variantb calibrate] 归因结论：{summary['per_profile_verdict']} => {summary['verdict_key']}")
+    _log(f"[variantb calibrate] {summary['verdict']}")
+    _log(
+        f"[variantb calibrate] 门禁：恒等门禁 {gate_pass} / 更新量门禁 {update_pass} / "
+        f"取回路径（正向 + 反向验证）{retrieval_pass}"
+    )
+    _log(f"[variantb calibrate] JSON -> {json_path} (sha256={digest[:16]}...)")
+    _log(f"[variantb calibrate] Markdown -> {md_path} (sha256={md_digest[:16]}...)")
+    _log(
+        f"[variantb calibrate] 耗时 {time.time() - t0:.1f}s（只进日志，不入产物）；"
+        f"产物指纹 = {report.get('artifact_fingerprint', '')[:16]}..."
+    )
+    if not gate_pass:
+        _log("[variantb calibrate] 恒等门禁未通过（退码 1，不以成功状态落账）")
+        return 1
+    if not update_pass:
+        _log("[variantb calibrate] 可训参数更新量门禁未通过（退码 1，不以成功状态落账）")
+        return 1
+    if not retrieval_pass:
+        _log("[variantb calibrate] 取回路径正向证据或反向验证未通过（退码 1，不以成功状态落账）")
+        return 1
+    _log("[variantb calibrate] OK（归因结论不参与退码：否证条款要求如实报结论）")
+    return 0
+
+
 def cmd_variantb_report(args: argparse.Namespace) -> int:
     """``variantb report``：读 ``eval``（或 ``train``）产物渲染 JSON + Markdown。"""
     _variantb_selector_args(args)
@@ -1587,12 +1819,19 @@ def cmd_variantb_report(args: argparse.Namespace) -> int:
 
 
 def cmd_variantb(args: argparse.Namespace) -> int:
-    """``variantb`` 子命令分派：probe / drill / train / eval / report。
+    """``variantb`` 子命令分派：probe / drill / train / eval / calibrate / report。
 
-    **CLI 错误边界**：非法的 ``--profiles`` 等由 :func:`_csv_names` 在参数层给出可读报文；
-    运行期的 ``ValueError`` / ``KeyError`` / ``FileNotFoundError`` 在此转成**单行可读报文 +
-    退码 2**（依赖缺失等 ``EncoderUnavailableError`` 属 ``RuntimeError``，会带可读报文退码 1）。
-    捕获范围**只包住 variantb 子命令族**，既有子命令的分发逻辑逐字符未改。
+    **CLI 错误边界**：非法的 ``--profiles`` 等由 :func:`_csv_names` / :func:`_float_list`
+    在参数层给出可读报文；运行期的 ``ValueError`` / ``KeyError`` / ``FileNotFoundError``
+    在此转成**单行可读报文 + 退码 2**（依赖缺失等 ``EncoderUnavailableError`` 属
+    ``RuntimeError``，会带可读报文退码 1）。捕获范围**只包住 variantb 子命令族**，
+    既有子命令的分发逻辑逐字符未改。
+
+    **``UnicodeEncodeError`` 必须先于 ``ValueError`` 捕获（R59 F1 修复）**：它**继承**
+    ``ValueError``，若不单独拦下，控制台编码故障会被报成「**非法参数** + 退码 2」——
+    用户看到的是完全错误的归因，而且一次已经跑完的长跑成果被整条丢弃。
+    这里把它单独报成「输出编码错误」（退码 1，区别于参数错误的退码 2）。
+    报文本身只用 ASCII + 汉字（cp936 可编码），保证这条错误路径不会二次崩溃。
     """
     sub = str(getattr(args, "variantb_cmd", "") or "probe")
     handlers = {
@@ -1600,6 +1839,7 @@ def cmd_variantb(args: argparse.Namespace) -> int:
         "drill": cmd_variantb_drill,
         "train": cmd_variantb_train,
         "eval": cmd_variantb_eval,
+        "calibrate": cmd_variantb_calibrate,
         "report": cmd_variantb_report,
     }
     if sub not in handlers:
@@ -1609,6 +1849,13 @@ def cmd_variantb(args: argparse.Namespace) -> int:
         return int(handlers[sub](args))
     except FileNotFoundError as exc:
         _log(f"[variantb] 输入产物缺失：{exc}")
+        return 1
+    except UnicodeEncodeError as exc:
+        _log(
+            "[variantb] 输出编码错误（日志含当前控制台编码无法表示的字符）："
+            f"{type(exc).__name__}: {exc}. "
+            "这不是参数错误；可用 PYTHONIOENCODING=utf-8 重跑，或把日志字符改为 ASCII。"
+        )
         return 1
     except (ValueError, KeyError) as exc:
         _log(f"[variantb] 非法参数：{exc}")
@@ -1794,10 +2041,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="变体 B（第二步）：单层 D→D 可学变换 + 冻结特征库（只变换、不生成）",
         description=(
             "变体 B：**只变换、不生成** —— 单层 D→D 可学变换 T（恒等初始化）+ 冻结特征库"
-            "内积评分，只学变换层。probe（口径与恒等门禁取证，不训练）/ drill（单条端到端"
-            "演练，含梯度非零硬门禁）/ train（扰动自监督训练 + 逐格 变体B vs KNN 对照 + A 组"
-            "干净训练对照）/ eval（同 train 并加硬门禁断言，失败退码 1）/ report（读产物渲染"
-            "JSON + Markdown）。产物一律写 checkpoints/qa_learn/_verify/variant_b/，"
+            "内积评分，只学变换层。probe（口径与恒等门禁取证 + 恒等锚点，不训练）/ drill"
+            "（单条端到端演练，含梯度非零与取回路径反向验证硬门禁）/ train（扰动自监督训练 + "
+            "逐格 变体B vs KNN 对照 + A 组干净训练对照 + 训练无害下限）/ eval（同 train 并加"
+            "硬门禁断言，失败退码 1）/ **calibrate（训练前提校准轮：恒等锚点 + "
+            "train_scorer × lr × weight_decay 最小网格 + 机器可读归因结论）** / report"
+            "（读产物渲染 JSON + Markdown）。训练侧打分口径 `--train-scorer`：`normalized`"
+            "（默认，与评测同一口径：先变换、再 L2 归一化、后内积）/ `raw`（现状未归一化口径，"
+            "显式对照档）。产物一律写 checkpoints/qa_learn/_verify/variant_b/，"
             "不落盘特征矩阵、不产 zip 产物。"
         ),
     )
@@ -1807,7 +2058,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_vb.add_argument("--seed", type=int, default=VB.VARIANT_B_SEED,
                       help="训练 seed（**冻结单 seed 口径**；只驱动局部 generator）")
     p_vb.add_argument("--epochs", type=int, default=VB.DEFAULT_EPOCHS,
-                      help="训练轮数（drill 固定 1 轮，不受此项影响）")
+                      help="训练轮数（drill 固定 1 轮，不受此项影响；calibrate 的矩阵档轮数）")
     p_vb.add_argument("--batch-size", type=int, default=VB.DEFAULT_BATCH_SIZE,
                       help="训练批大小（同时影响训练侧批内扰动的行号基准）")
     p_vb.add_argument("--lr", type=float, default=VB.DEFAULT_LR, help="Adam 学习率")
@@ -1815,6 +2066,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Adam 权重衰减")
     p_vb.add_argument("--train-mode", default="perturb", choices=list(VB.TRAIN_MODES),
                       help="perturb = 扰动自监督（主方案）；clean = 干净自监督（A 组口径）")
+    p_vb.add_argument("--train-scorer", default=VB.DEFAULT_TRAIN_SCORER,
+                      choices=list(VB.TRAIN_SCORERS),
+                      help="训练侧打分口径：normalized（默认，与评测同一口径）/ raw（现状未归一化）")
     p_vb.add_argument("--log-every", type=int, default=20,
                       help="每多少训练步打印一次（只进日志）")
     p_vb.add_argument("--skip-identity-gate", action="store_true",
@@ -1824,8 +2078,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_vb.add_argument("--verify-dir", default="", help="产物目录（与 --out-dir 同义）")
     p_vb.add_argument("--eval-json", default="",
                       help="report 的输入产物路径（缺省按 eval -> run 顺序自动探测）")
+    # --- calibrate 专用（只挂在本 parser 上）---------------------------------
+    # [!] 措辞精确化（离朱 R59 F3）：本轮的 parser 改动**不是**「逐字符未改」——
+    #     除新增本组 flag 外，还触及既有两处：`--epochs` 的 help 追加「；calibrate 的矩阵档轮数」、
+    #     `variantb_cmd` 的 choices 追加 "calibrate"。**选项集合 = 旧集合 ⊂ 新集合**，
+    #     语义未变（离朱 AST 核验：新增恰为本轮声明的 flag），但不得写成「逐字符未改」。
+    p_vb.add_argument("--calibrate-scorers", default=",".join(VB.CALIBRATE_SCORERS),
+                      help="校准网格的打分口径轴（逗号分隔；缺省 = 两个口径）")
+    p_vb.add_argument("--calibrate-lr", default=",".join(f"{v:g}" for v in VB.CALIBRATE_LR_GRID),
+                      help="校准网格的 lr 轴（逗号分隔）")
+    p_vb.add_argument("--calibrate-wd", default=",".join(f"{v:g}" for v in VB.CALIBRATE_WD_GRID),
+                      help="校准网格的 weight_decay 轴（逗号分隔）")
+    p_vb.add_argument("--grid-combo", default="",
+                      help='只跑单个组合（形如 "normalized:1e-2:0.0"），支撑单组合复跑')
+    p_vb.add_argument("--dry-run", action="store_true",
+                      help="calibrate 的演练口径：只跑网格的**第一个组合**（先单组合再放全网格）")
     p_vb.add_argument("variantb_cmd", nargs="?", default="probe",
-                      choices=["probe", "drill", "train", "eval", "report"],
+                      choices=["probe", "drill", "train", "eval", "calibrate", "report"],
                       help="variantb 子命令（缺省 probe）")
     p_vb.set_defaults(func=cmd_variantb)
     return parser
