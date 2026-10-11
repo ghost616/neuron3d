@@ -664,3 +664,50 @@ R51 确认 **F1/F2/F3 三处修复全部收口**：F1 —— R50 检不出的三
   （旧键名按设计出现在 `third_step` 登记字段）⇒ 该断言按 R64 规格收窄为**可核对的作用域形式**
   （每个 `train` 块不得含旧键 + 旧名只能出现在 `third_step` 登记字段，用「全文计数 == `third_step`
   序列化计数」断言，现场每件 2 次恰在两处登记字段），并已核验不存在被放宽/删除的等号式键集合断言。
+## 文本侧数据改造（第三步 Phase 1：多表述 -> 原文）
+
+把文本侧从「**自匹配恒等任务**」改造成「**多表述 -> 原文**」的真实检索任务，并引入难负例；**本轮零训练**（不上任何模型、不训练），只用纯余弦检索判定改造是否有效。新增 `n3d_qa_learn/text_variants.py`（核心）与 `n3d_qa_learn/text_variants_run.py`（CLI），并在 `step2_run` **纯新增** `textvariants` 子命令。产物一律写 `checkpoints/qa_learn/_verify/text_variants/`（不落盘特征矩阵、不产 zip、无挂钟字段）。
+
+**4 支变体（问题侧；答案恒为行原文，与 1a / 步骤 2 的 `outputs = 行原文` 一致）**
+- `原文`（锚点，恒等）；`关键词`（KeyBERT + 仓库自有 `models/bge-m3` 薄适配 `RepoEncoderEmbedder`）；`摘要`（抽取式**三级阶梯**：句级 -> 子句级 -> 兜底截断，结果恒为原文**连续子串**）；`自适应`（按 `char_len` 分档：short 0-24 关键词 / mid 25-64 首子句上限 24 / long >=65 上限 42）。
+- 冻结口径常量：`KEYWORD_TOP_K=3`、`KEYWORD_NGRAM_RANGE=(1,3)`、`KEYWORD_USE_MMR=False`、`KEYWORD_POS_KEEP`、`KEYWORD_MIN_DOC_FREQ=2`、**`KEYWORD_MAX_CANDIDATES=32`**（R67 由 5 改为 32：5 会使 `TOP_K=3` 退化，见下）、`SUMMARY_MAX_SENTENCES=2`、`SUMMARY_MAX_CHARS=60`、`SUMMARY_CLAUSE_MAX_CHARS=24`、`SUMMARY_HEAD_MAX_CHARS=12`、`SUMMARY_HEAD_FALLBACK_BELOW_CHARS=12`、`SUMMARY_MIN_CHARS=1`、`ADAPTIVE_TIERS`、`ADAPTIVE_MID_MAX_CHARS=24`、`ADAPTIVE_LONG_MAX_CHARS=42`；纯确定性、不消耗全局 RNG；极短行 / 空文本**显式回退原文并计数登记**，不产空串 / NaN / 零范数。
+- 语料级候选词表：`build_keyword_vocabulary` 从**全量行表**构建并**落成产物** `keyword_vocab.json`（R67 由 `_cache/` 迁移为产物；`keyword_vocabulary_path()` 仅作直接调用 API 的缓存回退，为唯一登记例外）。`KEYWORD_ENCODER_MAX_LENGTH=512`（`char_len` 最大 293 ⇒ 不截断）。
+- **现场实测驱动的修正**：① 2092/2665 行只有单句，句级抽取对它们等于原样返回 -> 必须下沉到子句级；② `RepoEncoderEmbedder` **必须**继承 `keybert.backend.BaseEmbedder`（否则 keybert 0.9.0 的 `select_backend()` 会**静默回落到 `paraphrase-multilingual-MiniLM-L12-v2` 并尝试下载**）；基类**惰性求值**（缺 keybert 时退回 `object`，模块导入不被阻断，R67）；③ keybert 0.9.0 的 `doc_embeddings` 是 `np.ndarray`（传 `True` 抛 `TypeError`）。
+
+**变体产物与指纹**：规范化 JSONL（`sort_keys` + 紧凑分隔符、无挂钟字段）+ 逐支 SHA256（`variant_fingerprint` / `variant_product_files` / `serialize_variant_records`）+ **覆盖度** `coverage`（`n_rows` / `source_total_rows` / `limit` / `coverage_ratio` / `is_full_corpus`）。
+
+**难负例**：`same_file`（同 `file` 他行，**按 |line_no 差| 最近**、并列按 `row_id` 升序，取前 `HARD_NEGATIVE_CAP=16`）/ `adjacent_line`（`line_no ± 1`）/ `encoder_neighbor`（编码器归一化特征余弦 top-n，**全序键 `(-cos, row_id)`**）/ `random`（局部 `random.Random(TEXT_VARIANTS_SEED)`，`RANDOM_NEGATIVE_COUNT=16`）。产物落 `counts` / `fingerprint` / `encoder_neighbor_skipped` + `encoder_neighbor_skip_reason`。
+
+**特征差异门禁（R67 起为真实断言）**：`feature_gate` 对**每一个可约简行**（`row_is_irreducible == False`）**逐支断言**其 float32 特征与原文支**逐位不同**（违反即 `AssertionError`，fail-closed）；**不可约简行**（任何抽取算子都只能返回自身，由 `row_is_irreducible` **独立于抽取实现**枚举得出）的重合**如实登记**。产物含 `hard_gate.{passed, assertion_passed, reducible_rows, reducible_rows_with_identical_features, irreducible_rows, violations_head, rule}`、`per_variant.cos_distribution`、`per_tier`、`short_tier_identity_registration`、`identity_registration`、**`coverage`**。
+
+**零训练评测（R67 起为三设定，含真对照）**：`evaluate_retrieval`（全量池）/ **`evaluate_retrieval_pools`（逐查询池）** + `zero_training_eval`：
+- A **`full_pool_all_rows`**：池 = 本次评估的全部行，**不消费 `negatives.json`**（主指标基线）；
+- B **`small_pool_hard`**：每查询行池 = { 自身 } ∪ 难负例（≤ `NEGATIVE_POOL_SIZE=16`）；
+- C **`small_pool_random`**：同查询集、**池大小与 B 完全一致**，负例换 `random` 类；
+- **难负例对照 = B − C**（同池大小、只差负例内容），口径常量 `SMALL_POOL_RULE` / `FULL_POOL_RULE` 与 `negatives_participation` 一并落产物（显式声明 A 不消费负例、不得当作对照基础）。**修正前的"对照"两种设定共用同一池与同一函数调用，结构性恒为 0**。
+- 分档报 `R@1`/`R@5`（**不混平均**）；公共子集在同一批查询行上**真正分别评测三次**。**金标集口径 `GOLD_SET_RULE`**：`金标集 = 自身行 ∪ 原文逐字节相同的其他行`，修复「重复原文档住 top-1 导致锚点 `R@1` 非结构性 < 1.0」的测量缺陷。
+
+**机器可读判定**：`render_verdict` —— 规则文本由常量**派生**（`_build_verdict_rule()`，导入期 `assert` 与 `VERDICT_RULE` 逐字相同），结论键 `anchor_not_structural` / `variant_too_close`（`1-R@1 <= 0.01`）/ `variant_too_far`（`R@1 <= 1e-9`）/ `task_valid_not_identity`（`1-R@1 >= 0.05` 且 `R@1 - 1/pool >= 1e-6`）/ `undecided` / `mixed`（R67 补 `all(undecided)` 分支）。**粒度守卫**（`GRANULARITY_GUARD_RULE`，含等号）。
+
+**产物内「声明口径」与「实测口径」分离（R67）**：`retrieval_eval.json` 的 `retrieval_pool_size` / `random_baseline` / `granularity` **均为本次运行实测值**，另落 `declared_constants`（全语料常量 + 显式注记「不得直接当作本次实测基线」）、`coverage`、`measured_scope.{n_rows, source_total_rows, limit, granularity_measured, random_baseline_measured_full_pool, per_setting}` ⇒ 下游仅凭产物即可正确复算随机基线与粒度。
+
+**QA 侧数据组织取证**：`qa_answer_groups` / `candidate_group_map` 把「同答案的多问题」显式成组并出规模、组内问题数分布与指纹；**本轮只取证、不接任何损失**（`QA_GROUPING_NO_LOSS_NOTE`）。
+
+**CLI**：`python -m n3d_qa_learn.text_variants_run {probe|gate|eval|report}` 与 `python -m n3d_qa_learn.step2_run textvariants {probe|gate|eval|report}` 两条入口**共用同一份参数表函数**；支撑 `--limit`、`--log-file`（UTF-8 无 BOM）、`--no-encoder-neighbors`、`--repro-dir`、`--hard-cap`（0 = 用冻结常量默认）。产物目录守卫：只允许写在 `checkpoints/qa_learn/_verify/` 之下（**相对与绝对路径同口径**）。缺 `negatives.json` 时 `gate` / `report` / `eval` **统一**为可读报错 + 退码 1。`step2_run` 既有 8 个子命令参数表**逐字符未改**。
+
+**全量 2665 现场实测（R67，`probe --no-encoder-neighbors` -> gate -> eval -> report 全部退码 0）**：耗时 probe **7068.5 s** / gate 61.2 s / eval 107 s / report 63.8 s；覆盖度 2665/2665（`is_full_corpus=true`）。**设定 A**：`R@1` = 原文 **1.000000** / 关键词 **0.445403** / 摘要 **0.956848** / 自适应 **0.768480**；`R@5` = 1.0 / 0.775610 / 0.989869 / 0.931332；`verdict_key = mixed`，逐支 `[task_valid_not_identity, undecided, task_valid_not_identity]`。**设定 B（难负例小池，池恒 17）**：0.694934 / 0.982364 / 0.897561；**设定 C（随机小池）**：0.970356 / 0.999250 / 0.986867；**对照 B−C** = 原文 0.000000 / 关键词 **−0.275422** / 摘要 −0.016886 / 自适应 −0.089306。门禁 `passed=True`、`assertion_passed=True`、`reducible_rows=2387`、`violations=0`、`irreducible_rows=278`。产物指纹：`variants.jsonl` 2416229 B `92b1ddbd382cc43b`、`variants_meta.json` 6618 B `82d2e8690ccb54c0`、`negatives.json` 2282329 B `e96878e7a228a5d3`、`feature_gate.json` 7155 B `3b58efb156b1b6f8`、`qa_grouping.json` 1430 B `7de71d4f47be6866`、`keyword_vocab.json` 241001 B `990027709ab78b20`。**现场反向验证**：① 全量上互换 `random` 与 `same_file` 清单后，设定 A 四支 `R@1` **完全不变**、B−C **符号翻转**（−0.275422 → +0.275422）⇒ 对照量真依赖 `negatives.json`；② 在真实产物上把一条可约简行的摘要/关键词支改写成原文后重跑门禁，**`AssertionError` 如期抛出**。**双跑**：`gate`+`eval` 在第二个独立进程重算后 6 件内容产物逐字节相同，`retrieval_eval.json` / `gate_summary.json` 归一化内嵌路径后逐项相等；如实登记「variants.jsonl 等 4 件为带入对照目录而非第二进程重算，真正独立重算的是 feature_gate.json」。
+
+**依赖**：`keybert 0.9.0` / `jieba 0.42.1`（含 `scikit-learn` / `scipy` / `joblib` / `threadpoolctl` / `narwhals` / `cloudpickle` / `sentence-transformers` 传递依赖），登记在 `n3d_qa_learn/requirements-qa.txt`；**根 `requirements.txt` 未改动**。安装口径：`pypi.org` 下载 `scipy` wheel 长时间零字节增长 ⇒ 改用 `pypi.tuna.tsinghua.edu.cn` 镜像；`jieba` 只有 sdist。离线可用：`HF_HUB_OFFLINE=1` + 本地 `models/bge-m3`。
+
+**如实登记的局限（不得包装）**：① 抽取式关键词/摘要属**信息减少**、**不是**真 paraphrase，结论不得包装成「解决了换说法泛化」；② `--no-encoder-neighbors` 使三类难负例只落地两类（产物已落 skip 标记）；③ 四个 md 文件行数并不均等（`a.md` 51 / `b.md` 2403 / `c.md` 167 / `d.md` 44），任务描述「每文件约 666 行」现场不成立；④ 单 seed、无跨 seed 极差；⑤ 全量 `probe` 的 117.8 min 主要耗在候选词 bge-m3 嵌入（CPU）。
+
+**零回归**：`entry_table.py` / `robust_eval.py` / `variant_b.py` 零改动；顶层 9 个 `qa_*.pt.zip` 的 SHA256/字节/mtime 与顶层文件清单逐项不变；第二步 5 件冻结产物逐字节不变；根 `requirements.txt` 未改；四个上游模块 `git status --porcelain` 为空；`compileall` 退码 0。
+
+**R68 小收口轮（渲染层 / 文案 / 取证字段，**判定量零变化**）**
+- **报告渲染**：`render_markdown` 的第 5 节现为 `5.1/5.2/5.3`（三设定）-> **`5.4` 公共子集（按三个池键分别三张表，含池 min/中位/max）** -> **`5.5` 难负例对照** -> **`5.6` 小池前置条件**；小节编号不重复，报告全文不再出现 `None`（此前公共子集表整表为 `None`：`zero_training_eval` 在 `common_subset` 下产出的是 `variants_full_pool` / `variants_small_pool_hard` / `variants_small_pool_random` 三个分池键，没有 `variants` 键）。
+- **小池前置条件**：新增常量 `SMALL_POOL_PRECONDITION_RULE`；`zero_training_eval` 在评测前 **fail-closed 断言**「B/C 查询集相同 且 逐查询行池大小相等」（B − C 只有在此前提下才只是「负例内容」之差）；`report` 新增 `small_pool_precondition`（只读 `measured_scope.per_setting`，**不向 `retrieval_eval.json` 新增字段**）并渲染到 §5.6。
+- **截断取证**：`build_keyword_backend` 的 `word_max_length` 改取**编码器实际生效**的 `max_length` 并由 `_build_generator` 透传；`probe` 新增 `_truncation_evidence()`（`encode_batch_with_stats` 对最长 8 条行文本实测）把 `truncation_observed`（`n_tokens_max` / `n_truncated` / `verdict`）写进 `keyword_backend`（落 `variants_meta.json` + `probe_summary.json`）。现场：`max_length=512`、`longest_char_len=293`、`n_truncated=0`。
+- **确定性证据可读性**：`determinism_check.json` 新增 `n_content_common_files` / `content_common_files` / `content_files_bitwise_equal`，4 件内嵌 `out_dir` 的报告收敛为常量 `PATH_DEPENDENT_FILES`（不再被误读为确定性失败）；`report` 的 `determinism_evidence` 同步分列「内容产物」与「path-dependent」两类。
+- **语料级候选词表**：回退路径 `KEYWORD_VOCAB_FILE`（`_cache/text_variants/keyword_vocab.json`）的**旧文件已删除**（R68），仅保留为直接调用 API 时的回退；`probe` 一律使用产物目录下由**全量行表**构建的 `keyword_vocab.json`。
+- **`negatives.json.rule`** 文案按 `NEGATIVE_KINDS` 顺序重写（各类只描述一次；「抽出即全部入池」）。该修复**必须**改动 `negatives.json` 字节（报告为硬约束例外，判定量零影响）。
+- **`honest_notes`** 与三设定一致（A 才是全量池；B/C 是逐查询行小池；对照 = B − C），并新增 `determinism_evidence` 使「证据缺位」类文字的出现条件可审计（仅在证据文件确实缺失时出现）。

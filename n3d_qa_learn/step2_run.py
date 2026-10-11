@@ -29,6 +29,7 @@ import torch
 
 from . import encoders as E
 from . import robust_eval as R
+from . import text_variants_run as TVRUN
 from . import step2 as S
 from . import variant_b as VB
 from .route import QuestionRouter
@@ -1908,6 +1909,47 @@ def cmd_verify_vectorizer(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_textvariants_all_arguments(p: argparse.ArgumentParser) -> None:
+    """把第三步 Phase 1 的**全部**参数（含 eval 专属）挂到 ``textvariants`` 子解析器上。
+
+    存在理由：``step2_run`` 的 ``textvariants`` 是**单一**子命令（子命令由
+    位置参数 ``textvariants_cmd`` 给出），故它必须同时接受 probe/gate/report 的通用开关
+    与 eval 的专属开关（``--topk`` / ``--repro-dir`` / ``--rebuild-negatives``）。
+    这里通过一个临时子解析器转接 ``text_variants_run`` 的**同一份**参数表
+    （每个子命令一份），因此 ``dest`` / 默认值 / 类型**不可能**与独立入口不一致；
+    不需要任何手写参数名。
+    """
+    existing = {
+        opt for act in p._actions for opt in getattr(act, "option_strings", [])
+    }
+    for name, _help in TVRUN.TEXT_VARIANTS_COMMANDS:
+        holder = argparse.ArgumentParser(add_help=False)
+        TVRUN._add_textvariants_arguments(holder, subcommand=name)
+        for action in holder._actions:
+            if not getattr(action, "option_strings", None):
+                continue
+            if action.option_strings[0] in existing:
+                continue
+            p._add_action(action)
+            existing.update(action.option_strings)
+
+
+def cmd_textvariants(args: argparse.Namespace) -> int:
+    """第三步 Phase 1（文本侧数据改造）的**纯新增**子命令入口。
+
+    存在理由：计划点名的驱动方式是
+    ``python -m n3d_qa_learn.step2_run textvariants {probe|gate|eval|report}``。
+    本函数**只做委派**：直接调用
+    :func:`n3d_qa_learn.text_variants_run.cmd_textvariants`（与独立入口
+    ``python -m n3d_qa_learn.text_variants_run`` 共用**同一份**分派与实现，
+    因此两条入口不可能漂移）。
+
+    **零回归**：本函数不写任何自有产物、不读取也不修改 step2 的产物 / 配置；
+    返回值就是被委派函数的退码。既有子命令的发送逻辑**逐字符未改**。
+    """
+    return int(TVRUN.cmd_textvariants(args))
+
+
 def _dump(obj: Any) -> None:
     """UTF-8 安全 JSON 打印。"""
     print(json.dumps(obj, ensure_ascii=False, indent=1, default=str))
@@ -2097,6 +2139,22 @@ def build_parser() -> argparse.ArgumentParser:
                       choices=["probe", "drill", "train", "eval", "calibrate", "report"],
                       help="variantb 子命令（缺省 probe）")
     p_vb.set_defaults(func=cmd_variantb)
+
+    # --- 第三步 Phase 1：文本侧数据改造（**纯新增**） -------------------------
+    # 参数表**逐个接用** ``text_variants_run._add_textvariants_arguments``，
+    # 故两条入口的 ``dest`` / 默认值不可能不一致。
+    p_tv = sub.add_parser(
+        "textvariants",
+        help="第三步 Phase 1：4 支变体 + 难负例 + 特征差异硬门禁 + 零训练余弦检索",
+        description=(
+            "文本侧数据改造（多表述 -> 原文）：probe（数据/依赖/变体构造/难负例/QA 成组取证，不训练）/ "
+            "gate（特征差异硬门禁）/ eval（零训练纯余弦检索，4 支 x 2 种负例设定）/ "
+            "report（JSON + Markdown 渲染）。产物一律写 —"
+            "— checkpoints/qa_learn/_verify/text_variants/，不落盘特征矩阵、不产 zip。"
+        ),
+    )
+    _add_textvariants_all_arguments(p_tv)
+    p_tv.set_defaults(func=cmd_textvariants, textvariants_cmd="probe")
     return parser
 
 

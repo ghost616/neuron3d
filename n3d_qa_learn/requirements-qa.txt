@@ -12,9 +12,73 @@
 # 3. 本文件是**口径声明文件**，不被任何脚本以 `pip install -r` 执行；它存在的目的
 #    是让"依赖边界"有唯一、可审计的落点。
 #
+# 依赖清单（第 9 轮新增 `keybert` / `jieba` 一族：第三步 Phase 1 文本侧改造）
+# ---------------------------------------------------------------------------
+# 用途：`n3d_qa_learn/text_variants.py` 的关键词支（KeyBERT 关键词抽取）
+#       与其中文分词（jieba 作 KeyBERT 候选词 tokenizer）。**二者只在生成
+#       「关键词支」时需要**；缺失一律**可读报错 + 退码非 0**，不静默跳过。
+#
+#   keybert              # KeyBERT 0.9.0（关键词抽取骨架）
+#   jieba                # 0.42.1（中文分词；KeyBERT 默认按空格切词对中文失效）
+#
+# 传递依赖（现场实测由 pip 一并装入）
+# ---------------------------------------------------------------------------
+#   scikit-learn  1.9.1  # keybert 的直接依赖
+#   scipy         1.18.1 # scikit-learn 的依赖
+#   joblib        1.6.0  # scikit-learn 的依赖
+#   threadpoolctl 3.7.0  # scikit-learn 的依赖
+#   narwhals      2.26.0 # scikit-learn 的依赖
+#   cloudpickle   3.1.2  # joblib 的依赖
+#   sentence-transformers 6.1.0
+#                        # **keybert 的直接依赖**（本模块**不使用**它的后端；
+#                        #   见下「后端口径」。它的 transformers / torch 依赖在本机已满足）
+#
+# **安装口径（现场实测，不得省略）**
+# ---------------------------------------------------------------------------
+#   1. `python -m pip install keybert jieba`
+#   2. **必须**用 `--only-binary=:all:` 或国内镜像：现场实测 `pypi.org` 下载
+#      `scipy` 的 36.7 MB wheel 时**长时间零字节增长**（两次分别挂起 15 分钟与 20 分钟，
+#      缓存字节数完全不增），改为
+#      `python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --only-binary=:all: keybert`
+#      后一次装完（现场 1 次成功）。
+#   3. `jieba` 在 PyPI 上**只有 sdist**（无 wheel）：`--only-binary=:all:` 会报
+#      `ERROR: Could not find a version that satisfies the requirement jieba (from versions: none)`；
+#      它是纯 Python 包，直接 `python -m pip install jieba` 会本地构建 wheel 并成功
+#      （现场实测 `jieba-0.42.1-py3-none-any.whl`，19.3 MB）。
+#
+# **后端口径：优先复用仓库自有 `models/bge-m3`，不引 sentence-transformers 后端**
+# ---------------------------------------------------------------------------
+#   * `text_variants.RepoEncoderEmbedder` 是 `n3d_qa_learn.encoders.HFTextEncoder`
+#     的**薄适配**（CLS pooling + L2 归一化），**优先**使用；
+#   * 它**必须**继承 `keybert.backend.BaseEmbedder`：现场核实 keybert 0.9.0 的
+#     `select_backend()` 对「不是 BaseEmbedder 实例」的对象一律**回落到**
+#     `SentenceTransformerBackend("paraphrase-multilingual-MiniLM-L12-v2")`
+#     ——即**静默尝试下载一个模型**；继承是「只复用仓库自有 bge-m3、绝不下载」
+#     这条契约的唯一实现方式；
+#   * keybert 0.9.0 的 `doc_embeddings` 形参是 `np.ndarray`（**不是**老版本的布尔开关）；
+#     传 `True` 会在 `doc_embeddings[index].reshape(1, -1)` 处抛
+#     `TypeError: 'bool' object is not subscriptable`。本模块固定传 `None`
+#     （由 keybert 在本次调用内现算文档嵌入，纯前向、确定性）；
+#   * 离线口径：`HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1` + 本地
+#     `models/bge-m3`（9 文件 2.29 GB，含 `sentence_bert_config.json` /
+#     `modules.json`），现场实测**不需要联网**即可跑通关键词支；
+#   * 若仓库自有编码器路径不可用，`build_keyword_backend(...)` 在
+#     `allow_sentence_transformers_fallback=True` 时回退到 sentence-transformers
+#     后并**在产物 `keyword_backend.note` 中如实登记失败原因**；CLI 提供
+#     `--no-st-fallback` 关闭回退（此时直接**可读报错 + 退码 1**）。
+#
+# 现场实测运行时版本（第 9 轮）
+# ---------------------------------------------------------------------------
+#   keybert 0.9.0 / jieba 0.42.1 / scikit-learn 1.9.1 / scipy 1.18.1
+#   joblib 1.6.0 / threadpoolctl 3.7.0 / narwhals 2.26.0 / cloudpickle 3.1.2
+#   sentence-transformers 6.1.0（**未使用其后端**）
+#
 # 依赖清单（第 6 轮新增 `transformers` 一族）
 # ---------------------------------------------------------------------------
 #   transformers          # 通用 HF 编码器适配器（encoders.HFTextEncoder）
+#                         #   （**继承下条**：第 9 轮新增 keybert 一族后，它既是可选依赖，
+#                         #     也经由 keybert -> sentence-transformers -> transformers 成为
+#                         #     传递依赖；本机实际版本仍为 5.18.0，未再升级）
 #   tokenizers            # transformers 传递依赖（XLM-R sentencepiece 快分词器）
 #   huggingface_hub       # transformers 传递依赖（模型下载 / revision 锁定）
 #   safetensors           # transformers 传递依赖（本仓库 bge-m3 无 safetensors 变体，
@@ -47,6 +111,11 @@
 #   * 默认特征实现（`local-hash` / `zh-bag` 确定性词袋）与步骤 1/2 的既有路径：
 #     **仍然零新依赖**（只用 torch / numpy 与标准库），逐位行为不变；
 #   * **可选**的 HF 编码器实现（`encoders.HFTextEncoder` + `bge-m3`）新增
-#     `transformers` 一族依赖 —— 这是本文件新增清单的**唯一**来源，
-#     不再与「零新依赖」矛盾。
+#     `transformers` 一族依赖；
+#   * **可选**的关键词支实现（`text_variants.py` 的关键词支）新增
+#     `keybert` / `jieba` 一族依赖（见本文件上半部分）。
+#     以上两者是本文件依赖清单的**来源**，均不再与「零新依赖」矛盾；
+#     **步骤 1 / 步骤 2 的既有默认路径依旧零新依赖、逐位行为不变**。
+#
+# 根 `requirements.txt` 依旧**不改动**（属 framework 模块管辖）。
 

@@ -39,6 +39,15 @@
   **训练前提校准轮**（``train_scorer × lr × weight_decay`` 最小网格 + 机器可读归因结论），
   入口 ``python -m n3d_qa_learn.step2_run variantb {probe|drill|train|eval|calibrate|report}``，
   产物一律写 ``checkpoints/qa_learn/_verify/variant_b/``（不落盘特征矩阵、不产 zip）。
+* :mod:`n3d_qa_learn.text_variants` / :mod:`n3d_qa_learn.text_variants_run`：
+  **第三步 Phase 1 文本侧数据改造** —— 把文本侧从「自匹配恒等任务」改造成
+  「**多表述 -> 原文**」：4 支变体（``原文`` 锚点 / ``关键词`` KeyBERT / ``摘要`` 抽取式 /
+  ``自适应`` 按 ``char_len`` 分档）+ 难负例（同文档他行 / 相邻行 / 编码器近邻）
+  + **特征差异硬门禁**（逐位 + cos 分布 + 短行重合比例）+ **零训练**纯余弦检索
+  ``R@1``/``R@5``（两种负例设定分开报）+ 机器可读判定结论（规则与判定同源）
+  + QA 侧「同答案多问题」成组取证（**本轮只取证、不接损失**），
+  入口 ``python -m n3d_qa_learn.text_variants_run {probe|gate|eval|report}``，
+  产物一律写 ``checkpoints/qa_learn/_verify/text_variants/``（不落盘特征矩阵、不产 zip）。
 
 上游边界
 --------
@@ -66,6 +75,8 @@ __all__ = [
     "entry_table",
     "robust_eval",
     "variant_b",
+    "text_variants",
+    "text_variants_run",
     "cli",
 ]
 
