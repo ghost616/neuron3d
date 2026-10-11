@@ -390,14 +390,17 @@ def cmd_drill(args: argparse.Namespace) -> int:
     first_bytes = E.vector_bytes(first.vector)
     key = _cache_key_of(encoder, text)
     cache_on = bool(key)
-    disk = E.EmbeddingCache(str(cfg.cache_dir)).read_bytes(key) if cache_on else None
+    cache_obj = E.EmbeddingCache(str(cfg.cache_dir)) if cache_on else None
+    disk = cache_obj.read_bytes(key) if cache_obj is not None else None
     second = E.encode_with_stats_of(encoder, text)
     second_bytes = E.vector_bytes(second.vector)
-    meta_path = os.path.join(str(cfg.cache_dir), f"{key}.json")
+    # **分片感知读取（本轮修复）**：写路径一律写 ``emb/<key[:2]>/<key>.json``，
+    # 若仍按历史扁平布局拼 ``<cache_dir>/<key>.json``，在分片条目上会**永远读空**
+    # （修复前实测 cache_entry_meta 全为 null、cache_record 全为空串）。
+    # 口径收敛到 EmbeddingCache.read_meta（分片优先 + 扁平只读回退）。
     meta: Dict[str, Any] = {}
-    if key and os.path.isfile(meta_path):
-        with open(meta_path, "r", encoding="utf-8") as handle:
-            meta = dict(json.load(handle))
+    if cache_obj is not None:
+        meta = dict(cache_obj.read_meta(key) or {})
 
     evidence.update(
         {

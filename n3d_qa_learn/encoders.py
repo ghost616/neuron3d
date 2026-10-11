@@ -31,8 +31,14 @@
     + L2 归一化**，不引 sentence-transformers / FlagEmbedding。
 
 * **嵌入缓存**（:class:`EmbeddingCache`，:data:`DEFAULT_EMB_CACHE_DIR`）：键 =
-  模型名 + revision + pooling + max_length + 文本哈希（+ 权重 SHA256 / 口径版本），
-  逐条落盘、可跨进程复用。
+  ``sha256(canonical_json(schema, model_id, revision, pooling, max_length, normalize,
+  weight_sha256, text_sha256))`` —— **8 个分量一个都不能少**（唯一权威实现见
+  :meth:`EmbeddingCache.key_for`；本节只是摘要，冲突时以实现为准）：
+  ``schema`` = :data:`ENCODER_SCHEMA_VERSION`、``model_id`` = 注册表声明名、
+  ``revision`` = 冻结 revision、``pooling`` / ``normalize`` = 编码口径、
+  ``max_length`` = 该角色生效截断长度、``weight_sha256`` = 权重文件指纹、
+  ``text_sha256`` = 文本 UTF-8 裸字节 SHA256。
+  逐条落盘（**现行 = 分片布局** ``emb/<key[:2]>/<key>.bin|.json``）、可跨进程复用。
 
 编码口径
 --------
@@ -62,7 +68,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -86,6 +92,19 @@ ROLE_MAX_LENGTH: Dict[str, int] = {ROLE_QUESTION: 512, ROLE_TEXT_LINE: 8192}
 
 #: 嵌入缓存根目录（相对仓库根；跨进程复用）。
 DEFAULT_EMB_CACHE_DIR: str = os.path.join("checkpoints", "qa_learn", "_cache", "emb")
+
+#: 嵌入缓存的**目录分片深度**（取缓存键的前 N 个十六进制字符做子目录名）。
+#:
+#: 取值理由（现场实测，见 ``_verify/emb_cache/`` 的 scale_bench / micro_bench）：
+#: 条目全部平铺在根目录时，根目录条目数达到 **67,592**（= 33,795 条目 × 2 文件）后，
+#: 单次按名查找的实测成本从 **0.34~0.76 ms**（40 / 100 / 2,000 / 8,000 条目目录）
+#: 跃升到 **58~83 ms**（exFAT 目录按名查找是**线性扫描**，与目录条目数强相关）；
+#: 一次缓存**命中**因此要付 2 次 stat + 2 次 open ≈ **177~239 ms**，
+#: 使「命中的代价」与「重算的代价」同量级 ⇒ 缓存形同虚设。
+#: 深度 2 把 33,795 条目摊到 **256** 个子目录（每片约 132 条），查找成本回到亚毫秒级。
+#: 该常量**只影响条目的落盘位置**，不影响缓存键、不影响任何向量取值、
+#: 也不参与口径指纹（``fingerprint()`` 仍原样委派）。
+EMB_CACHE_SHARD_DEPTH: int = 2
 
 #: 默认模型下载目录（相对仓库根）。
 DEFAULT_MODEL_DIR: str = os.path.join("models", "bge-m3")
@@ -408,12 +427,24 @@ class EncodeResult:
 class EmbeddingCache:
     """逐条文本的嵌入缓存（落盘、可跨进程复用）。
 
-    目录布局（:data:`DEFAULT_EMB_CACHE_DIR`）::
+    目录布局（:data:`DEFAULT_EMB_CACHE_DIR`）**现行 = 分片**（:data:`EMB_CACHE_SHARD_DEPTH`
+    = 2）：::
 
-        emb/<key>.bin     float32 小端裸字节（长度 = dim * 4）
-        emb/<key>.json    条目元数据（含 model/revision/pooling/max_length/
-                          text_sha256/dim/sha256/n_tokens/n_truncated/created_utc）
-        emb/_weights_sha256.json  权重 SHA256 记忆化（加速器，不参与口径）
+        emb/<key[:2]>/<key>.bin     float32 小端裸字节（长度 = dim * 4）
+        emb/<key[:2]>/<key>.json    条目元数据（含 model/revision/pooling/max_length/
+                                    text_sha256/dim/sha256/n_tokens/n_truncated/created_utc）
+        emb/_weights_sha256.json    权重 SHA256 记忆化（加速器，不参与口径）
+
+    目录布局（**历史 = 扁平**，仍可**只读**复用）::
+
+        emb/<key>.bin / emb/<key>.json
+
+    **为何要分片（性能，取值零变化）**：根目录平铺时条目数达 **67,592**
+    （= 33,795 条目 × 2 文件）后，单次按名查找实测 **58~83 ms**（40 / 100 / 2,000 /
+    8,000 条目目录只有 0.34~0.76 ms）—— exFAT 的按名查找是**线性扫描**，成本随
+    目录条目数增长；于是一次**命中**要付 2 stat + 2 open ≈ **177~239 ms**，
+    与重算同量级 ⇒ 缓存给不出速度。分片后每片约 132 条，查找回到亚毫秒级。
+    分片**只改条目落盘位置**：缓存键、条目字节、向量取值、口径指纹全部不变。
 
     键（``key = sha256(canonical_json(...))``）由下列字段组成：``schema`` /
     ``model_id`` / ``revision`` / ``pooling`` / ``max_length`` / ``normalize`` /
@@ -423,7 +454,9 @@ class EmbeddingCache:
     ----------
     * 同一 ``(口径, 文本)`` 的键唯一；不同口径（如 512 / 8192）**不共用**条目；
     * 条目以**裸 float32 字节**存放，故「与落盘缓存逐位比对」是字节级判定；
-    * 缓存只影响**速度**，不参与任何口径指纹。
+    * 缓存只影响**速度**，不参与任何口径指纹；
+    * 分片与扁平两种布局**读路径都认**（扁平为只读回退，读到即**尽力迁移**到分片），
+      写路径**一律写分片** —— 故旧条目不会因布局变更而失效（不产生重算）。
 
     进程内 memo（性能，取值不变）
     ----------------------------
@@ -434,11 +467,35 @@ class EmbeddingCache:
     以保证「与落盘缓存逐位比对」这条验证口径不受 memo 影响。
     """
 
-    def __init__(self, root: str = DEFAULT_EMB_CACHE_DIR) -> None:
+    def __init__(
+        self,
+        root: str = DEFAULT_EMB_CACHE_DIR,
+        shard_depth: int = EMB_CACHE_SHARD_DEPTH,
+        auto_migrate: bool = False,
+    ) -> None:
         self.root = str(root)
+        if int(shard_depth) < 0:
+            raise ValueError(f"shard_depth 必须 >= 0，当前 {shard_depth}")
+        if int(shard_depth) > 8:
+            raise ValueError(
+                f"shard_depth 过大（{shard_depth}）：子目录名取自缓存键的十六进制前缀，"
+                "最多 8 位以免缓存目录层级失控"
+            )
+        self.shard_depth = int(shard_depth)
+        #: 读到**历史扁平**条目时是否顺手迁移到分片。
+        #: 默认 ``False`` —— 现场实测「读 + 改名」≈ **0.7 s/键**（改名会**改动那个大目录**，
+        #: 使它按名查找的线性扫描缓存反复失效），会让一次全量 probe 从分钟级涨到小时级；
+        #: 一次性维护请走显式的 :meth:`migrate_flat_keys`（每个键只做一次文件操作）。
+        self.auto_migrate = bool(auto_migrate)
         self._memo: Dict[str, Tuple[np.ndarray, Dict[str, Any]]] = {}
         self._memo_hits = 0
         self._disk_hits = 0
+        #: 历史扁平布局下仍存在的键（**一次 ``os.listdir`` 惰性建立**）。
+        #: 为空时读路径完全不走扁平回退 —— 迁移排空后不再付扁平目录的线性扫描成本。
+        self._flat_keys: Optional[Set[str]] = None
+        self._flat_hits = 0
+        self._migrated = 0
+        self._migrate_failed = 0
 
     def key_for(
         self,
@@ -479,41 +536,142 @@ class EmbeddingCache:
         }
         return sha256_bytes(canonical_dumps(payload))
 
+    # -- 路径（分片 = 写路径 / 首查路径；扁平 = 只读回退）-------------------
+    def _shard_dir(self, key: str) -> str:
+        """条目所属的分片子目录（``shard_depth=0`` 时退化为根目录 = 历史扁平口径）。"""
+        if self.shard_depth <= 0:
+            return self.root
+        return os.path.join(self.root, str(key)[: self.shard_depth])
+
     def _entry_paths(self, key: str) -> Tuple[str, str]:
-        """``(向量文件, 元数据文件)`` 路径。"""
+        """``(向量文件, 元数据文件)`` 的**现行（分片）**路径。"""
+        shard = self._shard_dir(key)
+        return (
+            os.path.join(shard, f"{key}.bin"),
+            os.path.join(shard, f"{key}.json"),
+        )
+
+    def _flat_entry_paths(self, key: str) -> Tuple[str, str]:
+        """``(向量文件, 元数据文件)`` 的**历史（扁平）**路径（只读回退用）。"""
         return (
             os.path.join(self.root, f"{key}.bin"),
             os.path.join(self.root, f"{key}.json"),
         )
 
-    def get(self, key: str) -> Optional[Tuple[np.ndarray, Dict[str, Any]]]:
-        """读条目（**先查进程内 memo，再查磁盘**）；不存在 / 损坏时返回 ``None``。
+    def flat_keys(self) -> Set[str]:
+        """历史扁平布局下仍存在的键集合（惰性一次 ``os.listdir``；取证用）。
 
-        memo 与磁盘返回的是同一份字节解出的同一数组，故取值不受影响；
-        ``read_bytes`` 不经过 memo，保证「与落盘缓存逐位比对」这条口径独立。
+        只是**加速器**：即使该集合过期，读路径也只会多算一次或回退实算，
+        不会返回错值。
         """
-        hit = self._memo.get(key)
-        if hit is not None:
-            self._memo_hits += 1
-            return hit
-        bin_path, meta_path = self._entry_paths(key)
-        if not (os.path.isfile(bin_path) and os.path.isfile(meta_path)):
-            return None
+        if self._flat_keys is None:
+            try:
+                names = os.listdir(self.root)
+            except OSError:
+                names = []
+            self._flat_keys = {n[: -len(".bin")] for n in names if n.endswith(".bin")}
+        return self._flat_keys
+
+    def _read_pair(
+        self, bin_path: str, meta_path: str
+    ) -> Optional[Tuple[np.ndarray, Dict[str, Any]]]:
+        """读一对 ``(bin, json)`` 并做完整性校验；任一步不满足返回 ``None``。
+
+        校验口径（与改动前**逐字相同**）：① 两文件都存在；② 元数据可解析为 JSON 对象；
+        ③ ``dim >= 1`` 且 ``len(blob) == dim * 4``；④ ``sha256(blob)`` 等于元数据
+        ``sha256``。任一不满足 = 损坏 / 失配 ⇒ 返回 ``None``（**不抛异常**），
+        调用方回退实算。
+
+        **性能口径**：① 不用 ``os.path.isfile`` 预检查 —— 直接 ``open`` 并捕获
+        ``OSError``（含 ``FileNotFoundError``）。在扁平大目录上，一次「按名查找」的实测
+        成本是 **45 ms**（存在）~ **130 ms**（不存在），故把 4 次查找压到 2 次
+        是这一步唯一的性能取舍；语义与「先 isfile 再 open」**逐字等价**（不存在的分支
+        一样返回 ``None``，不抛异常）。
+        """
         try:
             with open(meta_path, "r", encoding="utf-8") as handle:
-                meta = dict(json.load(handle))
+                raw = json.load(handle)
             with open(bin_path, "rb") as handle:
                 blob = handle.read()
         except (OSError, ValueError):
             return None
+        # 元数据必须是 **JSON 对象**：``[]`` / ``42`` / ``true`` / ``1.5`` 都是「合法 JSON
+        # 但不是对象」，``dict(...)`` 会抛 ``TypeError`` —— 而契约要求损坏条目
+        # **返回 None 而不是抛出**（历史遗留缺陷，本轮修复；12 类损坏逐例对照中其余
+        # 12 类的行为与改动前逐字相同）。
+        if not isinstance(raw, dict):
+            return None
+        meta = dict(raw)
         dim = int(meta.get("dim", 0))
         if dim < 1 or len(blob) != dim * 4:
             return None
         if sha256_bytes(blob) != str(meta.get("sha256", "")):
             return None
         vec = np.frombuffer(blob, dtype="<f4").astype(np.float32)
+        return vec, meta
+
+    def _migrate_to_shard(self, key: str, bin_path: str, meta_path: str) -> bool:
+        """把读到的一条**扁平**条目尽力迁移到**分片**位置（性能；取值不变）。
+
+        顺序 = **先 bin 后 json**（与 :meth:`put` 的提交序一致）；任一步失败只记数，
+        不抛异常 —— 迁移失败最多让下一次再读一次扁平路径，绝不会改变取值。
+        """
+        if self.shard_depth <= 0:
+            return False
+        target_bin, target_meta = self._entry_paths(key)
+        try:
+            os.makedirs(os.path.dirname(target_bin), exist_ok=True)
+        except OSError:
+            self._migrate_failed += 1
+            return False
+        ok = True
+        for src, dst in ((bin_path, target_bin), (meta_path, target_meta)):
+            if os.path.isfile(dst):
+                # 目标已存在（他进程已迁 / 已有更新的写入）：删掉扁平副本即可
+                try:
+                    os.remove(src)
+                except OSError:
+                    self._migrate_failed += 1
+                continue
+            try:
+                os.replace(src, dst)
+            except OSError:
+                ok = False
+                self._migrate_failed += 1
+        if key in self.flat_keys():
+            self._flat_keys.discard(key)  # type: ignore[union-attr]
+        if ok:
+            self._migrated += 1
+        return ok
+
+    # -- 读 / 写 -----------------------------------------------------------
+    def get(self, key: str) -> Optional[Tuple[np.ndarray, Dict[str, Any]]]:
+        """读条目（**先查进程内 memo，再查分片，最后只读回退扁平**）；损坏即 ``None``。
+
+        memo 与磁盘返回的是同一份字节解出的同一数组，故取值不受影响；
+        ``read_bytes`` 不经过 memo，保证「与落盘缓存逐位比对」这条口径独立。
+        布局回退**只影响从哪里读**：校验口径、返回的数组与元数据与改动前逐位相同。
+        """
+        hit = self._memo.get(key)
+        if hit is not None:
+            self._memo_hits += 1
+            return hit
+        bin_path, meta_path = self._entry_paths(key)
+        legacy = False
+        read = self._read_pair(bin_path, meta_path)
+        if read is None and self.shard_depth > 0 and key in self.flat_keys():
+            legacy = True
+            bin_path, meta_path = self._flat_entry_paths(key)
+            read = self._read_pair(bin_path, meta_path)
+        if read is None:
+            return None
+        vec, meta = read
         self._memo[key] = (vec, meta)
         self._disk_hits += 1
+        if legacy:
+            self._flat_hits += 1
+            if self.auto_migrate:
+                self._migrate_to_shard(key, bin_path, meta_path)
         return vec, meta
 
     def put(
@@ -522,12 +680,14 @@ class EmbeddingCache:
         vector: Sequence[float],
         meta: Dict[str, Any],
     ) -> str:
-        """写条目（向量 + 元数据），返回向量文件路径。
+        """写条目（**一律写分片位置**），返回向量文件路径。
 
         写入是**先写向量再写元数据**：元数据充当提交标记，故不会读到半成品。
+        tmp 与目标同目录（同卷）以保证 ``os.replace`` 的原子性。
         """
-        os.makedirs(self.root, exist_ok=True)
         bin_path, meta_path = self._entry_paths(key)
+        shard = os.path.dirname(bin_path)
+        os.makedirs(shard, exist_ok=True)
         blob = np.asarray(list(vector), dtype="<f4").tobytes()
         record = dict(meta)
         record.update(
@@ -547,34 +707,214 @@ class EmbeddingCache:
         with open(tmp_meta, "w", encoding="utf-8") as handle:
             json.dump(record, handle, ensure_ascii=False, indent=1, sort_keys=True)
         os.replace(tmp_meta, meta_path)
+        # 同步清理同名扁平副本（若存在）：避免扁平目录长期不排空
+        if self.shard_depth > 0 and key in self.flat_keys():
+            flat_bin, flat_meta = self._flat_entry_paths(key)
+            for path in (flat_bin, flat_meta):
+                if os.path.isfile(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            self._flat_keys.discard(key)  # type: ignore[union-attr]
         # 写入后同步 memo（同进程内的后续读取不必再落磁盘）
         self._memo[key] = (np.asarray(list(vector), dtype=np.float32), record)
         return bin_path
 
     def read_bytes(self, key: str) -> Optional[bytes]:
-        """直接读条目的**裸字节**（「与落盘缓存逐位比对」用；**不经过 memo**）。"""
-        bin_path, _ = self._entry_paths(key)
-        if not os.path.isfile(bin_path):
-            return None
-        with open(bin_path, "rb") as handle:
-            return handle.read()
+        """直接读条目的**裸字节**（「与落盘缓存逐位比对」用；**不经过 memo**）。
+
+        分片位置优先，缺失时只读回退历史扁平位置（同样用 ``open`` + ``OSError``
+        而不是 ``isfile`` 预检查，见 :meth:`_read_pair`）。
+
+        **口径边界（不得误读）**：本方法**只看文件在不在**，**不校验内容** ——
+        零字节 / 截断 / ``sha256`` 失配的 ``.bin`` 同样会被**原样读出**
+        （这正是「逐位比对」这条口径要的语义：调用方拿裸字节自己去比）。
+        只有「两处都没有该 ``.bin``」才返回 ``None``。内容校验只发生在
+        :meth:`get` / :meth:`_read_pair`（损坏 ⇒ 返回 ``None``）。
+        """
+        for path in (self._entry_paths(key)[0], self._flat_entry_paths(key)[0]):
+            try:
+                with open(path, "rb") as handle:
+                    return handle.read()
+            except OSError:
+                continue
+        return None
+
+    def read_meta(self, key: str) -> Optional[Dict[str, Any]]:
+        """读条目的**元数据**（分片位置优先，缺失时只读回退历史扁平位置）。
+
+        与 :meth:`read_bytes` 的区别：这里**解析 JSON 并要求「必须是对象」**
+        （与 :meth:`_read_pair` 同口径），但**不校验向量内容** ——
+        供取证侧回答「这条条目是谁写的、什么时候写的」。
+
+        返回
+        ----
+        Optional[Dict[str, Any]]
+            元数据字典；两处都不存在 / 不可解析 / 不是 JSON 对象时返回 ``None``
+            （**不抛异常**）。
+
+        存在理由（布局变更的连带面）：写路径自本轮起一律写分片位置，任何
+        「按历史扁平布局直接拼 ``<cache_dir>/<key>.json``」的读取方在分片条目上都会
+        **永远读空**；本方法把这个读取口径**收敛到 ``EmbeddingCache`` 内部**，
+        调用方（如 ``encoders_run`` 的 G2 取证）不必再知道布局。
+        """
+        for path in (self._entry_paths(key)[1], self._flat_entry_paths(key)[1]):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    raw = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            return dict(raw) if isinstance(raw, dict) else None
+        return None
+
+    def migrate_flat_keys(
+        self,
+        keys: Optional[Iterable[str]] = None,
+        *,
+        mode: str = "rename",
+        sink: Optional[Any] = None,
+        chunk_report: int = 2000,
+    ) -> Dict[str, int]:
+        """**批量**把历史扁平条目尽力迁移到分片位置（一次性维护操作；只改名）。
+
+        为什么要它：每一处「扁平目录里的按名查找」实测要 **45 ms**（存在）/ **130 ms**
+        （不存在），而分片目录里只要亚毫秒；``get`` 的**惰性迁移**要先把条目读一遍
+        （2 次查找）再改名（2 次查找），批量预迁移**只做改名**（2 次查找），
+        对「全量工作负载」这类一次性成本约为惰性路径的一半。
+
+        参数
+        ----
+        keys : Optional[Iterable[str]]
+            要迁移的键；``None`` = 迁移当前已知的全部扁面条目（:meth:`flat_keys`）。
+        mode : str
+            ``"rename"``（默认，``os.replace``，扁平目录**会被改动** —— 现场实测
+            改名后该目录的按名查找变慢，整批可达 **0.34 s/键**）或
+            ``"copy"``（``open``+写，**只读**扁平目录 —— 实测 **0.11 s/键**，
+            更快，但扁平副本会留下，成为不再被读取的死重）。
+        sink : Optional[Any]
+            可选的回调 ``sink(统计字典)``，每 ``chunk_report`` 条报一次进度。
+        chunk_report : int
+            进度上报间隔。
+
+        返回
+        ----
+        Dict[str, int]
+            ``{"attempted", "migrated", "failed"}``；**只搬运字节、不解析、不校验**，
+            故取值不可能被改变（读出时照旧走 :meth:`_read_pair` 的完整校验）。
+
+        **计数口径（逐分支完整对齐，避免歧义）**
+        ========================================
+
+        * ``attempted`` —— 以**键**为单位：进入循环的每个键都 +1（无论成功与否）。
+        * ``migrated`` —— 以**键**为单位：该键 **≥1 个文件**搬运成功即 +1。
+        * ``failed`` —— 以**文件**为单位，**逐个文件独立计数**：``.bin`` 与 ``.json``
+          各自失败各记 1。因此：
+          - 一个键的两个文件都缺（或都搬运失败）⇒ ``failed += 2``，
+            故 ``failed`` **可能大于** ``attempted``；
+          - 一个键只失败一半 ⇒ ``migrated += 1`` **且** ``failed += 1``（同一键同时计入两者）。
+        * 目标位置**已存在**时：``mode="rename"`` / ``"copy"`` 都是**直接覆盖**
+          （``os.replace`` / ``open(wb)``），**不计 failed**；这与 :meth:`_migrate_to_shard`
+          （``auto_migrate=True`` 的惰性路径）不同 —— 后者遇到目标已存在会改为
+          ``os.remove(src)`` 删除扁平副本（删除失败才 +1 到实例级的
+          ``_migrate_failed`` 计数器，**不进本方法的返回值**）。
+        * ``shard_depth == 0`` 时整个循环直接 ``break``：三个计数恒为 0（安全 no-op）。
+        """
+        if str(mode) not in ("rename", "copy"):
+            raise ValueError(f"mode 仅允许 'rename' / 'copy'，当前 {mode!r}")
+        todo = list(self.flat_keys() if keys is None else keys)
+        attempted = 0
+        migrated = 0
+        failed = 0
+        for index, key in enumerate(todo, start=1):
+            if self.shard_depth <= 0:
+                break
+            bin_path, meta_path = self._flat_entry_paths(key)
+            target_bin, target_meta = self._entry_paths(key)
+            try:
+                os.makedirs(os.path.dirname(target_bin), exist_ok=True)
+            except OSError:
+                failed += 1
+                continue
+            moved_any = False
+            for src, dst in ((bin_path, target_bin), (meta_path, target_meta)):
+                try:
+                    if str(mode) == "copy":
+                        with open(src, "rb") as handle:
+                            blob = handle.read()
+                        with open(dst, "wb") as handle:
+                            handle.write(blob)
+                    else:
+                        os.replace(src, dst)
+                    moved_any = True
+                except OSError:
+                    failed += 1
+            attempted += 1
+            if moved_any:
+                migrated += 1
+                # ``_flat_keys`` 是**惰性**索引（初值 None，只有 flat_keys() 会建立）：
+                # 显式传 keys=[...] 时它可能还没建立，此时**不得**假定它存在
+                # （本轮 P0 缺陷：AttributeError: 'NoneType' object has no attribute 'discard'）。
+                if self._flat_keys is not None:
+                    self._flat_keys.discard(key)
+                self._migrated += 1
+            else:
+                self._migrate_failed += 1
+            if sink is not None and chunk_report > 0 and index % int(chunk_report) == 0:
+                sink({"attempted": attempted, "migrated": migrated, "failed": failed,
+                      "index": index, "total": len(todo)})
+        return {"attempted": attempted, "migrated": migrated, "failed": failed}
 
     def memo_stats(self) -> Dict[str, Any]:
-        """进程内 memo 统计（取证用：证明 memo 只加速、不改值）。"""
+        """进程内 memo / 布局迁移统计（取证用：证明这些机制只加速、不改值）。"""
         return {
             "memo_entries": int(len(self._memo)),
             "memo_hits": int(self._memo_hits),
             "disk_hits": int(self._disk_hits),
+            "flat_hits": int(self._flat_hits),
+            "migrated": int(self._migrated),
+            "migrate_failed": int(self._migrate_failed),
+            "shard_depth": int(self.shard_depth),
             "note": "memo 只加速；read_bytes 仍只读磁盘，逐位比对口径不受影响",
         }
 
     def stats(self) -> Dict[str, Any]:
-        """缓存统计：条目数 / 总字节 / 根目录。"""
+        """缓存统计：条目数 / 总字节 / 根目录 / 两种布局各自的条目数。
+
+        分片后逐片统计（每片目录很小），故统计本身也从「秒级」回到「毫秒级」。
+        """
+        n_entries = 0
+        total = 0
         if not os.path.isdir(self.root):
-            return {"root": self.root, "n_entries": 0, "bytes": 0}
-        bins = [n for n in os.listdir(self.root) if n.endswith(".bin")]
-        total = sum(os.path.getsize(os.path.join(self.root, n)) for n in bins)
-        return {"root": self.root, "n_entries": int(len(bins)), "bytes": int(total)}
+            return {"root": self.root, "n_entries": 0, "bytes": 0,
+                    "n_sharded_entries": 0, "n_flat_entries": 0,
+                    "shard_depth": int(self.shard_depth)}
+        dirs = [self.root]
+        if self.shard_depth > 0:
+            try:
+                dirs += [
+                    os.path.join(self.root, name)
+                    for name in os.listdir(self.root)
+                    if os.path.isdir(os.path.join(self.root, name))
+                ]
+            except OSError:
+                pass
+        n_sharded = 0
+        n_flat = 0
+        for index, directory in enumerate(dirs):
+            try:
+                bins = [n for n in os.listdir(directory) if n.endswith(".bin")]
+            except OSError:
+                continue
+            n_entries += len(bins)
+            total += sum(os.path.getsize(os.path.join(directory, n)) for n in bins)
+            if index == 0:
+                n_flat += len(bins)
+            else:
+                n_sharded += len(bins)
+        return {"root": self.root, "n_entries": int(n_entries), "bytes": int(total),
+                "n_sharded_entries": int(n_sharded), "n_flat_entries": int(n_flat),
+                "shard_depth": int(self.shard_depth)}
 
 
 # ---------------------------------------------------------------------------
@@ -1695,11 +2035,35 @@ def boundary_selftest(
         dim_detail = {"raised": True, "type": type(exc).__name__, "message": str(exc)[:400]}
     except Exception as exc:  # noqa: BLE001
         dim_detail = {"raised": True, "type": type(exc).__name__, "message": str(exc)[:400]}
+    # ``actual`` 的**口径必须显式**：本轮之前它取的是 ``spec.expect_dim``
+    # （= **注册表声明维度**，不是实测值），字段名容易被误读成「现场实测的 hidden_size」。
+    # 修法（采纳「显式标注口径」方案，不动字段名以免打断既有断言）：保留 ``actual``，
+    # 新增 ``actual_measured``（从构造期报文里解析出的**实测 hidden_size**，解析不到为
+    # ``None``）与 ``actual_source`` 说明文本。
+    measured: Optional[int] = None
+    message = str(dim_detail.get("message", ""))
+    marker = "hidden_size="
+    if marker in message:
+        tail = message.split(marker, 1)[1]
+        digits = ""
+        for ch in tail:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits:
+            measured = int(digits)
     cases.append({
         "case": "dim_mismatch_construction_error",
         "applicable": True,
         "passed": bool(dim_ok),
         "detail": {**dim_detail, "declared": int(wrong_dim), "actual": int(spec.expect_dim),
+                   "actual_measured": measured,
+                   "actual_source": (
+                       "actual = 注册表声明维度 spec.expect_dim（**不是实测值**）；"
+                       "actual_measured = 从构造期报文解析出的实测 hidden_size"
+                       "（解析不到为 null）"
+                   ),
                    "rule": "hidden_size != 声明维度 -> 构造期 EncoderDimMismatchError"},
     })
     return cases
@@ -1712,6 +2076,7 @@ __all__ = [
     "ROLES",
     "ROLE_MAX_LENGTH",
     "DEFAULT_EMB_CACHE_DIR",
+    "EMB_CACHE_SHARD_DEPTH",
     "DEFAULT_MODEL_DIR",
     "HF_MIRROR_ENDPOINT",
     "NORMALIZE_MODE",
