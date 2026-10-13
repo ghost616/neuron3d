@@ -7,7 +7,7 @@
 * `probe` —— 数据与依赖取证（**不训练**）：行表规模 / `char_len` 分布 / 库查询划分 /
   4 支变体构造 + KeyBERT 关键词支小批演练 / 编码器近邻 / QA 侧同答案多问题成组取证；
 * `gate` —— 特征差异**硬门禁**（逐位 + cos 分布 + 短行重合比例）+ 难负例清单；
-* `eval` —— **零训练**纯余弦检索评测（4 支 x 2 种负例设定 -> `R@1` / `R@5`）
+* `eval` —— **零训练**纯余弦检索评测（4 支 x **4 种**负例设定 -> `R@1` / `R@5`）
   + 机器可读判定；`--repro-dir` 时额外产出**双跑逐字节一致**证据；
 * `report` —— 渲染 `text_variants_report.{json,md}`。
 
@@ -453,14 +453,31 @@ def cmd_probe(args: argparse.Namespace) -> int:
     _log("[probe] done")
     return 0
 def _neighbor_encoder(args: argparse.Namespace) -> Any:
-    """构造**编码器近邻**用的编码器（仓库自有 `models/bge-m3`；缺失即抛可读错）。"""
-    from n3d_qa_learn.encoders import ENCODER_BGE_M3, EncoderConfig, build_vectorizer
+    """构造**编码器近邻**用的编码器（默认仓库自有 `models/bge-m3`；缺失即抛可读错）。
+
+    **源/口径解析（R69 扩展，支持「不同源档」对照）**：按注册表能力分派 ——
+    * ``hf`` 家族（``bge-m3``）：``source`` 取 ``--neighbor-source``，空则用
+      ``TV.ENCODER_NEIGHBOR_SOURCE``（``models/bge-m3``）；
+    * ``hash`` 家族（``local-hash`` / ``zh-bag``）：**必须为空 source**
+      （``encoders._build_hash_encoder`` 明确规定：hash 家族不使用模型文件，
+      非空 source 一律报错）⇒ 此处**显式置空**，不把 HF 的路径误传给 hash 家族。
+
+    存在理由：设定 D 的**同源性**必须可对照 —— 主档用语义编码器 ``bge-m3``（与词面
+    评测不同源），对照档需要能用 **被评测的那个编码器**（``zh-bag``，同源）或
+    **同族哈希编码器**（``local-hash``）现场造邻，否则「同源性」只能空口声明。
+    """
+    from n3d_qa_learn.encoders import ENCODER_BGE_M3, EncoderConfig, build_vectorizer, get_spec
     import n3d_qa_learn.text_variants as TV
 
+    name = str(getattr(args, "neighbor_encoder", "") or ENCODER_BGE_M3)
+    spec = get_spec(name)
+    source = str(getattr(args, "neighbor_source", "") or "")
+    if str(spec.kind) == "hf" and not source:
+        source = str(TV.ENCODER_NEIGHBOR_SOURCE)
     kwargs: Dict[str, Any] = {
-        "name": str(getattr(args, "neighbor_encoder", "") or ENCODER_BGE_M3),
+        "name": name,
         "role": TV.ENCODER_NEIGHBOR_ROLE,
-        "source": str(getattr(args, "neighbor_source", "") or TV.ENCODER_NEIGHBOR_SOURCE),
+        "source": source,
     }
     cache_dir = str(getattr(args, "enc_cache_dir", "") or "")
     if cache_dir:
@@ -663,7 +680,8 @@ def cmd_gate(args: argparse.Namespace) -> int:
             ),
         }
         _log("[gate] 复核 negatives.json（沿用 probe 冻结清单，不重抽）；"
-             "encoder_neighbor_skipped = "
+             "kinds = " + json.dumps(manifest.get("kinds", []), ensure_ascii=False)
+             + "；encoder_neighbor_skipped = "
              + str(neg_info["encoder_neighbor_skipped"]))
     else:
         # **统一口径（warning 11）**：缺 negatives.json 时 gate 与 eval 一致 -> 可读报错 + 退码 1。
@@ -767,15 +785,52 @@ PATH_DEPENDENT_FILES: Tuple[str, ...] = (
     "determinism_check.json",
 )
 
+#: **后置可重渲件**（R70 收口修复轮新增）：在**证据生成之后**才由 `report` 写出 / 重渲的件
+#: ⇒ **整类不参与**证据比对（连 SHA 都不记录）。
+#:
+#: **为什么必须整类排除（皋陶 error 2 的回路根因）**：`cmd_report` 生成的
+#: ``text_variants_report.json`` 会**内嵌 `determinism` 摘要**；若证据块又逐文件记录
+#: 这两个报告的 SHA256，就形成「**报告内嵌证据 ←→ 证据记录报告 SHA**」的**回路**，
+#: 使证据文件**不是**输入目录内容的确定性函数 —— 按常规工作序
+#: （`eval -> report -> eval`）再跑 `eval`，它**必然改变**（皋陶现场实测：7433 B
+#: `f81f04be…` -> 跑 report -> 7433 B `b7759b46…`）。
+#: 排除后，证据文件只由「**探针 / 门禁 / 评测 + 变体产物**」决定，回路断开。
+RERENDERABLE_FILES: Tuple[str, ...] = (
+    "text_variants_report.json",
+    "text_variants_report.md",
+)
+
 
 def _determinism_block(out_dir: str, repro_dir: str) -> Dict[str, Any]:
-    """**双跑逐字节一致**证据：逐文件比对主产物目录与对照目录。"""
+    """**双跑逐字节一致**证据：逐文件比对主产物目录与对照目录。
+
+    **两处排除（都必须显式登记）**
+    ------------------------------
+    1. **证据文件自身**（``TV.DETERMINISM_EVIDENCE_FILE``）：否则其 ``a_sha256``
+       是「上一次运行留在磁盘上的自己」⇒ 自指哈希链；
+    2. **后置可重渲件**（:data:`RERENDERABLE_FILES`）：它们在证据**之后**才由 `report`
+       写出，且报告**内嵌本证据的摘要** ⇒ 若参与比对就形成
+       「报告内嵌证据 ←→ 证据记录报告 SHA」的**回路**，使本文件不是输入目录内容的
+       确定性函数（常规工作序 `eval -> report -> eval` 下**必然改变**）。
+
+    排除后，本文件**只**由「探针 / 门禁 / 评测产物 + 变体产物」决定；
+    ``files`` 里逐文件的 ``a_sha256`` 记录的都是**本次运行之前**（或本次更早步骤写出）的
+    快照，故 ``all_bitwise_equal`` 一类的「全体共有文件都相等」在存在天然不同的
+    path-dependent 件时**结构上恒为 False**、对读者无信息量 —— 该字段已**移除**，
+    判据收敛到语义明确的 ``content_files_bitwise_equal`` / ``determinism_ok``
+    （并额外列出 ``common_but_not_equal_files`` 说明差异来自哪些件）。
+    """
     import n3d_qa_learn.text_variants as TV
 
+    excluded = {str(TV.DETERMINISM_EVIDENCE_FILE)} | {str(x) for x in RERENDERABLE_FILES}
     names: List[str] = []
     for base in (out_dir, repro_dir):
         if os.path.isdir(base):
             for name in os.listdir(base):
+                # **排除 1/2**：证据文件自身 + 后置可重渲件（见 docstring 与
+                # `RERENDERABLE_FILES` 的口径说明）。
+                if str(name) in excluded:
+                    continue
                 if name not in names and os.path.isfile(os.path.join(base, name)):
                     names.append(name)
     files: Dict[str, Any] = {}
@@ -814,6 +869,10 @@ def _determinism_block(out_dir: str, repro_dir: str) -> Dict[str, Any]:
         k for k, v in files.items() if v["common"] and k not in PATH_DEPENDENT_FILES
     ]
     content_ok = all(files[k]["bitwise_equal"] for k in content_common)
+    # **R70**：把「共有但不相等的件」显式列出（不再用恒为 False 的 `all_bitwise_equal`）。
+    common_but_not_equal = [
+        k for k, v in sorted(files.items()) if v["common"] and not v["bitwise_equal"]
+    ]
     return {
         "out_dir": out_dir,
         "repro_dir": repro_dir,
@@ -824,19 +883,110 @@ def _determinism_block(out_dir: str, repro_dir: str) -> Dict[str, Any]:
         "content_files_bitwise_equal": bool(content_common and content_ok),
         "only_in_out_dir": sorted(only_a),
         "only_in_repro_dir": sorted(only_b),
-        "all_bitwise_equal": bool(n_common > 0 and common_ok),
+        # **R70 取代 `all_bitwise_equal`**：语义明确、且不为「空集恒真/恒假」所误导。
+        "determinism_ok": bool(content_common and content_ok),
+        "common_but_not_equal_files": common_but_not_equal,
+        "determinism_scope": (
+            "确定性判定 = **内容产物**（两目录共有、且不属于 `PATH_DEPENDENT_FILES`）"
+            "逐字节相等且集合非空；`a_sha256` 记录的是**本次更早步骤**写出的快照，"
+            "故对天然不同的件不构成失败。"
+        ),
         "rule": (
             "两目录**共有**的文件必须逐字节相等（存在性 + 字节数 + SHA256 + 裸字节）；"
             "单边文件**如实登记**（only_in_out_dir / only_in_repro_dir）、"
-            "不计入失败；两次运行必须是**不同进程**。"
+            "不计入失败；两次运行必须是**不同进程**；"
+            "**R69**：枚举**不含本证据文件自身**（`DETERMINISM_EVIDENCE_FILE`）；"
+            "**R70**：枚举**不含后置可重渲件**（`RERENDERABLE_FILES`），"
+            "使本文件成为输入目录内容的确定性函数（回路断开）。"
         ),
         "path_dependent_files": list(PATH_DEPENDENT_FILES),
+        # **R69 自指修复登记**：本证据文件**不参与**自身比对（否则每次重跑必变）。
+        "excluded_self_file": str(TV.DETERMINISM_EVIDENCE_FILE),
+        # **R70 回路修复登记**：后置可重渲件**整类不参与**（连 SHA 都不记）。
+        "excluded_rerenderable_files": [str(x) for x in RERENDERABLE_FILES],
+        "rerenderable_exclusion_rule": (
+            "`text_variants_report.{json,md}` 属**后置可重渲件**：它们由 `report` 在"
+            "本证据**之后**写出/重渲，且报告 JSON **内嵌本证据的摘要** ⇒ 若参与比对即构成"
+            "「报告内嵌证据 ←→ 证据记录报告 SHA」的**回路**，使本文件**不是**输入目录内容的"
+            "确定性函数（常规工作序 `eval -> report -> eval` 下**必然改变**）。"
+            "故本类**整类排除**：既不进 `files`，也**不记录任何 SHA / 字节数**"
+            "（只登记它们的**文件名**）；判定收敛到 `content_files_bitwise_equal` / `determinism_ok`。"
+        ),
+        "self_exclusion_rule": (
+            "枚举两目录时**跳过本证据文件自身**（`DETERMINISM_EVIDENCE_FILE`）："
+            "它由本函数之后写出，把「上一次运行留在盘上的自己」算进 files 会构成"
+            "**自指哈希链**（本次内容 = 上一轮文件哈希），使该文件在结构上不可能稳定。"
+            "因此 `files` 不含自身一项；`content_common_files` 本就不含自己。"
+        ),
         "path_dependence_note": (
-            "上列三件**内嵌了本次运行的 out_dir 字符串**，故两个不同目录下跑出来"
-            "的它们**天然不同**；它们是**运行报告**，不是本轮要求的冻结变体产物。"
+            "`PATH_DEPENDENT_FILES` 里的件**内嵌了本次运行的 out_dir 字符串**，"
+            "故两个不同目录下跑出来的它们**天然不同**；它们是**运行报告**，"
+            "不是本轮要求的冻结变体产物。它们仍在 `files` 里**如实登记**"
+            "（`common_but_not_equal_files` 会列出它们），但**不计入**确定性判定。"
             "本轮要求的确定性声明只针对**变体产物**（variants.jsonl 及其指纹）与"
-            "其余内容产物（variants_meta.json / feature_gate.json / negatives.json / qa_grouping.json），"
-            "它们在两个独立进程下**逐字节相同**。"
+            "其余内容产物（variants_meta.json / feature_gate.json / negatives.json / qa_grouping.json）。"
+            "**R69**：本证据文件自身已从枚举中排除（见 `self_exclusion_rule`）。"
+            "**R70**：后置可重渲件整类排除（见 `rerenderable_exclusion_rule`）⇒ "
+            "本文件是**输入目录内容的确定性函数**：`eval` 连跑、或 `report` 之后再 `eval`，"
+            "本文件**逐字节相同**（现场已在真实产物目录复现）。"
+        ),
+    }
+
+
+def _determinism_summary(det: Dict[str, Any]) -> Dict[str, Any]:
+    """把确定性证据压成**只记摘要**的版本（供 `report` 内嵌）。
+
+    存在理由（皋陶 error 2 的另一半）：`cmd_report` 生成的
+    ``text_variants_report.json`` 若**内嵌整块证据**（含逐文件 SHA 与 out_dir/repro_dir 路径），
+    就会与「证据记录报告 SHA」形成回路。摘要版**不含任何逐文件哈希、不含目录路径**
+    （只保留文件名与计数），故「报告内嵌摘要」**不会反过来改变证据**。
+
+    参数
+    ----
+    det : Dict[str, Any]
+        :func:`_determinism_block` 的返回值（可为空 dict）。
+
+    返回
+    ----
+    Dict[str, Any]
+        只含判定与计数类字段的摘要；``det`` 为空时全部字段为「缺位」形态。
+    """
+    import n3d_qa_learn.text_variants as TV
+
+    if not det:
+        return {
+            "file": str(TV.DETERMINISM_EVIDENCE_FILE),
+            "present": False,
+            "n_common_files": 0,
+            "n_content_common_files": 0,
+            "content_common_files": [],
+            "content_files_bitwise_equal": False,
+            "determinism_ok": False,
+            "common_but_not_equal_files": [],
+            "path_dependent_files": [],
+            "excluded_self_file": str(TV.DETERMINISM_EVIDENCE_FILE),
+            "excluded_rerenderable_files": [str(x) for x in RERENDERABLE_FILES],
+            "summary_rule": (
+                "报告只内嵌**摘要**（无逐文件 SHA、无目录路径），"
+                "逐文件明细见 `determinism_check.json` 本尊。"
+            ),
+        }
+    return {
+        "file": str(TV.DETERMINISM_EVIDENCE_FILE),
+        "present": True,
+        "n_common_files": int(det.get("n_common_files", 0)),
+        "n_content_common_files": int(det.get("n_content_common_files", 0)),
+        "content_common_files": list(det.get("content_common_files", [])),
+        "content_files_bitwise_equal": bool(det.get("content_files_bitwise_equal", False)),
+        "determinism_ok": bool(det.get("determinism_ok", False)),
+        "common_but_not_equal_files": list(det.get("common_but_not_equal_files", [])),
+        "path_dependent_files": list(det.get("path_dependent_files", [])),
+        "excluded_self_file": str(det.get("excluded_self_file", "")),
+        "excluded_rerenderable_files": list(det.get("excluded_rerenderable_files", [])),
+        "summary_rule": (
+            "报告只内嵌**摘要**（无逐文件 SHA、无目录路径），"
+            "逐文件明细见 `determinism_check.json` 本尊；"
+            "`determinism_ok` = 内容产物两目录共有且逐字节相等。"
         ),
     }
 
@@ -897,6 +1047,22 @@ def cmd_eval(args: argparse.Namespace) -> int:
          for n in TV.VARIANT_ORDER},
         ensure_ascii=False,
     ))
+    # **R69**：设定 D（编码器近邻小池）与**新实验量 D - C**（不得覆盖 B - C）。
+    _has_enc = bool(ev.get("encoder_setting_applicable", False))
+    if _has_enc:
+        _enc = ev["settings"]["small_pool_hard_encoder"]
+        _log("[eval] 设定 D（编码器近邻小池）R@1 = " + json.dumps(
+            {n: _enc["variants"][n]["recall_at_1"] for n in TV.VARIANT_ORDER},
+            ensure_ascii=False,
+        ))
+        _log("[eval] 编码器近邻对照 D-C 同支 R@1 差 = " + json.dumps(
+            {n: ev["encoder_vs_random_delta"][n]["delta_encoder_minus_random"]
+             for n in TV.VARIANT_ORDER},
+            ensure_ascii=False,
+        ))
+    else:
+        _log("[eval] 设定 D 不可用（不产 0 值假数据）：" + str(ev.get("encoder_setting_note", "")))
+    _log("[eval] 同源性登记 = " + str(ev.get("homology_rule", TV.ENCODER_NEIGHBOR_HOMOLOGY_RULE)))
     _log("[eval] verdict_key = " + verdict["verdict_key"] + "；逐支 = "
          + json.dumps(verdict["verdict_keys"], ensure_ascii=False))
 
@@ -909,6 +1075,12 @@ def cmd_eval(args: argparse.Namespace) -> int:
         "verdict": verdict,
         "negative_counts": manifest.get("counts", {}),
         "negative_fingerprint": manifest.get("fingerprint", {}),
+        # **R69**：把「本产物落地了哪几类难负例」与「设定 D 是否可用 / 同源性口径」
+        # 提到 eval 产物顶层，便于下游不钻进 retrieval_eval 就能核对。
+        "negatives_kinds": list((manifest.get("per_kind", {}) or {}).keys()),
+        "encoder_neighbor_skipped": bool(manifest.get("encoder_neighbor_skipped", False)),
+        "encoder_setting_applicable": bool(ev.get("encoder_setting_applicable", False)),
+        "homology_rule": str(TV.ENCODER_NEIGHBOR_HOMOLOGY_RULE),
         "coverage": coverage,
         "measured_scope": ev.get("measured_scope", {}),
         "retrieval_pool_size": int(len(records)),
@@ -943,16 +1115,22 @@ def cmd_eval(args: argparse.Namespace) -> int:
         det = _determinism_block(out_dir, repro_dir)
         det_path = os.path.join(out_dir, TV.DETERMINISM_EVIDENCE_FILE)
         _write_json(det_path, det)
-        _log("[eval] 双跑逐字节一致 = " + str(det["all_bitwise_equal"])
+        # **R70**：不再打印恒为 False 的 `all_bitwise_equal`，改打印语义明确的
+        # `determinism_ok`（= 内容产物两目录共有且逐字节相等）。
+        _log("[eval] 确定性判定 determinism_ok = " + str(det["determinism_ok"])
+             + "；共有文件 = " + str(det["n_common_files"])
+             + "；其中内容产物 = " + str(det["n_content_common_files"])
              + "；证据 -> " + TV.DETERMINISM_EVIDENCE_FILE)
+        _log("[eval] 排除件：自身 = " + str(det["excluded_self_file"])
+             + "；后置可重渲件 = " + str(det["excluded_rerenderable_files"]))
         content = [
             n for n, v in (det.get("files", {}) or {}).items()
             if v.get("common") and n not in (det.get("path_dependent_files") or [])
         ]
         content_equal = all(det["files"][n]["bitwise_equal"] for n in content) if content else False
         _log("[eval] 内容产物逐字节一致 = " + str(content_equal)
-             + "；" + str(len(content)) + " 件；路径相关含报告 = "
-             + str(det.get("path_dependent_files")))
+             + "；" + str(len(content)) + " 件；路径相关（天然不同，不计入）= "
+             + str(det.get("common_but_not_equal_files")))
         if not content_equal:
             _log("[eval] FAIL：两次运行的**内容产物**未逐字节一致")
             return 1
@@ -986,11 +1164,11 @@ def _rows_from_records(records: Sequence[Dict[str, Any]]) -> List[Any]:
 
 
 def _small_pool_precondition(ev: Dict[str, Any]) -> Dict[str, Any]:
-    """小池设定（B/C）的显式前置条件与现场一致性（fix 8）。
+    """小池设定（B / C / D）的显式前置条件与现场一致性（fix 8；R69 扩到三侧）。
 
-    B - C 只在两侧**逐查询行的池大小严格相等**时才只是「负例内容」之差；否则它是
-    「池大小 + 内容」的混合差。本函数只**读** ``retrieval_eval.json`` 里已有的
-    ``measured_scope.per_setting``，**不向该产物新增任何字段**（保持其指纹不变）。
+    `B - C` 与 `D - C` 只在两侧（三侧）**逐查询行的池大小严格相等**时才只是「负例内容」
+    之差；否则它是「池大小 + 内容」的混合差。本函数只**读** ``retrieval_eval.json`` 里已有的
+    ``measured_scope.per_setting``，**不向该产物新增任何字段**。
 
     参数
     ----
@@ -1000,7 +1178,7 @@ def _small_pool_precondition(ev: Dict[str, Any]) -> Dict[str, Any]:
     返回
     ----
     Dict[str, Any]
-        前置条件文本 + 现场池大小三元组 + 两项一致性布尔。
+        前置条件文本 + 现场池大小三元组 + 两项一致性布尔 + 设定 D 可用性。
     """
     from .text_variants import SMALL_POOL_PRECONDITION_RULE
 
@@ -1008,21 +1186,36 @@ def _small_pool_precondition(ev: Dict[str, Any]) -> Dict[str, Any]:
     pst = ms.get("per_setting", {}) or {}
     b = pst.get("small_pool_hard", {}) or {}
     c = pst.get("small_pool_random", {}) or {}
+    d = pst.get("small_pool_hard_encoder", {}) or {}
+    # **R70（info 7）**：D 是否被评测一律以 `measured_scope.encoder_setting_applicable`
+    # 为准（该字段语义明确、由 `zero_training_eval` 现场写入）。
+    # 修复前用 `if d else []` 判「该键是否存在」——若某轮该键存在但取值是**空 dict**，
+    # 三元组会退化为 `(None, None, None)` 并与 B/C 判为「相等」、
+    # `settings_covered` 也会把 D 计入（假阳性）。
+    has_enc = bool(ms.get("encoder_setting_applicable", False))
 
-    def _trip(d: Dict[str, Any]) -> Tuple[Any, Any, Any]:
-        return (d.get("pool_size_min"), d.get("pool_size_median"), d.get("pool_size_max"))
+    def _trip(x: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+        return (x.get("pool_size_min"), x.get("pool_size_median"), x.get("pool_size_max"))
+
+    _trips = [_trip(b), _trip(c)] + ([_trip(d)] if has_enc else [])
+    _nq = [b.get("n_queries"), c.get("n_queries")] + ([d.get("n_queries")] if has_enc else [])
 
     return {
         "rule": SMALL_POOL_PRECONDITION_RULE,
         "sufficient_condition": (
-            "\u6bcf\u4e2a\u67e5\u8be2\u884c\u5747\u6709 >= NEGATIVE_POOL_SIZE \u6761\u540c\u7c7b\u8d1f\u4f8b\uff0c"
-            "\u4e14\u4e24\u8bbe\u5b9a\u7684\u67e5\u8be2\u884c\u96c6\u76f8\u540c"
+            "每个查询行均有 >= NEGATIVE_POOL_SIZE 条同类负例，且各小池设定的查询行集相同"
         ),
+        "settings_covered": (["small_pool_hard", "small_pool_random"]
+                             + (["small_pool_hard_encoder"] if has_enc else [])),
         "observed_pool_size_triplet_hard": list(_trip(b)),
         "observed_pool_size_triplet_random": list(_trip(c)),
-        "pool_size_triplet_equal": bool(_trip(b) == _trip(c)),
-        "query_count_equal": bool(b.get("n_queries") == c.get("n_queries")),
-        "asserted_in": "zero_training_eval\uff08fail-closed\uff09",
+        "observed_pool_size_triplet_encoder": (list(_trip(d)) if has_enc else None),
+        "pool_size_triplet_equal": bool(all(t == _trips[0] for t in _trips)),
+        "query_count_equal": bool(len(set(_nq)) == 1),
+        "encoder_setting_applicable": has_enc,
+        "encoder_setting_note": str(ms.get("encoder_setting_note", "")),
+        "d_judged_by": "measured_scope.encoder_setting_applicable",
+        "asserted_in": "zero_training_eval（fail-closed，显式 raise）",
     }
 
 
@@ -1038,6 +1231,9 @@ def cmd_report(args: argparse.Namespace) -> int:
     code = _require_negatives_for(out_dir, "report")
     if code is not None:
         return int(code)
+    # **R69**：报告要渲染「本产物落地了哪几类难负例」⇒ 直接读 `negatives.json` 本尊
+    # （而不是从 `gate_summary.json` 转手），以保持 `gate_summary.json` 的键集合不变。
+    neg_manifest = _read_json(os.path.join(out_dir, "negatives.json"))
 
     det_path = os.path.join(out_dir, TV.DETERMINISM_EVIDENCE_FILE)
     det = _read_json(det_path) if os.path.isfile(det_path) else {}
@@ -1051,13 +1247,18 @@ def cmd_report(args: argparse.Namespace) -> int:
         "所有随机过程使用局部 RNG（random.Random / numpy），不消耗全局 RNG。",
         # **R68 收口修正**：原文案称「检索池全程恒为全量行、两种负例设定」，
         # 与三设定设计（B/C 是**逐查询行的小池**）**直接矛盾**，故改写为与实现一致的描述。
-        "检索共**三种设定**（A `full_pool_all_rows` / B `small_pool_hard` / "
-        "C `small_pool_random`）：**仅 A 的检索池 = 本次评估的全部行**"
-        "（库支恒为「原文支」）；**B / C 是逐查询行的小池**"
-        "（池 = { 自身 } ∪ 同类负例，本轮池大小恒为 17）。"
-        "难负例对照 = **B - C**（两侧逐行池大小严格相等，故只差负例内容）；"
+        # **R69**：设定由三种扩为**四种**（新增 D `small_pool_hard_encoder`）。
+        "检索共**四种设定**（A `full_pool_all_rows` / B `small_pool_hard` / "
+        "C `small_pool_random` / D `small_pool_hard_encoder`）："
+        "**仅 A 的检索池 = 本次评估的全部行**"
+        "（库支恒为「原文支」）；**B / C / D 是逐查询行的小池**"
+        "（池 = { 自身 } ∪ 同类负例，本轮池大小恒为 17，三者**逐行严格相等**）。"
+        "对照量：**B - C**（难负例 vs 随机负例）与 **D - C**（编码器近邻 vs 随机负例，"
+        "R69 新增实验量，**不得**用它反向解释或覆盖 B - C）；"
         "**A 不消费 negatives.json**，不得当作难负例对照基础。"
-        "小池设定的前置条件由 `zero_training_eval` 在评测前 `assert` 校验。",
+        "小池设定的前置条件由 `zero_training_eval` 在评测前 `assert` 校验；"
+        "`encoder_neighbor` 的**同源性**登记见 `homology_rule`"
+        "（只作诊断、不得当作无偏难度度量）。",
         "变体文本一律是**确定性**的（KeyBERT 关闭 MMR、候选词由 jieba 固定分词），"
         "故同参重跑产物逐字节一致。",
     ]
@@ -1075,11 +1276,20 @@ def cmd_report(args: argparse.Namespace) -> int:
         "content_files_bitwise_equal": (
             bool(det.get("content_files_bitwise_equal", False)) if det else False
         ),
-        "all_common_files_bitwise_equal": (
-            bool(det.get("all_bitwise_equal", False)) if det else False
+        # **R70**：原 `all_common_files_bitwise_equal`（读 `all_bitwise_equal`）在存在
+        # path-dependent 共有件时**结构上恒为 False**、对读者无信息量，已移除；
+        # 改为语义明确的 `determinism_ok` + 「共有但不相等的件」白名单。
+        "determinism_ok": bool(det.get("determinism_ok", False)) if det else False,
+        "common_but_not_equal_files": (
+            list(det.get("common_but_not_equal_files", [])) if det else []
         ),
         "path_dependent_files": (
             list(det.get("path_dependent_files", [])) if det else []
+        ),
+        # **R70 回路修复登记**：后置可重渲件整类排除（证据不再记录它们的 SHA）。
+        "excluded_rerenderable_files": (
+            list(det.get("excluded_rerenderable_files", [])) if det
+            else [str(x) for x in RERENDERABLE_FILES]
         ),
     }
     if not det:
@@ -1092,10 +1302,13 @@ def cmd_report(args: argparse.Namespace) -> int:
             "双跑证据**已具备**：" + str(TV.DETERMINISM_EVIDENCE_FILE)
             + " 共比对 " + str(int(det.get("n_common_files", 0))) + " 件共有文件，"
             "其中**内容产物 " + str(det_evidence["n_content_common_files"])
-            + " 件逐字节一致 = " + str(det_evidence["content_files_bitwise_equal"]) + "**；"
-            "另 " + str(len(det_evidence["path_dependent_files"]))
-            + " 件内嵌 out_dir 的运行报告登记为 path_dependent_files（天然不同，"
-            "不计入确定性判定）。"
+            + " 件逐字节一致 = " + str(det_evidence["content_files_bitwise_equal"]) + "**"
+            "（判定字段 `determinism_ok` = " + str(det_evidence["determinism_ok"]) + "）；"
+            "另有 " + str(len(det_evidence["common_but_not_equal_files"]))
+            + " 件共有但天然不同（" + str(det_evidence["common_but_not_equal_files"])
+            + "，属 `path_dependent_files`，不计入判定）；"
+            "**后置可重渲件 " + str(det_evidence["excluded_rerenderable_files"])
+            + " 已整类排除**（证据不记录其 SHA ⇒ 与「报告内嵌证据」不再构成回路）。"
         )
     if str(probe.get("keyword_backend", {}).get("kind", "")) == "sentence-transformers":
         honest.append(
@@ -1141,11 +1354,24 @@ def cmd_report(args: argparse.Namespace) -> int:
         "negatives": {
             "counts": gate.get("negatives", {}).get("counts", {}),
             "fingerprint": gate.get("negatives", {}).get("fingerprint", {}),
+            # **R69**：把「落地了哪几类」与 skip 标记一并渲染，便于直接核对三类难负例。
+            # 来源 = `negatives.json` 本尊（**不**经 `gate_summary.json`，避免改动其键集合）。
+            "kinds": list((neg_manifest or {}).get("kinds", [])),
+            "encoder_neighbor_topk": int((neg_manifest or {}).get("encoder_neighbor_topk", 0)),
+            "encoder_neighbor_skipped": bool(
+                (neg_manifest or {}).get("encoder_neighbor_skipped", False)
+            ),
+            "encoder_neighbor_skip_reason": str(
+                (neg_manifest or {}).get("encoder_neighbor_skip_reason", "")
+            ),
         },
         "retrieval_eval": ev.get("retrieval_eval", {}),
         "verdict": ev.get("verdict", {}),
         "qa_grouping": {"summary": qa.get("summary", {}), "top_groups": qa.get("top_groups", [])},
-        "determinism": det,
+        # **R70 回路修复**：只内嵌**摘要**（无逐文件 SHA、无目录路径）。
+        # 修复前这里内嵌整块证据（含两件报告的 SHA256 + out_dir/repro_dir），
+        # 与「证据记录报告 SHA」构成回路 ⇒ 常规工作序下证据每次必变。
+        "determinism": _determinism_summary(det),
         "honest_notes": honest,
         "ascii_safe_log_note": ASCII_SAFE_LOG_NOTE,
     }
@@ -1167,7 +1393,7 @@ def cmd_report(args: argparse.Namespace) -> int:
 TEXT_VARIANTS_COMMANDS: Tuple[Tuple[str, str], ...] = (
     ("probe", "数据/依赖/变体构造/难负例/QA 成组取证（不训练）"),
     ("gate", "特征差异硬门禁 + 难负例清单复核"),
-    ("eval", "零训练纯余弦检索评测（4 支 x 2 种负例设定）+ 判定"),
+    ("eval", "零训练纯余弦检索评测（4 支 x 4 种负例设定）+ 判定"),
     ("report", "渲染 text_variants_report.{json,md}"),
 )
 
@@ -1179,7 +1405,26 @@ def cmd_textvariants(args: argparse.Namespace) -> int:
     退码 2**；`FileNotFoundError` / `RuntimeError`（依赖缺失、模型不可用）转成
     可读报文 + 退码 1。`UnicodeEncodeError` 必须先于 `ValueError` 捕获
     （它**继承** `ValueError`），否则控制台编码故障会被误报成「非法参数」。
+    `TV.VariantContractError`（契约 / 门禁失败）**必须先于** `RuntimeError` 捕获，
+    否则会被笼统报成「依赖 / 模型 / 产物不可用」。
+
+    **`-O` 守卫（R70，皋陶 warning 1）**：本模块已把全部裸 `assert` 改为
+    **显式 `raise VariantContractError`**（`python -O` 下不再被跳过）；此处**另加**
+    入口级显式校验 —— `sys.flags.optimize != 0` 时**直接拒绝运行**（可读报文 + 退码 1），
+    因为优化模式还会丢掉 docstring 与 `__debug__` 分支，使「说明与实现同源」的口径不可审计。
     """
+    # **入口级 `-O` 守卫**：见 docstring。放在最前面，任何子命令都先过这一道。
+    from n3d_qa_learn.text_variants import VariantContractError
+
+    if int(getattr(sys.flags, "optimize", 0)) != 0:
+        _log(
+            "[textvariants] 拒绝在优化模式下运行：sys.flags.optimize = "
+            + str(int(getattr(sys.flags, "optimize", 0)))
+            + "（由 python -O / PYTHONOPTIMIZE 打开）。本模块的契约 / 门禁已改为显式 raise、"
+            "不依赖 assert，但优化模式会丢弃 docstring 与 __debug__ 分支，"
+            "使口径文本不可审计；请用 python（不带 -O）重跑。"
+        )
+        return 1
     sub = str(getattr(args, "textvariants_cmd", "") or "probe")
     handlers = {
         "probe": cmd_probe,
@@ -1198,6 +1443,9 @@ def cmd_textvariants(args: argparse.Namespace) -> int:
             + type(exc).__name__ + ": " + str(exc)
             + "。这不是参数错误；可用 PYTHONIOENCODING=utf-8 重跑。"
         )
+        return 1
+    except VariantContractError as exc:
+        _log("[textvariants] 契约 / 门禁失败（fail-closed，非参数错误）：" + str(exc))
         return 1
     except FileNotFoundError as exc:
         _log("[textvariants] 输入产物缺失：" + str(exc))
@@ -1309,9 +1557,11 @@ def _add_textvariants_arguments(
     p.add_argument("--neighbor-encoder", default="", help="编码器近邻用的编码器（空 = bge-m3）")
     p.add_argument("--neighbor-source", default="", help="编码器近邻模型来源（空 = models/bge-m3）")
     p.add_argument("--encoder-topk", type=int, default=0,
-                   help="编码器近邻 top-n（0 = 冻结默认 3）")
+                   help="编码器近邻 top-n（0 = 冻结默认 16 = NEGATIVE_POOL_SIZE；"
+                        "设定 D 的池大小必须与 B/C 一致，故该值不得小于 NEGATIVE_POOL_SIZE）")
     p.add_argument("--random-negatives", type=int, default=0,
-                   help="随机负例条数（0 = 冻结默认 1）")
+                   help="随机负例条数（0 = 冻结默认 16 = RANDOM_NEGATIVE_COUNT；"
+                        "与 NEGATIVE_POOL_SIZE 同值，故 B/C 池大小一致）")
     p.add_argument("--hard-cap", type=int, default=0,
                    help="每类难负例上限（0 = 用冻结默认 HARD_NEGATIVE_CAP）")
     p.add_argument("--qa-limit", type=int, default=0,

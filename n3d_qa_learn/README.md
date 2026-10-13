@@ -1368,8 +1368,12 @@ JSON 语法损坏、元数据缺 ``dim`` 字段、``dim`` 与字节长度失配�
   **历史轮次**（2026-10-06，``encoder=bge-m3`` 且用过显式 ``--text``）留下的；
   本轮以 ``--encoder zh-bag`` 复跑 cold 相位后再跑 ``--reuse-only``，因默认 ``--text``
   与历史记录不同而在**任何缓存访问之前**（``encoders_run.py`` 的文本比对分支）退码 1。
-  该分支与缓存布局无关（失败点在构造 ``EmbeddingCache`` 之前），本轮**未改动**
-  ``encoders_run.py``；跨进程复用本身已由 ``cache_layout_selftest.py --phase write/read``
+  该分支与缓存布局无关（失败点在构造 ``EmbeddingCache`` 之前），**上一轮（分片修复轮）
+  未改动** ``encoders_run.py``；**其后的皋陶复审收口轮（本轮 §九 warning 1）改动过它**，
+  但改动面**只有一处**：G2 取证的 meta 读取由「按历史扁平布局直拼 ``<cache_dir>/<key>.json``」
+  改为 ``EmbeddingCache.read_meta(key)``（**分片优先 + 扁平只读回退**）—— 它**只影响 meta 取证**
+  （修复前 13 键全 ``null``，修复后全部非空），**不影响任何向量、缓存键与口径指纹**；
+  跨进程复用本身已由 ``cache_layout_selftest.py --phase write/read``
   （两个独立进程：写入进程 → 读取进程得 ``cached=True``）独立证明。
 * **口径更正（不得再引用「命中与重算逐位相同」这句绝对表述）——根因定性由「把差异当作
   与批组成无因果关系的浮点抖动」改为「确定性、可归因的批组成（padding 配置）依赖」
@@ -1569,6 +1573,10 @@ Select-String -Path n3d_qa_learn\*.py -Pattern 'read_bytes|read_meta|_entry_path
 
 **10.2 未决发现（warning 2，**本轮不修**，交回风后决策）**
 
+> **R69 收口（皋陶遗留文档项 ③）**：本条按**方案 D「只登记不修」**结案，**代码零改动**
+> （`encoders.py` / `encoders_run.py` 的 `git status` 与 `git diff` 均为空，见 §10.5）。
+> 本节补齐四要素：**触发条件** / **影响面** / **A/B/C/D 四方案与代价** / **选择 D 的理由**。
+
 * **现象**：`HFTextEncoder.encode_batch_with_stats` 把「未命中的下标」按 `self.batch_size`
   切块后**整块** `_forward` ⇒ **一次实算的批组成取决于当时的缓存命中状态** ⇒
   同一文本在不同缓存状态下会落进**不同的批**、得到**不同的向量**（本轮实测
@@ -1585,29 +1593,68 @@ Select-String -Path n3d_qa_learn\*.py -Pattern 'read_bytes|read_meta|_entry_path
 * **可选修法与代价（未采纳，供决策）**：
   | 方案 | 做法 | 代价 |
   | --- | --- | --- |
-  | A. 键里加批组成签名 | 把 `(batch_size, 批内最长 token 数或整批文本签名)` 折进缓存键 | **改键分量** ⇒ 与「不得改动键分量」的硬约束冲突，且全部既有条目失效（需全量重算） |
-  | B. 逐条实算 | 未命中时**逐条** `_forward`（batch_size=1，即无 padding 影响） | 失去批处理吞吐（CPU 上实测明显变慢），且**仍会改变**既有条目的取值口径（历史条目是批算的） |
-  | C. 固定 padding | 前向时把 padding 固定到该口径的理论上界（如所有批都 pad 到 `max_length`） | 计算量随 `max_length` 放大（`text_line` 为 8192），不可行 |
+  | A. 键里加批组成签名 | 把 `(batch_size, 批内最长 token 数或整批文本签名)` 折进缓存键 | **改键分量** ⇒ 与「不得改动键分量」的硬约束冲突，且**既有 6 万+ 条目全部失效**（现场计数：`_cache/emb` 下分片 `42,609` 个 `.bin` + 历史扁平顶层 `26,897` 个 `.bin` = **69,506 条目**，需全量重算） |
+  | B. 逐条实算 | 未命中时**逐条** `_forward`（batch_size=1，即无 padding 影响） | **失去批处理吞吐**（CPU 上实测明显变慢），且**仍会改变**既有条目的取值口径（历史条目是批算的）⇒ 一次「精度改善」换来一次**历史口径变更** |
+  | C. 固定 padding | 前向时把 padding 固定到该口径的理论上界（如所有批都 pad 到 `max_length`） | **算力不可行**：计算量随 `max_length` 放大（`text_line` 为 8192），CPU 上按全量 2665 行 × 8192 位置的注意力开销远超本轮全部预算 |
   | D. 只登记不修（本轮） | 明确「强不变量仅在零重算前提下成立」并登记回退风险 | 不消除矛盾，但**零风险、零口径变化** |
 
-**10.3 措辞扫描（error 1 的验收口径）**
+* **选择 D 的理由（R69 决策，量化）**：本项目**最小的可分辨粒度 = 1/2665 ≈ 3.75e-4**
+  （`GRANULARITY`，也是判定规则里粒度守卫的阈值），而批组成依赖造成的向量差
+  **实测 7.823e-08 ~ 1.229e-07** —— 前者比后者**大约 3000 倍**
+  （3.75e-4 / 1.229e-07 ≈ 3.1e3）。也就是说：该差异**远低于本项目任何可观察判定量的分辨率**，
+  要让它影响任何结论，必须有候选对的打分差落在 ~1e-7 以内 —— 本轮全量 2665 行 × 4 支 ×
+  4 设定的现场读数里**未观察到任何一例**。而 A / B / C 三案的代价分别是
+  「6.95 万条目全部失效 + 改键分量（硬约束冲突）」「失去吞吐 + 变更历史口径」
+  「算力不可行」⇒ **三案代价均大于收益**，故取 D：**只登记不修**。
+  本条的适用前提仍是「所需键全量命中、零重算」（见上文「条件性如实登记」），
+  一旦该前提被破坏（回退重算），上述量级论证**仍然成立**，但 `read_bytes` 式逐位比对
+  会观察到变化——故风险已在上文「风险登记」显式写出，不隐藏。
+
+**10.5 「代码零改动」的现场证明（R69）**
+
+本条为**纯登记**：与批组成依赖相关的两个源码文件在本轮**逐字节未变**。现场命令与结果：
+
+```powershell
+git status --porcelain -- n3d_qa_learn/encoders.py n3d_qa_learn/encoders_run.py
+git diff -- n3d_qa_learn/encoders.py n3d_qa_learn/encoders_run.py
+```
+
+两条命令的输出**均为空**（无条件粘贴见 §17.19.7）。本轮**唯一**改动的源码是
+`n3d_qa_learn/text_variants.py` / `text_variants_run.py`（第三步 Phase 1 的设定 D 与自指修复），
+**不触及**编码器与缓存层的任何一行。
+
+**10.3 措辞扫描（error 1 的验收口径；**R69 收口：计数前先剔除强调标记**）**
 
 ```powershell
 # 统计 README 中三个定性用词的出现次数（并分 §13.11 段内 / 段外）
-.venv\Scripts\python.exe -u -c "<脚本见 _verify/emb_cache/wording_scan.py>"
+.venv\Scripts\python.exe checkpoints\qa_learn\_verify\emb_cache\wording_scan.py
 ```
 
-| 用词 | §13.11 段内 | README 全文 | 说明 |
-| --- | --- | --- | --- |
-| 不**确**定 | **0** | **0** | 全文已无 |
-| 不**可**归因 | **0** | **0** | 全文已无 |
-| 噪**声** | **0** | **48**（全部在 §13.11 **之外**） | **如实登记差异**：这 48 处属 §15「分档鲁棒性考卷」的**高斯扰动实验与 噪**声**底标定**（`noise` 扰动类、`noise_floor` 口径），是**另一个技术概念**，与 §13.11 的根因定性无关；那两节有各自的冻结口径与产物，**不在本轮「只修表述」的范围内**（改动它们会变更已验收轮的文档口径）。故本轮的达标口径是「**§13.11 段内三词均 0**」+「**全文前两词均 0**」 |
+**口径变更（R69，皋陶遗留文档项 ②）——「0」必须是语料属性、不是书写形式的函数**
 
-> **书写约定**：为满足「全文出现次数 = 0」这条验收口径，上表三个词一律以**加粗分隔**
-> 形式书写（断开字面量）；扫描脚本 `_verify/emb_cache/wording_scan.py` 按**未断开的字面量**
-> 计数，故结果恒为 0。本节另需引用 §15 的既有术语（如 噪**声**底 / `noise_floor`）时，
-> 一律沿用同一「断开字面量」写法 —— 该术语属**引用既有口径**，不在本条验收口径的判定范围内；
-> 该判定口径与「全文 = 0」的字面要求之间的差异已在上表「说明」列**如实登记，不强行对齐**。
+上一轮的写法是「把词用**加粗断开**，脚本按**未断开的字面量**计数」，于是计数结果成了
+**markdown 书写形式的函数**：只要改写强调写法就能把计数压成 0，它并不能说明 README
+里没有该词。本轮改为两条：
+
+1. 扫描器**先剔除 markdown 强调标记**（`**` / `*` / `` ` ``，即 `EMPHASIS_MARKERS`）
+   再做子串计数，并**同时报出未剔除的原始计数**（`raw_total` / `raw_in_13.11`）；
+   两套计数**任一越界即 FAIL**（原始为 0 蕴含剔除后为 0，反之不然 ⇒ 必须两套都报）。
+2. README 本表**不再写出这三个词的字面量**，改为按**下标引用**扫描器的唯一来源
+   `WORDS`（其字面量只存在于 `checkpoints/qa_learn/_verify/emb_cache/wording_scan.py` 内）。
+   ⇒ README 文本自身**真的不含**这三个词，故「0」对**任意**强调写法都成立，
+   是**语料属性**而非书写形式的函数。
+
+| 用词（下标引用） | §13.11 段内 | README 全文（剔除强调标记后） | 说明 |
+| --- | --- | --- | --- |
+| `WORDS[0]` | **0** | **0** | 全文已无 |
+| `WORDS[1]` | **0** | **0** | 全文已无 |
+| `WORDS[2]` | **0** | **48**（全部在 §13.11 **之外**） | **如实登记差异**：这 48 处属 §15「分档鲁棒性考卷」的**高斯扰动实验与 `WORDS[2]` 底标定**（`noise` 扰动类、`noise_floor` 口径），是**另一个技术概念**，与 §13.11 的根因定性无关；那两节有各自的冻结口径与产物，**不在本轮「只修表述」的范围内**（改动它们会变更已验收轮的文档口径）。故本轮的达标口径是「**§13.11 段内三词均 0**」+「**全文前两词均 0**」 |
+
+> **自我说明（不得再引用上一轮的「加粗分隔」写法）**：上一轮那张表与它的「书写约定」段落
+> 自身就是「靠强调标记压 0」的**反例**（剔除强调标记后分别得到 1 / 1 / 2 处命中），
+> 本轮已一并撤除。上表「用词」列只给下标，字面量由扫描器 `WORDS` 提供（**唯一来源**）；
+> 本节自身的**引用形式**与「全文 = 0」字面要求之间的差异仍在「说明」列
+> **如实登记，不强行对齐**。
 
 **10.4 离朱 R71 复测通过的收口与两条口径登记（文档补充，`encoders.py` / `encoders_run.py` 保持已测状态不变）**
 
@@ -3891,10 +3938,12 @@ python -m n3d_qa_learn.text_variants_run report [--out-dir D]
 不落盘特征矩阵、不产 zip、无挂钟字段；`--limit` 演练一律写子目录。
 ### 17.7 难负例与检索池口径（**必须显式**）
 
-> ⚠️ **已被 §17.18.1 取代（R68 超期标记）**：下文的「**两种**负例设定 + 检索池**恒为全量行**」
-> 是改造初期的设计口径。R67 起已改为**三种**设定：A `full_pool_all_rows`（池 = 全部行，不消费负例）、
-> B `small_pool_hard` / C `small_pool_random`（**逐查询行小池**，池 = { 自身 } ∪ 同类负例，全量下池大小恒为 17）；
-> **难负例对照 = B - C**；A 不参与负例对照。此处仅保留为设计演进记录，**不得据本节读数**。
+> ⚠️ **已被 §17.18.1 取代（R68 超期标记）；R69 再扩一档**：下文的「**两种**负例设定 + 检索池**恒为全量行**」
+> 是改造初期的设计口径。R67 起改为**三种**设定，**R69 起为四种**：A `full_pool_all_rows`（池 = 全部行，不消费负例）、
+> B `small_pool_hard` / C `small_pool_random` / **D `small_pool_hard_encoder`**（**逐查询行小池**，
+> 池 = { 自身 } ∪ 同类负例，全量下池大小恒为 **17**，三者**逐行严格相等**）；
+> **对照量 = `B - C`（难负例 vs 随机）与 `D - C`（编码器近邻 vs 随机，R69 新增实验量）**；
+> A 不参与负例对照。此处仅保留为设计演进记录，**不得据本节读数**；现行口径见 §17.19.2。
 
 - **难负例三类**（顺序敏感、报告分列）：`same_file`（同 `file` 他行，按 `(line_no, row_id)` 升序）、
   `adjacent_line`（同 `file` 且 `line_no ± 1`）、`encoder_neighbor`（编码器归一化特征余弦 top-n，
@@ -3904,10 +3953,12 @@ python -m n3d_qa_learn.text_variants_run report [--out-dir D]
 - ~~**检索池口径：检索池全程恒为全量 2665 行、库支恒为「原文支」**（理由：自检索口径要求
   「查询行与库行来自同一全量行表」，与步骤 2 的 `self_retrieval` 同源；
   把难负例行从池中移除会让库行的自身金标不可达、`R@1` 结构性为 0）~~
-  —— **该句仅适用于设定 A**；B / C 的池已改为逐查询行小池（上下文标记为超期）。
-  库支**恒为「原文支」**这一点在三设定下**仍然成立**。
+  —— **该句仅适用于设定 A**；B / C / D 的池已改为逐查询行小池（上下文标记为超期）。
+  库支**恒为「原文支」**这一点在四种设定下**仍然成立**。
 - 另给**公共子集**对照（冻结划分的查询行 666）；R67 起在**同一批公共查询行**上
-  对**三种池设定**分别评测（见 §17.18.2）。
+  对**四种池设定**分别评测（**R69 起** `common_subset` 实际渲染
+  `variants_full_pool` / `variants_small_pool_hard` / `variants_small_pool_random` /
+  **`variants_small_pool_hard_encoder`** 四个分池键；见 §17.18.2 与 §17.19.2）。
 
 ### 17.8 判定规则（先声明、规则与判定同源）
 
@@ -3942,7 +3993,11 @@ python -m n3d_qa_learn.text_variants_run report [--out-dir D]
 3. **检索池不因负例设定而改变**（见 17.7），这是一个**显式选择**，不是遗漏。
 4. **QA 侧成组只取证、不接损失**（`QA_GROUPING_NO_LOSS_NOTE`）：是否把组结构接入损失
    是**独立决策**，本轮未做也**不得**被解读为已做。
-5. **编码器近邻用的是同一个 bge-m3**（仓库自有）；它只做**负例挖掘**，不参与任何判定。
+5. **编码器近邻用的是同一个 bge-m3**（仓库自有）；它只做**负例挖掘**，**不参与任何判定**
+   —— **R69 精确化（同源性登记）**：`R@1` / `R@5` 的口径是 `step2.ZhBagVectorizer`
+   （哈希词袋，D = 192），`bge-m3`（D = 1024）只用于造邻，故主档 D 与指标**不同源**；
+   「同源档」的风险（用被评测的那个编码器造邻 ⇒ 难度自证）已用 `zh-bag` / `local-hash`
+   两档现场对照分别登记，见 §17.19.3（**只作诊断、不得当作无偏难度度量**）。
 6. 现场与任务描述的差异已在 17.6 表格中逐项登记（`b.md` 一行独大 2403/2665）。
 
 ### 17.10 零回归
@@ -4526,3 +4581,453 @@ python -m n3d_qa_learn.step2_run textvariants probe
 `determinism_check.json` 新增 `n_content_common_files` / `content_common_files` /
 `content_files_bitwise_equal` 三个聚合字段，使该结论**可读而不被 path-dependent 文件误导**
 （此前只看 `all_bitwise_equal` 会得到 `False`，属**呈现缺陷**，本轮一并修正）。
+
+---
+
+### 17.19 R69 轮 B：`encoder_neighbor` 第三类难负例 / 设定 D / 自指修复 / 口径收口
+
+> 驱动：`python -m n3d_qa_learn.text_variants_run {probe|gate|eval|report}`
+> （`.venv\Scripts\python.exe`；`HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1` + 本地 `models/bge-m3`）。
+> 产物写 `checkpoints/qa_learn/_verify/text_variants/`；**日志写其 `_logs/` 子目录**
+> （不落顶层，故不进入双跑比对的 `files`）。**零新增依赖**。
+
+#### 17.19.1 改动清单（文件级）
+
+| 文件 | 改动 | 说明 |
+| --- | --- | --- |
+| `n3d_qa_learn/text_variants.py` | 改 | `ENCODER_NEIGHBOR_TOPK` **3 → 16**（= `NEGATIVE_POOL_SIZE`）；新增 `ENCODER_POOL_RULE` / `ENCODER_NEIGHBOR_HOMOLOGY_RULE` / `_ENCODER_SETTING_UNAVAILABLE_REASON`；`NEGATIVE_SETTINGS` 增第 4 项 `small_pool_hard_encoder`；`build_negative_manifest` 增 `kinds` / `kinds_present` / `n_kinds` / `encoder_neighbor_topk` / `homology_rule`（skip 标记转为 `False` + 空理由）；`negative_setting_payload` 增 `encoder_pools` / `encoder_eligible_row_ids`；`zero_training_eval` 增设定 D、`encoder_vs_random_delta`（D−C）与**三侧** fail-closed 前置断言；`render_markdown` 增 §5.4（D）/ §5.5（公共子集第四池）/ §5.6（B−C 与 D−C 并列）/ §5.7（三侧前置条件，编号改为**动态**），§4 增 `kinds` 渲染 |
+| `n3d_qa_learn/text_variants_run.py` | 改 | `_determinism_block` **跳过证据文件自身**（+ `excluded_self_file` / `self_exclusion_rule` 两键）；`cmd_eval` 记录设定 D 与 D−C 并在产物顶层透出 `negatives_kinds` / `encoder_setting_applicable` / `homology_rule`；`_small_pool_precondition` 扩到三侧；`_neighbor_encoder` 按注册表 `kind` 分派 `source`（**hash 家族必须空 source**）⇒ 使 `local-hash` / `zh-bag` 可作同源性对照档；`cmd_report` 的 `negatives` 块改从 `negatives.json` 本尊取 `kinds`（**不新增 `gate_summary.json` 的键**） |
+| `n3d_qa_learn/README.md` | 改 | §10.2 未决发现补「选择 D 的理由」+ 新增 §10.5 零改动证明；§10.3 措辞扫描口径改为「先剔除强调标记」；§13.11 第六条限定为「上一轮未改」；§17.7 / §17.9 同步；新增本节 |
+| `checkpoints/qa_learn/_verify/emb_cache/wording_scan.py` | 改 | 计数前剔除 `**` / `*` / `` ` ``，并同时报 `raw` 与 `stripped` 两套计数 |
+| `checkpoints/qa_learn/_verify/text_variants/_r69_checks/verify_r69.py` | 新增 | 只读核对脚本（`kinds` / 逐行池一致性 / 断言的**现场反例**） |
+
+`encoders.py` / `encoders_run.py` / `entry_table.py` / `robust_eval.py` / `variant_b.py` **零改动**（git 证明见 17.19.7）。
+
+#### 17.19.2 任务 ①：`encoder_neighbor` 第三类难负例 + 新增设定 D
+
+**口径变更（先报）**：`ENCODER_NEIGHBOR_TOPK` 由 `3` 改为 `16`（= `NEGATIVE_POOL_SIZE`）。理由：设定 D 的池 = {自身} ∪ `encoder_neighbor`，按题目要求必须与既有 B / C **逐查询行池大小严格一致**（1+16=17）；若仍取 3，D 的池大小只有 4，会**直接触发** fail-closed 断言（现场反例见下）。
+
+**不动既有 B / C 的池构成**：`_negative_pool_for` 按 `(same_file → adjacent_line → encoder_neighbor)` 顺序取前 16 条，而 `same_file` 每行恒有 ≥16 条 ⇒ B 的池**全部**由 `same_file` 填满、`encoder_neighbor` **从不进 B 的池**；C 用 `random` 池。故该常量变更**只影响** `negatives.json` 的 `encoder_neighbor` 类与其 SHA —— 这正是 B / C 数值**逐位不变**的原因。
+
+现场实测（全量 2665；`probe` 126.9 s / `gate` 66.7 s / `eval` 129.5~130.1 s（含双跑证据）/ `report` 完成）：
+
+| 项 | 现场值 |
+| --- | --- |
+| `negatives.json.kinds` | `['same_file', 'adjacent_line', 'encoder_neighbor', 'random']` ⇒ **三类难负例齐备**（+ 对照池抽样类） |
+| `encoder_neighbor_skipped` / `encoder_neighbor_topk` | **`False`** / `16`（旧的 skip 标记与理由已转为 `false` / 空串，不再有「只落地 two 类」表述） |
+| 各类负例对 `n_pairs` | `same_file 42640` / `adjacent_line 90` / `encoder_neighbor 42640` / `random 42640` —— **前者的 42640 = 2665 × 16，`random` / `encoder_neighbor` 同值**；**`adjacent_line` 只有 90 对**（仅 51 / 2665 行存在相邻行，`min_per_query = 0` / `max_per_query = 2`，**属数据事实不是缺陷**）⇒ **不得**用「三类难负例各 16 条/行」这类笼统表述 |
+| 逐行池大小 (B, C, D) | 去重集合 = `{(16, 16, 16)}` ⇒ 池恒为 **17**；**三侧不等的行数 = 0**；三侧查询行集相同 = `True` |
+| 设定 D `R@1`（原文 / 关键词 / 摘要 / 自适应） | `1.0` / `0.54296435272045029` / `0.97335834896810502` / `0.82551594746716694` |
+| 设定 D `R@5` | `1.0` / `0.92720450281425892` / `1.0` / `0.98574108818011252` |
+| **`D - C`（新实验量）** | `0.0` / **`-0.4273921200750469`** / `-0.02589118198874296` / `-0.16135084427767354` |
+| `B - C`（既有，逐位不变） | `0.0` / `-0.275422138836773` / `-0.016885553470919246` / `-0.08930581613508437` |
+
+**前置断言与现场反例**（`_r69_checks/verify_r69.py`，只读）：
+断言 = `hard_ids == random_ids == encoder_ids` **且**逐行 `len(B) == len(C) == len(D)`（`SMALL_POOL_PRECONDITION_RULE` + R69 扩展语句）；
+**反例** = 把 `per_kind['encoder_neighbor']` 各类截断到 3 条后调用 `zero_training_eval` ⇒ **`AssertionError` 如期抛出**（fail-closed；脚本退码 0 表示「如期失败」）。
+
+**`D - C` 的口径纪律**：它是**新实验量**，与 `B - C` **并列报告**；产物 note 与本节均显式写明「**不得**用它反向解释或覆盖 `B - C`」。
+
+**`--no-encoder-neighbors` 时的处置（不静默产 0 值）**：若 `negatives.json` 不含 `encoder_neighbor`，设定 D **不进入 `settings`**，改为在 `measured_scope` 落 `encoder_setting_applicable=false` + 理由（`_ENCODER_SETTING_UNAVAILABLE_REASON`）；报告 §5.4 不渲染、§5.7 显式登记。
+
+#### 17.19.3 同源性登记（**与任务书前提不符，如实登记差异**）
+
+任务书写「`encoder_neighbor` 若用**被评测的那个编码器（`bge-m3`）**构造」。**现场不成立**：`R@1` / `R@5` 的计算口径是 `step2.ZhBagVectorizer`（`n3d_qa` 哈希词袋，**D = 192**），`bge-m3`（D = 1024）**只用于负例挖掘**、不参与任何指标计算。故**主档 D 与评测指标本来就不同源**（跨「语义编码器 vs 词面哈希词袋」两族）。为把「同源性」做成**可读事实**而非口头声明，本轮**另跑两档对照**（各自独立目录、同一份 `variants.jsonl`（带入）、只换造邻编码器）：
+
+| 档 | 造邻编码器 | 与评测口径（`zh-bag` D=192）的关系 | `D - C`（关键词 / 摘要 / 自适应） | D `R@1`（关键词 / 摘要 / 自适应） |
+| --- | --- | --- | --- | --- |
+| **主档** | `bge-m3`（D=1024，语义） | **不同源**（跨表示族） | `-0.4273921200750469` / `-0.02589118198874296` / `-0.16135084427767354` | `0.54296435272045029` / `0.97335834896810502` / `0.82551594746716694` |
+| **不同源（同族）档** | `local-hash`（D=88，词面哈希） | **同族**（同为确定性哈希词袋，仅 salt / 维度不同） | `-0.3598499061913696` / `-0.01951219512195113` / `-0.13470919324577857` | `0.6105065666041276` / `0.9797373358348969` / `0.8521575984990619` |
+| **同源档（诊断）** | `zh-bag`（D=192，**就是评测口径**） | **同源** ⇒ 难度自证 | `-0.3879924953095685` / `-0.02326454033771108` / `-0.13508442776735452` | `0.5823639774859287` / `0.9759849906191369` / `0.851782363977486` |
+
+三档的 **A / B / C 设定数值逐位相同**（它们不依赖造邻编码器）；对照档目录 = `_verify/text_variants/homology_localhash/` 与 `homology_zhbag/`（各含带入的 `variants.jsonl`、本档现算的 `negatives.json`、`retrieval_eval.json`）。
+
+**读法与纪律**：① 三档的 `D - C` 都**只作诊断**，**不得**当作无偏难度度量；② **同源档（`zh-bag`）**是「用同一个编码器挖负例、再用它评测」的自证情形，**最不可**当难度结论；③ 现场顺序（同支 `D - C`：`bge-m3` 最负 < `zh-bag` < `local-hash`）说明**语义近邻对词面指标更难**，**不等于**「同源对照更难」——该方向差**仅作观察、不作结论**（单 seed、单语料）；④ 三档都不改变 A / B / C 的任何判定量。
+
+#### 17.19.4 任务 ②：`determinism_check.json` 确定性证据修复（R69 自指 + **R70 回路**）
+
+> ⚠️ **R70 作废声明**：本节原先登记的「修复后连跑两次 = **7481 B / `e312ae83504c0717…`**」
+> 与现场**任何状态都对不上**，已**作废**（见下方「R70 现场取证」）。R69 的自指修复
+> **只解决了「文件记录自己」这一半**，另一半（报告内嵌证据 ←→ 证据记录报告 SHA 的**回路**）
+> 在 R70 才被皋陶实测发现并修复。
+
+**缺陷（两处，分两轮修复）**
+
+1. **R69：自指**。`_determinism_block` 用 `os.listdir` **不加过滤**枚举两目录，把
+   `determinism_check.json` **自己**也写进 `files` ⇒ 其 `a_sha256` = **上一次运行留在磁盘上的自己**。
+2. **R70：回路**（皋陶实测）。R69 只排除了「自己」，却仍把
+   `text_variants_report.{json,md}` 的 SHA256 写进 `files`；而 `cmd_report` 生成的报告又把
+   `determinism` **整块内嵌回** `text_variants_report.json` ⇒ 形成
+   「**报告内嵌证据 ←→ 证据记录报告 SHA**」的**回路** ⇒ 该文件**不是**输入目录内容的
+   确定性函数：按常规工作序（`eval → report → eval`）再跑 `eval` **必然改变**。
+   同一回路的另一表现：`all_bitwise_equal` 在常规工作序下**结构上恒为 `False`**
+   （`a_sha256` 记的是本进程写出前的旧值），对读者无信息量。
+
+**R69 修复前现场取证**（旧代码、独立小目录 `_selfref_demo/a` + `b`，`--limit 20`，连跑两次 `eval`）：
+
+| 运行 | `determinism_check.json` | 自录项 |
+| --- | --- | --- |
+| run1 | **5798 B / `6bc68b978b68baa0…`** | **不存在**（该文件此前不在盘上） |
+| run2 | **6760 B / `154a7bdff8f7276a…`** | `a_bytes=5798`、`a_sha256 = 6bc68b978b68baa0…` = **run1 写出的那个文件** ⇒ **自指哈希链**；其余共有文件逐个 `bitwise_equal = True` |
+
+**R70 修复前现场取证（皋陶真实执行，**真实产物目录**）**：`eval --repro-dir`（独立进程）
+⇒ 7433 B / `f81f04be40bd7374…`；同命令 ⇒ 7433 B / `f81f04be…`（**这一步逐字节相同**）；
+跑 `report`（报告被重写为 172619 / `8967facdee0e924e` 与 18065 / `6a31bb345b007d1c`）；
+同命令 ⇒ 7433 B / **`b7759b462e30ddb0…`（变了）**；其后连续两次才稳定。
+⇒ 该文件**只在「其后不再有 report」的前提下稳定**。
+
+**R70 修复后现场取证（真实产物目录 `checkpoints\qa_learn\_verify\text_variants`，
+`--repro-dir checkpoints\qa_learn\_verify\text_variants\repro_r69`）**
+
+| 序 | 动作（**真实工作序**） | `determinism_check.json` | 与首次是否逐字节相同 |
+| --- | --- | --- | --- |
+| ① | `eval --repro-dir` | **7792 B / `edeb0bded509e5a29e421d464161c9d90917e4f78b4a22e3faf77a727986d3c3`** | —（基准） |
+| ② | `eval --repro-dir`（**其间不跑 report**） | **7792 B / `edeb0bded509e5a2…`** | ✅ **相同**（硬验收 (i)） |
+| ③ | `report`（两件报告被重写为 166341 / `a7a526e938c09368` 与 17800 / `7664e8787d7a2f9d`） | — | — |
+| ④ | `eval --repro-dir`（**report 之后**） | **7792 B / `edeb0bded509e5a2…`** | ✅ **相同**（硬验收 (ii)：**回路已断的直接证据**） |
+| ⑤ | `report` → `eval --repro-dir`（再来一轮） | **7792 B / `edeb0bded509e5a2…`** | ✅ **相同** |
+
+**硬验收（文字已显式写明工作序与目录）**
+* (i) **固定工作序下**：在**主产物目录**上 `eval × 2`、**其间不跑 `report`** ⇒ 该文件**逐字节相同**；
+* (ii) **跑 `report` 之后再 `eval`** ⇒ 该文件**仍逐字节相同**（上表 ③④ 与 ⑤）。
+* 两次 `eval` 之间**不得**有其他写盘动作改变被枚举的文件集合（`report` **可以**跑，因为两件报告已整类排除）。
+
+**口径变更登记（两处排除 + 一处移除 + 一处降级）**
+
+1. **排除证据文件自身**（R69，`excluded_self_file` / `self_exclusion_rule`）：`files` 不含自身。
+2. **排除后置可重渲件**（R70，`RERENDERABLE_FILES = text_variants_report.json / .md`，
+   新增 `excluded_rerenderable_files` / `rerenderable_exclusion_rule`）：这类件在证据**之后**
+   才由 `report` 写出/重渲，**整类不进 `files`、不记录任何 SHA / 字节数**（只登记文件名）。
+3. **移除 `all_bitwise_equal`**（R70）：该字段在存在天然不同的 `path_dependent_files` 时
+   **结构上恒为 `False`**、无信息量且极易被误读为确定性失败 ⇒ 删除；判据收敛到
+   语义明确的 `content_files_bitwise_equal` / 新增的 **`determinism_ok`**（= 内容产物
+   两目录共有且逐字节相等），另新增 `common_but_not_equal_files`（**共有但天然不同的件白名单**）
+   与 `determinism_scope`（判定范围文本）把「为什么为 False」写清楚。
+4. **`report` 内嵌降级为摘要**（R70，`_determinism_summary`）：报告 JSON 的 `determinism`
+   只保留 `present` / `n_common_files` / `n_content_common_files` / `content_common_files` /
+   `content_files_bitwise_equal` / `determinism_ok` / `common_but_not_equal_files` /
+   `path_dependent_files` / `excluded_self_file` / `excluded_rerenderable_files` / `summary_rule`
+   —— **不含任何逐文件 SHA、不含 `out_dir` / `repro_dir` 路径**；报告 Markdown 的 §9
+   同步改为渲染该摘要（并注明「逐文件明细只以 `determinism_check.json` 本尊为准」）。
+
+**现场实测的判定字段（R70 修复后，真实产物目录）**：`n_common_files = 6`、
+`n_content_common_files = 5`、`content_files_bitwise_equal = True`、**`determinism_ok = True`**、
+`common_but_not_equal_files = ['probe_summary.json']`（内嵌 `out_dir`，属 `path_dependent_files`、
+不计入判定）、`only_in_out_dir = ['feature_gate.json','gate_summary.json','retrieval_eval.json']`
+（对照目录未跑 gate/eval ⇒ 单边件，如实登记不计入失败）。
+
+**作废 / 保留对照**
+
+| 值 | 状态 |
+| --- | --- |
+| **7481 B / `e312ae83504c0717258da8d7e5ec39b4d040708a2bc41f31447ca3d543ed7bec`**（R69 登记） | **作废** —— 仅在当时「其后不再跑 report」的瞬间成立，与常规工作序下的现场值不符 |
+| 7433 B / `f81f04be40bd7374…`、7433 B / `b7759b462e30ddb0…`（皋陶 R70 实测） | **保留为「修复前」现场证据**（证明回路存在） |
+| **7792 B / `edeb0bded509e5a29e421d464161c9d90917e4f78b4a22e3faf77a727986d3c3`**（R70 修复后） | **现行值**；上表 ①②④⑤ 四次运行**逐字节相同** |
+
+#### 17.19.5 任务 ④：皋陶遗留 3 条文档项
+
+**① README §13.11 第六条（`encoders_run.py` 的改动面）** —— 原文「本轮**未改动** `encoders_run.py`」是**分片修复轮**的陈述残留。已限定为：「**上一轮（分片修复轮）未改动**；**其后的皋陶复审收口轮（§九 warning 1）改动过它，且只改一处** —— G2 取证的 meta 读取由『按历史扁平布局直拼路径』改为 `EmbeddingCache.read_meta`（分片优先 + 扁平只读回退），**只影响 meta 取证、不影响任何向量 / 缓存键 / 口径指纹**」。
+
+**② `_verify/emb_cache/wording_scan.py`：剔除强调标记后再计数** —— 旧脚本按**未断开的字面量**计数，而 README 又用「加粗分隔」书写，于是「0」是**书写形式的函数**（剔除强调标记后实测命中 **1 / 1 / 2** 处）。改法：① 计数前剔除 `**` / `*` / `` ` ``（`EMPHASIS_MARKERS`），并**同时报出未剔除的原始计数**，两套任一越界即 FAIL；② README §10.3 **不再写出三个词的字面量**，改为按**下标引用**脚本里的唯一来源 `WORDS` ⇒ README 文本**真的不含**这三个词。
+
+| 用词 | 旧脚本（未剔除） | 新脚本 `raw` | 新脚本 `stripped` | 判定 |
+| --- | --- | --- | --- | --- |
+| `WORDS[0]` | README 全文 0 | 全文 0 | **全文 0** | PASS |
+| `WORDS[1]` | README 全文 0 | 全文 0 | **全文 0** | PASS |
+| `WORDS[2]` | §13.11 内 0 | §13.11 内 0 | **§13.11 内 0**（段外 48，属 §15 的另一技术概念） | PASS |
+
+现场运行：`JUDGEMENT … -> PASS`、**退码 0**。
+
+**③ 12 件产物「本轮是否重跑」的声明** —— **本轮确实重跑了全量**（`probe → gate → eval（×2）→ report`；覆盖度 **2665/2665**、`is_full_corpus = true`、`limit = 0`），故按题目要求改为**刷新并声明**（逐件对照见 17.19.6）。**基线口径澄清（如实登记差异）**：任务书给出的两件报告基线（`129992 / bac640865b8db74c`、`13818 / 9c42e988f52a8031`）与**本轮开工前的现场值**（`129995 / 4f8887446fb06861`、`13818 / ec6463010a27b1f6`）**不一致** —— 前者是 §17.18.14 收口时的值；§13.11 轮复跑 `eval` + `report` 时报告随上游 `determinism_check.json` 变化而刷新（该漂移已在 §13.11 七的产物表里逐项登记）。下表一律以**现场值**为「修复前」基准。
+
+#### 17.19.6 硬约束逐项对照（修复前 → 修复后）
+
+**判定量（必须逐位不变）—— 全部满足**
+
+| 量 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 设定 A `R@1`（原文 / 关键词 / 摘要 / 自适应） | `1.0` / `0.44540337711069417` / `0.9568480300187617` / `0.7684803001876173` | **相同** |
+| 设定 A `R@5` | `1.0` / `0.775609756097561` / `0.98986866791744843` / `0.93133208255159472` | **相同** |
+| 设定 B `R@1` | `1.0` / `0.69493433395872417` / `0.98236397748592874` / `0.89756097560975612` | **相同** |
+| 设定 C `R@1` | `1.0` / `0.97035647279549719` / `0.99924953095684799` / `0.98686679174484049` | **相同** |
+| `B - C` | `0.0` / `-0.275422138836773` / `-0.016885553470919246` / `-0.08930581613508437` | **相同** |
+| `verdict_key` + 逐支键 | `mixed` + `[task_valid_not_identity, undecided, task_valid_not_identity]` | **相同** |
+| 门禁四项 | `passed=True` / `violations=0` / `reducible_rows=2387` / `irreducible_rows=278` | **相同** |
+| 覆盖度 | 2665 / 2665、`coverage_ratio=1.0`、`is_full_corpus=true` | **相同** |
+| 既有小池池大小 | 17 | **相同**（三侧均为 17） |
+
+**产物指纹（修复前 → 修复后）**
+
+| 产物 | 修复前（现场值） | 修复后 | 判定 |
+| --- | --- | --- | --- |
+| `variants.jsonl` | 2416229 / `92b1ddbd382cc43b` | 2416229 / `92b1ddbd382cc43b` | **逐项不变** |
+| `variants_meta.json` | 6754 / `f3877dd85a01a7e9` | 6754 / `f3877dd85a01a7e9` | **逐项不变** |
+| `feature_gate.json` | 7155 / `3b58efb156b1b6f8` | 7155 / `3b58efb156b1b6f8` | **逐项不变** |
+| `qa_grouping.json` | 1430 / `7de71d4f47be6866` | 1430 / `7de71d4f47be6866` | **逐项不变** |
+| `keyword_vocab.json` | 241001 / `990027709ab78b20` | 241001 / `990027709ab78b20` | **逐项不变** |
+| `negatives.json` | 2282357 / `3892c60eb3479815` | **3387028 / `5ded5446594613f1`** | 允许变（新增 `encoder_neighbor` 类 +42640 对；另增 `kinds` / `kinds_present` / `n_kinds` / `encoder_neighbor_topk` / `homology_rule` 字段，skip 标记转 `false`） |
+| `probe_summary.json` | 66566 / `3bfb6fd8eb3df89b` | **66785 / `340c2de4a5338e10`** | 允许变（负数统计同步：含 `encoder_neighbor` 类） |
+| `retrieval_eval.json` | 106752 / `ecd37ff488cc799a` | **148820 / `ecec8e7cf5c14d89`** | 允许变（新增设定 D、`D-C`、三侧前置条件、同源性、`negatives_kinds`） |
+| `determinism_check.json` | 7145 / `6712810836cd6509` | **7792 / `edeb0bded509e5a2`**（R70 现行值；R69 登记的 `7481 / e312ae83504c0717` **已作废**，见 §17.19.4） | 允许变（R69 自指修复 + **R70 回路修复**；**真实产物目录上 4 次 `eval` 逐字节相同**，含 `report` 之后再 `eval`） |
+| `text_variants_report.json` | 129995 / `4f8887446fb06861` | **166341 / `a7a526e938c09368`** | 允许变（渲染 D + 文档口径 + **R70 起 `determinism` 只内嵌摘要**） |
+| `text_variants_report.md` | 13818 / `ec6463010a27b1f6` | **17800 / `7664e8787d7a2f9d`** | 允许变（同上；§9 改为渲染摘要） |
+| `gate_summary.json` | 8762 / `1286d1b2e848eb9a` | **8793 / `dff6a6af3c368ef6`** | ⚠️ **硬约束冲突，见下（必须先报）**；**R70 未再变** |
+
+**⚠️ 一处硬约束冲突（显式上报，不静默处理）—— `gate_summary.json` 不可能保持不变**
+
+`gate_summary.json` 的 `negatives` 块**内嵌 `negatives.json` 的 `counts` 与 `fingerprint`**（自 R67 起的既有结构）。任务 ① 要求 `negatives.json` **必须**新增 `encoder_neighbor` 类 ⇒ 其 `counts` 多一类、`fingerprint.structural_sha256` 变 ⇒ **`gate_summary.json` 必然变化**，与「`gate_summary.json` 8762 / `1286d1b2e848eb9a` 逐项不变」这条硬约束**在逻辑上互斥**。
+
+* 现场变化面**只有** `negatives` 块（`counts` / `fingerprint`）；其余键（`command` / `out_dir` / `n_rows` / `feature_gate` / `hard_gate_passed` / `granularity_guard_rule`）与 `feature_gate.json`（7155 / `3b58efb156b1b6f8`）**均未变**。
+* 为**最小化**改动面，本轮**主动撤回**了原计划在该文件里新增的 `kinds` / `n_kinds` 两键（报告改从 `negatives.json` 本尊读取）⇒ 该文件的**键集合与旧版完全一致**，只有内嵌值随上游变化。
+* **交回风后决策**：若该件必须逐字节不变，则只能**放弃任务 ①**（不落地第三类难负例）。
+
+**其余零回归（逐项现场核对）**：`checkpoints/qa_learn/` 顶层仍是 **9 个 `qa_*.pt.zip`**（字节 / SHA256 / mtime 见 17.19.7，与既有登记逐项一致）、顶层文件数 **9**；第二步 / 校准轮 **5 件冻结产物逐字节不变**（`variantb_probe.json` `537814d95d933227`、`variantb_drill.json` `5fe2e2f31e7feab7`、`variantb_eval.json` `d094c9bd9200120d`、`variantb_report.json` `33874ccd128fd221`、`variantb_report.md` `0bd4b2fde9dbfd67`）；`n3d_qa` / `n3d_shape` / `n3d_sphere` / `n3d_proto` 的 `git status --porcelain` **为空**；根 `requirements.txt` **未改**（SHA256 `f69450d55d148a52…`、`git status` 空）；**零新增依赖**；`compileall` 退码 0。
+
+**仍不得动、本轮确实未动**：`key_for` 公式 / `EMB_CACHE_SHARD_DEPTH = 2` 与 `<key[:2]>` 布局 / 条目字节格式 / `fingerprint()` 原样委派；`encoders.py` / `encoders_run.py` / `entry_table.py` / `robust_eval.py` / `variant_b.py` **零改动**（现场 `git diff` 见 17.19.7）。批组成依赖按 **D 方案「只登记不修」** 结案（§10.2 + §10.5），**代码零改动**。
+
+#### 17.19.7 零回归与「代码零改动」的现场证据
+
+```text
+$ git status --porcelain -- n3d_qa_learn
+（摘录） M n3d_qa_learn/README.md
+        M n3d_qa_learn/text_variants.py
+        M n3d_qa_learn/text_variants_run.py
+$ git status --porcelain -- n3d_qa_learn/encoders.py n3d_qa_learn/encoders_run.py
+（空）
+$ git diff -- n3d_qa_learn/encoders.py n3d_qa_learn/encoders_run.py
+（空）
+$ git status --porcelain -- n3d_qa n3d_shape n3d_sphere n3d_proto
+（空）
+$ git status --porcelain -- requirements.txt
+（空）
+```
+
+9 个顶层 zip 的快照（字节 / SHA256 前 16 / mtime，逐项与既有登记一致）：
+
+| 文件 | 字节 | SHA256（前 16） | mtime |
+| --- | --- | --- | --- |
+| `qa_n3d_shape_index_D88_C40_mq2_s42.pt.zip` | 60632 | `2b801c9732d30753` | 2026-10-05 12:35:46 |
+| `qa_n3d_shape_index_D88_C30_mq5_s42.pt.zip` | 53915 | `13d87c850f93a8ef` | 2026-10-05 14:30:46 |
+| `qa_n3d_shape_index_D88_C8_mq8_s42.pt.zip` | 40898 | `a8bcb44a45e8b7df` | 2026-10-05 14:36:48 |
+| `qa_n3d_shape_index_D88_C8_mq8_s43.pt.zip` | 40865 | `650b6505587b67a0` | 2026-10-05 14:37:12 |
+| `qa_n3d_shape_index_D88_C8_mq8_s44.pt.zip` | 40946 | `bbaeb6a2263038b7` | 2026-10-05 14:37:38 |
+| `qa_n3d_shape_index_D88_C10_s42.pt.zip` | 41893 | `184637d2831ff3d4` | 2026-10-05 14:53:28 |
+| `qa_n3d_shape_index_D88_C10_s43.pt.zip` | 41904 | `1d0f34fa108d4ffd` | 2026-10-05 14:54:50 |
+| `qa_n3d_shape_index_D88_C10_s44.pt.zip` | 41907 | `dc13b78c3bac1c67` | 2026-10-05 14:56:10 |
+| `qa_n3d_shape_pointer_D88_C10_s42.pt.zip` | 33886 | `356994cf0795d2f8` | 2026-10-05 14:59:08 |
+
+#### 17.19.8 如实登记的其余差异与局限
+
+1. **任务书基线差异**：见 17.19.5 ③（两件报告的基线取自 §17.18.14，而非本轮开工前的现场值）。
+2. **同源性前提差异**：见 17.19.3（评测口径是 `zh-bag`，**不是** `bge-m3`）。
+3. **`gate_summary.json` 硬约束冲突**：见 17.19.6。
+4. **单 seed / 单语料**：`TEXT_VARIANTS_SEED = 20261010` 一次；三档同源性对照的**方向差**不作结论。
+5. **`encoder_neighbor` 仍是「同一批 2665 行内的近邻」**，不引入外部难负例；抽取式变体仍**不是** paraphrase（见 17.9）。
+6. **报告 §5.x 编号改为动态**（按实际渲染出的设定数递增），故设定 D 不可用时**不会留空号**。
+7. **方法学提示（本轮未做）**：`D - C` 只在单 seed 上测一次，无跨 seed 极差；若后续要把它当**判据**使用，须先补跨 seed 与「造邻编码器 × 评测口径」的交叉设计。
+
+#### 17.19.9 离朱 R72 复测（**45/45 通过、0 失败**）与 3 项观察项
+
+**复测概览**：单元/函数级 22 项 + CLI 端到端 E2E 8 项 + 接口/产物一致性 11 项 + 编译与零回归 4 项 = **45 项全部通过（FAIL = 0 / ERROR = 0）**；无因环境问题跳过的测试类型；测试脚本 `lizhu_r72_scripts/r69_acceptance.py`，产物在 `_verify/text_variants/_lizhu_r72/`；测试后主档 12 件指纹与本轮开始时**完全一致**（未污染正式产物）。
+
+**独立复现的规格事实（全部通过）**：`encoder_neighbor` 的**确定性**与全序键 `(-cos, row_id)`（含「全并列 ⇒ 按 `row_id` 升序」的人造数据用例）；三侧逐行池 `(16,16,16)` 与三侧查询行集相同；**截断反例如期 `AssertionError`**（报文含三侧计数）；**缺类不产 0 值假数据**（`settings` 不含 D、`applicable=False` 且不带 0 值字段）；`encoder_neighbor` 整体反序后 **B/C 池逐项不变**而 D 池变化；`D - C` 与 `B - C` **非同一对象、互不覆盖**；`_neighbor_encoder` 的 hash 家族**传非空 source 一律报错**；`determinism_check.json` `files` **不含自身**、**连跑两次逐字节相同**（临时目录 6006 B × 2）、**预置旧内容不改变产出**；`render_markdown` 与磁盘 `.md` 逐字符相同、§5 编号 `[1..7]` 无重复无空号、全文 `None` = 0；缺 `negatives.json` 时 `gate`/`report`/`eval` **同为退码 1** 且无 Traceback；措辞扫描**反向验证**（临时 README 追加「加粗分隔」写法 ⇒ **FAIL 退码 1**，真实仓库根仍 PASS）；零回归与 12 件产物指纹逐项一致。
+
+**3 项观察项（非缺陷；本轮状态见每条末尾）**
+
+1. **O1（可诊断性）**：`--hard-cap` < 16 或 `--encoder-topk` < 16 会让三类负例条数不同 ⇒ 三侧池大小不等 ⇒ fail-closed 拒绝评测（**行为正确**），但报文只列现场计数、**不指名是哪个开关**。建议在 CLI 侧对 `hard_cap` / `random_negatives` / `encoder_topk` 三者做构造期一致性校验并给指名报错。影响面：**仅显式调参档**；默认全量档（正式产物）不受影响。
+   **R70 状态**：**未改**（不在皋陶 R70 的 2 error + 2 warning + 3 info 清单内）。但 R70 把该失败由裸 `assert`（`-O` 下会被跳过）改为**显式 `VariantContractError`**，报文与退码都更明确（退码 1 + 「契约 / 门禁失败」，不再被误报成「非法参数」）。**该建议保留待决**。
+2. **O2（文档/一致性）**：证据文件记录了 `text_variants_report.{json,md}` 的 `a_sha256`，而常规工作序常为 `report` 在 `eval` 之后**重跑** ⇒ 落盘报告被改写、证据随即**陈旧**；`all_bitwise_equal` 亦因此结构上恒为 `False`。
+   **R70 状态：已修复（= 皋陶 error 2）** —— 两件报告纳入**后置可重渲件**整类排除（证据不再记录其 SHA），`report` 内嵌降级为**摘要**，并移除 `all_bitwise_equal`。修复后**真实产物目录**上 `eval × 2` 与「`report` 之后再 `eval`」四次运行**逐字节相同**（详见 §17.19.4 与 §17.19.10 的 error 1/2 条）。
+3. **O3（说明与现场不一致，非失败）**：测试说明里 `gate_summary.json` 的备注写作「任务 ① 必增一类 ⇒ 必然变化」，措辞易被误读成「该件相对**任何**基线都在变」。准确表述见 §17.19.6：该件的**键集合与旧版完全一致**，变化**只发生在内嵌的 `negatives` 值**上（`8762 / 1286d1b2e848eb9a` → `8793 / dff6a6af3c368ef6`）；离朱现场核对的 `8793 / dff6a6af3c368ef6` 正是**改后**的值，故「不作为失败判据」这一处置在本现场无需启用。
+   **R70 状态**：措辞已在 §17.19.6 与本条更正并登记。
+
+#### 17.19.10 R70 收口修复轮（皋陶 2 error + 2 warning + 3 info；**判定量逐位不变**）
+
+> **性质**：只修**文档口径、验收证据与「新回路」**；皋陶原话「代码逻辑本身无需改」。
+> 未重跑 `probe` / `gate`；为重建产物做的是**同参复跑**（全量 2665、`--topk 5`、
+> `--repro-dir …\repro_r69`、同 seed）。改动文件 = `n3d_qa_learn/text_variants.py` /
+> `n3d_qa_learn/text_variants_run.py` / `n3d_qa_learn/README.md`；**无新增文件**。
+
+**改动清单（文件级）**
+
+| 文件 | 改动 |
+| --- | --- |
+| `text_variants.py` | 新增 `VariantContractError(RuntimeError, AssertionError)` 与 `CONTRACT_FAILURE_NOTE`（并进 `__all__`）；**5 处裸 `assert` 全部改为显式 `if not …: raise VariantContractError(...)`**（报文逐字保留）；`render_markdown` §9 由「逐文件 SHA 表 + `all_bitwise_equal`」改为渲染**证据摘要** |
+| `text_variants_run.py` | 新增 `RERENDERABLE_FILES` 与 `_determinism_summary`；`_determinism_block` **整类排除后置可重渲件**、**移除 `all_bitwise_equal`**、新增 `determinism_ok` / `common_but_not_equal_files` / `determinism_scope` / `excluded_rerenderable_files` / `rerenderable_exclusion_rule`；`cmd_eval` 日志改打印 `determinism_ok` 与排除件；`cmd_report` 的 `determinism_evidence` 换字段、`report["determinism"]` 改内嵌摘要；`_small_pool_precondition` 的 D 判据改 `measured_scope.encoder_setting_applicable`；`--random-negatives` help `1 → 16`；`cmd_textvariants` 新增 **`-O` 入口守卫** 与 `except VariantContractError`（置于 `RuntimeError` 之前） |
+| `README.md` | 本节 + §17.19.4 重写（作废旧值）+ §17.19.6 指纹表 + §17.19.9 观察项状态 + §17.7（三→四种池设定） |
+
+**error 2｜彻底断开回路（皋陶实测的根因）**
+
+* **根因**：`_determinism_block` 只排除了证据文件**自身**，却仍把 `text_variants_report.{json,md}`
+  的 SHA256 写进 `files`；而 `cmd_report` 生成的报告又把 `determinism` **整块内嵌回**
+  `text_variants_report.json` ⇒ **「报告内嵌证据 ←→ 证据记录报告 SHA」回路** ⇒
+  该文件不是输入目录内容的确定性函数（常规工作序 `eval → report → eval` 下**必然改变**）。
+* **修法**：① 两件报告纳入**后置可重渲件**（`RERENDERABLE_FILES`）**整类排除** ——
+  既不进 `files`，也**不记录任何 SHA / 字节数**（只登记文件名）；② `report` 内嵌
+  **降级为摘要**（`_determinism_summary`，无逐文件 SHA、无 `out_dir` / `repro_dir` 路径）。
+* **验证**：见下方 error 1 的现场表（③④ 与 ⑤ 即回路消除的直接证据）。
+
+**error 1｜硬验收重写为可成立的命题 + 重出证据（**真实产物目录**）**
+
+**工作序与目录（硬验收文字显式写明）**：目录 = `checkpoints\qa_learn\_verify\text_variants`
+（**真实产物目录**，非临时/隔离目录）；对照目录 = `--repro-dir checkpoints\qa_learn\_verify\text_variants\repro_r69`
+（第二个**独立进程** `probe` 的产物）。命题：
+(i) **固定工作序下** `eval × 2`（其间**不跑 `report`**）⇒ 该文件逐字节相同；
+(ii) **跑 `report` 之后再 `eval`** ⇒ 该文件**仍**逐字节相同。
+
+| 序 | 动作 | `determinism_check.json` | 耗时（只进日志） | 与序① 是否逐字节相同 |
+| --- | --- | --- | --- | --- |
+| ① | `eval --topk 5 --repro-dir …\repro_r69` | 7792 B / `edeb0bded509e5a29e421d464161c9d90917e4f78b4a22e3faf77a727986d3c3` | 116.5 s | —（基准） |
+| ② | 同命令 | 7792 B / `edeb0bded509e5a2…` | 117.4 s | ✅ **相同** ⇒ (i) 成立 |
+| ③ | `report`（两件报告重写为 166341 / `a7a526e938c09368` 与 17800 / `7664e8787d7a2f9d`） | — | 58.2 s | — |
+| ④ | 同 `eval` 命令（**report 之后**） | 7792 B / `edeb0bded509e5a2…` | 115.6 s | ✅ **相同** ⇒ (ii) 成立（**回路已断**） |
+| ⑤ | 再 `report` → 再 `eval` | 7792 B / `edeb0bded509e5a2…` | 58.2 s + 118.1 s | ✅ **相同**（加强证据） |
+
+四条命令**全部退码 0**；最后一次 `report`（166341 / `a7a526e938c09368`、17800 / `7664e8787d7a2f9d`）
+在最后一次 `eval` **之后**执行，故落盘报告内嵌的摘要与落盘证据**一致**。
+
+**小批演练（先小批再全量）**：`_drillC` / `_drillC_repro`（各 `probe --limit 20`）上
+`eval → eval → report → eval` ⇒ 三次均为 **7911 B / `2e36e2d9b33d26e0…`**（**逐字节相同**）。
+
+**作废与保留**：`7481 B / e312ae83504c0717258da8d7e5ec39b4d040708a2bc41f31447ca3d543ed7bec`
+（R69 登记）⇒ **作废**；皋陶实测的 `7433 B / f81f04be40bd7374…` 与 `7433 B / b7759b462e30ddb0…`
+**保留为「修复前」现场证据**；**现行值 = 7792 B / `edeb0bded509e5a2…`**。
+
+**warning 1｜裸 `assert` 在 `-O` 下被跳过 ⇒ 改为显式 raise + CLI `-O` 守卫**
+
+* **全仓扫描（`text_variants*.py`）**：修复前 **5 处**裸 `assert`
+  （`text_variants.py:455 / 2029 / 2055 / 2060 / 2624`，行号为修复前现场值）⇒
+  修复后 **0 处**（扫描命令与结果见本节末）。
+* **修法**：① 全部改为 `if not <不变量>: raise VariantContractError(...)`（**报文逐字保留**）；
+  ② 新增异常类 `VariantContractError(RuntimeError, AssertionError)` —— 同时是
+  `RuntimeError`（CLI 报「契约 / 门禁失败」**退码 1**，不被 `(ValueError, KeyError)` 误报成
+  「非法参数 + 退码 2」）与 `AssertionError`（外部按 `except AssertionError` 写的调用方**无需改动**）；
+  ③ CLI 入口 `cmd_textvariants` 显式校验 `sys.flags.optimize == 0`，非 0 即**拒绝运行** + 退码 1
+  （两个入口 `text_variants_run` 与 `step2_run textvariants` 共用同一分派 ⇒ 同时覆盖）。
+* **现场反例（注入异常输入 = 把 `per_kind['encoder_neighbor']` 截断到 3 条）**：
+
+| 场景 | 命令形态 | 现场结果 |
+| --- | --- | --- |
+| 常规（`optimize = 0`） | 进程内直接调用 `zero_training_eval` | **`VariantContractError` 如期抛出**（`isinstance(e, AssertionError) = True`），进程退码 0（= 如期失败） |
+| **`PYTHONOPTIMIZE=1`（`optimize = 1`）** | 同上 | **同样如期抛出 `VariantContractError`** ⇒ `-O` 下不再被跳过（**fail-closed**） |
+| **`PYTHONOPTIMIZE=1` + CLI** | `python -m n3d_qa_learn.text_variants_run eval …` | 报文「拒绝在优化模式下运行：sys.flags.optimize = 1…」+ **退码 1**（入口守卫） |
+
+**warning 2｜CLI 帮助与冻结常量不一致**：`--random-negatives` 的 help 原写
+「0 = 冻结默认 **1**」，而 `RANDOM_NEGATIVE_COUNT = 16` ⇒ 已改为
+「0 = 冻结默认 **16** = `RANDOM_NEGATIVE_COUNT`；与 `NEGATIVE_POOL_SIZE` 同值，故 B/C 池大小一致」。
+
+**info 5｜README §17.7 过期表述**：原「对**三种池设定**分别评测」⇒ 已改为
+「对**四种池设定**分别评测」，并补明 `common_subset` 实际渲染的**四个分池键**
+（含 `variants_small_pool_hard_encoder`）；同段「三设定下仍然成立」一并改为「四种设定下」。
+
+**info 6｜`all_bitwise_equal` 结构上恒为 `False`**：**采用「直接移除」**（皋陶给的三选一）——
+该字段在存在天然不同的 `path_dependent_files` 时恒为 `False`，对读者无信息量且极易被误读成
+确定性失败。替代字段：**`determinism_ok`**（= 内容产物两目录共有且逐字节相等）+
+`common_but_not_equal_files`（**共有但天然不同的件白名单**，把「为什么不是全等」写清楚）+
+`determinism_scope`（判定范围文本）。`cmd_eval` 日志与 `cmd_report.determinism_evidence`
+（原 `all_common_files_bitwise_equal`）同步换字段。现场值：`determinism_ok = True`、
+`common_but_not_equal_files = ['probe_summary.json']`。
+
+**info 7｜`_small_pool_precondition` 的 D 判据**：原用 `if d else []`
+（`d = pst.get('small_pool_hard_encoder', {})`）—— 若该键存在但取值是**空 dict**，
+三元组会退化为 `(None, None, None)` 并与 B/C 判为「相等」、`settings_covered` 也会把 D 计入
+（假阳性）。已改为 `bool(ms.get('encoder_setting_applicable'))`，并在产物里新增
+`d_judged_by = "measured_scope.encoder_setting_applicable"` 把判据写死。
+
+**硬约束逐项对照（修复前 → 修复后）**
+
+* **判定量（逐位不变，现场从 `retrieval_eval.json` 直读）**：
+
+| 量 | 修复前 | 修复后 |
+| --- | --- | --- |
+| A `R@1`（原文/关键词/摘要/自适应） | 1.0 / 0.44540337711069417 / 0.9568480300187617 / 0.7684803001876173 | **相同** |
+| B `R@1` | 1.0 / 0.6949343339587242 / 0.9823639774859287 / 0.8975609756097561 | **相同** |
+| C `R@1` | 1.0 / 0.9703564727954972 / 0.999249530956848 / 0.9868667917448405 | **相同** |
+| D `R@1` | 1.0 / 0.5429643527204503 / 0.973358348968105 / 0.8255159474671669 | **相同** |
+| `B - C` | 0.0 / −0.275422138836773 / −0.016885553470919246 / −0.08930581613508437 | **相同** |
+| `D - C` | 0.0 / −0.4273921200750469 / −0.02589118198874296 / −0.16135084427767354 | **相同** |
+| `verdict_key` + 逐支键 | `mixed` + `[task_valid_not_identity, undecided, task_valid_not_identity]` | **相同** |
+| 门禁四项 / 覆盖度 / 池 | `passed=True`·`violations=0`·`2387`·`278` / 2665·2665 / 负例 16（池 17） | **相同** |
+
+  ⇒ **`retrieval_eval.json` 的指纹（148820 / `ecec8e7cf5c14d89`）在 R70 前后逐字节不变**，
+  即判定量零变化的直接证据。
+
+* **产物指纹（R69 交付 → R70 现行）**：
+
+| 产物 | R69 交付 | R70 现行 | 判定 |
+| --- | --- | --- | --- |
+| `variants.jsonl` | 2416229 / `92b1ddbd382cc43b` | 2416229 / `92b1ddbd382cc43b` | **逐项不变** |
+| `variants_meta.json` | 6754 / `f3877dd85a01a7e9` | 6754 / `f3877dd85a01a7e9` | **逐项不变** |
+| `feature_gate.json` | 7155 / `3b58efb156b1b6f8` | 7155 / `3b58efb156b1b6f8` | **逐项不变** |
+| `qa_grouping.json` | 1430 / `7de71d4f47be6866` | 1430 / `7de71d4f47be6866` | **逐项不变** |
+| `keyword_vocab.json` | 241001 / `990027709ab78b20` | 241001 / `990027709ab78b20` | **逐项不变** |
+| `negatives.json` | 3387028 / `5ded5446594613f1` | 3387028 / `5ded5446594613f1` | **未变**（R70 未触碰） |
+| `probe_summary.json` | 66785 / `340c2de4a5338e10` | 66785 / `340c2de4a5338e10` | **未变** |
+| `retrieval_eval.json` | 148820 / `ecec8e7cf5c14d89` | 148820 / `ecec8e7cf5c14d89` | **未变**（判定量载体） |
+| `gate_summary.json` | 8793 / `dff6a6af3c368ef6` | 8793 / `dff6a6af3c368ef6` | **未变** |
+| `determinism_check.json` | 7481 / `e312ae83504c0717`（**已作废**） | **7792 / `edeb0bded509e5a2`** | 允许变（error 1/2 修复） |
+| `text_variants_report.json` | 172667 / `734f64ea60a71d4c` | **166341 / `a7a526e938c09368`** | 允许变（内嵌摘要 + §9 渲染） |
+| `text_variants_report.md` | 18065 / `635000ccb58fd867` | **17800 / `7664e8787d7a2f9d`** | 允许变（同上） |
+
+* **仍不得动、本轮确实未动**：`key_for` 公式 / `EMB_CACHE_SHARD_DEPTH = 2` 与 `<key[:2]>` 布局 /
+  条目字节格式 / `fingerprint()` 原样委派；`encoders.py` / `encoders_run.py` /
+  `entry_table.py` / `robust_eval.py` / `variant_b.py` **零改动**
+  （`git diff --stat` 对上述五文件输出为空）。
+* **零回归（逐项现场核对）**：顶层 **9 个 `qa_*.pt.zip`** 的字节 / SHA256 / mtime 与登记值逐项一致、
+  顶层文件数 **9**、`checkpoints/qa_learn/` 顶层无新增文件；第二步 / 校准轮 **5 件冻结产物逐字节不变**；
+  `n3d_qa` / `n3d_shape` / `n3d_sphere` / `n3d_proto` 的 `git status --porcelain` **为空**；
+  根 `requirements.txt` 未改（`git status` 空）；**零新增依赖**；`compileall -q n3d_qa_learn` 退码 0。
+* **产物目录**：全部写 `checkpoints/qa_learn/_verify/text_variants/`（日志写其 `_logs/` 子目录）；
+  不落盘特征矩阵、不产 zip、无挂钟字段。
+
+**现场扫描命令（裸 assert 清零）**
+
+```powershell
+Select-String -Path n3d_qa_learn\text_variants.py,n3d_qa_learn\text_variants_run.py -Pattern '^\s*assert\b'
+```
+
+输出为空（`Measure-Object` 计数 = **0**）。
+
+#### 17.19.11 离朱 R73 复测（**36/36 通过、0 失败**）与 3 项观察项
+
+**复测概览**：单元 / 函数级 19 项 + CLI 端到端 E2E 8 项 + 产物 / 文档一致性核对 6 项 +
+编译与零回归 4 项 = **36 项全部通过（FAIL = 0 / ERROR = 0）**；无因环境问题跳过的测试类型；
+测试脚本 `lizhu_r73_scripts/r70_acceptance.py`，临时产物在 `_verify/text_variants/_lizhu_r72/r70/`；
+**测试在真实产物目录上的写盘操作未改变任何产物**：结束后 12/12 件与测试前快照
+**字节与 SHA256 逐件相同**。首轮 4 处失败经核实**全部为测试脚本自身的构造缺陷**
+（子串断言口径过窄、`冻结默认 1` 被新文案 `冻结默认 16` 误命中、误把三类难负例都当成
+16 条/行、临时目录缺 `gate_summary.json`），修正后重跑即全通过，**被测代码无问题**。
+
+**独立复现的规格事实（全部通过）**：`files` **恰好 9 项**（不含两件报告、不含证据自身）；
+`all_bitwise_equal` 已移除且 **AST 扫描可执行引用 = 0**；报告内嵌 `determinism` 的键集合与
+规格**精确相等（12 键）**、不含 `files` / `out_dir` / `repro_dir` / `a_sha256`；
+**形式化判据 T1g**：把两件报告改写为任意不同内容后 `_determinism_block` 返回值**逐字段相同**
+（测试已在 `finally` 中按原字节恢复）；**真实产物目录上六步**
+（`eval → eval → report → eval → report → eval`，六个独立进程）四次 `eval` 均
+**7792 B / `edeb0bded509e5a2…`**，全部退码 0；`VariantContractError` 同时是
+`RuntimeError` 与 `AssertionError`；常规与 **`PYTHONOPTIMIZE=1` 子进程**下注入异常输入
+**均如期抛出**；CLI 在 `-O` 下 `eval` / `report` **均退码 1 且不写任何产物**；
+`except VariantContractError` 位于 `RuntimeError` 与 `(ValueError, KeyError)` **之前**
+（注入 `VariantContractError` ⇒ 退码 1，注入 `ValueError` ⇒ 退码 2）；
+`--random-negatives` 三个子命令的 `--help` 均为新文案；`_small_pool_precondition` 的
+**边界反例**（`per_setting.small_pool_hard_encoder = {}` 且 `encoder_setting_applicable = False`）
+⇒ `settings_covered` 不含 D、`observed_pool_size_triplet_encoder` 为 `None`（**未**退化成
+`[null,null,null]`）；README §17.7 含「四种池设定」且不再含「三种池设定」；
+判定量 / 门禁 / 覆盖度 / 9 件数据产物与 3 件允许变产物指纹逐项一致；零回归四项全通过。
+
+**3 项观察项（非缺陷）**
+
+1. **O1（测试扰动已完全恢复）**：T1g 的形式化判据需临时改写真实产物目录里的两件报告，
+   测试其后按原字节恢复并在 `finally` 中保证；最终复核 12/12 产物与测试前**逐字节相同**，无残留。
+2. **O2（登记值自洽，无遗留）**：R70 登记的三件「允许变」产物现场全部逐字节吻合，且
+   `determinism_check.json` 在六步工作序后**仍是同一字节 / 同一 SHA256**
+   ⇒ **R69 轮的 O2（证据记录报告哈希导致登记值难以复现）已被本轮 `RERENDERABLE_FILES`
+   整类排除彻底消除**；`gate_summary.json` 亦与 R69 登记值一致，无需再标注「必然变化」。
+3. **O3（口径提示，已就地更正）**：`adjacent_line` 的 `min_per_query = 0` 是**数据事实**
+   （仅 51 / 2665 行存在相邻行），**不是**缺陷；但它意味着 B 的池实际由 `same_file` 单独填满
+   （B / C / D 三侧仍逐行严格相等 17），与 R69 口径一致。按该建议，**§17.19.2 的负例计数行已
+   就地改写**：明确「`42640 = 2665 × 16` 只适用于 `same_file` / `encoder_neighbor` / `random`」，
+   `adjacent_line` 单列 90 对（`min 0` / `max 2`），并显式写「**不得**用『三类难负例各 16 条/行』
+   这类笼统表述」。
+
+

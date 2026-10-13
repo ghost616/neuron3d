@@ -88,6 +88,39 @@ TEXT_VARIANT_DEPENDENCY_NOTE: str = (
     "根 requirements.txt 不动）。"
 )
 
+
+# ---------------------------------------------------------------------------
+# 契约 / 门禁失败异常（**显式 raise，禁止用裸 assert**）
+# ---------------------------------------------------------------------------
+
+
+class VariantContractError(RuntimeError, AssertionError):
+    """**契约 / 门禁失败**：数据不满足本模块的硬不变量时抛出。
+
+    为什么**不用裸 `assert`**（R70 收口修复轮，皋陶 warning 1）
+    ----------------------------------------------------------
+    `python -O` / `PYTHONOPTIMIZE=1` 下 `assert` 语句会被**整体跳过**（连表达式
+    求值都不发生），于是异常输入会**静默产出被污染的 `B - C` / `D - C` 对照量** ——
+    而「对照量的可解释性」正是本模块的核心交付。故本模块**不再使用任何裸 `assert`**，
+    一律改成 `if not <不变量>: raise VariantContractError(...)`（报文与原先逐字相同）。
+
+    为什么同时继承 `RuntimeError` 与 `AssertionError`
+    ------------------------------------------------
+    * `RuntimeError`：CLI 的分派层据此报「**契约 / 门禁失败**」并退码 **1**
+      （而不是被 `(ValueError, KeyError)` 分支误报成「非法参数 + 退码 2」——
+      那会把数据门禁失败说成参数错误，与 R59 F1 属同一类误标）；
+    * `AssertionError`：保留历史语义 —— 修复前这些检查就是 `assert`，
+      外部按 `except AssertionError` 写的调用方**无需改动**即可继续捕获。
+    """
+
+
+#: 契约 / 门禁失败时的统一处置说明（进日志与文档）。
+CONTRACT_FAILURE_NOTE: str = (
+    "契约 / 门禁失败为 **fail-closed**：一律**显式 raise**（不是裸 assert），"
+    "故 `python -O` / `PYTHONOPTIMIZE=1` 下**同样生效**；"
+    "CLI 入口另显式校验 `sys.flags.optimize == 0`（见 text_variants_run）。"
+)
+
 # ---------------------------------------------------------------------------
 # 冻结口径常量（全部可枚举；判定规则与判定实现由同一常量派生）
 # ---------------------------------------------------------------------------
@@ -281,7 +314,15 @@ RANDOM_NEGATIVE_COUNT: int = 16
 NEGATIVE_POOL_SIZE: int = 16
 
 #: 编码器近邻的 top-n（确定性抽取；并列按 row_id 升序打破平局）。
-ENCODER_NEIGHBOR_TOPK: int = 3
+#:
+#: **R69 口径变更：``3`` -> ``16``（= :data:`NEGATIVE_POOL_SIZE`）**。理由：设定 D
+#: ``small_pool_hard_encoder`` 的池 = { 自身 } ∪ ``encoder_neighbor``，必须与既有
+#: B / C **逐查询行池大小严格一致**（1 + 16 = 17，由
+#: :data:`SMALL_POOL_PRECONDITION_RULE` fail-closed 断言），故近邻条数必须等于
+#: ``NEGATIVE_POOL_SIZE``。该变更**只影响** ``encoder_neighbor`` 这一类的内容与其
+#: SHA256（B 的池由 ``same_file`` 的前 16 条填满，``encoder_neighbor`` 从不进 B 的池，
+#: 故 B / C 的数值**逐位不变**）。
+ENCODER_NEIGHBOR_TOPK: int = NEGATIVE_POOL_SIZE
 
 #: 编码器近邻使用的编码器（**只用仓库自有 models/bge-m3**）。
 ENCODER_NEIGHBOR_ENCODER: str = "bge-m3"
@@ -298,6 +339,43 @@ NEIGHBOR_ENCODER_MAX_LENGTH: int = 2048
 
 #: 编码器近邻的每批行数。
 ENCODER_NEIGHBOR_BATCH: int = 64
+
+#: **设定 D** 的池口径文本（「编码器近邻小池」：池 = { 自身 } ∪ ``encoder_neighbor``）。
+ENCODER_POOL_RULE: str = (
+    "「编码器近邻小池」设定（设定 D `small_pool_hard_encoder`）：对**每个查询行**，"
+    "检索池 = { 自身行 } ∪ { 该行的 `encoder_neighbor` 难负例前 "
+    "NEGATIVE_POOL_SIZE 条}。**池大小与 B / C 逐查询行严格一致**（全量下恒为 17），"
+    "故 `D - C` 与 `B - C` 一样**只差负例内容**（同池大小、只换负例来源）。"
+    "`encoder_neighbor` 由**确定性**的归一化特征余弦 top-n 抽出（全序键 `(-cos, row_id)`）。"
+)
+
+#: 设定 D **不可用**时的统一理由文本（缺 `encoder_neighbor` 类时使用，唯一来源）。
+_ENCODER_SETTING_UNAVAILABLE_REASON: str = (
+    "`negatives.json` **不含** `encoder_neighbor` 类（probe 用了 "
+    "`--no-encoder-neighbors`，或行数不足以构造近邻）⇒ 设定 D "
+    "`small_pool_hard_encoder` **不适用**：本产物**不产出**该设定的任何 0 值假数据，"
+    "只登记 `applicable = False` 与理由。"
+)
+
+#: **同源性登记（必须显式、不得省略）**：造邻编码器与评测特征口径是不是同一个。
+#:
+#: **现场事实（本轮核实）**：
+#: * 「造邻」编码器 = :data:`ENCODER_NEIGHBOR_ENCODER`（``bge-m3``，语义编码器，D = 1024）；
+#: * 「被评测」特征口径 = ``step2.ZhBagVectorizer``（``n3d_qa`` 哈希词袋，D = 192）——
+#:   ``R@1`` / ``R@5`` 是在**词面哈希词袋**上算的，**不是**在 bge-m3 上算的。
+#: ⇒ 主档 D 的难负例与评测指标**不同源**（跨表示族：语义编码器 vs 词面哈希词袋）。
+#: 但「同源档」的风险必须登记：**若用被评测的那个编码器造邻**（CLI
+#: ``--neighbor-encoder zh-bag``），难负例与指标**同源** ⇒ 难度是自证的，
+#: **只能作诊断、不得当作无偏难度度量**。本轮亦给出一个**同族档**对照
+#: （``local-hash``，D = 88 的确定性哈希词袋）分别登记（见 README §17.19.3）。
+ENCODER_NEIGHBOR_HOMOLOGY_RULE: str = (
+    "同源性登记（必须显式）：① 「造邻」编码器与「被评测」特征口径**是不是同一个**必须写出；"
+    "② 若造邻编码器 **= 被评测的那个编码器**，则难负例与评测指标**同源** ⇒ 难度是"
+    "「自证」的，**只作诊断、不得**当作无偏难度度量；③ 若**不同源**，仍须登记两者的"
+    "**表示族关系**（同为哈希词袋 / 跨「语义编码器 vs 词面哈希」）；④ 建议另给一个"
+    "**不同源档**的对照并分别登记。本模块现场口径：造邻 = ENCODER_NEIGHBOR_ENCODER（bge-m3，"
+    "语义，D=1024），评测 = step2.ZhBagVectorizer（n3d_qa 哈希词袋，D=192）。"
+)
 
 #: **允许与原文支逐位相同**的支：它们的重合比例**必须**如实登记，
 #: 但**不**作为硬门禁。**现场实测驱动**：
@@ -407,7 +485,11 @@ def _build_verdict_rule() -> str:
 #: 判定规则文本（唯一口径来源；进产物与 Markdown）。
 VERDICT_RULE: str = _build_verdict_rule()
 
-assert VERDICT_RULE == _build_verdict_rule(), "VERDICT_RULE 与常量派生结果不一致"
+# **导入期不变量**：规则文本必须与常量派生结果逐字相同。
+# **显式 raise（不是裸 assert）**：`python -O` 会跳过 assert，使「规则与判定同源」
+# 这条口径在优化模式下**静默失效**（见 :class:`VariantContractError`）。
+if VERDICT_RULE != _build_verdict_rule():
+    raise VariantContractError("VERDICT_RULE 与常量派生结果不一致")
 
 #: 「如实登记」的统一文本：抽取式不是 paraphrase。
 EXTRACTIVE_NOT_PARAPHRASE_NOTE: str = (
@@ -1718,6 +1800,8 @@ def encoder_neighbor_sets(
         ),
     }
     return dict(sorted(out.items(), key=lambda kv: kv[0])), evidence
+
+
 def build_negative_manifest(
     rows: Sequence[TextRow],
     *,
@@ -1786,12 +1870,19 @@ def build_negative_manifest(
         "counts": counts,
         "fingerprint": fingerprint,
         "evidence": evidence,
+        # **R69**：把「本产物到底落地了哪几类」显式写出（顺序 = per_kind 插入顺序，
+        # 与 ``NEGATIVE_KINDS`` 一致，``random`` 为对照池的抽样，排在最后）。
+        "kinds": list(per_kind.keys()),
+        "kinds_present": list(per_kind.keys()),
+        "n_kinds": int(len(per_kind)),
+        "encoder_neighbor_topk": int(encoder_topk) if include_encoder_neighbors else 0,
         "encoder_neighbor_skipped": bool(not include_encoder_neighbors),
         "encoder_neighbor_skip_reason": (
             "" if include_encoder_neighbors else
             "调用方显式跳过（include_encoder_neighbors=False / CLI --no-encoder-neighbors）："
             "本产物**不含** encoder_neighbor 类，故难负例只落地 two 类（same_file / adjacent_line）。"
         ),
+        "homology_rule": ENCODER_NEIGHBOR_HOMOLOGY_RULE,
         "rule": (
             # 每一类只描述一次，顺序与 NEGATIVE_KINDS 一致（same_file -> adjacent_line
             # -> encoder_neighbor -> random），避免同一类被描述两次且次序错位。
@@ -1800,7 +1891,10 @@ def build_negative_manifest(
                if int(hard_cap) > 0 else "全部（上限 0 = 不限；全部他行入池）")
             + "；"
             "adjacent_line = 同 file 且 line_no +/- 1 的行；"
-            "encoder_neighbor = 编码器归一化特征余弦 top-n（确定性；全序排序键 = (-cos, row_id)）；"
+            "encoder_neighbor = 编码器归一化特征余弦 top-n（确定性；全序排序键 = (-cos, row_id)；"
+            + ("本轮 top-n = " + str(int(encoder_topk))
+               if include_encoder_neighbors else "**本轮未落地该类**")
+            + "）；"
             "random = 局部 random.Random(seed) 从全部他行中抽 "
             + str(int(random_count)) + " 条（**抽出即全部入池**）"
         ),
@@ -1969,10 +2063,11 @@ def feature_gate(
     identity_counts = {n: int(per_variant[n]["n_identical"]) for n in NON_ANCHOR_VARIANTS}
     if IDENTITY_GATED_VARIANTS:
         for n in IDENTITY_GATED_VARIANTS:
-            assert identity_counts[n] == 0, (
-                "特征差异硬门禁失败：" + str(n) + " 支有 " + str(identity_counts[n])
-                + " 行与原文支特征逐位相同，但该支不允许与原文支重合"
-            )
+            if identity_counts[n] != 0:
+                raise VariantContractError(
+                    "特征差异硬门禁失败：" + str(n) + " 支有 " + str(identity_counts[n])
+                    + " 行与原文支特征逐位相同，但该支不允许与原文支重合"
+                )
 
     # --- **真实逐位门禁（R67 修正）** -------------------------------------------
     # 此前：`IDENTITY_GATED_VARIANTS` 为空时上面的 assert 循环**不执行**，
@@ -1995,17 +2090,19 @@ def feature_gate(
                         "text_head": str(items[i]["variants"][VARIANT_ANCHOR])[:40],
                     }
                 )
-    assert not violations, (
-        "特征差异硬门禁失败：在**可约简行**上发现 "
-        + str(len(violations)) + " 处“变体特征 == 原文特征”（前 5 处 = "
-        + str(violations[:5]) + "）"
-    )
-    assert int(per_variant[VARIANT_SUMMARY]["n_identical"]) == n_irreducible, (
-        "摘要支不变量失败：重合行 = "
-        + str(int(per_variant[VARIANT_SUMMARY]["n_identical"]))
-        + " 不等于不可约简行数 " + str(n_irreducible)
-        + "（可约简行上必须为零重合）"
-    )
+    if violations:
+        raise VariantContractError(
+            "特征差异硬门禁失败：在**可约简行**上发现 "
+            + str(len(violations)) + " 处“变体特征 == 原文特征”（前 5 处 = "
+            + str(violations[:5]) + "）"
+        )
+    if int(per_variant[VARIANT_SUMMARY]["n_identical"]) != n_irreducible:
+        raise VariantContractError(
+            "摘要支不变量失败：重合行 = "
+            + str(int(per_variant[VARIANT_SUMMARY]["n_identical"]))
+            + " 不等于不可约简行数 " + str(n_irreducible)
+            + "（可约简行上必须为零重合）"
+        )
     # 门禁字段**只**承载门禁成员（``IDENTITY_GATED_VARIANTS``）的数值；
     # 登记类支的数值由 ``identity_registration`` 承载（两者不得混用）。
     gated = {n: int(identity_counts[n]) for n in IDENTITY_GATED_VARIANTS}
@@ -2268,12 +2365,15 @@ SMALL_POOL_RULE: str = (
 )
 
 SMALL_POOL_PRECONDITION_RULE: str = (
-    "\u96be\u8d1f\u4f8b\u5bf9\u7167 B - C \u53ea\u5728**\u9010\u67e5\u8be2\u884c\u7684\u6c60\u5927\u5c0f\u4e25\u683c\u76f8\u7b49**"
+    "\u96be\u8d1f\u4f8b\u5bf9\u7167\uff08B - C \u4e0e D - C\uff09\u53ea\u5728**\u9010\u67e5\u8be2\u884c\u7684\u6c60\u5927\u5c0f\u4e25\u683c\u76f8\u7b49**"
     "\u65f6\u624d**\u53ea\u662f\u300c\u8d1f\u4f8b\u5185\u5bb9\u300d\u4e4b\u5dee**\uff1b\u5426\u5219\u5b83\u540c\u65f6\u6df7\u5165\u300c\u6c60\u5927\u5c0f\u300d\u4e4b\u5dee\uff0c"
     "\u8bfb\u6cd5\u5fc5\u987b\u6539\u4e3a\u300c\u6df7\u5408\u5dee\u300d\u3002\u73b0\u573a\u5145\u5206\u6761\u4ef6\uff1a\u6bcf\u4e2a\u67e5\u8be2\u884c\u5747\u6709 "
     ">= NEGATIVE_POOL_SIZE \u6761**\u540c\u7c7b**\u8d1f\u4f8b\uff08\u672c\u8f6e\uff1a\u6bcf\u884c 16 \u6761 same_file \u4e0e 16 \u6761 random\uff09\uff0c"
     "\u4e14\u4e24\u8bbe\u5b9a\u7684**\u67e5\u8be2\u884c\u96c6\u76f8\u540c**\u3002\u8be5\u6761\u4ef6\u5bf9**\u66f4\u5c0f\u8bed\u6599\u6216\u5355\u6587\u4ef6\u8bed\u6599\u53ef\u80fd\u4e0d\u6210\u7acb**\uff0c"
     "\u6545 `zero_training_eval` \u5728\u8bc4\u6d4b\u524d**fail-closed \u65ad\u8a00**\uff0c\u5e76\u5728\u62a5\u544a\u91cc\u767b\u8bb0\u73b0\u573a\u6c60\u5927\u5c0f\u4e09\u5143\u7ec4\u3002"
+    "**R69 扩展**：该前置条件现对**三种小池设定**（B `small_pool_hard` / C `small_pool_random` / "
+    "D `small_pool_hard_encoder`）**同时成立** —— 三者的查询行集相同，且**逐查询行的池大小两两"
+    "严格相等**；因此 `B - C` 与新增的 `D - C` 都只是「负例内容」之差。"
 )
 
 
@@ -2296,6 +2396,7 @@ class NegativeSetting:
 
 
 #: \u4e09\u79cd\u8bbe\u5b9a\uff08**\u5206\u5f00\u62a5**\uff09\u3002
+#: **R69 起为四种设定**（A / B / C / D）—— 上面那行「三种设定」的旧注释已被本行取代。
 NEGATIVE_SETTINGS: Tuple[NegativeSetting, ...] = (
     NegativeSetting(
         key="full_pool_all_rows",
@@ -2316,6 +2417,16 @@ NEGATIVE_SETTINGS: Tuple[NegativeSetting, ...] = (
         description="\u8bbe\u5b9a C\uff08\u968f\u673a\u8d1f\u4f8b\u5c0f\u6c60\uff09\uff1a\u4e0e\u8bbe\u5b9a B **\u6c60\u5927\u5c0f\u5b8c\u5168\u4e00\u81f4**\uff0c\u53ea\u5c06\u8d1f\u4f8b\u6362\u4e3a random \u7c7b",
         query_rule="query_ids = \u6709 >=1 \u6761\u968f\u673a\u8d1f\u4f8b\u7684\u884c",
         pool_rule=SMALL_POOL_RULE,
+        consumes_negatives=True,
+    ),
+    NegativeSetting(
+        key="small_pool_hard_encoder",
+        description=(
+            "设定 D（编码器近邻小池）：每查询行的池 = { 自身 } ∪ 其 encoder_neighbor "
+            "难负例（最多 NEGATIVE_POOL_SIZE 条）；**池大小与 B / C 逐行严格一致**"
+        ),
+        query_rule="query_ids = 有 >=1 条 encoder_neighbor 难负例的行",
+        pool_rule=ENCODER_POOL_RULE,
         consumes_negatives=True,
     ),
 )
@@ -2427,7 +2538,7 @@ def negative_setting_payload(
     *,
     common_query_ids: Sequence[str],
 ) -> Dict[str, Any]:
-    """\u628a\u8d1f\u4f8b\u6e05\u5355\u6574\u7406\u6210**\u4e09\u79cd\u8bbe\u5b9a + \u516c\u5171\u5b50\u96c6**\u7684\u8bc4\u6d4b\u89c6\u56fe\u3002
+    """\u628a\u8d1f\u4f8b\u6e05\u5355\u6574\u7406\u6210**\u56db\u79cd\u8bbe\u5b9a + \u516c\u5171\u5b50\u96c6**\u7684\u8bc4\u6d4b\u89c6\u56fe\u3002
 
     \u5f02\u5e38
     ----
@@ -2450,20 +2561,31 @@ def negative_setting_payload(
     random_pools = {
         rid: _negative_pool_for(rid, ("random",), per_kind) for rid in all_ids
     }
+    # **R69**：设定 D 的池 —— 只由 ``encoder_neighbor`` 一类构成（确定性、全序 (-cos, row_id)）。
+    # 当 ``encoder_neighbor`` 未落地（``--no-encoder-neighbors`` / 行数不足）时该映射为空 dict，
+    # 设定 D 的查询行集随之为空（下游 ``zero_training_eval`` 的 fail-closed 断言会显式报出）。
+    encoder_pools = {
+        rid: _negative_pool_for(rid, ("encoder_neighbor",), per_kind)
+        for rid in all_ids
+    }
     hard_ids = sorted(rid for rid in all_ids if hard_pools[rid])
     random_ids = sorted(rid for rid in all_ids if random_pools[rid])
+    encoder_ids = sorted(rid for rid in all_ids if encoder_pools[rid])
     common = [str(x) for x in common_query_ids if str(x) in set(all_ids)]
     return {
         "all_row_ids": list(all_ids),
         "hard_eligible_row_ids": list(hard_ids),
         "random_eligible_row_ids": list(random_ids),
+        "encoder_eligible_row_ids": list(encoder_ids),
         "common_subset_row_ids": list(common),
         "hard_pools": hard_pools,
         "random_pools": random_pools,
+        "encoder_pools": encoder_pools,
         "counts": {
             "n_all_rows": int(len(all_ids)),
             "n_hard_eligible_rows": int(len(hard_ids)),
             "n_random_eligible_rows": int(len(random_ids)),
+            "n_encoder_eligible_rows": int(len(encoder_ids)),
             "n_common_subset": int(len(common)),
         },
         "per_kind_counts": manifest["counts"],
@@ -2480,16 +2602,23 @@ def zero_training_eval(
     topk: int = 5,
     coverage: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """**\u96f6\u8bad\u7ec3\u8bc4\u6d4b**\uff1a4 \u652f x 3 \u79cd\u8bbe\u5b9a\uff08+ \u516c\u5171\u5b50\u96c6\uff09\u3002
+    """**零训练评测**：4 支 x **4 种设定**（+ 公共子集）。
 
-    \u4e09\u79cd\u8bbe\u5b9a\uff08**\u5fc5\u987b\u5206\u5f00\u62a5**\uff09
-    --------------------------------
-    * A ``full_pool_all_rows``\uff1a\u6c60 = \u5168\u90e8\u884c\uff08**\u4e0d\u6d88\u8d39\u8d1f\u4f8b**\uff09\u2014\u2014 \u4e3b\u6307\u6807\u57fa\u7ebf\uff1b
-    * B ``small_pool_hard``\uff1a\u6bcf\u884c\u6c60 = {\u81ea\u8eab} \u222a \u96be\u8d1f\u4f8b\uff08\u2264 :data:`NEGATIVE_POOL_SIZE`\uff09\uff1b
-    * C ``small_pool_random``\uff1a\u6bcf\u884c\u6c60 = {\u81ea\u8eab} \u222a \u968f\u673a\u8d1f\u4f8b\uff08\u540c\u6c60\u5927\u5c0f\uff09\u3002
+    **四种设定**（**必须分开报**）
+    ----------------------------------
+    * A ``full_pool_all_rows``：池 = 全部行（**不消费负例**）—— 主指标基线；
+    * B ``small_pool_hard``：每行池 = {自身} ∪ 难负例（<= :data:`NEGATIVE_POOL_SIZE`）；
+    * C ``small_pool_random``：每行池 = {自身} ∪ 随机负例（**同池大小**）；
+    * D ``small_pool_hard_encoder``（**R69 新增**）：每行池 = {自身} ∪ ``encoder_neighbor``
+      难负例（**池大小与 B / C 逐行严格一致**）。
 
-    **\u96be\u8d1f\u4f8b\u5bf9\u7167** = B \u2212 C\uff08\u6c60\u5927\u5c0f\u5b8c\u5168\u4e00\u81f4\u3001\u53ea\u5dee\u8d1f\u4f8b\u5185\u5bb9\uff09\u3002
-    A \u4e0e B/C \u7684\u5dee\u522b**\u540c\u65f6\u5305\u542b\u6c60\u5927\u5c0f\u4e0e\u8d1f\u4f8b\u5185\u5bb9**\uff0c\u6545\u4e0d\u4f5c\u4e3a\u96be\u8d1f\u4f8b\u5bf9\u7167\u3002
+    **对照量**：``B - C``（难负例 vs 随机负例）与 **``D - C``（编码器近邻 vs 随机负例，
+    R69 新增）**；三者同池大小、只差负例内容。A 与 B/C/D 的差别**同时包含池大小与
+    负例内容**，故不作为负例对照。
+
+    ``D - C`` 是**新实验量**，与 ``B - C`` 并列报告，**不得**用它反向解释或覆盖 ``B - C``；
+    ``encoder_neighbor`` 的**同源性登记**见 :data:`ENCODER_NEIGHBOR_HOMOLOGY_RULE`
+    （只作诊断、不得当作无偏难度度量）。
     """
     view = negative_setting_payload(manifest, common_query_ids=query_split_ids)
     all_ids = list(view["all_row_ids"])
@@ -2513,21 +2642,35 @@ def zero_training_eval(
 
     hard_ids = list(view["hard_eligible_row_ids"])
     random_ids = list(view["random_eligible_row_ids"])
+    encoder_ids = list(view["encoder_eligible_row_ids"])
+    # 设定 D 是否**可用**：`negatives.json` 必须真的含 `encoder_neighbor` 类。
+    # 不可用时**不静默产出 0 值**，而是显式登记 `applicable = False` + 理由（见返回块）。
+    has_encoder = bool(encoder_ids)
 
-    # --- \u5c0f\u6c60\u8bbe\u5b9a\u7684**\u663e\u5f0f\u524d\u7f6e\u6761\u4ef6**\uff08R68 \u5c0f\u6536\u53e3\u8f6e\uff09------------------------------
-    # B - C \u53ea\u6709\u5728\u4e24\u4fa7\u9010\u67e5\u8be2\u884c\u7684\u6c60\u5927\u5c0f\u4e25\u683c\u76f8\u7b49\u65f6\u624d\u53ea\u662f\u300c\u8d1f\u4f8b\u5185\u5bb9\u300d\u4e4b\u5dee\uff1b
-    # \u5426\u5219\u5b83\u540c\u65f6\u6df7\u5165\u300c\u6c60\u5927\u5c0f\u300d\u4e4b\u5dee\uff0c\u8bfb\u6cd5\u5fc5\u987b\u6539\u3002\u672c\u8f6e\u73b0\u573a\u6ee1\u8db3\uff08\u6bcf\u884c 16 \u6761 same_file + 16 \u6761 random\uff09\uff0c
-    # \u4f46\u5bf9\u66f4\u5c0f\u8bed\u6599 / \u5355\u6587\u4ef6\u8bed\u6599\u53ef\u80fd\u4e0d\u6210\u7acb\uff0c\u6545\u5728\u8fd9\u91cc fail-closed \u65ad\u8a00\u3002
-    _same_query_set = bool(hard_ids == random_ids)
+    # --- 小池设定的**显式前置条件**（R68 小收口轮；R69 扩到三侧）------------------
+    # B - C 与 D - C 只有在**逐查询行的池大小严格相等**时才只是「负例内容」之差；
+    # 否则它同时混入「池大小」之差，读法必须改。本轮现场满足，但对更小语料 /
+    # 单文件语料可能不成立，故在这里 fail-closed 断言。
+    _same_query_set = bool(
+        hard_ids == random_ids == encoder_ids if has_encoder else hard_ids == random_ids
+    )
     _pool_size_equal = all(
-        len(view["hard_pools"][rid]) == len(view["random_pools"][rid]) for rid in hard_ids
+        (len(view["hard_pools"][rid]) == len(view["random_pools"][rid])
+         == len(view["encoder_pools"][rid]))
+        if has_encoder else
+        (len(view["hard_pools"][rid]) == len(view["random_pools"][rid]))
+        for rid in hard_ids
     )
-    assert _same_query_set and _pool_size_equal, (
-        "\u96be\u8d1f\u4f8b\u5c0f\u6c60\u8bbe\u5b9a\u7684\u524d\u7f6e\u6761\u4ef6\u4e0d\u6210\u7acb\uff1a" + SMALL_POOL_PRECONDITION_RULE
-        + "\uff08\u73b0\u573a\uff1a\u67e5\u8be2\u884c\u96c6\u76f8\u540c = " + str(_same_query_set)
-        + "\uff1b\u9010\u884c\u6c60\u5927\u5c0f\u76f8\u7b49 = " + str(_pool_size_equal)
-        + "\uff1bn_hard = " + str(len(hard_ids)) + "\uff1bn_random = " + str(len(random_ids)) + "\uff09"
-    )
+    # **fail-closed**：不变量不成立即**显式 raise**（不是裸 assert —— 后者在
+    # `python -O` 下会被整体跳过，异常输入会静默产出被污染的 `B - C` / `D - C`）。
+    if not (_same_query_set and _pool_size_equal):
+        raise VariantContractError(
+            "难负例小池设定的前置条件不成立：" + SMALL_POOL_PRECONDITION_RULE
+            + "（现场：查询行集相同 = " + str(_same_query_set)
+            + "；逐行池大小相等 = " + str(_pool_size_equal)
+            + "；n_hard = " + str(len(hard_ids)) + "；n_random = " + str(len(random_ids))
+            + "；n_encoder = " + str(len(encoder_ids)) + "；has_encoder = " + str(has_encoder) + "）"
+        )
 
     settings: Dict[str, Any] = {
         "full_pool_all_rows": {
@@ -2562,10 +2705,25 @@ def zero_training_eval(
             },
         },
     }
+    # **R69 新增设定 D**：只在 `negatives.json` 真的含 `encoder_neighbor` 类时加入；
+    # 否则**不产出 0 值假数据**，改为在 `encoder_setting` 里显式登记 `applicable = False`。
+    if has_encoder:
+        settings["small_pool_hard_encoder"] = {
+            "description": NEGATIVE_SETTINGS[3].description,
+            "query_ids_rule": NEGATIVE_SETTINGS[3].query_rule,
+            "pool_rule": ENCODER_POOL_RULE,
+            "consumes_negatives": True,
+            "n_queries": int(len(encoder_ids)),
+            "negative_counts": view["per_kind_counts"],
+            "variants": {
+                name: _block_small(name, encoder_ids, view["encoder_pools"])
+                for name in VARIANT_ORDER
+            },
+        }
     common_block: Dict[str, Any] = {}
     if common:
         common_block = {
-            "query_ids_rule": "\u516c\u5171\u5b50\u96c6 = n3d_qa \u51bb\u7ed3\u5212\u5206\u7684\u67e5\u8be2\u884c\uff08\u4e09\u79cd\u8bbe\u5b9a\u90fd\u5728\u540c\u4e00\u6279\u67e5\u8be2\u884c\u4e0a\u8bc4\u6d4b\uff09",
+            "query_ids_rule": "\u516c\u5171\u5b50\u96c6 = n3d_qa \u51bb\u7ed3\u5212\u5206\u7684\u67e5\u8be2\u884c\uff08\u56db\u79cd\u8bbe\u5b9a\u90fd\u5728\u540c\u4e00\u6279\u67e5\u8be2\u884c\u4e0a\u8bc4\u6d4b\uff09",
             "n": int(len(common)),
             "variants_full_pool": {n: _block_full(n, common) for n in VARIANT_ORDER},
             "variants_small_pool_hard": {
@@ -2575,6 +2733,10 @@ def zero_training_eval(
                 n: _block_small(n, common, view["random_pools"]) for n in VARIANT_ORDER
             },
         }
+        if has_encoder:
+            common_block["variants_small_pool_hard_encoder"] = {
+                n: _block_small(n, common, view["encoder_pools"]) for n in VARIANT_ORDER
+            }
 
     def _r1(setting: str, name: str) -> float:
         return float(settings[setting]["variants"][name]["recall_at_1"])
@@ -2604,7 +2766,42 @@ def zero_training_eval(
             ),
         }
 
-    # --- \u5b9e\u6d4b\u53e3\u5f84\u4e0e\u58f0\u660e\u53e3\u5f84\u5206\u79bb\uff08warning 4\uff09---
+    # --- **R69 新实验量 D - C**（同池大小、只换负例来源：编码器近邻 vs 随机）---
+    # 与 `B - C` **并列报告**；不得用它反向解释或覆盖 `B - C`。
+    delta_encoder: Dict[str, Any] = {}
+    n_enc = max(1, int(settings["small_pool_hard_encoder"]["n_queries"])) if has_encoder else 1
+    gran_enc = 1.0 / n_enc
+    for name in VARIANT_ORDER:
+        if not has_encoder:
+            delta_encoder[name] = {
+                "applicable": False,
+                "reason": _ENCODER_SETTING_UNAVAILABLE_REASON,
+            }
+            continue
+        enc = _r1("small_pool_hard_encoder", name)
+        rnd = _r1("small_pool_random", name)
+        gap_enc = abs(float(enc - rnd))
+        delta_encoder[name] = {
+            "applicable": True,
+            "recall_at_1_small_pool_hard_encoder": float(enc),
+            "recall_at_1_small_pool_random": float(rnd),
+            "delta_encoder_minus_random": float(enc - rnd),
+            "gap_abs": float(gap_enc),
+            "granularity_used": float(gran_enc),
+            "below_granularity": bool(gap_enc <= gran_enc),
+            "recall_at_1_full_pool_reference": float(_r1("full_pool_all_rows", name)),
+            "note": (
+                "**新实验量** 编码器近邻对照 = 同池大小的 D - C（只差负例来源）；"
+                "落差 <= 粒度 " + repr(gran_enc) + " 者不得作为判定依据；"
+                "它**不得**用于反向解释或覆盖 B - C；同源性见 ENCODER_NEIGHBOR_HOMOLOGY_RULE"
+                if gap_enc <= gran_enc else
+                "**新实验量** 编码器近邻对照 = 同池大小的 D - C；落差 > 粒度 "
+                + repr(gran_enc) + "，可作为对照依据（**仍不得**覆盖 B - C；同源性见 "
+                "ENCODER_NEIGHBOR_HOMOLOGY_RULE）"
+            ),
+        }
+
+    # --- 实测口径与声明口径分离（warning 4）---
     def _pool_stats(block: Dict[str, Any]) -> Dict[str, Any]:
         ent = block["variants"][VARIANT_ANCHOR]
         med = float(ent.get("pool_size_median") or 0.0)
@@ -2641,13 +2838,30 @@ def zero_training_eval(
             "full_pool_all_rows": _pool_stats(settings["full_pool_all_rows"]),
             "small_pool_hard": _pool_stats(settings["small_pool_hard"]),
             "small_pool_random": _pool_stats(settings["small_pool_random"]),
+            **(
+                {"small_pool_hard_encoder": _pool_stats(settings["small_pool_hard_encoder"])}
+                if has_encoder else {}
+            ),
         },
+        "encoder_setting_applicable": bool(has_encoder),
+        "encoder_setting_note": (
+            "设定 D `small_pool_hard_encoder` 已产出（negatives.json 含 encoder_neighbor 类）"
+            if has_encoder else _ENCODER_SETTING_UNAVAILABLE_REASON
+        ),
     }
 
     return {
         "settings": settings,
         "common_subset": common_block,
         "hard_vs_random_delta": delta,
+        "encoder_vs_random_delta": delta_encoder,
+        "encoder_setting_applicable": bool(has_encoder),
+        "encoder_setting_note": (
+            "设定 D `small_pool_hard_encoder` 已产出（negatives.json 含 encoder_neighbor 类）"
+            if has_encoder else _ENCODER_SETTING_UNAVAILABLE_REASON
+        ),
+        "encoder_pool_rule": ENCODER_POOL_RULE,
+        "homology_rule": ENCODER_NEIGHBOR_HOMOLOGY_RULE,
         "measured_scope": measured,
         "small_pool_rule": SMALL_POOL_RULE,
         "full_pool_rule": FULL_POOL_RULE,
@@ -2656,9 +2870,12 @@ def zero_training_eval(
             "full_pool_all_rows": False,
             "small_pool_hard": True,
             "small_pool_random": True,
+            "small_pool_hard_encoder": bool(has_encoder),
             "note": (
-                "**\u53ea\u6709 B/C \u4e24\u4e2a\u5c0f\u6c60\u8bbe\u5b9a\u771f\u6b63\u6d88\u8d39 negatives.json**\uff1b"
-                "A\uff08\u5168\u91cf\u6c60\uff09\u4e0d\u6d88\u8d39\u8d1f\u4f8b\uff0c\u6545\u4e0d\u53ef\u5f53\u4f5c\u96be\u8d1f\u4f8b\u5bf9\u7167\u57fa\u7840\u3002"
+                "**只有 B/C/D 三个小池设定真正消费 negatives.json**；"
+                "A（全量池）不消费负例，故不可当作难负例对照基础。"
+                "B - C 与 D - C 都是「同池大小、只差负例内容」的对照量；"
+                "D - C 是 R69 新增的**新实验量**，不得反向解释或覆盖 B - C。"
             ),
         },
     }
@@ -2758,6 +2975,7 @@ def render_verdict(
         },
         "granularity_guard_rule": GRANULARITY_GUARD_RULE,
         "extractive_not_paraphrase_note": EXTRACTIVE_NOT_PARAPHRASE_NOTE,
+        "homology_rule": ENCODER_NEIGHBOR_HOMOLOGY_RULE,
     }
 
 
@@ -3060,13 +3278,33 @@ def render_markdown(report: Dict[str, Any]) -> str:
             + _fmt(ent.get("max_per_query")) + " |"
         )
     add("")
+    # **R69**：显式渲染「本产物实际落地了哪几类」，使「三类难负例是否齐备」可直接读产物核对。
+    add("- 本产物**实际落地的类别**（`kinds`）：`" + str(ng.get("kinds", [])) + "`；"
+        "设计口径 = 三类难负例 `NEGATIVE_KINDS` = `" + str(list(NEGATIVE_KINDS))
+        + "` + 对照池抽样类 `random`。")
+    add("- `encoder_neighbor_skipped` = **" + _fmt(bool(ng.get("encoder_neighbor_skipped")))
+        + "**" + ("（理由：" + str(ng.get("encoder_neighbor_skip_reason", "")) + "）"
+                  if ng.get("encoder_neighbor_skipped") else "（三类难负例齐备）"))
+    add("")
 
     add("## 5. 零训练检索评测（分档，不混平均）")
     add("")
-    _setting_order = ("full_pool_all_rows", "small_pool_hard", "small_pool_random")
-    for _si, setting_key in enumerate(_setting_order):
+    # **R69**：设定由三种扩为**四种**（新增 D `small_pool_hard_encoder`）。若该产物不含
+    # `encoder_neighbor` 类（`--no-encoder-neighbors`），D 不在 settings 里，此处**静默跳过**
+    # 由 §5.7 的 `encoder_setting_applicable = false` 显式登记，不渲染空表。
+    _setting_order = (
+        "full_pool_all_rows", "small_pool_hard", "small_pool_random",
+        "small_pool_hard_encoder",
+    )
+    _missing_settings: List[str] = []
+    _sec = 0
+    for setting_key in _setting_order:
         block = (report.get("retrieval_eval", {}).get("settings", {}) or {}).get(setting_key, {})
-        add("### 5." + str(_si + 1) + " " + str(setting_key))
+        if not block:
+            _missing_settings.append(str(setting_key))
+            continue
+        _sec += 1
+        add("### 5." + str(_sec) + " " + str(setting_key))
         add("")
         add(str(block.get("description", "")))
         add("")
@@ -3089,13 +3327,19 @@ def render_markdown(report: Dict[str, Any]) -> str:
         add("- 池口径：" + str(block.get("pool_rule", "")))
         add("- 是否消费 negatives.json：**" + _fmt(bool(block.get("consumes_negatives"))) + "**")
         add("")
+    if _missing_settings:
+        add("本产物**缺**以下设定的数据（**不渲染空表**，条件由 §5.7 显式登记）："
+            + "`" + str(_missing_settings) + "`")
+        add("")
     # **fix 1（R68）**：`zero_training_eval` 在 common_subset 下产出的是**三个分池键**
     # （variants_full_pool / variants_small_pool_hard / variants_small_pool_random），
     # **没有** `variants` 键；此前按 `common.get("variants")` 取行使该表**整表渲染为 None**。
     # 现按三个池键分别输出（与 §5.1–5.3 的口径一致）。
     common = report.get("retrieval_eval", {}).get("common_subset", {}) or {}
     if common:
-        add("### 5.4 公共子集（" + _fmt(common.get("n")) + " 行；**三种池设定分别评测**）")
+        _sec += 1
+        add("### 5." + str(_sec) + " 公共子集（" + _fmt(common.get("n"))
+            + " 行；**各种池设定分别评测**）")
         add("")
         add("- 查询行口径：" + str(common.get("query_ids_rule", "")))
         add("")
@@ -3103,14 +3347,14 @@ def render_markdown(report: Dict[str, Any]) -> str:
             ("全量池 A", "variants_full_pool"),
             ("难负例小池 B", "variants_small_pool_hard"),
             ("随机负例小池 C", "variants_small_pool_random"),
+            ("编码器近邻小池 D", "variants_small_pool_hard_encoder"),
         ):
             _cblk = common.get(_ckey, {}) or {}
+            if not _cblk:
+                # **R69**：缺键（如 D 不适用）时**不渲染空表**，也不写误导性的「缺该支数据」。
+                continue
             add("**" + _ctitle + "**（`common_subset." + _ckey + "`）")
             add("")
-            if not _cblk:
-                add("本池设定缺数据（该键不存在）——**不渲染空表**")
-                add("")
-                continue
             add("| 支 | R@1 | R@5 | 池 min/中位/max |")
             add("| --- | --- | --- | --- |")
             for name in report.get("variant_order", []):
@@ -3129,12 +3373,16 @@ def render_markdown(report: Dict[str, Any]) -> str:
                 )
             add("")
 
-    add("### 5.5 难负例 vs 随机负例：同支 R@1 差")
+    _sec += 1
+    add("### 5." + str(_sec) + " 难负例 vs 随机负例：同支 R@1 差（B-C 与 **D-C** 并列）")
+    add("")
+    _rr = report.get("retrieval_eval", {}) or {}
+    add("**对照量 ①：`B - C`（难负例小池 vs 随机负例小池）**")
     add("")
     add("| 支 | R@1（随机小池 C） | R@1（难负例小池 B） | 差 B-C | 落差 | 判据粒度 | 粒度判定 | R@1（全量池 A，参考） |")
     add("| --- | --- | --- | --- | --- | --- | --- | --- |")
     for name in report.get("variant_order", []):
-        ent = (report.get("retrieval_eval", {}).get("hard_vs_random_delta", {}) or {}).get(str(name), {})
+        ent = (_rr.get("hard_vs_random_delta", {}) or {}).get(str(name), {})
         add(
             "| " + str(name) + " | " + _fmt(ent.get("recall_at_1_small_pool_random")) + " | "
             + _fmt(ent.get("recall_at_1_small_pool_hard")) + " | "
@@ -3144,6 +3392,28 @@ def render_markdown(report: Dict[str, Any]) -> str:
             + _fmt(ent.get("recall_at_1_full_pool_reference")) + " |"
         )
     add("")
+    add("**对照量 ②（R69 新增实验量）：`D - C`（编码器近邻小池 vs 随机负例小池）**")
+    add("")
+    add("> `D - C` 是**新实验量**，与 `B - C` **并列报告**；**不得**用它反向解释或覆盖 `B - C`。")
+    add("> **同源性**：" + str(_rr.get("homology_rule", ENCODER_NEIGHBOR_HOMOLOGY_RULE)))
+    add("")
+    if not bool(_rr.get("encoder_setting_applicable", False)):
+        add("- 本产物**不适用**：" + str(_rr.get("encoder_setting_note", "")))
+        add("")
+    else:
+        add("| 支 | R@1（随机小池 C） | R@1（编码器近邻小池 D） | 差 D-C | 落差 | 判据粒度 | 粒度判定 | R@1（全量池 A，参考） |")
+        add("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        for name in report.get("variant_order", []):
+            ent = (_rr.get("encoder_vs_random_delta", {}) or {}).get(str(name), {})
+            add(
+                "| " + str(name) + " | " + _fmt(ent.get("recall_at_1_small_pool_random")) + " | "
+                + _fmt(ent.get("recall_at_1_small_pool_hard_encoder")) + " | "
+                + _fmt(ent.get("delta_encoder_minus_random")) + " | "
+                + _fmt(ent.get("gap_abs")) + " | " + _fmt(ent.get("granularity_used")) + " | "
+                + ("<= 粒度（不作判据）" if ent.get("below_granularity") else "> 粒度") + " | "
+                + _fmt(ent.get("recall_at_1_full_pool_reference")) + " |"
+            )
+        add("")
     _ms = report.get("retrieval_eval", {}).get("measured_scope", {}) or {}
     if _ms:
         add("**实测口径 vs 声明口径（分离登记）**")
@@ -3170,22 +3440,37 @@ def render_markdown(report: Dict[str, Any]) -> str:
     if _pst:
         _pb = _pst.get("small_pool_hard", {}) or {}
         _pc = _pst.get("small_pool_random", {}) or {}
+        _pd = _pst.get("small_pool_hard_encoder", {}) or {}
         _trip_b = (_pb.get("pool_size_min"), _pb.get("pool_size_median"), _pb.get("pool_size_max"))
         _trip_c = (_pc.get("pool_size_min"), _pc.get("pool_size_median"), _pc.get("pool_size_max"))
-        add("### 5.6 小池设定的**前置条件**（B-C 何时才只是「内容差」）")
+        _trip_d = (_pd.get("pool_size_min"), _pd.get("pool_size_median"), _pd.get("pool_size_max"))
+        _sec += 1
+        add("### 5." + str(_sec) + " 小池设定的**前置条件**（B-C 与 D-C 何时才只是「内容差」）")
         add("")
         add("- 代码内 `assert`（fail-closed）：" + str(SMALL_POOL_PRECONDITION_RULE))
         add("")
+        add("- 设定 D 是否可用：**" + _fmt(bool(_ms.get("encoder_setting_applicable")))
+            + "**（" + str(_ms.get("encoder_setting_note", "")) + "）")
+        add("")
         add("| 设定 | n_queries | 池 min | 池中位 | 池 max |")
         add("| --- | --- | --- | --- | --- |")
-        for _k, _t in (("small_pool_hard", "B 难负例小池"),
-                       ("small_pool_random", "C 随机负例小池")):
+        _rows = [("small_pool_hard", "B 难负例小池"), ("small_pool_random", "C 随机负例小池")]
+        if _pd:
+            _rows.append(("small_pool_hard_encoder", "D 编码器近邻小池"))
+        for _k, _t in _rows:
             _e = _pst.get(_k, {}) or {}
             add("| " + _t + " | " + _fmt(_e.get("n_queries")) + " | " + _fmt(_e.get("pool_size_min"))
                 + " | " + _fmt(_e.get("pool_size_median")) + " | " + _fmt(_e.get("pool_size_max")) + " |")
         add("")
-        add("- 现场一致性：两侧池大小三元组相同 = **" + _fmt(_trip_b == _trip_c)
-            + "**；查询行集行数相同 = **" + _fmt(_pb.get("n_queries") == _pc.get("n_queries")) + "**")
+        _trips = [_trip_b, _trip_c] + ([_trip_d] if _pd else [])
+        _nq = [_pb.get("n_queries"), _pc.get("n_queries")] + ([_pd.get("n_queries")] if _pd else [])
+        add("- 现场一致性：**逐行池大小三元组两两相同** = **"
+            + _fmt(all(t == _trip_b for t in _trips))
+            + "**；**查询行集行数相同** = **" + _fmt(len(set(_nq)) == 1) + "**")
+        if _pd:
+            add("- `D - C` 与 `B - C` 因此都只是「负例内容」之差（池大小逐行严格相等）。")
+        else:
+            add("- 设定 D 未产出（见上「设定 D 是否可用」），故本次只有 `B - C` 一个对照量。")
         add("")
 
     add("## 6. 判定结论（机器可读、单点来源）")
@@ -3230,19 +3515,25 @@ def render_markdown(report: Dict[str, Any]) -> str:
     add("")
     det = report.get("determinism", {}) or {}
     if det:
-        add("## 9. 双跑逐字节一致（确定性证据）")
+        # **R70 回路修复**：报告内嵌的是**摘要**（`_determinism_summary`），
+        # 不再含逐文件 SHA / 字节数 / out_dir / repro_dir ⇒ 本节改渲染摘要字段；
+        # 逐文件明细一律以 `determinism_check.json` 本尊为准（唯一的 SHA 出处）。
+        add("## 9. 双跑逐字节一致（确定性证据：**摘要**）")
         add("")
-        add("| 文件 | SHA256 | 字节 | 逐字节一致 |")
-        add("| --- | --- | --- | --- |")
-        for name, ent in sorted((det.get("files", {}) or {}).items()):
-            add(
-                "| `" + str(name) + "` | `" + str(ent.get("a_sha256", "")) + "` | "
-                + _fmt(ent.get("a_bytes")) + " | "
-                + _fmt(ent.get("bitwise_equal")) + " |"
-            )
+        add("| 项 | 值 |")
+        add("| --- | --- |")
+        add("| 证据文件 | `" + str(det.get("file", "")) + "` |")
+        add("| 证据是否具备 | " + _fmt(bool(det.get("present"))) + " |")
+        add("| 共有文件数（已排除自身与后置可重渲件） | " + _fmt(det.get("n_common_files")) + " |")
+        add("| 其中内容产物数 | " + _fmt(det.get("n_content_common_files")) + " |")
+        add("| 内容产物逐字节一致 | " + _fmt(bool(det.get("content_files_bitwise_equal"))) + " |")
+        add("| **确定性判定 `determinism_ok`** | **" + _fmt(bool(det.get("determinism_ok"))) + "** |")
+        add("| 共有但天然不同（不计入判定） | `" + str(det.get("common_but_not_equal_files", [])) + "` |")
+        add("| 机制相关件（内嵌 out_dir） | `" + str(det.get("path_dependent_files", [])) + "` |")
+        add("| **整类排除：后置可重渲件** | `" + str(det.get("excluded_rerenderable_files", [])) + "` |")
         add("")
-        add("- 全部逐字节一致 = **" + _fmt(det.get("all_bitwise_equal")) + "**")
-        add("- 对照目录 = `" + str(det.get("repro_dir", "")) + "`")
+        add("- 逐文件 SHA256 / 字节数**只**在 `determinism_check.json` 本尊里；本报告只内嵌摘要。")
+        add("- " + str(det.get("summary_rule", "")))
         add("")
     return "\n".join(lines) + "\n"
 # ---------------------------------------------------------------------------
@@ -3279,6 +3570,7 @@ __all__ = [
     "ANCHOR_TOL",
     "ANCHOR_TOLERANCE",
     "ASCII_SAFE_LOG_NOTE",
+    "CONTRACT_FAILURE_NOTE",
     "BASE_TOL",
     "BASELINE_TOL",
     "BUCKETS_PER_ORDER",
@@ -3286,6 +3578,8 @@ __all__ = [
     "CLOSE_TO_ZERO_TOLERANCE",
     "DETERMINISM_EVIDENCE_FILE",
     "ENCODER_NEIGHBOR_ENCODER",
+    "ENCODER_NEIGHBOR_HOMOLOGY_RULE",
+    "ENCODER_POOL_RULE",
     "ENCODER_NEIGHBOR_ROLE",
     "ENCODER_NEIGHBOR_SOURCE",
     "ENCODER_NEIGHBOR_TOPK",
@@ -3346,6 +3640,7 @@ __all__ = [
     "VARIANT_ANCHOR",
     "VARIANT_KEYWORD",
     "VARIANT_ORDER",
+    "VariantContractError",
     "VARIANT_SUMMARY",
     "VERDICTS",
     "VERDICT_RULE",
