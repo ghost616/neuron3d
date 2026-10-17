@@ -757,3 +757,185 @@ R51 确认 **F1/F2/F3 三处修复全部收口**：F1 —— R50 检不出的三
 - **info 7｜D 判据写死**：`_small_pool_precondition` 判「设定 D 是否被评测」由 `if d else []`（键存在但为空 dict 时会与 B/C 假性判等）改为 `bool(measured_scope.encoder_setting_applicable)`，并在产物新增 `d_judged_by = "measured_scope.encoder_setting_applicable"`。
 - **info 5｜文档过期表述**：README §17.7 的「对**三种池设定**分别评测」改为「**四种池设定**」并补明 `common_subset` 实际渲染的四个分池键（含 `variants_small_pool_hard_encoder`）。
 - **现场实测（R70）**：`probe` / `gate` **未重跑**（产物逐项不变）；`eval` 116.5 / 117.4 / 115.6 / 118.1 s，`report` 58.2 s，全部退码 0；小批演练（`_drillC`，`--limit 20`）`eval → eval → report → eval` 三次均 **7911 B / `2e36e2d9b33d26e0…`**。产物：**逐项不变** `variants.jsonl` 2416229/`92b1ddbd382cc43b`、`variants_meta.json` 6754/`f3877dd85a01a7e9`、`feature_gate.json` 7155/`3b58efb156b1b6f8`、`qa_grouping.json` 1430/`7de71d4f47be6866`、`keyword_vocab.json` 241001/`990027709ab78b20`，且 `negatives.json` 3387028/`5ded5446594613f1`、`probe_summary.json` 66785/`340c2de4a5338e10`、`retrieval_eval.json` 148820/`ecec8e7cf5c14d89`、`gate_summary.json` 8793/`dff6a6af3c368ef6` **未变**；允许变 `determinism_check.json` **7792/`edeb0bded509e5a2`**、`text_variants_report.json` **166341/`a7a526e938c09368`**、`.md` **17800/`7664e8787d7a2f9d`**。零回归：顶层 9 个 `qa_*.pt.zip` 三项与顶层文件数 9 不变、第二步 5 件冻结产物逐字节不变、四上游 `git status` 空、根 `requirements.txt` 未改、零新增依赖、`compileall` 退码 0。
+## 合并表零训练对照（轮 C）
+
+把「QA 与文本是**同一个 map**」这条架构命题做成**零训练离线对照**：`merge_table.py`（核心）+ `merge_table_run.py`（CLI），驱动脚本为 `python -m n3d_qa_learn.merge_table_run {drill|eval|report}`。**本轮不改生产路由**（`route.py` 零改动）、不做任何训练。
+
+**合并表（口径冻结）**：`MergedEntryKeyTable` 复用 1a 的 `EntryKeyTable`（键 `[N, D]` float32 逐行 L2 归一化 + `entry_ids` + `outputs` + `meta`），新增的**唯一**结构是「逐条目类型标记」`entry_kinds`（`KIND_QA='qa'` / `KIND_TEXT='text'`），按类型的下标区间由 `half_slice` / `indices_of` **现场推导并交叉校验**（区间必须恰等于该 kind 的条目集合，否则拒绝出数）。类型标记由**两个独立视图**背书：写入的 `entry_kinds` 与「按输出内容归类」的 `outputs_index` —— 不一致即构造期报错。合并顺序 `MERGE_ORDER = ('qa','text')`（QA 半区在前）。两侧元数据经 `MergeProvenance` **完整保留**（dim / norm_spec / encoder_profile / encoder_fingerprint / key_table_sha256 / source）。现场口径：**N = 2814 = QA 侧 train_known 149 + 文本侧全量行 2665**，`D = 88`（`lexical-88`），`merge_key_table_sha256 = e81839673cc60b30...`。
+
+**三条合并前置断言**（`PREMERGE_ASSERTION_KEYS`，**先跑、任一失败即停止**，全过才允许出数）：① `same_dtype_and_norm`（两侧同 D / 同 dtype / 各自逐行 L2 归一化，现场范数区间 qa `[0.99999994, 1.00000012]` / text `[0.99999988, 1.00000012]`）；② `role_bitwise_identity`（`local-hash` 的 `question` 与 `text_line` 两角色对同一文本逐位相同，现场 **2665/2665**，两角色口径指纹同一串）；③ `merge_key_bytes_unchanged`（合并前后各半键字节零变化，qa **149/149** / text **2665/2665**）。**口径纪律**：断言③一律用**键裸字节 SHA256**（新增 `raw_keys_sha256`，与 `TextRowKeyTable.sha256()` 同源）比较，**不得**与 `EntryKeyTable.sha256()` 的**内容指纹**（schema+形状+裸字节+ids+outputs+dim 的规范化 JSON SHA256）互比 —— 二者是不同指纹方案，混比会把天然不同误判为字节漂移（本模块首跑即因此失败，已修复并登记）。
+
+**类型标记契约**：`LookupContract(index, returned_kind, expected_kind, returned_output)`，其中 `returned_kind ∈ RETURN_KINDS = ('qa','text','none')`、`expected_kind ∈ ENTRY_KINDS = ('qa','text')`；`type_contract_ok` 即「返回物类型 == 查询期望类型」；`classify_type_violation` 按 `TYPE_VIOLATION_CLASSES = ('returned_none_expected_entry','returned_qa_expected_text','returned_text_expected_qa')` 归类；`empty_violation_counts()` 给零值计数表。`MergedEntryKeyTable.lookup_typed(i)` 返回 `(该行 float32 裸字节, LookupContract)`；`contract_for(i, expected_kind)` / `miss_contract(expected_kind)` 供路由侧构造契约。
+
+**两臂对照（唯一变量是路由结构）**：`ARM_ORDER = ('qa_priority','merged_topk1')`。`qa_priority` = 现状两级硬优先级（QA 半区 top-1 达 `TAU` 即返回，否则文本半区，两级都低于门禁则「无匹配」）；`merged_topk1` = 合并表全表单次排序取 top-1（低于 `TAU` 则「无匹配」）。两臂**共用**同一批查询（QA 侧 `test_known` **20** 条 + 文本侧冻结 666 查询行 x 4 支变体）、同一批键与**同一个** `TAU = 0.5`（`TAU` 不接受运行期覆盖）。`topk_scores(query_feats, keys, index=None|候选下标, topk, batch_size)` 是两臂共用的打分实现（余弦 = 逐行 L2 归一化后的内积；`argsort(stable=True)` 保证并列确定性）；`arm_top1(query_feats, merged, arm, expected_kind, tau, batch_size)` 返回逐查询的 `top1_index` / `top1_score` / `top1_kind` / `returned_index` / `returned_kind` / `returned_output` / `type_contract_ok` / `type_contract_violation` / `stage`。
+
+**主判据口径**：命中率 / `R@1` / 返回类型正确率一律取**未过滤 top-1**（不受 `TAU` 影响），`TAU` 过滤后的量单列为诊断（带 `_returned` 后缀），以免门限取值污染主对照。文本侧 `R@1` 的金标集 = 自身行 ∪ 与查询行**原文逐字节相同**的其他行（`GOLD_SET_RULE`）；原文支 `R@1 == 1.0` 是**结构性锚点**、单列报告且**不参与判定**。文本侧变体一律读**已冻结**的 `_verify/text_variants/variants.jsonl`（`load_frozen_variants` / `variant_fields_of`），**禁止**本轮重新生成。因两臂 `stage` 语义不同（`qa_priority` 是两级路由的**到达档**；`merged_topk1` 退化为「top-1 的 kind」），文本侧 `R@1` 必须**同时**报总体值与按 `stage` 拆分值。
+
+**现场实测（单 seed，`lexical-88`，`D=88`）**：三条前置断言全过、合并表 2814 条目；`原文` 支 `R@1` = `qa_priority` 0.156156 / `merged_topk1` **1.000000**（结构性锚点）；非锚点三支 `R@1` = 关键词 0.243243→**0.346847**、摘要 0.267267→**0.879880**、自适应 0.267267→**0.659159**；返回类型正确率 0.432191→**0.998882**；QA 侧命中率两臂**并列** 1.000000（基线落在**饱和点 1.0** ⇒ 该指标上「严格优于 / 不劣于」**不可判**，已显式登记），严格命中率两臂并列 0.300000（两臂在 QA 侧逐查询决策 20/20 完全相同）。判定 = **`merged_strictly_better`**（劣化指标 `[]`，改进 4 项；最小增益 +0.103604、最大 +0.612613）。返回类型不一致样本数（两臂合计）= **1527**（全部 `returned_qa_expected_text`、全部来自 `qa_priority` 臂的文本侧查询，按查询侧拆分 `{'qa': 全 0, 'text': 1527}`），已按规定**登记为缺陷**并给出逐样本；`merged_topk1` 臂残留 **3** 条（均在 `关键词` 支，QA 条目 56 / 100 / 11 以 0.576572 / 0.627490 / 0.647529 压过正确文本行）为**真实负结果**。
+
+**确定性**：产物一律写 `checkpoints/qa_learn/_verify/merge_table/`（`_guard_out_dir` 只允许写在 `_verify/` 之下），**不落盘裸特征矩阵、不产 zip、无挂钟 / 耗时字段**；同参双跑（`eval` -> `eval --repro-dir`）现场**共有文件 4、逐字节相同 = True**；`determinism_block` **排除证据文件自身**且**不记录两件报告自身的 SHA**（报告在证据之后才渲染）⇒ 无自指哈希回路；`report` 连跑两次产出的 `.json` / `.md` 逐字节相同。产物路径由 `checkpoint_path_resolution` **现场**调用 `n3d_shape.train.resolve_checkpoint_path`（最终参数 `dim=88 / max_batches=0 / tag='merge_table'`，`status=computed`）复算，`artifact_scope_evidence` 核实该路径**不在**本模块产物目录内（产物保护）。
+
+**零回归**：`route.py` / `entry_table.py` / `robust_eval.py` / `variant_b.py` / `text_variants.py` / `text_variants_run.py` / `encoders.py` 等**零改动**；上游四目录 `git status --porcelain` 为空；顶层 9 个 `qa_*.pt.zip` 与第二步冻结件、第三步 12 件产物的 SHA256 / 字节 / mtime **逐项不变**（逐行 diff 为空）；根 `requirements.txt` 与 `requirements-qa.txt` 未改；零新增依赖（仅 torch / numpy + 标准库）；`compileall` 退码 0。
+
+**如实登记的局限（不得包装）**：单 seed 单切分（`split_seed=42`）、QA 侧查询仅 20 条；`qa_hit_rate` 基线饱和、该指标不可判；`bge-m3-1024` 语义档**未做**（两角色 `max_length` 512 / 8192 不同口径，需先对齐才可与本结论并列）⇒ 结论只在 `lexical-88` 档成立；`TAU=0.5` 未做标定扫描；原文支援性锚点 1.0 不得当作检索能力证据；本结论**仅在 C=10 口径下成立**，扩 C 后合并表规模与异构干扰量都会变化、**必须另行复跑**。
+**离朱 R74 测试与三项缺陷修复（判定量逐位不变）**
+
+离朱 R74 结果：单元 85 条 → **82 PASS / 3 FAIL**（均真缺陷）、集成 **9/9 PASS**、`compileall` 退码 0、零回归全过。三项缺陷处置如下（判定量逐位不变：`route_eval.json` 31424 B `bf2444a40f7339bf...` 与 `route_eval_queries.jsonl` 1538962 B `f188d788171537f0...` **逐字节不变**；`drill.json` 2684 B `f5b5d2d7d9592066...` 不变）。
+
+- **D1（一般）`MergedEntryKeyTable.meta()` 顶层缺 `encoder_profile` / `encoder_fingerprint`**：修法为顶层补齐这两项（沿用前半区取值），并新增 `encoder_consistency()`（逐半 `encoder_profile` / `encoder_fingerprint` + `profiles_equal` / `fingerprints_equal` / `top_level_field_source`），明确「两半口径不同时以 `per_half` 为准」。现场两半均 `lexical-88`、指纹同一串 `d4a4881aaa8dfa8c...`。影响面：`merge_table.json` 14701 → **17273 B**。
+- **D2（重要）`determinism_block` 把证据文件自身纳入比对**：枚举共有文件时未排除 `determinism_check.json`，与函数自身写的 `excluded_self_file` 约定自相矛盾；且在**全新**对照目录上首跑必然 `determinism_ok=False`（该文件只存在于一侧 ⇒ 计入 `b_only_files`）。修法：两个目录**都**过滤 `excluded_self_file`（不进 `files`、不记 SHA），新增 `excluded_self_present` / `n_files_before_exclusion` 取证，并把「`determinism_ok` 只对两目录共有的非排除文件成立、单侧独有文件不纳入该布尔值」写成新字段 `determinism_ok_semantics` 显式登记（不静默忽略）。现场复验：干净目录 A + 上轮产物目录 B 首跑 ⇒ `excluded_self_present={'in_a_dir': False, 'in_b_dir': True}`、`n_common_files=3`，不再因自身判 False；同参双跑仍 `determinism_ok=True`。影响面：`determinism_check.json` 2099 → **2943 B**。
+- **D3（重要）`eval` 在 cp936 控制台下输出 UTF-8（GBK 解码失败）**：根因是 `cmd_eval` 调 `checkpoint_path_resolution` → `import n3d_shape.train` → 该模块**导入期** `_reconfigure_stdio()` 把 `sys.stdout` / `sys.stderr` 重配为 `utf-8` / `errors='replace'`，并 `log_info` 打印一行含中文的产物保护提示 ⇒ 本模块 `_log` 的 backslashreplace 兜底永不触发、GBK 纪律被静默旁路。修法：新增 `_save_stdio_encoding()` / `_restore_stdio_encoding()`，并把「导入 + 复算」整段**重定向到临时缓冲**（`io.StringIO`）——上游改的是缓冲的编码、上游日志落在缓冲里，真实 stdout 的编码与内容都不受影响，随后按进来时口径恢复；取证落 `checkpoint_path_resolution.stdio_encoding.{before,buffer_encoding_after_import,restore,upstream_stdout,rule}`（`upstream_stdout` 记录被重定向内容的字符数 / SHA256 / 首行，供审计「上游确实打印过什么」）。现场字节级复验：`drill` / `eval` / `report` 的 stdout 分别 **123 / 952 / 180 B，三者均为合法 GBK**（对 UTF-8 解码失败）、全退码 0；修复前 `eval` 的 stdout 是合法 UTF-8。
+
+**另 3 条口径提示（非缺陷，登记不修）**：**R1** 未登记子命令由 argparse 写 stderr（`invalid choice`），契约错误（TAU 覆盖 / 产物目录越界）写 stdout，两处退码语义一致（2）；**R2** `--log-file` 为 LF、控制台为 CRLF，归一化后文本一致；**R3** `top1_score` 在 `batch_size` 1 vs 64 存在 ≤1e-6 浮点差异（BLAS 分块），主判据字段（`top1_index` / `returned_kind` / `stage`）严格相同。
+**轮 3 收口（P1 / P2）**
+
+- **P1 · `merge_table_report.json` 的唯一终值**：§18.13「产物影响面」此前把它记成**中间态**
+  `58017 B` / `5b553c3c...`，而 §19.8 的旧→新表、`merge_table/report.log` 首行、盘上实测
+  三方一致给出**终值** `58860 B` / `73805cb62da0a558...`。已改为终值，并显式登记「中间态
+  58017 只用于说明指纹演进的中间步骤，**不是终值**」；同段的
+  `determinism_check.json` 登记值一并订正为 `3782 B` / `61e627792c6d06b2...`。
+- **P2 · W1/E1/W3 三块**渲染进报告**：`qa_scale_run.render_markdown` 新增 **§4.2**
+  （`criterion_tables_by_scope` 三格作用域表 + `cross_scope_rule` + `why` + `scopes`）、
+  **§4.3**（E1 的 `merged_consistency` 逐类自洽表 + `merged_total_self_consistency`）、
+  **§4.4**（W3 的 `task_list_consistency` 四来源 + `missing`/`extra`/`per_task_rows`）。
+  此前这三块**只在 JSON 产物里**、报告全文没有作用域表与跨作用域声明，与 §19.4.1 的承诺不符。
+  现场渲染值（C=298）：全量类 298/0.003610/0.103610、匹配 275/0.003636/0.103636、
+  解题 6/0.166667/0.266667（`10/C`=1.666667 ⇒ `applicable=False`）；E1 两口径 × 两单位
+  逐类自洽全 True、合并侧合计 10210 / 13468；W3 四来源逐项相同、`per_task_rows` 合计 50865。
+  §19.8 变更原因列改述为「W1/E1/W3 三块**渲染进报告**（P2 修复后）」。
+  指纹：`qa_scale_report.json` 136406 `41ecf14f...` → **136406 `fc1037d7...`**、
+  `qa_scale_report.md` 10214 `06fd0b6a...` → **13773 `3a960828...`**。
+## QA 侧数据规模扩容与任务分层（轮 1）
+
+把 QA 侧数据规模从「每类仅 2~22 条、主测试集仅 20 条」扩到**全量口径**，并把「解题类任务」从匹配任务中拆出。**只改数据口径与任务分层，不改模型结构、不改打分链路、不做任何训练**。新增 `qa_scale.py`（核心）+ `qa_scale_run.py`（CLI），入口 `python -m n3d_qa_learn.qa_scale_run {probe|eval|report}`，产物一律写 `checkpoints/qa_learn/_verify/qa_scale/`（不落盘裸特征矩阵、不产 zip、无挂钟字段）。
+
+**数据来源（现场枚举，不凭记忆）**：只读 `checkpoints/qa_learn/dataset/` 的冻结产物 —— `answer_table.jsonl`（298 行；字段 = `['count','display','index','key','raw_variants','sources']`）、`n3d_qa_all_pairs.jsonl`（50865 行；字段 = `['answer_table_size','answer_text','candidate_answer_index','candidate_answer_key','label','pair_id','question_id','question_text','row_id','task']`）、`n3d_qa_all.npz`（`X [50865,306]` float32 + `y` 二值；**只读 `meta`**）、`manifest.json`。**一处字段陷阱（已实测并登记）**：`n3d_qa_all_pairs.jsonl` 的 `task` 列**恒为 `'all'`**（不承载逐行任务）；**逐行真实任务**取自 `n3d_qa_all.npz` 的 `meta.task_of_row`（与该文件逐行同序，现场核对行数一致）。**为什么不用 QA JSON 缓存**：manifest 的 `classes = 298` 只对冻结产物成立，缓存是另一套答案空间（基数与类集合都不同）；缓存口径的现状基线（C=10 / 149 / 20）作为**另一总体**单独登记，不混为一谈。
+
+**扩 C（同一个总体上的唯一变量是类别数上限）**：`ScaleCorpus` / `build_scale_corpus(product_dir, max_classes)` —— 类别截断按 `(-count, key)` 降序取前 `max_classes`（与 `data.build_answer_space` 的确定性排序键一致）；`max_classes=0` 为全量。截断到 C 类时**金标全部落在保留类之内**的问题才属于该口径，金标含被截断类的问题**整体排除**（不能只删越界的那部分金标 —— 那会把「答案不在表内」偷偷变成「答案在表内」），行下标过滤后**重新编号**保证只有一套「语料行号」。现场：C=10 重建 = 10 类 / 10161 问题 / 39909 行（排除 2566 个越界问题）；C=298 全量 = **298 类 / 12727 问题 / 50865 行**（排除 0）；问题 **x1.253**、行 **x1.275**、类别 **x29.8**。
+
+**按比例留出（边界归属 = 小于）**：`question_side` 是唯一实现 —— `h = int(sha256("qgroup\0{seed}\0{task}\0{question_id}"), 8B big-endian) % 100`，`h < holdout_pct` 进测试侧；作用单位是**问题组**（同一 `question_id` 的全部行同侧，哈希只用 `(seed, task, question_id)` 故构造性成立）。**边界归属 = 严格小于**（左闭右开 `[0, holdout_pct)`，命中概率恰为 `holdout_pct/100`）；`proportional_holdout_evidence()` 给出 `boundary_probe`（`h = pct-1 / pct / pct+1` 三点上「`<`」与「`<=`」的判定对照，`h == pct` 处两者**可区分**）与 `pct ∈ {0,100}` 退化端证据。废掉了 `test_per_class=2` 的逐类封顶语义。现场实际测试问题占比 0.191954 / 测试行占比 0.192313（目标 0.20）。
+
+**判据退化修正**：`macro_criterion_applicability(n_classes)` —— 阈值 `10/C`，`applicable ⇔ 10/C < 1.0`（**严格小于**）；**恰好等于边界的现场用例**：C=10 时 `threshold == 1.0` ⇒ `applicable=False`（`boundary_case.threshold_at_10 / applicable_at_10`）。C=298 时阈值 0.033557 ⇒ `applicable=True`。真正生效的两条是「`macro >= 多数类基线 + 10pp`」与「`+ 5pp`」（阈值均为闭区间下界，判据用 `>=`）；`saturated_baseline_check` 做可行域边界核查（内部 ⇔ `0.0 < baseline < 1.0`），两个口径的多数类基线（0.100000 / 0.003610）都在内部 ⇒ 可判。
+
+**解题类任务拆分（依据现场统计而非直觉）**：`SOLVE_TASKS = ('judge','choice')`、`MATCH_TASKS = ('blank','solve','triviaqa')`；依据 = 现场 per-task 答案类数 `{'blank':153,'choice':4,'judge':2,'solve':78,'triviaqa':100}`（judge/choice 只有 **2 / 4** 类，答案由计算/选项判定而非问题相似性，如「3 是奇数吗」与「3 是偶数吗」问法极相似而答案相反）。`task_side_stats` / `grouped_stats` 给分任务分侧统计；`task_split.impact_on_merged_metric` 显式给拆分对**合入口径**的影响：C=298 下解题任务集基线 macro 0.166667 vs 合入口径 0.003610（**x46**），故不拆分会让解题任务被 298 类长尾淹没。
+
+**确定性参照基线（不训练、不用模型）**：`deterministic_baseline_metrics` 给 `constant_majority`（一律答本侧正样本行数最多的类）与 `row_argmax`（按本次统计行的正样本行数取多数类）两条；micro/macro 口径显式（macro 分母 = 本范围内实际出现的类数）；新增 `class_coverage`（`n_classes_with_gold_rows` vs `n_classes_with_candidate_rows` 分开报，macro 分母只由前者性质决定）与 `n_rows_out_of_scope`（指向本轮未保留类别的行，**逐行计数**、不进分母，全量口径下恒为 0 —— 这是「集合类断言必须显式列出允许的额外项」的落地）。现场：C=10 测试侧 micro 0.233512 / macro 0.100000；C=298 测试侧 micro 0.196074 / macro 0.003610。
+
+**产物与确定性**：`qa_scale_probe.json` 8098 B `dc4e64c856b0ddd5...`、`qa_scale_eval.json` 88154 B `975534da01940a71...`、`qa_scale_report.{json,md}` 102830 B `5eb43f03d056eab4...` / 10152 B `3eebe0b302f2b7fc...`、`determinism_check.json` 2594 B `e21df22b8809ba6e...` + 4 个日志。`eval` 双跑（主目录 -> 拷内容产物到 `_repro/` -> `eval --repro-dir`）`n_common_files = 2`、`not_equal_files = []`、`determinism_ok = True`；`report` 连跑两次逐字节相同；证据块**排除**证据文件自身与两件报告（后置可重渲件）⇒ 无自指哈希回路；单侧独有文件显式登记、**不纳入** `determinism_ok` 布尔值。**如实登记一处非确定性来源**：`a_dir`/`b_dir` 保留命令原样串 ⇒ 绝对路径不同的运行之间不逐字节相同，同路径同参重跑才逐字节相同；另给 `*_normalized` 与 `paths_normalized_equal` 供机器判定。
+
+**生效口径（所有结论受此约束）**：**max_classes = 298（全量）+ 20% 按比例留出 + 单 seed（42）+ 问题组级切分**。
+
+**如实登记的局限（不得包装）**：单 seed（跨 seed / 跨留出比例极差未测）；**样本量只涨 x1.25** —— 冻结产物本身**已经是**「只导出已入表答案」的口径（`questions_in_table = 12727` / `questions_seen = 38364`），扩 C 的收益是「不再预先丢掉 288 个类」而非样本量暴涨（要真正暴涨必须回到 `questions_not_relevant = 25637` 的未入表问题，那需改上游口径，不在本轮范围）；本轮**不训练**，两条基线**不得**当作模型能力；测试零样本类 **51** 个（哈希比例抽稀不保证每类都有测试样本，保证会破坏比例性；这 51 类对 macro 无贡献，macro 分母只含实际出现的 277 类）；`triviaqa` 测试侧仅 7 问题 / 129 行 / 92 类，方差极大，不得据此下任务级结论；解题任务集类数极少（2/4），可行域窄，任何「优于基线」判据必须先做饱和点核查；**C=10 重建不是现状基线**（后者用缓存总体，二者总体不同，不得互相代入）。
+
+**零回归**：`data.py` / `route.py` / `entry_table.py` / `robust_eval.py` / `variant_b.py` / `text_variants.py` / `encoders.py` / `backends.py` / `train.py` 等**零改动**；上游四目录 `git status --porcelain` 为空；顶层 9 个 `qa_*.pt.zip`、`_verify/text_variants/` 12 件、`step2/` 9 件、`_verify/merge_table/` 11 件、`dataset/` 17 件与两个 requirements 文件的 SHA256 + 字节**逐项不变**（基线↔终态共有 42 项比对 `CHANGED = []`）；`compileall` 退码 0；零新增依赖。
+**轮 2 审查收口（皋陶 approved=false 的 1 error + 3 warning + 1 info，以及计划 1 遗留 3 项）**
+
+- **E1（error，必修）按行口径合并分布聚合错误**：`qa_scale_run._scale_block` 的 `merged_r` 原为 `zip(q_all, r_all)`（把「训练侧**问题数**」与「训练侧**正样本行数**」相加），得到既不是问题数也不是行数的混合量；现场污染值 `merged_by_row.total` = **C=10 16480（min 310 / max 3632）**、**C=298 21698（min 2 / max 3632）**，且被渲染进 README 第 19.2 节直方图的「按正样本行数」列。修法：改为与 `merged_q` 对称的 `zip(r_all, r_test)`。修复后现场 `merged_by_row.total` = **10210（C=10）/ 13468（C=298）**，与 `train_by_row.total + test_by_row.total`（8240+1970 / 10849+2619）逐项相等。**新增现场断言** `assert_merged_distribution_consistent`：`merged[i] == train[i] + test[i]` **逐类逐项**（question 与 row 两个单位各自独立跑），取证落 `class_distribution.merged_consistency.{question,row}` 与 `merged_total_self_consistency.{question,row}`。**非恒真**：现场反例（任改一个元素 / 用历史污染数组 / 三者长度不一致）**均如期抛 `AssertionError``。
+- **W1（warning）判据基线作用域显式化**：`criterion_table_using_test_baseline` 用的是**全量类口径**基线，与**分任务集** macro（解题任务集仅 2/4 类）不同量纲。修法：新增 `criterion_scope_declaration`（作用域 → 基线 → 阈值 绑成一格 + `cross_scope_rule`）与产物 `criterion_tables_by_scope`（`all_classes` / `match_tasks` / `solve_tasks` 各一格，含该作用域自己的类数、基线 macro 与三条阈值）；分侧基线由 `deterministic_baseline_metrics(..., tasks=SOLVE_TASKS/MATCH_TASKS)` **同作用域现场算出**。现场：C=298 的 `+10pp` 阈值 = all_classes **0.103610**（298 类）/ match_tasks **0.103636**（275 类）/ solve_tasks **0.266667**（6 类）；`solve_tasks` 的 `random 10/C` = **1.666667 ≥ 1 ⇒ applicable=False`（与 C=10 全量类同源）。
+- **W2（warning）`constant_majority` 命名与实现对齐**：实现取的是**本侧（side + 任务过滤）**正样本行数最多的类，而 `predictor` 字段与 README 曾写「全局最高频类」⇒ 名实不符。取方案①（改述字段与文档，因为「取本侧多数类」是本基线想表达的意思）：`predictor` 改为 **`scope_side_majority_class`**，`row_argmax` 改为 **`scope_rows_positive_row_count_argmax_class`**，两条各增 `scope_of_majority` / `scope_of_majority_detail`（现场 = `side_row_positive_counts`，仅本侧无正样本行时回退 `frozen_table_count_fallback`）；`majority_class_index` docstring 同步改述为「纯 argmax 工具，不隐含全局语义」。
+- **W3（warning）`ALL_TASKS` 现场一致性校验**：此前 `ALL_TASKS` 硬编码、文档声称「现场来自 manifest」但**全流程无校验**。修法：新增 `validate_task_list`（`probe` 与 `eval` 两条路径都跑），把**三处来源**（`manifest.tasks` / `npz meta.task_of_row` 去重 / `pairs` 回填后的任务去重）**逐项比对**再与 `ALL_TASKS` 比集合：**现场多出的任务名 ⇒ 抛 `AssertionError`（fail-closed，防静默漏样本）**；**清单多出的任务名 ⇒ 不抛但显式列出**（允许的额外项）。现场三处逐项相同、`missing=[]`、`extra=[]`。**非恒真**：去掉 `triviaqa` 或改名 `triviaqa2` ⇒ 抛；多一个 `math2` ⇒ 通过并在 `extra_in_declared` 列出。
+- **I1（info）`__init__.py` 登记本轮新模块**：docstring 模块清单与 `__all__` 补入 `qa_scale` / `qa_scale_run`，与包内既有惯例一致。
+- **F1（计划 1 遗留）`build_verdict` 量化字段语义**：`min_gain` / `max_drop` 原都写成 `min(delta)` ⇒ 恒相等且劣化时为负「增益」。修法：新增 `_quantified_deltas` —— 只在「可比且 `baseline_interior == True`」的指标上统计；`min_gain` = **正向 delta 最小值**（无增益时 `None`）；`max_drop` = **负向 delta 最小值**（无劣化时 `0.0`）；新增 `eligible_metrics` / `excluded_metrics` / `n_gains` / `n_drops` / `basis`。现场：`min_gain = 0.1036036036036036`、`max_drop = 0.0`、`excluded_metrics = ['qa_hit_rate']`（基线饱和不可判）⇒ 与 README 18.6 的 **+0.103604（关键词支）** 一致。**主判据逐项未变**（`verdict` / `degraded_metrics` / `improved_metrics`）。
+- **F2（计划 1 遗留）`RETURN_TYPE_RULE` 第②类违规**：合同声明两类计数、实现只做第①类。取方案①：新增 `content_view_violations(merged, returned_indices, expected_kinds)` —— 第②类（期望 qa 但返回物**不属于任何 qa 条目的展示文本**）**只看输出内容**（`outputs_index` 内容视图）、**不看 `kind` 字段**，逐臂落 `route_eval.json.return_type_contract.content_view_check`。新增常量 `RETURN_TYPE_VIOLATION_CLASS_2_REACHABILITY` 写明**结构上不可达**（`__post_init__` 强制 kind ↔ 内容逐条一致）。**非恒真**：改 `outputs_index` ⇒ 构造函数当场抛 `ValueError`；用 `object.__new__` 绕过构造器喂伪造内容视图 ⇒ 报出 1 条第②类违规（`content_view_kind=''` 而 `returned_kind_by_field='qa'`）。现场 `n_class2_violations_total = 0`（两臂各 1684 检查项）。
+- **F3（计划 1 遗留）`GOLD_SET_RULE` 注释**：原称「逐字抄录」但漏抄 rank 一句。取方案②：改述为**「口径等价摘录（本轮不使用 rank 字段）」**，新增 `GOLD_SET_RULE_SOURCE`（上源权威位置 = `n3d_qa_learn.text_variants.GOLD_SET_RULE`）与 `GOLD_SET_RULE_EXCERPT_NOTE`（明写**不声称逐字一致**）。
+- **产物指纹重新基线（旧值 → 新值）**：`qa_scale_probe.json` 8098 `dc4e64c8…` → **9252 `4b2683ea…`**；`qa_scale_eval.json` 88154 `975534da…` → **119973 `7faeda90…`**；`qa_scale_report.json` 102830 `5eb43f03…` → **136406 `41ecf14f…`**；`qa_scale_report.md` 10152 `3eebe0b3…` → **10214 `06fd0b6a…`**；`qa_scale/determinism_check.json` 2594 `e21df22b…` → **2596 `1c90d2d9…`**；`merge_table.json` 17273 `759f3a1e…` → **17542 `f7a678f7…`**；`route_eval.json` 31424 `bf2444a4…` → **36767 `6b8853a5…`**；`route_eval_queries.jsonl` 1538962 `f188d788…` → **1652875 `a01f2cc1…`**；`merge_table_report.json` 52402 → **58017 `5b553c3c…`**；`merge_table_report.md` 19424 → **19693 `28b908ca…`**；`merge_table/determinism_check.json` 2940 `1c4234dc…` → **2943 `ac84a475…`**；`drill.json` 2684 `f5b5d2d7…` **不变**。
+- **零回归**：上游四目录 `git status --porcelain` 为空；顶层 9 件 / `step2` 9 件 / `text_variants` 12 件 / `dataset` 17 件与两个 requirements 文件指纹**逐项不变**（11 项核心比对 `CHANGED=[]`）；`compileall` 退码 0；零新增依赖；本模块**只改** `qa_scale.py` / `qa_scale_run.py` / `merge_table.py` / `merge_table_run.py` / `__init__.py` / `README.md`。cp936 控制台下 `qa_scale` 三子命令与 `merge_table report` 的 stdout **均合法 GBK 且退码 0**。
+**轮 3 主体：B3 QA 侧变体生成 + B4 开集 τ 标定（`qa_variants*.py` / `open_set_tau*.py`）**
+
+### B3 · QA 侧变体生成（`qa_variants.py` / `qa_variants_run.py`）
+
+**只用数据、不训练。** 复用第三步 `text_variants.VariantGenerator` 的 4 支生成器
+（`原文` / `关键词` / `摘要` / `自适应`），**不改动**文本行侧产出路径与其 12 件既有产物
+（零回归已逐项确认）。
+
+- **B3-2 绑定输出 = 答案，不是问题原文**：`BINDING_OUTPUT_RULE` 唯一来源；
+  现场 `binding_output.n_binding_equals_question_text = 0`（若等于问题数则口径当场失败）。
+- **B3-3 严格按 `question_id` 整组切分**：定侧复用轮 1 的 `question_side`
+  （`h = int(sha256('qgroup\0seed\0task\0question_id'), 8B) % 100; h < holdout_pct` 进测试侧），
+  故「整组同侧」构造性成立；仍由 `verify_group_split` 复核三条不变量
+  （`rows_disjoint_and_union_complete` / `questions_disjoint_and_union_complete` /
+  `every_question_wholly_on_one_side`）；**权威全集（`expected_row_keys` /
+  `expected_question_ids`）必须显式传入**，否则退回自比并标 `authority=self_referential`
+  （该模式**不能**发现丢行）。现场 400 题 × 4 支 = 1600 条，训练 332×4 / 测试 68×4，
+  三不变量全 True；**四个反例**（翻半组 / 复制一行 / 删一行 / 删整组）全部如期翻面。
+- **B3-4 特征确实变化**：`feature_difference_report` 以原文支为参照，给逐位裸字节相同数、
+  余弦 min/mean/p50、`n_cosine_below_one`；判定
+  `feature_really_changes = 存在余弦<1 或存在裸字节不同`（**只看文本不同不足以断言**）。
+  现场（400 题）：关键词 0/400 同文本、cos mean 0.393480；摘要 **4/400 逐字节同原文**、
+  cos mean 0.876336；自适应 cos mean 0.681775；原文支 400/400（锚点，应然）。
+- **执行范围如实登记**：实际在**按 `question_id` 升序的前 400 题**上全量生成（非 12727 全量），
+  因全量外推约 1 小时、超出单次前台执行上限（600 s），且后台执行在本环境会使子进程停滞
+  （现场 CPU 时间停在 0.078 s、模型未加载）。
+- **词表口径显式偏离**：`QA_VOCAB_MIN_DOC_FREQ = 20`（文本侧为 2）；QA 语料唯一候选词
+  163690、mdf=2 保留 49988 词、mdf=20 保留 2849 词；**400 题子集上仅保留 50 词** ⇒
+  关键词支更保守。偏离文本落 `generator.vocab_caliber_deviation`。
+- 产物写 `checkpoints/qa_learn/_verify/qa_variants/`（**不落盘裸特征矩阵、不产 zip、
+  无挂钟字段**）；双跑 `determinism_ok=True`、`n_common_files=3`、`not_equal_files=[]`。
+
+### B4 · 开集「未识别」档的 τ 标定（`open_set_tau.py` / `open_set_tau_run.py`）
+
+**补齐第一步 1a 的遗留。** 此前 5 处「本档**不标定**阈值（属第二步变体 B 的范围）」声明
+**已全部订正**为「已实现 + 指向实现入口」（`robust_eval.py` 模块 docstring /
+`unrecognized_report` docstring / `threshold_standard` 字段 / `run_evaluation` notes /
+`render_markdown` 4 节 / `step2_run.py` 的 `unrecognized_note`）。
+实现入口：`robust_eval.calibrate_thresholds(..., unrecognized_scores=...)` 的
+`unrecognized_tau` 块；核心 = `open_set_tau.calibrate_tau`。
+
+- **工作点**：τ = 使平衡准确率 `(recall+specificity)/2` 最大的候选阈值（候选 = `sorted(pos∪neg)`
+  相邻中点），并列按 `(balanced_accuracy↓, margin↓, τ↑)` 字典序 —— 确定性、无超参。
+- **边界归属（显式）**：判据 = **`margin > max(noise_floor, granularity)`，严格大于、等号归无效**
+  （`GUARD_BOUNDARY_RULE`）；理由 = 恰好等分辨率的间隔可能只由**一个样本**造成。
+  现场：确定性网格扫 37 组**可分**组合，命中 **6 组** `margin == threshold`，**全部 effective=False**；
+  严格性对照（负总体降一档 ⇒ margin 0.25→0.5、threshold 不变 ⇒ effective 翻 True）
+  证明判据**非恒假**。
+- **噪声底同总体、同口径、样本量减半**：`noise_floor_of` 把同一批 pos/neg 确定性对半拆分、
+  各自重标定取最大偏差（现场 0.0001197755）；**粒度** = 工作点移动一个样本引起的 τ 变化
+  （现场 0.0009683371）+ 比率空间 `1/n_pos` / `1/n_neg`，与落差一并核算。
+  `calibrate_tau` **强制**校验 `population` 的 `side` / `profile` / `table_sha256` 齐备且
+  `pos_side == neg_side`，缺失或不一致**直接抛**（**禁止跨总体复用**）。
+- **现场场景**（真实语料）：键表 = 9227 个训练侧题面向量（`lexical-88`/role=question/dim=88），
+  正总体 = 抽掉的 1057 个训练侧问题（**不在表内**），负总体 = 2443 个测试侧问题
+  （轮 1 整组切分下从不进表）；`table_sha256 = 858dcb40...`。
+- **诚实结论（负结果）**：τ = 0.8392274976、`margin = 0.0001155138`
+  **小于** `threshold = 0.0009683371`（主因粒度比 margin 大 8.4 倍）⇒ **`effective = False`**。
+  两总体最高余弦几乎完全重叠（mean 0.8544 vs 0.8536）⇒ 单靠全局 τ 无法分到超过观测分辨率；
+  **不得**据此宣称「开集识别已可用」，该 τ 仅作参照值且必须随向量化器/键表重新标定。
+- 产物写 `checkpoints/qa_learn/_verify/robust/`；**不落盘裸特征矩阵、不产 zip、无挂钟字段**。
+- **局限**：题面自检索而非「问题→答案」闭环，不代表任务准确率；两总体样本量不同（1057 vs 2443）；
+  单 seed；噪声底用对半拆分近似、**未做** bootstrap（零新依赖约束）。
+**轮 4：README 文档收口（纯文档，零代码改动，不重跑产物）**
+
+皋陶遗留 3 项 warning 全部是 README 第 20 节的**文档内部不一致**，其中 D1 是轮 2 已修过的
+「同一文件出现两个最终值」同型问题的**复现**。
+
+- **D1 · 同一文件的唯一终值**：§20.3.5 的产物指纹表仍是**中间态**
+  （`27066` / `1aa71396…`、`40671` / `70c4b642…`、`7857` / `d45d3814…`、`d9aad608…`），
+  与 §20.5.3 的终值（`27863` / `ed889854…`、`41476` / `b3f9e9e1…`、`8109` / `d621888e…`、
+  `15109dc6…`）及盘上实测矛盾。处置取**比「标注中间态」更彻底的「改为指针」**：
+  §20.3.5 **整表删除**，数值一律以 §20.5.3 为**唯一来源**（理由：标注法仍会让同一文档
+  出现两个字节数，后续引用仍可能选错）。§20.6 的引用改为三处**可唯一解析**的目标
+  （§20.3.5 = 双跑工作序与证据口径 / §20.4.6 = robust 侧双跑取证 / §20.5.3 = B3 侧指纹终值）。
+  **现场校验**：7 个终值字符串在全文**各出现恰好 1 次**；5 个中间态字符串**各出现 0 次**
+  （`7857` 在 §17 的浮点数 `-0.13470919324577857` 里有 1 次巧合子串，非指纹引用，已核实）。
+- **D2 · 章节编号全局唯一**：`#### 20.4.7 产物` 与 `#### 20.4.7 如实登记的局限` 重号，
+  后者改为 **20.4.8**；新增 **§20.6.2**「编号唯一性校验（脚本断言，防再犯）」，
+  内含**现场枚举结果**（全篇 `#### 20.x.y` 标题 **19** 个、去重后 **19** 个、重复项 = 空
+  ⇒ 断言通过）+ 19 行编号/标题清单 + 可复算的断言脚本（正则枚举 + `Counter` + `assert`）。
+- **D3 · 改动面唯一口径**：原 §20.6 写「新增 4 + 修改 6」却只列 5 项、§20.5.2 表列 8 项（称 7+README）。
+  以 `git status --porcelain -- n3d_qa_learn` **现场实测**统一为
+  **本轮（轮 3）实际动过 = 9 个文件 = 新增 4 + 修改 5**（新增 `qa_variants.py` /
+  `qa_variants_run.py` / `open_set_tau.py` / `open_set_tau_run.py`；修改 `qa_scale_run.py`(P2) /
+  `robust_eval.py` / `step2_run.py` / `__init__.py` / `README.md`），新增 **§20.6.1** 逐项表，
+  与 §20.5.2 的逐文件表逐项对齐。
+  **关键澄清**：仓库级 `git status` 是 **修改 4 + 未跟踪 8** —— 差异逐文件解释：
+  4 个已跟踪文件显示 ` M`；4 个本轮新建文件是 `??`；**`qa_scale_run.py` 是轮 1 新建、
+  至今未提交**，故仓库级只能归入 `??`（`??` 表示**提交状态**，不是「本轮没动过」）；
+  `qa_scale.py` / `merge_table.py` / `merge_table_run.py` 建于轮 1 / 轮 C、本轮**未动**。
+  据此：凡「本轮改动面」以 **新增 4 + 修改 5 = 9** 为准；凡「零代码改动」以
+  **本轮仅改 `README.md`** 为准。
+- **验收证据（现场枚举，非记忆）**：① **29 个** `n3d_qa_learn/*.py` 的 SHA256 改动前后
+  逐项比对 ⇒ `CHANGED python files: (none)`、`removed: (none)`（任务要求的「16 个」是这 29 个
+  的子集，此处给出全覆盖的更强证据）；② **16 件既有产物逐项命中**、无一被重跑；
+  ③ 第 20 节内 **62 处** `20.x.y` 引用、**0 处**未解析；④ 冻结产物件数不变
+  （顶层 9 / `step2` 9 / `text_variants` 12 / `dataset` 17），上游四目录 git status 为空；
+  ⑤ `compileall` 退码 0。**本轮只改 1 个文件**：`n3d_qa_learn/README.md`。

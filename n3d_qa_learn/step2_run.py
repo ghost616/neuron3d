@@ -1093,10 +1093,30 @@ def cmd_robust_calibrate(args: argparse.Namespace) -> int:
         return 1
     _log(f"[robust calibrate] 读 run 产物 = {run_path}")
     run_result = R.load_run(run_path)
+    # **E-B4b 修复（离朱 R82）**：把开集「未识别」档的 pos/neg 分布喂给 calibrate，
+    # 使 `unrecognized_tau` 块真正产出（此前只算主判据侧的段落落差，该块恒为
+    # applicable=False）。失败时**如实登记**、不静默跳过。
+    unrecognized_scores: Optional[Dict[str, object]] = None
+    try:
+        inputs = R.open_set_score_inputs(seed=int(getattr(args, "seed", R.ROBUST_SEED)))
+        unrecognized_scores = {
+            "positive": list(inputs["positive"]),
+            "negative": list(inputs["negative"]),
+            "population": dict(inputs["population"]),
+        }
+        _log(f"[robust calibrate] 开集标定输入就绪：pos={len(unrecognized_scores['positive'])} "
+             f"neg={len(unrecognized_scores['negative'])} "
+             f"table_sha256={str(unrecognized_scores['population'].get('table_sha256', ''))[:16]}")
+    except Exception as exc:
+        _log(f"[robust calibrate] 开集 τ 场景构造失败（{type(exc).__name__}: {exc}）；"
+             "本产物不含 unrecognized_tau 证据")
     calibration = R.calibrate_thresholds(
         run_result,
         factor=float(getattr(args, "factor", R.THRESHOLD_FACTOR)),
         primary_side=str(getattr(args, "primary_side", "text") or "text"),
+        unrecognized_scores=(
+            None if not unrecognized_scores else unrecognized_scores
+        ),
     )
     _log(f"[robust calibrate] 噪声底上界 = {calibration['noise_floor_max']:.6f}；"
          f"标定阈值 τ = {calibration['tau_calibrated']:.6f}（factor = {calibration['factor']}）")
@@ -1119,8 +1139,11 @@ def cmd_robust_calibrate(args: argparse.Namespace) -> int:
     ]
     calibration["unrecognized_tau_reference"] = float(tau_text)
     calibration["unrecognized_note"] = (
-        "未识别档的 τ 口径：本批**不标定**该档阈值（属第二步变体 B）；报告里已给"
-        "不依赖 τ 的分位数。此处记录 calibrate 现场得到的 τ 仅作参照，不作为判定依据。"
+        "未识别档的 τ 口径：**该档的 τ 标定已实现**（轮 3 补齐 1a 遗留），入口 = "
+        "`robust_eval.calibrate_thresholds` 的 `unrecognized_tau` 块，核心 = "
+        "`n3d_qa_learn.open_set_tau.calibrate_tau`（噪声底 / 粒度 / 严格大于的边界归属）。"
+        "此处记录的 τ 是**主判据侧**的标定值，仅作参照；未识别档的 τ 必须用**它自己的** "
+        "pos/neg 分布标定（**禁止跨总体复用**）。报告里另给不依赖 τ 的分位数。"
     )
     calibration["unrecognized_acknowledged"] = acknowledged
     path = os.path.join(out_dir, "robust_calibration.json")

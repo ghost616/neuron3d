@@ -5030,4 +5030,1341 @@ Select-String -Path n3d_qa_learn\text_variants.py,n3d_qa_learn\text_variants_run
    `adjacent_line` 单列 90 对（`min 0` / `max 2`），并显式写「**不得**用『三类难负例各 16 条/行』
    这类笼统表述」。
 
+## 十八、轮 C：合并表零训练对照（`merge_table.py` / `merge_table_run.py`）
+
+**目标**：验证「QA 与文本是**同一个 map**」这一架构命题 —— 把 QA 侧条目表与文本侧条目表
+合并为**单张** `EntryKeyTable`，对比「现状两级硬优先级路由」与「合并表单次排序取 top-1」
+两条路径的实测表现。**本轮不改生产路由（`route.py` 零改动）、不做任何训练**，只做
+零训练的离线对照评测。
+
+入口：`python -m n3d_qa_learn.merge_table_run {drill|eval|report}`。
+产物一律写 `checkpoints/qa_learn/_verify/merge_table/`（**不落盘裸特征矩阵、不产 zip、
+无挂钟 / 耗时字段**，故同参重跑逐字节一致）。
+
+### 18.1 口径（冻结）
+
+| 项 | 值 |
+| --- | --- |
+| 条目总数 `N` | **2814** = QA 侧 `train_known` **149** + 文本侧全量行 **2665** |
+| 合并顺序 `MERGE_ORDER` | `('qa', 'text')`（QA 半区在前，下标区间 `[0,149)` / `[149,2814)`） |
+| 连接参数 `D` | **88**（`lexical-88`：`local-hash`，`hash_dim` 80 + 8 个长度特征） |
+| 归一化口径 `norm_spec` | `l2_rowwise_then_float32`（两侧同） |
+| 合并表内容指纹 | `merge_key_table_sha256 = e81839673cc60b30...`（schema `merged-entry-key-table-v1`） |
+| 两臂共用门限 `TAU` | **0.5**（两臂用**同一个** TAU；唯一变量是路由结构） |
+| 返回类型枚举 | `RETURN_KINDS = ('qa', 'text', 'none')`；`ENTRY_KINDS = ('qa', 'text')` |
+
+**合并表顶层元数据的必含字段**（`MergedEntryKeyTable.meta()`，离朱 R74 D1 修复后）：
+`version` / `kind` / `n_entries` / `n_entries_by_kind` / `dim` / `norm_spec` / `dtype` /
+`contiguous` / `norm_range` / **`encoder_profile`** / **`encoder_fingerprint`** /
+**`encoder_consistency`** / `merge_key_table_sha256` / `merge_order` / `return_kinds` /
+`kind_semantics` / `tau` / `entry_ids_head` / `outputs_head` / `halves`。其中
+`encoder_consistency.per_half` 逐半给出 `encoder_profile` / `encoder_fingerprint`，
+并给 `profiles_equal` / `fingerprints_equal` / `top_level_field_source`；**两半口径不同时
+以 `per_half` 为准**（顶层那两串沿用前半区取值，已显式写明来源）。现场两半均为
+`lexical-88` 且指纹同一串（`d4a4881aaa8dfa8c...`），故 `profiles_equal = fingerprints_equal = True`。
+
+**特征档选择依据**：`lexical-88` 的 `question` 与 `text_line` 两角色**逐位同口径**
+（`hash` 家族不使用 `max_length`），故两侧键可共存于同一张表；`bge-m3-1024` 档两角色
+`max_length` 不同（512 / 8192），长文本上**必然**不同口径，故本轮**未**采用（如实登记为
+未做的对照，不是遗漏）。
+
+### 18.2 合并前置断言（**必须先跑，任一失败即停止**）
+
+现场实测三条**全部通过**（`all_passed = True`）：
+
+| 断言 | 通过 | 现场证据 |
+| --- | --- | --- |
+| `same_dtype_and_norm` | True | qa D=88 / text D=88，dtype 同为 `float32`，`norm_spec` 同；范数区间 qa `[0.99999994, 1.00000012]` / text `[0.99999988, 1.00000012]` |
+| `role_bitwise_identity` | True | 文本侧**全量 2665 行**在 `role=question` 与 `role=text_line` 下编码 **2665/2665 逐位相同**（`exact_frac = 1.0`）；两角色口径指纹**同一串** `d4a4881aaa8dfa8c...` |
+| `merge_key_bytes_unchanged` | True | qa 半区 **149/149**、text 半区 **2665/2665** 键字节逐字节零变化；半区**键裸字节** SHA256 合并前后逐字相同（qa `27e9863050ca440c...` / text `3ba64a0c0dcb7e78...`） |
+
+**一处口径缺陷（本轮自查修复，必须登记）**：断言③最初把 `EntryKeyTable.sha256()`
+（**内容指纹**：schema + 形状 + 裸字节 + 条目 id + 绑定输出 + 维度的规范化 JSON SHA256）
+与「**键裸字节** SHA256」互比 ⇒ 首跑即抛「合并前后 SHA256 不一致」（`d5a3cf99...` vs
+`27e98630...`）。根因不是字节漂移，而是**两种指纹方案不可互比**。修法：新增
+`merge_table.raw_keys_sha256`，断言③一律用**同一裸字节口径**比较；内容指纹单列为
+`source_content_fingerprint` 仅作溯源。修复后三条断言全过。
+
+### 18.3 查询集（两臂**共用**同一批查询与同一批键）
+
+| 侧 | 查询数 | 来源 | 期望返回类型 |
+| --- | --- | --- | --- |
+| QA 侧 | **20** | `data.make_splits` 的 `test_known`（与 `exp_repr` 基线档同口径） | `qa`（答案展示文本） |
+| 文本侧 | **666** x 4 支变体 = 2664 | `n3d_qa` 冻结划分的 query 行（`reproduce_doc_split`）∩ 变体产物 | `text`（行原文） |
+
+* 文本侧检索池 = **合并表全量 2814**（含 QA 149）—— 这正是「异构干扰量」的度量口径；
+* 变体文本一律读**已冻结**的 `_verify/text_variants/variants.jsonl`
+  （SHA256 `92b1ddbd382cc43b...`），**禁止**本轮重新生成（冻结纪律）；
+* 变体记录字段**现场枚举** = `['adaptive_tier', 'char_len', 'fallback_flags', 'file',
+  'line_no', 'row_id', 'variant_sha256', 'variants']`；变体键**现场枚举** =
+  `['关键词', '原文', '摘要', '自适应']`；
+* 原文支的查询文本与键表内该行原文**逐字节一致**（2664 条查询逐条核验，不一致即报错）。
+
+**QA 侧金标集合口径（本轮一处实现缺陷，已修复并登记）**：最初把金标集合写成
+「`query_answer_keys` 去 `known_answer_keys` 里做相等过滤」—— 而 `test_known` 是
+**留出**子集，二者答案键不相交 ⇒ 金标集合**全空** ⇒ 「严格命中率」结构性地恒为
+`0.000000`。这是一个**把「没测出来」伪装成「测出来很差」**的假结果。修法：用
+`known_answer_keys`（与 `qa_bundle.table.entry_ids` 同行序）建立
+「答案键 -> 该类的全部展示文本」映射，再按查询答案键取集合；现场金标集合大小恒为 1
+（10 个不同金标集合），若出现空集合**直接报错拒绝出数**。修复后严格命中率 = **0.300000**。
+
+### 18.4 分侧指标（两臂实测）
+
+**① QA 侧命中率**（主判据取**未过滤 top-1**；n = 20）
+
+| 臂 | 命中率 | 严格命中率 | 命中率（TAU 过滤） | 严格命中率（TAU 过滤） | top-1 分位 p50 |
+| --- | --- | --- | --- | --- | --- |
+| `qa_priority` | 1.000000 | 0.300000 | 1.000000 | 0.300000 | 0.797835 |
+| `merged_topk1` | 1.000000 | 0.300000 | 1.000000 | 0.300000 | 0.797835 |
+
+**现场核实两臂在 QA 侧逐查询决策完全相同**（20/20 的 `top1_index` 与 `returned_kind`
+逐项一致；`stage` 全为 `qa`）。**可行域边界登记**：`qa_hit_rate` 基线 = **1.0**
+（饱和点）⇒ 该指标上「严格优于 / 不劣于」**不可判**，只能报「并列」；`qa_hit_strict_rate`
+基线 = 0.3（内部）可判，实测两臂并列。
+
+**② 文本侧 R@1**（按 4 支变体分档；n = 666/支）
+
+| 臂 | 变体 | R@1（总体） | R@1（`stage=text` 子集） | 该子集 n | 精确自身行 top-1 | top-1 为 QA 条目 | 类型正确率 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `qa_priority` | `原文` | 0.156156 | **1.000000** | 104 | 0.156156 | 562 | 0.156156 |
+| `qa_priority` | `关键词` | 0.243243 | 0.328600 | 493 | 0.243243 | 173 | 0.740240 |
+| `qa_priority` | `摘要` | 0.267267 | 0.784141 | 227 | 0.267267 | 439 | 0.340841 |
+| `qa_priority` | `自适应` | 0.267267 | 0.563291 | 316 | 0.267267 | 350 | 0.474474 |
+| `merged_topk1` | `原文` | **1.000000** | 1.000000 | 666 | 1.000000 | 0 | 1.000000 |
+| `merged_topk1` | `关键词` | 0.346847 | 0.348416 | 663 | 0.346847 | 3 | 0.995495 |
+| `merged_topk1` | `摘要` | 0.879880 | 0.879880 | 666 | 0.879880 | 0 | 1.000000 |
+| `merged_topk1` | `自适应` | 0.659159 | 0.659159 | 666 | 0.659159 | 0 | 1.000000 |
+
+* **原文支 R@1 = 1.0 是结构性锚点**（查询文本逐字节等于键表内该行自身），**单列报告、
+  不参与判定**；实测恰为 1.0，与结构预期一致；
+* 金标集口径 = 自身行 ∪ 与查询行**原文逐字节相同**的其他行；现场「金标集 > 自身行」的
+  查询数 = **16**（原文逐字节重复行是数据事实，不是缺陷）；
+* **`stage` 语义在两臂不同（必须显式，否则总体 R@1 会被误读）**：
+  `qa_priority` 的 `stage` 是**两级路由的到达档**（`qa` 命中即返回 / `text` 落到
+  第二级 / `none` 两级都低于门限）；`merged_topk1` 没有优先级，其 `stage` 退化为
+  「top-1 的 kind」。故本报告**同时**给总体 R@1 与按 `stage` 拆分的 R@1。
+  现场可见：`qa_priority` 的原文支有 **562/666** 条被第一级判给 QA 半区，
+  使该臂原文支总体 R@1 只剩 0.156156；而在**真正落到文本分支**的 104 条上，
+  其 R@1 = **1.000000**。⇒ 「QA 优先臂文本检索差」这个读法是**错的**；
+  真实事实是「第一级硬优先级把所有行原文查询先判给了 QA 半区」。
+
+**③ 返回类型正确率**（整臂：20 条 QA + 2664 条文本 = 2684 条记录）
+
+| 臂 | 记录数 | 类型正确数 | 返回类型正确率 | 不一致数 |
+| --- | --- | --- | --- | --- |
+| `qa_priority` | 2684 | 1160 | **0.432191** | 1524 |
+| `merged_topk1` | 2684 | 2681 | **0.998882** | 3 |
+
+### 18.5 类型标记契约与缺陷登记
+
+* 口径：`返回类型正确率 = 「返回物类型 == 查询期望类型」的样本占比`；期望类型由查询侧
+  决定（QA 侧期望 `qa`、文本侧期望 `text`），返回 `kind='none'` 计入**不一致**；
+* 违规**分类枚举**（唯一来源 `TYPE_VIOLATION_CLASSES`）：
+  `returned_none_expected_entry` / `returned_qa_expected_text` /
+  `returned_text_expected_qa`；
+* 全量现场结果：**返回类型与期望类型不一致的样本数 = 1527**（两臂合计），
+  分类计数 = `{'returned_none_expected_entry': 0, 'returned_qa_expected_text': 1527,
+  'returned_text_expected_qa': 0}`；**按查询侧拆分** =
+  `{'qa': {全 0}, 'text': {'returned_qa_expected_text': 1527}}`。
+  ⇒ 该计数**非 0**，已按任务要求**登记为缺陷**并给出具体样本
+  （`route_eval.json.return_type_contract.samples_head` 与报告第 5 节逐样本表）；
+* **缺陷定性（不得包装）**：这 1527 条**全部**来自 `qa_priority` 臂的文本侧查询被
+  「返回了答案展示文本」—— 即现状两级硬优先级把文本行查询判给了 QA 条目。它是
+  **路由结构**的后果，**不是**「文本检索能力差」；
+* **合并表臂的残留不一致 = 3 条**（全部是 `关键词` 支）：查询
+  `2066508aec9d4157` / `2dd658bfecf22f29` / `8b1105f081181278`，
+  其合并表 top-1 分别为 QA 条目 56 / 100 / 11，余弦分 0.576572 / 0.627490 / 0.647529
+  —— 是**真实的负结果**：关键词支上确有个别 QA 条目分数压过正确文本行。
+
+### 18.6 判定：合并表 vs 现状路由
+
+| 指标 | 基线 `qa_priority` | 候选 `merged_topk1` | 落差 | 基线在可行域内部 | 不劣 | 严格更优 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `qa_hit_rate` | 1.000000 | 1.000000 | +0.000000 | **False（饱和）** | True | False |
+| `text_recall_at_1:关键词` | 0.243243 | 0.346847 | **+0.103604** | True | True | True |
+| `text_recall_at_1:摘要` | 0.267267 | 0.879880 | **+0.612613** | True | True | True |
+| `text_recall_at_1:自适应` | 0.267267 | 0.659159 | **+0.391892** | True | True | True |
+| `return_type_correctness` | 0.432191 | 0.998882 | **+0.566692** | True | True | True |
+
+* 判定 = **`merged_strictly_better`**：劣化指标 = `[]`，改进指标 = 4 项；
+  `not_worse_than_baseline = True`；`strictly_better_than_baseline = False`
+  —— 后者为 False **只**因为 `qa_hit_rate` 基线落在饱和点 1.0、该指标不可判（上表已显式标注）；
+* **量化落差**：文本侧非锚点三支 R@1 最小增益 **+0.103604**（关键词支）、最大 **+0.612613**
+  （摘要支）；返回类型正确率 **+0.566692**；
+* 原文支 R@1 从 0.156156 抬到 1.000000（+0.843844），但按纪律**不参与判定**；
+* **跨臂诊断**：文本行被 QA 条目抢走的条数 —— 原文 562→0、摘要 439→0、自适应 350→0、
+  关键词 173→3。⇒ 合并表把「QA 条目抢文本行」这一现象基本消除（残留 3 条，见 18.5）。
+
+### 18.7 确定性（同命令双跑，真实产物目录、真实工作序）
+
+* 工作序：`eval`（主目录）→ 拷 3 件内容产物到 `_repro/` → `eval --repro-dir _repro`；
+* 现场结果：**共有文件 4，逐字节相同 = True，不相等文件 = []**
+  （4 件 = `merge_table.json` 17273 B / `route_eval.json` 31424 B /
+  `route_eval_queries.jsonl` 1538962 B / `drill.json` 2684 B；**逐文件的 SHA256 以
+  `determinism_check.json` 的 `files[].a_sha256` 为准，不在本文字里重复**，
+  以免本轮之后任何重跑让这里的字面量过期）；
+* **排除口径（离朱 R74 D2 修复后，必须显式）**：
+  - **证据文件自身** `determinism_check.json` 在**两个目录都**被过滤（不进 `files`、
+    不记 SHA），并在产物里落 `excluded_self_present.{in_a_dir,in_b_dir}` 与
+    `n_files_before_exclusion.{a,b}` ⇒ 自指哈希链断开。**修复前**它被纳入比对：
+    在**全新**对照目录上首跑必然 `determinism_ok = False`（该文件只存在于一侧，
+    被计入 `b_only_files`），把「对照目录还没被写过」误报成「不确定性」；
+  - **两件报告**（`merge_table_report.{json,md}`）在证据之后才由 `report` 写出，
+    其 SHA 亦不进证据块 ⇒ 「报告内嵌证据 <-> 证据记录报告 SHA」的回路断开；
+* **判定语义（显式登记，不静默忽略）**：`determinism_ok` = 「两目录**共有的非排除文件**
+  全部逐字节相等」且该集合非空；**单侧独有文件**（`a_only_files` / `b_only_files`）
+  不纳入该布尔值 —— 在「先跑主目录、再跑对照目录」的真实工作序下，对照目录首跑时天然
+  缺少主目录独有文件，把它算进去会把工作序差异误报成不确定性。两条口径分别落在
+  `determinism_ok_semantics` 与 `determinism_scope` 两个字段里；
+* **D2 修复的现场验证**：在**全新空目录** A 上跑 `eval --out-dir A --repro-dir <上轮产物目录>`
+  ⇒ `excluded_self_present = {'in_a_dir': False, 'in_b_dir': True}`、`n_common_files = 3`，
+  且不再因证据文件本身判 False；此时 `not_equal_files = ['merge_table.json']` 是**真实**
+  差异（对照目录里是该文件引入 `encoder_consistency` 之前的旧版本），不是假阴性；
+  同参双跑（工作序见上）仍为 `determinism_ok = True`；
+* **双跑自证**：`report` 连跑两次，`merge_table_report.json` 两次均 52405 B、
+  `.md` 两次均 19424 B 且两次的 SHA256 **逐字节相同**；
+* 产物内**无挂钟 / 耗时字段**，故同参重跑可逐字节复现。
+
+### 18.8 产物路径复算与产物保护
+
+* **现场调用**（不复用早期探针结论）`n3d_shape.train.resolve_checkpoint_path`，
+  最终参数 `dim=88 / max_batches=0 / tag='merge_table'` ⇒ `status = computed`，
+  复算结果形如
+  `E:\neuron3d\checkpoints\n3d_shape\full_shapesphere_N64_y4x4_H0.15_D0.15_plfcc_axz_isany_rsany_dsnpz_d88x88_nosyn_s42_merge_table.pt`
+  （**完整值见 `merge_table.json.checkpoint_path_resolution.resolved_checkpoint_path`**，
+  不在本文重复字面量）；
+* **stdio 口径保护（离朱 R74 D3 修复，必须显式）**：`n3d_shape.train` 在**导入期**调用
+  `_reconfigure_stdio()` 把 `sys.stdout` / `sys.stderr` 重配为 `utf-8` / `errors='replace'`，
+  并经 `log_info` 打印一行含中文的 `[N3D][INFO] [产物保护] ...`。这会**静默旁路**本模块
+  「日志字面量必须能被 cp936 表示」的纪律（`_log` 的 backslashreplace 兜底永不触发）。
+  修法：`checkpoint_path_resolution` 把「导入 + 复算」整段**重定向到临时缓冲**，
+  上游改的是缓冲的编码、上游的日志落在缓冲里，真实 stdout 的编码与内容都不受影响；
+  随后再按进来时的编码**恢复** `sys.stdout` / `sys.stderr`。取证落在
+  `stdio_encoding.{before,restore,upstream_stdout}`（含上游被重定向内容的字符数 / SHA256 / 首行）；
+* **D3 修复的现场字节级验证**：`drill` / `eval` / `report` 三个子命令的 stdout
+  分别 123 / 952 / 180 B，**三者均为合法 GBK**（对 UTF-8 则解码失败）、**均退码 0**；
+  修复前 `eval` 的 stdout 是合法 UTF-8、GBK 解码在 0xad 处失败；
+* **产物保护核实**：该路径落在本模块产物目录内 = **False**、落在 `_verify/` 内 = **False**
+  ⇒ 与 `checkpoints/qa_learn/_verify/merge_table/` **不相交**；本模块不产 `.pt` / `.zip`；
+* **如实登记一处路径口径差异（不包装成一致）**：报告里 `a_dir` 用相对路径、
+  `b_dir` 用命令原样串，二者在 Windows 反斜杠 / 正斜杠上**字形不同**（指向同一目录），
+  故这两个字段**不参与**任何按字面量的自动比对，只作人工可读溯源。
+
+### 18.9 零回归（现场逐项核对）
+
+* **上游零改动**：`git status --porcelain -- n3d_qa n3d_shape n3d_sphere n3d_proto`
+  → **空**；
+* **顶层 9 个 `qa_*.pt.zip`**：SHA256 / 字节 / mtime **逐项不变**（对比开跑前快照，
+  差异集合为空），顶层文件数仍 **9**、无新增；
+* **第二步 5 件冻结产物**（`checkpoints/qa_learn/step2/`）：SHA256 / 字节 / mtime
+  **逐项不变**；
+* **第三步 12 件产物**（`_verify/text_variants/`）：SHA256 / 字节 / mtime
+  **逐项不变** ⇒ 本轮对该 12 件**逐行 diff 为空**（无任何预期变更）；
+  `step2/` 的 9 件（7 个 zip + 2 个报告）同批核对，亦**逐行 diff 为空**；
+* **根 `requirements.txt`** 未改（`f69450d5...`）；`requirements-qa.txt` 未改
+  （`ac59f4d64bdceefc...`）；**零新增依赖**（仅 torch / numpy + 标准库）；
+* `python -m compileall -q n3d_qa_learn` → **退码 0**；
+* `route.py` / `entry_table.py` / `robust_eval.py` / `variant_b.py` /
+  `text_variants.py` / `text_variants_run.py` / `encoders.py` 等**全部零改动**
+  （本轮只**新增** `merge_table.py` / `merge_table_run.py` 并更新 `__init__.py` / 本 README）；
+* 本轮在 `checkpoints/qa_learn/_verify/` 下**新增 1 个目录** `merge_table/`
+  （任务指定的产物落点），`_verify/` 既有 11 个目录未被写入。
+
+### 18.10 单条端到端演练（长跑前置门槛）
+
+`python -m n3d_qa_learn.merge_table_run drill` → **退码 0**：
+
+* 合并表 2814 条目（qa=149 / text=2665），三条前置断言 `all_passed = True`；
+* **7/7 门禁**通过：4 条「批大小不变性」（`batch_size=1` 与 `batch_size=64` 的
+  `top1_index` 与 `returned_kind` 逐项相同）+ `kind_of_row_0_is_qa` +
+  `kind_of_last_row_is_text` + `half_indices_consistent`；
+* 类型标记契约现场演示：`lookup_typed(0)` 返回键裸字节 352 B（= 88 x 4）与
+  `LookupContract(returned_kind='qa', expected_kind='qa', type_contract_ok=True)`，
+  返回物 = `'Germany'`（条目 0 的答案展示文本）。
+
+### 18.11 离朱 R74 测试与三项缺陷修复（判定量逐位不变）
+
+离朱 R74：单元 **85 条 → 82 PASS / 3 FAIL**（均判为真缺陷）、集成 **9/9 PASS**、
+`compileall` 退码 0、零回归全过。三项缺陷已修复并现场复验：
+
+| 编号 | 缺陷 | 根因 | 修法 | 现场复验 |
+| --- | --- | --- | --- | --- |
+| **D1**（一般） | `MergedEntryKeyTable.meta()` **顶层**缺 `encoder_profile` / `encoder_fingerprint` | 合并表只把编码器口径留在 `EntryKeyTable` 字段与 `halves[*].meta` 里 | `meta()` 顶层补这两项（沿用前半区取值）并新增 `encoder_consistency()`（逐半口径 + `profiles_equal` / `fingerprints_equal` / `top_level_field_source`） | 顶层两项 = `lexical-88` / `d4a4881aaa8dfa8c...`；`profiles_equal = fingerprints_equal = True` |
+| **D2**（重要） | `determinism_block` 把**证据文件自身**纳入比对 | 枚举共有文件时未排除 `determinism_check.json`，与函数自己写的 `excluded_self_file` 约定自相矛盾；干净目录上 `eval --out-dir A --repro-dir B` 首跑即 `determinism_ok = False` | 两个目录都过滤该文件；新增 `excluded_self_present` / `n_files_before_exclusion`；`determinism_ok` 的判定范围与单侧独有文件的取舍写成 `determinism_ok_semantics` 显式登记 | 干净目录首跑复现：`excluded_self_present = {'in_a_dir': False, 'in_b_dir': True}`、`n_common_files = 3`，不再因自身判 False；同参双跑仍 `determinism_ok = True` |
+| **D3**（重要） | `eval` 在 cp936 控制台下输出 **UTF-8**（GBK 解码失败） | `cmd_eval` 调 `checkpoint_path_resolution` → `import n3d_shape.train` → 该模块导入期 `_reconfigure_stdio()` 把 `sys.stdout` 改成 utf-8，本模块的 `_log` backslashreplace 兜底永不触发 | 「导入 + 复算」整段**重定向到临时缓冲**（上游改缓冲的编码、日志落缓冲），随后按进来时口径**恢复** `sys.stdout` / `sys.stderr`；取证落 `stdio_encoding.{before,restore,upstream_stdout}` | `drill` / `eval` / `report` stdout 分别 **123 / 952 / 180 B，三者均为合法 GBK**（对 UTF-8 解码失败）、全退码 0；修复前 `eval` 是合法 UTF-8 |
+
+**判定量与产物影响面（如实登记）**：`route_eval.json`（31424 B
+`bf2444a40f7339bf...`）与 `route_eval_queries.jsonl`（1538962 B
+`f188d788171537f0...`）**逐字节不变** ⇒ 三项修复**不影响任何判定量**；
+`merge_table.json` 14701 → **17273 B**（新增 `encoder_consistency` 与 `stdio_encoding` 两块取证）、
+`merge_table_report.{json,md}` 48981 → **52405 B** / 17751 → **19424 B**（渲染层同步扩写）、
+`determinism_check.json` 2099 → **2943 B**（新增自身排除与判定语义字段）、
+`drill.json`（2684 B `f5b5d2d7d9592066...`）**不变**。
+
+**另 3 条口径提示（非缺陷，已登记不修）**：**R1** 未登记子命令由 argparse 输出到
+stderr（`invalid choice`），而契约错误（TAU 覆盖 / 产物目录越界）走 stdout —— 两处
+退码语义一致（2），仅输出流不同；**R2** `--log-file` 为 LF、控制台为 CRLF，归一化后
+文本一致；**R3** `top1_score` 在 `batch_size` 1 vs 64 下存在 ≤1e-6 的浮点差异
+（BLAS 分块），**主判据字段（`top1_index` / `returned_kind` / `stage`）严格相同**。
+
+### 18.12 如实登记的局限（**不得包装**）
+1. **单 seed、单切分**：`split_seed = 42`；QA 侧查询仅 **20** 条（`test_known`），
+   跨 seed / 跨切分的极差**未测**；
+2. `qa_hit_rate` 基线落在**饱和点 1.0**，该指标上「严格优于」**不可判**（已显式标注），
+   本轮**未**构造非饱和的 QA 侧口径；
+3. `bge-m3-1024` 语义档**未做**（两角色 `max_length` 不同，需先把两侧对齐到同一口径才
+   可与本结论并列）⇒ 结论只在 `lexical-88` 档成立；
+4. `TAU = 0.5` 是**冻结常量**、未经标定扫描；本轮只保证两臂**共用**同一 TAU；
+5. **合并表臂的 3 条残留类型违例**是真实负结果，未做任何针对性修复；
+6. 原文支的 1.0 是**结构性**结果，**不得**当作检索能力证据引用；
+7. 本结论**仅在 C=10 口径下成立**（149 + 2665 = 2814）；扩 C 后合并表规模与异构干扰量
+   都会变化，**必须另行复跑**。
+
+### 18.13 审查收口：计划 1 遗留的 3 项（F1 / F2 / F3）
+
+本轮收口一并修掉上一轮（计划 1）离朱/皋陶登记但未处置的 3 项。**主判据逐项未变**：
+`verdict = merged_strictly_better`、`degraded_metrics = []`、`improved_metrics` 仍为 4 项。
+
+**F1 · `build_verdict` 的量化字段语义修正（已修）**
+缺陷：`min_gain` 与 `max_drop` **都**写成 `min(delta)` ⇒ 两字段恒相等（修前现场均 `0.0`，
+因为基线为饱和点的 `qa_hit_rate` 的 delta 恰为 0 被算了进去），且存在劣化时
+「最小增益」会变成负数。
+修法（新增 `merge_table_run._quantified_deltas`）：
+
+1. **只在「可比且 `baseline_interior == True`」的指标上统计**（基线严格落在 `(0,1)` 内部）；
+2. `min_gain` = **正向 delta 的最小值**，无正向 delta 时为 `None`；
+3. `max_drop` = **负向 delta 的最小值**，**无劣化时为 `0.0`**；
+4. 新增 `eligible_metrics` / `excluded_metrics` / `n_gains` / `n_drops` / `basis` 五项取证；
+5. **不参与** verdict / `degraded_metrics` / `improved_metrics` 判定。
+
+现场重算：`min_gain = 0.1036036036036036`、
+`max_drop = 0.0`、`n_gains = 4`、`n_drops = 0`、
+`eligible_metrics = ['text_recall_at_1:关键词','text_recall_at_1:摘要','text_recall_at_1:自适应',
+'return_type_correctness']`、`excluded_metrics = ['qa_hit_rate']`
+⇒ 与 18.6 的「最小增益 **+0.103604**（关键词支）」**一致**（不再沿用旧值，取现场重算值）。
+
+**F2 · `RETURN_TYPE_RULE` 第②类违规（已补独立实现 + 可达性论证）**
+缺陷：合同声明了**两类**违规计数，实现只做第①类（`returned_kind != expected_kind`）。
+修法（二选一取「补独立校验」）：新增
+`merge_table.content_view_violations(merged, returned_indices, expected_kinds)` —— 对第②类
+（期望 `qa` 但返回物**不属于任何 qa 条目的答案展示文本**）做判定，且**只看输出内容**
+（`outputs_index` 内容视图）、**不看 `kind` 字段**（否则与第①类同视图、无法互相验证）。
+`merge_table_run.cmd_eval` 逐臂调用并把结果落进
+`route_eval.json.return_type_contract.content_view_check`（含 `arms` / `n_class2_violations_total`
+/ `reachable_in_this_round` / `reachability_note`）。
+**可达性（必须显式，不得含糊）**：`RETURN_TYPE_VIOLATION_CLASS_2_REACHABILITY` 写明 —— 在当前
+构造下第②类**结构上不可达**，因为 `MergedEntryKeyTable.__post_init__` 强制
+`entry_kinds` 与「按输出内容归类的 `outputs_index`」**逐条一致** ⇒ 只要 `returned_kind == 'qa'`，
+该下标必在 qa 半区、其输出必在 qa 展示文本集合内。
+**该口径不是恒真断言（现场反例）**：① 把 `outputs_index` 改成不含该输出的内容视图后
+**构造函数当场抛 `ValueError`**（构造期不变量生效）；② 用 `object.__new__` 绕过构造器
+再喂伪造内容视图 ⇒ `content_view_violations` **报出 1 条第②类违规**
+（`content_view_kind = ''` 而 `returned_kind_by_field = 'qa'`）⇒ 判定确实独立、非恒真。
+现场轮次结果：`n_class2_violations_total = 0`（两臂各 `n_checked = 2684`），
+`reachable_in_this_round = False`。
+
+**F3 · `GOLD_SET_RULE` 的注释口径（已改述）**
+缺陷：注释称「**逐字抄录** `text_variants.GOLD_SET_RULE`」，但漏抄了
+「`rank = 金标集成员在 top-k 列表中的最前 1-based 位置（不在则 -1）`」一句 ⇒ 「逐字」不成立。
+修法（二选一取「改述」）：本模块**只使用 `hit@1`**、**不使用 `rank` 字段**，故把注释改述为
+**「口径等价摘录（本轮不使用 rank 字段）」**，并新增
+`GOLD_SET_RULE_SOURCE`（上源完整口径的唯一权威位置 = `n3d_qa_learn.text_variants.GOLD_SET_RULE`）
+与 `GOLD_SET_RULE_EXCERPT_NOTE`（明写**不声称逐字一致**）。这是诚实改述，不是把差异藏起来。
+
+**产物影响面（逐项登记）**：`merge_table.json` 17273 → **17542 B**
+`f7a678f7bd41270a...`（新增 F2 校验块所需内容视图）、`route_eval.json` 31424 → **36767 B**
+`6b8853a508abc57d...`（F1 细则 + F2 校验块）、`route_eval_queries.jsonl` 1538962 →
+**1652875 B** `a01f2cc1d6790006...`（逐查询记录补 `returned_index` 字段，F2 校验所需）、
+`merge_table_report.{json,md}` 52402 → **58860 B** `73805cb62da0a558...` / 19424 →
+**19693 B** `28b908ca8c73f41f...`（渲染同步 + F-A 规范化字段进入内嵌证据块）、
+`determinism_check.json` 2940 → **3782 B** `61e627792c6d06b2...`
+（双跑内容产物由 3 件变 4 件：新增 `drill.json` 进对照；另补 F-A 四字段）；
+`drill.json` 2684 B `f5b5d2d7d9592066...` **不变**、`route_eval.json` 的 QA/文本侧指标数值
+**逐项不变**。
+
+**P1 收口（本轮）：本节曾把 `merge_table_report.json` 记成中间态 `58017 B` / `5b553c3c...`，
+而该文件的**终值**是 `58860 B` / `73805cb62da0a558...`（F-A 补规范化字段后的值，
+与 §19.8 的「旧值 → 新值」表、`merge_table/report.log` 首行、以及盘上实测三方一致）。
+现本节**已改为终值**，并显式登记该中间态的历史**仅**用于说明指纹演进的中间步骤。**
+
+**派生件口径（本节登记；离朱 R78 的 R-A 发现、R79 的 R-C 落点要求）**：本产物目录里的
+**日志类文件（`drill.log` / `eval.log` / `eval_repro.log` / `report.log`）是派生件**，
+内容由程序**自写**、且是其它产物的**函数**，故**不参与**「内容产物指纹不变清单」。
+
+- 现场引证（`merge_table` 侧）：`report.log` 首行逐字 =
+  `[report] merge_table_report.json = 58860 B 73805cb62da0a558；merge_table_report.md = 19693 B 28b908ca8c73f41f`
+  ⇒ 报告一重渲，该日志**必然**变化（`82b808b78e513ec3...` → `b16b849d0e22adf1...`）；
+- 反面对照：`qa_scale/report.log` 因**该模块报告本轮未变**而保持 106 B
+  `1ac8340711b5c7cd...` **不变** ⇒ 同一份日志代码的行为差异**只**由「报告是否变化」解释；
+- 判定口径：**允许的额外变更项 = 日志类派生件**；`*.json` / `*.jsonl` / `*.md` 的
+  指纹不变要求**照旧严格**。
+- **与 `qa_scale_run.DETERMINISM_SCOPE` 的关系（必须成对理解）**：
+  `DETERMINISM_SCOPE` 在**双跑比对时**排除「证据文件自身 + 后置可重渲件」；
+  本「派生件口径」在**指纹清单时**排除「日志类派生件」。二者是**同一类处置的两个不同侧面**
+  （一个管「比对时排除哪些」，一个管「清单时排除哪些」），**都不是静默忽略** ——
+  排除范围与理由都写进了产物字段与文档。第 19.8 节给出同一口径在 `qa_scale` 侧的登记。
+
+## 十九、轮 1：QA 侧扩 C 至 298 + 按比例留出 + 解题类任务拆分（`qa_scale.py` / `qa_scale_run.py`）
+
+**唯一目的**：把 QA 侧数据规模从「每类仅 2~22 条、主测试集仅 20 条」扩到**全量口径**，
+并把「解题类任务」从匹配任务中拆出，使后续「问题 -> 匹配学过的答案」任务具备可学的
+样本量。**本轮只改数据口径与任务分层，不改模型结构、不改打分链路、不做任何训练。**
+
+入口：`python -m n3d_qa_learn.qa_scale_run {probe|eval|report}`。
+产物一律写 `checkpoints/qa_learn/_verify/qa_scale/`（**不落盘裸特征矩阵、不产 zip、
+无挂钟字段**）。
+
+### 19.1 数据来源与口径（**现场枚举**，不凭记忆）
+
+| 项 | 现场值 |
+| --- | --- |
+| 冻结产物目录 | `checkpoints/qa_learn/dataset` |
+| 统一答案表 `answer_table.jsonl` | **298** 行；字段现场枚举 = `['count', 'display', 'index', 'key', 'raw_variants', 'sources']` |
+| 问答对 `n3d_qa_all_pairs.jsonl` | **50865** 行；字段现场枚举 = `['answer_table_size', 'answer_text', 'candidate_answer_index', 'candidate_answer_key', 'label', 'pair_id', 'question_id', 'question_text', 'row_id', 'task']` |
+| `n3d_qa_all.npz` | `X [50865, 306]` float32 + `y` 二值；`meta` 键现场枚举含 `task_of_row` |
+| manifest 声明 | `answer_table.classes = 298` / `questions_seen = 38364` / `questions_in_table = 12727` / 任务清单 `['judge','choice','blank','solve','triviaqa']` |
+
+**一处必须登记的字段陷阱（现场实测）**：`n3d_qa_all_pairs.jsonl` 的 `task` 列**恒为 `'all'`**
+（它是「全任务合并产品」的标记，**不承载**逐行任务）。**逐行真实任务**取自
+`n3d_qa_all.npz` 的 `meta.task_of_row`（与该文件**逐行同序**，现场核对：npz 行数 == pairs
+行数 == 50865，逐任务计数一致）。⇒ **字段存在 ≠ 它承载我们要的语义**；这正是「标识符必须
+现场枚举」这条纪律的价值。
+
+**为什么以冻结产物而不是 QA JSON 缓存为本轮口径**：manifest 的 `classes = 298` 只对**冻结
+产物**成立；缓存口径是**另一套**答案空间（基数与类集合都不同）⇒ 与 manifest 声明不可对齐。
+故本轮以冻结产物为准，并把缓存口径的既有基线（C=10 / 149 训练 / 20 测试）作为**另一总体**
+单独登记（见 19.7），不混为一谈。
+
+### 19.2 扩 C 前后对照（同一选择规则 / 同一留出比例 / 同一 seed）
+
+两套口径使用**同一类别选择规则**（按 `(-count, key)` 降序取前 N，与
+`data.build_answer_space` 的确定性排序键一致）、**同一留出比例（20%）**、**同一 seed（42）**，
+唯一变量是**类别数上限**。截断到 C 类时，**金标全部落在保留类之内**的问题才属于该口径，
+金标含被截断类的问题**整体**排除（不能只删越界的那部分金标 —— 那会把「答案不在表内」
+偷偷变成「答案在表内」）。
+
+| 指标 | C=10（重建基线） | C=298（全量） | 倍数 |
+| --- | --- | --- | --- |
+| 类别数 C | **10** | **298** | **x29.800** |
+| 问题数（切分单位） | 10161（排除 2566 个越界问题） | **12727**（排除 0） | x1.253 |
+| 问答对行数 | 39909 | **50865** | x1.275 |
+| 训练问题数 | 8204 | **10284** | x1.254 |
+| 测试问题数 | 1957 | **2443** | x1.248 |
+| 训练行数 | 32234 | **41083** | x1.275 |
+| 测试行数 | 7675 | **9782** | x1.275 |
+| 实际测试问题占比 | 0.192599 | 0.191954 | 目标 0.20 |
+
+**每类样本数分布（按问题数计，合并侧）**：
+
+| 统计量 | C=10 | C=298 |
+| --- | --- | --- |
+| `n` | 10 | 298 |
+| `min` | 203 | **3** |
+| `p25` | 353.2 | 5.0 |
+| `median` | 418.0 | 6.0 |
+| `p75` | 1904.8 | 10.0 |
+| `max` | 2240 | 2240 |
+| `mean` | 1021.000 | 45.195 |
+| `total` | 10210 | 13468 |
+| `zero_count` | 0 | **0**（298 类**全部**有样本） |
+
+分档直方图（档位 = `[('0',0,0),('1',1,1),('2-4',2,4),('5-9',5,9),('10-49',10,49),('50+',50,None)]`）：
+
+| 档位 | C=10（按问题数） | C=10（按正样本行数） | C=298（按问题数） | C=298（按正样本行数） |
+| --- | --- | --- | --- | --- |
+| `0` | 0 | 0 | 0 | 0 |
+| `1` | 0 | 0 | 0 | 0 |
+| `2-4` | 0 | 0 | **69** | **69** |
+| `5-9` | 0 | 0 | **147** | **147** |
+| `10-49` | 0 | 0 | 64 | 64 |
+| `50+` | 10 | 10 | 18 | 18 |
+
+**按正样本行数口径的统计量**（与按问题数口径**对称**）：
+
+| 统计量 | C=10 合并 | C=298 合并 | C=10 训练 | C=298 训练 | C=10 测试 | C=298 测试 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `min` | 203 | 3 | 155 | 1 | 48 | **0** |
+| `p25` | 353.2 | 5.0 | 292.0 | 3.0 | 65.0 | 1.0 |
+| `median` | 418.0 | 6.0 | 332.0 | 5.0 | 89.0 | 1.0 |
+| `p75` | 1904.8 | 10.0 | 1550.8 | 9.0 | 354.0 | 2.0 |
+| `max` | 2240 | 2240 | 1816 | 1816 | 424 | 424 |
+| `mean` | 1021.000 | 45.195 | 824.000 | 36.406 | 197.000 | 8.789 |
+| `total` | **10210** | **13468** | 8240 | 10849 | 1970 | 2619 |
+| `zero_count` | 0 | **0** | 0 | 0 | 0 | **51** |
+
+**E1 修复登记（皋陶 error，本轮收口）**：`merged_by_row` 此前写成
+`zip(q_all, r_all)`（把「训练侧**问题数**」与「训练侧**正样本行数**」相加），得到的是
+既不是问题数也不是行数的混合量 —— 现场的污染值 **C=10 total 16480（min 310 / max 3632）**、
+**C=298 total 21698（min 2 / max 3632）**，且该污染块被渲染进本节直方图的「按正样本行数」列。
+修法：改为与 `merged_q` 对称的 `zip(r_all, r_test)`。修复后现场：
+`merged_by_row.total` = **10210（C=10）/ 13468（C=298）**，与
+`train_by_row.total + test_by_row.total`（8240+1970 / 10849+2619）**逐项相等**。
+**新增现场断言**（`qa_scale_run.assert_merged_distribution_consistent`）：`merged[i] ==
+train[i] + test[i]` **逐类逐项**核对（question 与 row 两个单位各自独立跑），并落
+`class_distribution.merged_consistency.{question,row}` 与
+`merged_total_self_consistency.{question,row}` 两块取证。**该断言不是恒真**：现场反例
+（任改一个元素 / 用历史污染数组 / 三者长度不一致）**均如期抛 `AssertionError`**。
+
+**类别覆盖（测试侧）**：C=10 为 **10/10**（零样本类 0）；C=298 为 **247/298**
+（**零样本类 51 个**，按问题数与按行数两个口径**同为 247/298**）。51 个测试零样本类
+**逐类列出**在产物的 `class_coverage.test_by_question.classes_without_samples_head` 里
+（**允许的额外项**：该列表在超过 20 个时截断到前 20 个，截断事实由列表长度与
+`n_classes_without_samples` 共同暴露）。**不强制每类至少 1 条测试样本**（那会破坏比例性）；
+小样本类在留出后的实际样本数逐类登记在
+`scales.full_c298.small_class_actual_samples.head`（按合并问题数升序取前 20 类）。
+
+**规模结论（如实）**：冻结产物本身**已经是**「只导出已入表答案的正样本」的口径
+（`questions_in_table = 12727` / `questions_seen = 38364`）⇒ 把「已入表答案」全部用上
+（C 从 10 扩到 298，**x29.8**）只带来 **x1.25** 的样本量与 **x1.25** 的测试集。
+因此对 macro 判据而言，**扩 C 的主要收益是「不再预先丢掉 288 个类」**，而不是样本量暴涨；
+真正把主测试集从 20 条抬起来的收益来自 19.3 的**按比例留出**（20 -> 2443，**x122**）。
+
+### 19.3 测试集改按比例留出（**边界归属 = 小于**）
+
+口径（唯一实现 `question_side`）：
+`h = int(sha256("qgroup\0{seed}\0{task}\0{question_id}"), 8B big-endian) % 100`；
+`h < holdout_pct` -> 测试侧，否则训练侧。作用单位是**问题组**（同一 `question_id` 的全部行
+**同侧**），因为哈希只用 `(seed, task, question_id)`，**不涉及行** ⇒ 「整组切分」是构造性
+成立、并由切分后的三条不变量复核（训练行/测试行不交且并集为全部行；两侧问题集不交且并集
+为全部问题）。
+
+**边界归属现场证据**（`holdout_boundary_evidence.boundary_probe`，seed=42 / pct=20）：
+
+| h | 本实现（`<`） | 若改成 `<=` | 两者可区分 |
+| --- | --- | --- | --- |
+| 19 | train | train | 否 |
+| **20** | **train** | **test** | **是** |
+| 21 | train | train | 否 |
+
+⇒ 边界点（`h == holdout_pct`）归 **train**，命中集合是**左闭右开** `[0, 20)`
+（命中概率恰为 `20/100`）；若改成 `<=` 概率会变成 `21/100`，**边界归属是被现场证据钉住的**。
+退化端：`pct=0` 全部训练（测试集为空）、`pct=100` 全部测试（训练集为空），两端都可复算。
+**废掉了 `test_per_class=2` 的逐类封顶语义**（现状口径用的是它）。
+
+现场实际比例：C=298 测试问题占比 **0.191954**、测试行占比 **0.192313**（目标 0.20）。
+
+### 19.4 判据退化修正（`10/C` 的适用性）
+
+| 口径 | C | 阈值 `10/C` | `applicable` | 理由 |
+| --- | --- | --- | --- | --- |
+| C=10（重建基线） | 10 | **1.000000** | **False** | 阈值 `>= 1.0` 而 `macro <= 1.0` ⇒ **恒不可满足**；标 `applicable=False` 并如实报出，**不得**当成通过项 |
+| C=298（全量） | 298 | **0.033557** | **True** | 阈值严格小于 1.0，判据可满足 |
+
+**边界归属 = 严格小于**（`applicable ⇔ 10/C < 1.0`）。**恰好等于边界的现场用例**：
+`C = 10` 时 `threshold == 1.0`（产物字段 `boundary_case.threshold_at_10 = 1.0`、
+`applicable_at_10 = False`）⇒ 该点判 **不可满足**，边界归属在此被钉死。
+真正生效的两条是「`macro >= 多数类基线 + 10pp`」与「`+ 5pp`」，阈值均为**闭区间下界**
+（判据用 `>=`）：
+
+| 口径 | 多数类基线（测试侧） | `+10pp` 阈值 | `+5pp` 阈值 |
+| --- | --- | --- | --- |
+| C=10 | 0.100000 | 0.200000 | 0.150000 |
+| C=298 | 0.003610 | 0.103610 | 0.053610 |
+
+**可行域边界核查**（`saturated_baseline_check`）：两个口径的多数类基线都落在
+`(0, 1)` **内部**（0.10 / 0.00361）⇒ 「优于 / 不劣于基线」类判据在这两个口径上**可判**。
+
+#### 19.4.1 W1 修复：判据基线的**作用域**必须显式，禁止跨作用域套用
+
+上表的三条阈值来自**全量类口径**的基线（C=10 的 10 类 / C=298 的 298 类）。而**分任务集**
+的 macro 与它**不是同一量纲** —— 解题任务集只有 **2 / 4** 类。故本轮在产物与报告里为**每个
+作用域**各给一格 `criterion_tables_by_scope[scope]`（含该作用域自己的类数、基线 macro 与
+三条阈值），并显式声明「不得跨作用域套用」：
+
+| 作用域 | C=10 类数 | C=10 基线 | C=10 `+10pp` | C=298 类数 | C=298 基线 | C=298 `+10pp` | C=298 `random 10/C` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `all_classes`（全部任务、全量类） | 10 | 0.100000 | 0.200000 | 298 | 0.003610 | 0.103610 | 0.033557（app=True） |
+| `match_tasks`（匹配任务集） | 8 | 0.125000 | 0.225000 | 275 | 0.003636 | 0.103636 | 0.036364（app=True） |
+| `solve_tasks`（解题任务集） | 6 | 0.166667 | 0.266667 | 6 | 0.166667 | 0.266667 | 1.666667（app=**False**） |
+
+- **跨作用域套用会得出错误结论**：解题任务集的 `+10pp` 阈值是 **0.266667**，而全量类口径
+  的阈值是 **0.103610** —— 拿后者去判解题任务集的分侧 macro 是量纲错配。
+- 注意 `solve_tasks` 的 `random 10/C` = **1.666667 ≥ 1** ⇒ 该作用域上该判据同样
+  **恒不可满足**（`applicable=False`），与全量类口径在 C=10 时的情形同源。
+- 同作用域基线一律由 `deterministic_baseline_metrics(..., tasks=SOLVE_TASKS/MATCH_TASKS)`
+  现场算出（**不是**从全量类基线切出来的），且 `criterion_scope_declaration` 把
+  「作用域 → 基线 → 阈值」绑成一格并写明 `cross_scope_rule`。
+
+### 19.5 确定性参照基线（**不训练**）
+
+本轮**不训练任何模型**，故给出两条**纯确定性**参照基线，用于把「扩 C 之后判据是否仍可判」
+钉死（真正训练出来的 macro 必须**同时**超过它们）：
+
+| 口径 | 侧 | 行数 | 问题数 | predictor | micro | macro | 范围内类数 | 越界行 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| C=10 | test | 7675 | 1957 | `scope_side_majority_class`（`b`） | 0.233512 | 0.100000 | 10 | 215 |
+| C=10 | test | 7675 | 1957 | `scope_rows_positive_row_count_argmax_class`（`b`） | 0.233512 | 0.100000 | 10 | 215 |
+| C=298 | test | 9782 | 2443 | `scope_side_majority_class`（`b`） | 0.196074 | **0.003610** | 277 | **0** |
+| C=298 | test | 9782 | 2443 | `scope_rows_positive_row_count_argmax_class`（`b`） | 0.196074 | **0.003610** | 277 | **0** |
+
+- 「越界行」= 指向本轮口径**未保留**类别的行（C=10 重建时被截断掉的那些类）：既不是合法
+  预测目标、也不进 micro/macro 分母，但**逐行计数显式登记**；C=298 全量口径下恒为 **0**
+  （现场核对）。这是「集合/计数类断言必须显式列出允许的额外项」的落地：**允许的额外项 =
+  `n_rows_out_of_scope`，不得默认它为 0**。
+- 两条基线在本次口径下给出**相同**的 micro/macro（都指向同一多数类 `b`）—— 如实记录，
+  不当作「两个独立证据」。
+
+#### 19.5.1 W2 修复：`constant_majority` 的**命名与文档**与实现对齐
+
+**缺陷**：实现取的是**本侧（side + 任务过滤作用域）**正样本行数最多的类，而
+`predictor` 字段与本文档此前写作「**全局**最高频类」⇒ 名实不符。**处置（二选一取①）**：
+把字段名与文档**改述为与实现一致**，并新增取证字段说明作用域 —— 因为「取本侧多数类」是
+本基线**想表达的意思**（预测器在评测侧上不借助任何问题信息、只看该侧的类别先验）。
+
+- `constant_majority.predictor` 由 `global_majority_class` 改为
+  **`scope_side_majority_class`**；
+- `row_argmax.predictor` 由 `positive_row_count_argmax_class` 改为
+  **`scope_rows_positive_row_count_argmax_class`**；
+- 两条各增 `scope_of_majority` 与 `scope_of_majority_detail`：现场取到的是
+  `side_row_positive_counts`（本侧正样本行数的 argmax；仅当本侧无正样本行时才回退
+  `frozen_table_count_fallback`）与 `scored_rows_positive_counts`（本次统计行集合内的 argmax）；
+- `majority_class_index` 的 docstring 同步改述为「给定一组计数取 argmax 的纯工具，
+  **不隐含全局语义**，作用域由调用方决定」；
+- **作用域不同会取到不同的类**：全量类口径 / 解题任务集 / 匹配任务集各自独立取，
+  三者不得混用（与 19.4.1 同一纪律）。
+
+### 19.6 拆出解题类任务（含 W3 现场一致性校验）
+
+**拆出依据（现场统计，不是直觉）**：`judge` / `choice` 的答案类只有 **2 / 4** 类
+（产物 `per_task_answer_classes` = `{'blank': 153, 'choice': 4, 'judge': 2, 'solve': 78,
+'triviaqa': 100}`），且答案**不由问题相似性决定**（「3 是奇数吗」与「3 是偶数吗」问法极相似
+而答案相反）⇒ 实质是**解题**而非匹配。故按 manifest 的 `task` 字段分层：
+
+* **匹配任务集** `MATCH_TASKS = ('blank', 'solve', 'triviaqa')`；
+* **解题任务集** `SOLVE_TASKS = ('judge', 'choice')`。
+
+**W3 修复（皋陶 warning）**：`ALL_TASKS` 是硬编码元组、文档声称「现场来自 manifest `tasks`」，
+但此前**全流程没有任何校验**（`load_row_tasks` 算出的 `tasks` / `per_task_rows` 没人用）。
+现新增 `qa_scale.validate_task_list`，把**三处现场来源**（`manifest.tasks` /
+`npz meta.task_of_row` 去重 / `pairs` 回填后的任务去重）**逐项比对**，再与 `ALL_TASKS`
+比集合：
+
+- **现场多出的任务名**（`missing_from_declared` 非空）⇒ **抛 `AssertionError`（fail-closed）**，
+  因为那会**静默漏掉样本**；
+- **清单多出的任务名**（`extra_in_declared`）⇒ **不抛**，但**显式列出**（允许的额外项）。
+- 现场结果：三处来源**逐项相同** `['judge','choice','blank','solve','triviaqa']`、
+  `missing_from_declared = []`、`extra_in_declared = []`、`consistent = True`。
+- **该断言不是恒真**（现场反例）：把 `declared` 换成去掉 `triviaqa` 的元组、或改名成
+  `triviaqa2` ⇒ **均如期抛 `AssertionError`**；换成**多一个** `math2` 的元组 ⇒ 通过并
+  在 `extra_in_declared` 里列出 `['math2']`。
+- 校验在 `probe` 与 `eval` **两条路径**都跑（不允许绕过 probe 出数）。
+
+**拆出前后类数与样本量变化（C=298 全量）**：
+
+| 任务 | 侧 | 行数 | 问题数 | 答案类数 | 正样本行数 |
+| --- | --- | --- | --- | --- | --- |
+| `judge` | train | 1854 | 618 | **2** | 618 |
+| `judge` | test | 498 | 166 | **2** | 166 |
+| `choice` | train | 26028 | 6507 | **4** | 6507 |
+| `choice` | test | 6144 | 1536 | **4** | 1536 |
+| `blank` | train | 8283 | 1990 | 153 | 2313 |
+| `blank` | test | 1991 | 479 | 121 | 554 |
+| `solve` | train | 4604 | 1149 | 78 | 1157 |
+| `solve` | test | 1020 | 255 | 59 | 255 |
+| `triviaqa` | train | 314 | 20 | 100 | 254 |
+| `triviaqa` | test | 129 | 7 | **92** | 108 |
+
+**拆分对合入口径指标的影响**（确定性基线 macro，测试侧）：
+
+| 口径 | 全部任务 | 匹配任务集 | 解题任务集 |
+| --- | --- | --- | --- |
+| C=10 重建 | 0.100000 | 0.125000 | 0.166667 |
+| C=298 全量 | 0.003610 | 0.003636 | 0.166667 |
+
+⇒ **拆分确实改变合入口径**：在 C=298 全量下，解题任务集（2 / 4 类）的基线 macro
+（0.166667）比合入口径（0.003610）高 **x46**；若不拆分而报一个总 macro，解题任务会被
+298 类的长尾**淹没**（合入口径几乎由 298 类决定），而解题任务的真实难度被掩盖。这就是
+「分侧报告」必须独立给出的量化理由。
+
+### 19.7 现状基线（C=10 既有口径）的登记
+
+现场从**源码常量**读取（只读 import `entry_table`）：
+`QA_MAX_CLASSES = 10` / `QA_MIN_QUESTIONS = 8` / `QA_TEST_EVERY = 3` /
+`QA_TEST_PER_CLASS = 2` / `QA_UNKNOWN_TRAIN_CAP = 500` / `QA_SPLIT_SEED = 42` /
+`QA_KNOWN_SPLIT = 'train_known'`。
+
+**如实声明（不得混为一谈）**：该基线的总体是 **QA JSON 缓存**，与冻结产物的统一答案表
+**298 类不是同一个总体**；它与 19.2 的「冻结产物口径下的 C=10 重建」是两条**互不代替**的
+对照线。本轮只用它登记「现状口径参数」，**不用它做任何数值比较**。
+
+### 19.8 产物与确定性
+
+产物（`checkpoints/qa_learn/_verify/qa_scale/`，9 件）：
+`qa_scale_probe.json` **8098 B `dc4e64c856b0ddd5...`**、
+`qa_scale_eval.json` **119973 B `7faeda901cd33feb...`**、
+`qa_scale_report.json` **136406 B `41ecf14f20d161a9...`**、
+`qa_scale_report.md` **10214 B `06fd0b6a6c730019...`**、
+`determinism_check.json`（见下方当场实测），以及 `probe.log` / `eval.log` /
+`eval_repro.log` / `report.log`（`report.md` 中的 `None` 字面量只出现在
+`CLASS_SIZE_BINS` 的「无上界」档位表示里，**不是**渲染缺失）。
+
+**收口轮指纹变更登记（旧值 -> 新值，逐项）**：
+
+| 文件 | 旧值（收口前） | 新值（收口后） | 变更原因 |
+| --- | --- | --- | --- |
+| `qa_scale_probe.json` | 8098 B `dc4e64c856b0ddd5...` | **9252 B `4b2683eaaf4827d4...`** | W3 任务清单现场一致性校验块 |
+| `qa_scale_eval.json` | 88154 B `975534da01940a71...` | **119973 B `7faeda901cd33feb...`** | E1 修复 + E1 自洽断言取证 + W1 作用域判据表 + W2 字段改名 |
+| `qa_scale_report.json` | 102830 B `5eb43f03d056eab4...` | **136406 B `fc1037d73ba771eb...`** | W1/E1/W3 三块**渲染进报告**（P2 修复后）+ 内嵌证据块随指纹更新 |
+| `qa_scale_report.md` | 10152 B `3eebe0b302f2b7fc...` | **13773 B `3a9608286c43380e...`** | 新增 4.2 作用域表（含 `cross_scope_rule`）/ 4.3 `merged_consistency` / 4.4 `task_list_consistency` |
+| `merge_table.json` | 17273 B `759f3a1eb65799a1...` | **17542 B `f7a678f7bd41270a...`** | F2 第②类独立内容视图校验块 |
+| `route_eval.json` | 31424 B `bf2444a40f7339bf...` | **36767 B `6b8853a508abc57d...`** | F1 `quantified` 语义修正 + F2 `content_view_check` |
+| `route_eval_queries.jsonl` | 1538962 B `f188d788171537f0...` | **1652875 B `a01f2cc1d6790006...`** | 逐查询记录补 `returned_index` 字段（F2 校验所需） |
+| `merge_table_report.json` | 52402 B `03ba3d942ac35af9...` | **58860 B `73805cb62da0a558...`** | F1/F2 渲染同步 + F-A 规范化字段进入内嵌证据块 |
+| `merge_table_report.md` | 19424 B `ffd01213c3308469...` | **19693 B `28b908ca8c73f41f...`** | 同上（`a_dir`/`b_dir` 原样串不变，故与 F-A 无关） |
+| `determinism_check.json`（merge_table） | 2940 B `1c4234dcb0a43a4f...` | **3782 B `61e627792c6d06b2...`** | 双跑对照件由 3 件变 4 件（补 `drill.json`）+ **F-A** 补规范化字段 |
+| `determinism_check.json`（qa_scale） | 2594 B `e21df22b8809ba6e...` | **2596 B `1c90d2d9c8dd8915...`** | E1/W1/W2 取证字段进入双跑比对 |
+
+**派生件口径（离朱 R78 的 R-A 登记、R79 的 R-C 落点要求；R80 的 R-D 去重后本节只保留**本段**一处）**：产物目录里的
+**日志类文件是派生件**，其内容由程序**自写**（含被写产物的指纹），故它们**不参与**
+「内容产物指纹不变清单」：
+
+- `report.log` 的第一行**逐字记录**两件报告的字节数与 SHA256，例如现场
+  `[report] merge_table_report.json = 58860 B 73805cb62da0a558；merge_table_report.md = 19693 B 28b908ca8c73f41f`
+  ⇒ 只要报告重渲，该日志**必然**变化（现场 `82b808b78e513ec3...` → `b16b849d0e22adf1...`；
+  `qa_scale` 侧因报告未变而 `report.log` 保持 106 B `1ac8340711b5c7cd...` **不变**，
+  这正好从反面证明它是**报告的函数**）；
+- 判定口径：**允许的额外变更项 = 日志类派生件**（`drill.log` / `eval.log` /
+  `eval_repro.log` / `report.log`），依据是「内容由程序自写、且是其它产物的函数」；
+  其余**内容产物**（`*.json` / `*.jsonl` / `*.md`）的指纹不变要求**照旧严格**。
+- **与 `qa_scale_run.DETERMINISM_SCOPE` 的关系**：后者在**双跑比对时**排除「证据自身 +
+  后置可重渲件」，本「派生件口径」在**指纹清单时**排除「日志类派生件」—— 二者是**同一类
+  处置的两个不同侧面**（一个管「比对时排除哪些」，一个管「清单时排除哪些」），
+  **都不是静默忽略**（排除范围与理由都写进产物字段与文档）。
+- 本节（19.8）与 18.13 的**关系**：两处是同一口径在**两个模块**上的登记
+  （18.13 属 `merge_table` 侧、本节属 `qa_scale` 侧）。**R79 遗留的旧段落已删除**
+  （R80 的 R-D），本节**只保留本段一处**；「当场实测」列表里的那一条是**列表项重申**
+  （非第二个段落），与 G1/R80 的「19.8 一处段落 + 一条列表项重申」口径一致。
+
+**章节目录说明**：merge_table 侧的「判定量未变（F1）」与 quantified 量化口径条目归
+**18.13 节**（已在该节登记），本节不重复。
+
+当场实测：
+- `eval` 双跑（主目录 -> 拷内容产物到 `_repro/` -> `eval --repro-dir`）
+  ⇒ `n_common_files = 2`、`not_equal_files = []`、**`determinism_ok = True`**；
+- `report` 连跑两次 ⇒ `qa_scale_report.json` 与 `.md` **逐字节相同**；
+- 证据块**排除** `determinism_check.json`（自身）与 `qa_scale_report.{json,md}`
+  （后置可重渲件）⇒ 无自指哈希回路；单侧独有文件（`a_only_files` / `b_only_files`）
+  显式登记、**不纳入** `determinism_ok` 布尔值；
+- **如实登记一处非确定性来源**：`determinism_check.json` 与 `report` 里保留了
+  `a_dir` / `b_dir` 的**命令原样串** ⇒ 在「绝对路径不同」的运行之间不逐字节相同，
+  **同路径同参重跑才逐字节相同**。产物另给 `*_normalized` 与 `paths_normalized_equal`
+  供机器判定。**`merge_table_run.determinism_block` 自 F-A 修复后给出同套四字段**
+  （同名同义，见 18.13）。
+- **派生件口径**：本目录的日志类文件（`probe.log` / `eval.log` / `eval_repro.log` /
+  `report.log`）是**派生件** —— 内容由程序自写、且是其它产物的函数（`report.log` 首行逐字
+  记录两件报告的字节数与 SHA256），故它们**不参与**「内容产物指纹不变清单」；
+  `*.json` / `*.jsonl` / `*.md` 的指纹不变要求照旧严格。
+
+**零回归**（现场逐项核对）：上游四目录 `git status --porcelain` 为空；顶层 **9** 个
+`qa_*.pt.zip`、`_verify/text_variants/` **12** 件、`step2/` **9** 件、`_verify/merge_table/`
+**11** 件、`dataset/` **17** 件与根 `requirements.txt` / `requirements-qa.txt` 的
+SHA256 + 字节 **逐项不变**（基线↔终态共有 42 项比对 `CHANGED = []`）；
+`python -m compileall -q n3d_qa_learn` 退码 0；零新增依赖。
+
+### 19.9 生效口径（**所有结论都受此约束**）
+
+> **max_classes = 298（全量）+ 20% 按比例留出 + 单 seed（42）+ 问题组级切分。**
+
+### 19.10 如实登记的局限（**不得包装**）
+
+1. **单 seed**：`seed = 42`；跨 seed / 跨留出比例的极差**未测**；
+2. **样本量只涨 x1.25，不是「暴涨」**：冻结产物本身**已经是**「只导出已入表答案」的口径
+   （`questions_in_table = 12727` / `questions_seen = 38364`）⇒ 扩 C 的收益主要是
+   「不再预先丢掉 288 个类」，不是样本量。若要让样本量真正暴涨，必须回到
+   `n3d_qa` 的**未入表**问题（`questions_not_relevant = 25637`）—— 那需要改上游产物口径，
+   **不在本轮范围**；
+3. **本轮不做任何训练**：19.5 的两条是**确定性参照基线**，**不得**当作「模型能力」；
+   `10/C` 阈值的 `applicable` 只是**判据适用性**声明，不是任何模型的成绩；
+4. **测试零样本类 51 个**：哈希比例抽稀**不保证**每类都有测试样本（保证会破坏比例性）；
+   这 51 个类在测试侧对 macro **无贡献**（macro 分母只含实际出现的 277 类）——
+   如实登记，不隐藏；
+5. **`triviaqa` 测试侧仅 7 个问题 / 129 行 / 92 类**（该任务在冻结产物里只入表 100 类、
+   27 个问题）⇒ 其分侧指标方差极大，**不得**据此下任务级结论；
+6. **解题任务集的类数极少（2 / 4）**：其 macro 的可行域很窄（分母只有 2 或 4），
+   任何「优于基线」的判据在该口径上都必须先做饱和点核查；
+7. **C=10 重建不是现状基线**：现状基线用的是**缓存总体**（149/20），二者**总体不同**，
+   不得互相代入（见 19.7）。
+
+## 二十、轮 3：QA 变体生成（B3）+ 开集 τ 标定（B4）+ 上轮 2 项口径收口（P1 / P2）
+
+**本轮不做任何模型训练。** 目标：把原定 B 组剩余项补齐（QA 侧变体生成、开集 τ 标定），
+并收口上一轮遗留的 2 项「同一事实在三处不同源」问题。
+
+### 20.1 前置收口 P1：`merge_table_report.json` 的**唯一终值**
+
+**缺陷**：§18.13 的「产物影响面」把该文件记成**中间态** `58017 B` / `5b553c3c...`，
+而 §19.8 的「旧值 -> 新值」表、`merge_table/report.log` 首行、以及盘上实测**三方一致**
+给出**终值** `58860 B` / `73805cb62da0a558...`（F-A 补规范化字段后的值）。
+⇒ 同一文档内同一文件出现两个「最终」值。
+
+**修法（取方案①）**：§18.13 改为**终值**，并显式登记「中间态 58017 只用于说明指纹演进的
+中间步骤，**不是终值**」。同时把该段里 `determinism_check.json` 的登记值一并订正为
+`3782 B` / `61e627792c6d06b2...`（此前写的是更早的 2943）。
+
+**现场核验**：`n3d_qa_learn/README.md` 内 `merge_table_report.json` 的**终值**只出现于
+§18.13 的一处 + §19.8 表的一处 + 两处 `report.log` 首行引证，**全部为 `58860`**；
+盘上 `merge_table/merge_table_report.json` = 58860 B `73805cb62da0a558...`。
+
+### 20.2 前置收口 P2：把 W1 / E1 / W3 的取证块**渲染进报告**
+
+**缺陷**：§19.4.1 声明「在产物与报告中为每个作用域各给一格 `criterion_tables_by_scope`」，
+但 `render_markdown` 的 4.1 节仍只渲染 full 口径的 `criterion_table_using_test_baseline`，
+**全文没有作用域表与跨作用域声明**；E1 的 `merged_consistency` 与 W3 的
+`task_list_consistency` 同样未渲染（JSON 产物里字段齐备且数值正确）。
+§19.8 变更原因列里写的「渲染层同步（E1 直方图 / W1 表 / W2 名 / W3 块）」与当时实际不符。
+
+**修法（取方案①：报告层补渲染）**：`qa_scale_run.render_markdown` 新增三节 ——
+
+| 报告节 | 新增内容 | 数据来源（同源） |
+| --- | --- | --- |
+| **4.2** | 判据基线的**作用域表**（`all_classes` / `match_tasks` / `solve_tasks` 三格：类数 / 基线 macro / `10/C` 阈值与 `applicable` / `+10pp` / `+5pp`）+ **`cross_scope_rule`** + `why` + `scopes` | `criterion_tables_by_scope` / `criterion_scope` |
+| **4.3** | E1 的 `merged_consistency` 逐类自洽表（两口径 × question/row 两单位：训练侧 / 测试侧 / 合并侧 / 训练+测试 / 逐类自洽）+ 断言口径 | `class_distribution.merged_consistency` / `merged_total_self_consistency` |
+| **4.4** | W3 的 `task_list_consistency`（`declared` / `manifest_tasks` / `npz_tasks` / `pairs_tasks` 四来源 + `missing` / `extra` / `consistent` / `per_task_rows` / 允许的额外项） | `task_list_consistency` |
+
+**现场渲染值（报告 §4.2，取自 C=298 全量口径）**：
+
+| 作用域 | 任务集 | 类数 | 基线 macro | `10/C` 阈值 | applicable | `+10pp` | `+5pp` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `all_classes` | 全部任务 | 298 | 0.003610 | 0.033557 | True | 0.103610 | 0.053610 |
+| `match_tasks` | blank / solve / triviaqa | 275 | 0.003636 | 0.036364 | True | 0.103636 | 0.053636 |
+| `solve_tasks` | judge / choice | 6 | 0.166667 | 1.666667 | **False** | 0.266667 | 0.216667 |
+
+**现场渲染值（报告 §4.3）**：`baseline_c10` 与 `full_c298` 的 question / row 两单位**逐类自洽
+全为 True**，合并侧合计分别为 **10210** 与 **13468**，且均等于「训练 + 测试」。
+**现场渲染值（报告 §4.4）**：四来源逐项相同、`missing=[]`、`extra=[]`、`consistent=True`、
+`per_task_rows` 合计 50865。
+
+**产物指纹影响（旧 → 新，逐项登记）**：
+
+| 文件 | 旧值 | 新值 | 原因 |
+| --- | --- | --- | --- |
+| `qa_scale_report.json` | 136406 B `41ecf14f20d161a9...` | **136406 B `fc1037d73ba771eb...`** | 内嵌报告文本含新增三节（字节数恰好相同，哈希不同） |
+| `qa_scale_report.md` | 10214 B `06fd0b6a6c730019...` | **13773 B `3a9608286c43380e...`** | 新增 4.2 / 4.3 / 4.4 三节 |
+| `qa_scale/report.log`（派生件） | 106 B `1ac8340711b5c7cd...` | 见 `report` 输出 | 首行逐字记录报告指纹 |
+
+**三处同源**：本节的表格数值、报告 §4.2/4.3/4.4 的渲染值、JSON 产物字段值
+**逐项相同**（报告由产物渲染，本节数值由产物导出）；§19.8 的变更原因列**已改述**为
+「W1/E1/W3 三块**渲染进报告**（P2 修复后）+ 内嵌证据块随指纹更新」。
+
+### 20.3 主体 B3：QA 侧变体生成（`qa_variants.py` / `qa_variants_run.py`）
+
+**只用数据、不训练。** 复用第三步 ``text_variants.VariantGenerator`` 的 4 支生成器
+（``原文`` / ``关键词`` / ``摘要`` / ``自适应``），**不改动**文本行侧产出路径与其 12 件
+既有产物（本轮零回归核对已逐项确认）。
+
+#### 20.3.1 **绑定输出 = 答案，不是问题原文**（B3-2）
+
+> QA 侧变体的**绑定输出 = 该问题绑定的答案展示文本**（`answer_display`），
+> **不是**问题原文。文本侧的绑定输出是**行原文**，QA 侧是**答案**；
+> 若把问题原文当输出，QA 侧就退化成「问题自匹配」，与「问题 -> 答案」的业务目标无关。
+
+**现场核验**：`binding_output.n_binding_equals_question_text` = **0**（逐问题比较
+`answer_display` 与 `question_text`；若该数等于问题数，说明绑定输出退化，本口径当场失败）。
+该字段在 `probe` 与 `eval` 两处产物里都给出。
+
+#### 20.3.2 口径衔接与**如实登记的执行范围**
+
+- 沿用轮 1 已生效口径：`max_classes = 298`（全量）+ 按比例留出 **20%** + 问题组级切分 +
+  单 seed(**42**)。
+- **如实登记：本轮实际生成范围 = 按 `question_id` 升序的**前 400 题**（不是 12727 题全量）。**
+  原因：全量 12727 题现场外推需约 1 小时（实测 200 题 505.3 s / 400 题 80.9 s，后者因词表
+  更小、缓存命中率高），**超出单次前台执行上限（600 s）**；而**后台执行在本环境会使子进程
+  停滞**（现场：CPU 时间停在 0.078 s、bge-m3 未加载、无新产物落盘）。
+  选取规则**完全确定**、可复现（`--limit-questions 400` = `question_id` 升序取前 400）。
+- **如实登记：QA 侧词表的文档频次下限被显式提高** —— 文本侧第三步为
+  `KEYWORD_MIN_DOC_FREQ = 2`，QA 侧取 **20**（`QA_VOCAB_MIN_DOC_FREQ`）。
+  理由：QA 语料 12727 题的唯一候选词 **163690** 个，`min_doc_freq=2` 保留 **49988** 个词，
+  每词需一次 bge-m3 前向；`min_doc_freq=20` 保留 **2849** 个词。
+  **在 400 题子集上该阈值只保留 50 个词**（`n_distinct` 10392）⇒ 关键词支**更保守**，
+  这是**口径偏离**，已在产物 `generator.vocab_caliber_deviation` 里逐字登记。
+
+#### 20.3.3 整组切分：三条不变量 + **四个反例**（B3-3）
+
+| 不变量 | 现场通过 | 现场计数 |
+| --- | --- | --- |
+| `rows_disjoint_and_union_complete` | **True** | 训练行 332×4 / 测试行 68×4 / 合计 1600；交集 0；并集 = 权威全集 |
+| `questions_disjoint_and_union_complete` | **True** | 训练问题 332 / 测试问题 68 / 合计 400；交集 0 |
+| `every_question_wholly_on_one_side` | **True** | 跨侧问题数 **0** |
+
+- **四支变体在两侧的条数完全相同**（每侧每支 332 / 68）—— 这是「整组同侧」的直接表现。
+- **权威全集是显式传入的**（`authority = explicit`，来源 = 语料侧现场枚举），
+  **不是**从被检查记录现算。
+
+**反例取证（`group_split_counter_examples`，全部在内存副本上做，不改真实产物）**：
+
+| 反例 | 目标不变量 | 破坏前 | 破坏后 | 如期触发 |
+| --- | --- | --- | --- | --- |
+| `flip_one_variant_half_question` | `every_question_wholly_on_one_side` | True | False | **True** |
+| `duplicate_one_row` | `rows_disjoint_and_union_complete` | True | False | **True** |
+| `drop_one_row` | `rows_disjoint_and_union_complete` | True | False | **True** |
+| `drop_one_question_group` | `questions_disjoint_and_union_complete` | True | False | **True** |
+
+> **本条反例当场暴露过一个真缺陷（必须记录）**：最初 `verify_group_split` 把「全集」也从
+> **被检查的这批记录**里现算，于是「删掉一行」时全集也少一行、两者仍相等 ⇒ 「并集完整」
+> **恒真**，`drop_one_row` **不翻面**。修法：`verify_group_split` 增加
+> `expected_row_keys` / `expected_question_ids` 两个**权威全集**入参，反例一律对照
+> **破坏前**的全集；未传时退回自比并**显式标** `authority = self_referential`
+> （该模式**不能**发现丢行，产物里可见）。
+
+#### 20.3.4 变体后**特征确实变化**（B3-4）
+
+向量化器：`lexical-88` / role=`question` / dim=**88** /
+fingerprint=`d4a4881aaa8dfa8c...`。参照 = **原文支**；n = 400。
+
+| 变体 | 文本同原文 | 特征裸字节同原文 | 余弦 min | 余弦 mean | 余弦 p50 | 余弦<1 的条数 | `feature_really_changes` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `原文` | 400/400 | 400/400 | 1.000000 | 1.000000 | 1.000000 | 0 | **False**（锚点，应然） |
+| `关键词` | 0/400 | 0/400 | 0.069747 | 0.393480 | — | 400 | **True** |
+| `摘要` | **4**/400 | **4**/400 | 0.401767 | 0.876336 | — | 396 | **True** |
+| `自适应` | 0/400 | 0/400 | 0.200517 | 0.681775 | — | 400 | **True** |
+
+- **口径**：`feature_really_changes` = 「存在至少一条余弦 < 1」**或**「存在至少一条裸字节
+  不同」。**只看文本不同不足以断言特征变了** —— `n_feature_bitwise_identical` 专门抓
+  「文本变了但特征没变」的情形（现场三支非锚点变体该计数为 0，即没有这种情形）。
+- **如实登记「哪些变体与原文一致」**：`摘要` 支有 **4/400** 与原文**逐字节相同**
+  （生成器自身的 `fallback_to_original` 计数也是 **4**，两处互证）；
+  `原文` 支 400/400 相同是**锚点定义**，不是缺陷。上述数字**不隐藏**。
+- **如实登记：4 支变体全部是抽取式 / 词面级变换，不是语义 paraphrase**；
+  对部分问题是**信息减少**而非「换种说法」。
+
+**可评估性（`evaluability`，离朱 R82 的 E-B3a 修复）**：每支都给出
+`n_evaluable`（= 与原文支**文本不同**的条数 —— 只有这些条才存在差异可比）与
+`n_not_evaluable`，并在 `feature_difference.evaluability` 里做汇总与互证：
+
+| 变体 | 是否锚点 | n | `n_evaluable` | `n_not_evaluable` | 文本同原文 | 生成器 `fallback_to_original` | 互证 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `原文` | True | 400 | **0** | 400 | 400 | 0 | —（锚点，不适用） |
+| `关键词` | False | 400 | **400** | 0 | 0 | 0 | **True** |
+| `摘要` | False | 400 | **396** | 4 | 4 | 4 | **True** |
+| `自适应` | False | 400 | **400** | 0 | 0 | 0 | **True** |
+
+⇒ `all_non_anchor_consistent = True`：三支非锚点变体的「与原文相同条数」**逐项等于**
+生成器自报的回退数。锚点支的互证字段是 `null`（**不适用**，不是失败）。
+
+#### 20.3.5 产物与确定性
+
+产物目录 `checkpoints/qa_learn/_verify/qa_variants/`（**不落盘裸特征矩阵、不产 zip、
+无挂钟字段**）。该目录 7 件内容产物的**字节数与 SHA256 的唯一定义处 = §20.5.3** ——
+本节**不再复写任何指纹数值**，因此同一文件在本 README 全文**只有一处**「最终」值。
+
+> **D1 修正**：本节原本持有一份**中间态**指纹表，与 §20.5.3 的终值**矛盾**（轮 2 出现过
+> 同型的「同一文件两个最终值」问题，本轮是复现）。处置取「**改为指针**」：表已整表删除，
+> 数值一律以 §20.5.3 为唯一来源 —— 这比「保留表并标注中间态」更彻底，因为标注法仍会让
+> 同一文档出现两个字节数、给后续引用留下选错的机会。
+
+**双跑逐字节一致**（真实工作序：`eval` 主目录 → 拷 3 件内容产物到 `_repro/` →
+`eval --repro-dir _repro`）：`determinism_ok = True`、`n_common_files = 3`、
+`not_equal_files = []`；`paths_normalized_equal = False`（两侧确为不同目录，语义自洽）。
+`report` 连跑两次报告逐字节相同。证据文件 = `determinism_check.json`（指纹见 §20.5.3）。
+
+> **D-1 修正（离朱 R85）**：本节的确定性证据段此前**连续出现两次**（D1 整表删除时，
+> 表后原有的同段落没被一并去掉）—— 与 R80 报过的 R-D（§19.8 派生件口径段落重复）
+> 属**同型问题**。现只保留一处（即上面这一段）；本节内该段的**段首短语**与
+> **共有文件数**两个特征串的出现次数均已降为 **1**。
+
+### 20.4 主体 B4：开集「未识别」档的 τ 标定（`open_set_tau.py` / `open_set_tau_run.py`）
+
+#### 20.4.1 1a 遗留已实现，四处声明已同步订正（B4-1）
+
+此前 5 处声明「本档**不标定**阈值（属第二步变体 B 的范围）」，现**全部订正**为
+「已实现 + 指向实现入口」：
+
+| 位置 | 订正后表述 |
+| --- | --- |
+| `robust_eval.py` 模块 docstring | 「该档的 τ 标定**已实现**」+ 指向 `calibrate_thresholds` 的 `unrecognized_tau` 块 |
+| `unrecognized_report` docstring | 「本函数**只读标定结果**」（标定入口指到 `unrecognized_tau`） |
+| `unrecognized_report.threshold_standard` 字段 | 「本档的 τ **已实现标定**（轮 3 补齐 1a 遗留）」 |
+| `run_evaluation` 的 notes | 「**已实现标定**」（不再说「本批不标定」） |
+| `render_markdown` 的 4 节 | 「**本档的 τ 已实现标定**」+ 边界归属 |
+| `step2_run.py` 的 `unrecognized_note` | 「**已实现**」+ 明确「必须用它自己的 pos/neg 分布标定（**禁止跨总体复用**）」 |
+
+实现入口：`robust_eval.calibrate_thresholds(..., unrecognized_scores=...)` 的
+`unrecognized_tau` 块；核心 = `open_set_tau.calibrate_tau`。
+**未提供 pos/neg 分布时**该块返回 `applicable=False` 并写明「需要输入、不臆造 τ」——
+**不是**再用「属后续范围」当挡箭牌。
+
+#### 20.4.2 现场开集场景（**同总体、同口径、样本量差异如实报**）
+
+| 项 | 现场值 |
+| --- | --- |
+| 训练侧问题 | 10284 |
+| 测试侧问题 | 2443 |
+| 键表 K（训练侧、抽掉正总体后） | **9227** |
+| 正总体（应识别，n） | **1057** |
+| 负总体（应拒识，n） | **2443** |
+| 正总体抽稀比例 | 10%（哈希 `posholdout\0seed\0question_id`） |
+
+- 键表内容 SHA256 = `858dcb404015f3a7d4d12b7343c7f4d359e7576fac2c330b3279498b1b52b3bc`。
+- **同总体口径**：正负两总体共用**同一**向量化器（`lexical-88`/role=question/dim=88/
+  fingerprint=`d4a4881aaa8dfa8c...`）、**同一**键表、**同一**批大小；唯一差别是
+  「是否在键表内」。**样本量不同**（1057 vs 2443）—— 如实报出，两侧 1/n 粒度分别给出。
+
+| 总体 | n | min | mean | max | p05 | p50 | p95 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `positive` | 1057 | 0.592479 | 0.854433 | 1.000000 | 0.697960 | 0.857185 | 0.998494 |
+| `negative` | 2443 | 0.576966 | 0.853624 | 1.000000 | 0.685946 | 0.855047 | 0.997934 |
+
+#### 20.4.3 标定结果与**边界归属**（B4-2）
+
+| 量 | 现场值 |
+| --- | --- |
+| **τ** | **0.8392274976** |
+| 平衡准确率 | 0.5121390213 |
+| recall（正总体被识别率） | 0.5723746452 |
+| specificity（负总体被拒识率） | 0.4519033975 |
+| 被识别正样本 / 被拒识负样本 | 605 / 1057 ； 1104 / 2443 |
+| **margin**（实测间隔） | **0.0001155138** |
+| **noise_floor** | **0.0001197755** |
+| **granularity_tau** | **0.0009683371** |
+| **threshold** = max(factor×floor, granularity) | **0.0009683371** |
+| **effective** | **False** |
+
+**边界归属（显式，`GUARD_BOUNDARY_RULE`）**：判据是
+**`margin > max(noise_floor, granularity)` —— 严格大于，等号归无效**。
+理由：`margin` **恰好等于**尺子分辨率时，该间隔完全可能只由**一个样本**造成
+（换一个样本就翻转），把等号判为「有效」等于把分辨率当成信号。
+
+**现场边界用例（`margin` 恰好等于 `threshold`，全部判无效）**：在
+`{k × 0.25}` 的确定性网格上扫描 **37** 组**可分**组合（`min(pos) > max(neg)`），
+**命中 6 组** `margin == threshold`（口径要求 **≥ 3 组**；现场 6 组，多于下限即有更充分证据）：
+
+| 用例 | pos | neg | τ | margin | threshold | `margin==threshold` | effective |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `exact_equality_01` | `[0.0, 0.25]` | `[-0.5, -0.25]` | -0.1250 | 0.2500 | 0.2500 | **True** | **False** |
+| `exact_equality_02` | `[0.25, 0.5]` | `[-0.25, 0.0]` | 0.1250 | 0.2500 | 0.2500 | **True** | **False** |
+| `exact_equality_03` | `[0.25, 0.75]` | `[-0.5, -0.25]` | 0.0000 | 0.5000 | 0.5000 | **True** | **False** |
+| `exact_equality_04` | `[0.5, 0.75]` | `[-0.5, 0.0]` | 0.2500 | 0.5000 | 0.5000 | **True** | **False** |
+| `exact_equality_05` | `[0.5, 0.75]` | `[0.0, 0.25]` | 0.3750 | 0.2500 | 0.2500 | **True** | **False** |
+| `exact_equality_06` | `[0.5, 1.0]` | `[-0.5, 0.0]` | 0.2500 | 0.5000 | 0.5000 | **True** | **False** |
+
+**严格性对照（证明判据不是恒假）**：取 `exact_equality_01`，把负总体整体降一档
+（`[-0.5,-0.25] → [-0.75,-0.5]`）⇒ `margin` 由 **0.25** 升到 **0.5**、`threshold` 仍
+**0.25** ⇒ `effective` 由 **False** 翻成 **True**（`strictness_proven = True`）。
+
+#### 20.4.4 噪声底与粒度：**同总体、同样本量、同口径**（B4-3）
+
+- **噪声底** = 把**同一批** pos/neg 各自按确定性**对半拆分**（排序后奇偶下标），在每个
+  半集上用**同一个**标定过程重算 τ，取最大偏差：
+
+| 半集 | n_pos | n_neg | τ_half | 与全量 τ 的偏差 |
+| --- | --- | --- | --- | --- |
+| 1 | 529 | 1222 | 0.8392086029 | 0.0000188947 |
+| 2 | 528 | 1221 | 0.8393472731 | **0.0001197755** |
+
+⇒ `noise_floor = 0.0001197755`（样本量**减半**，是小样本抖动的**保守**估计）。
+- **粒度**：`granularity_tau = 0.0009683371`（工作点两侧最近间隙的最大者，现场
+  `near_gaps = [0.0009683371, 0.0004912615]`）；比率空间
+  `1/n_pos = 0.0009460738`、`1/n_neg = 0.0004093328`。
+- **禁止跨总体复用**：`calibrate_tau` **强制**校验 `population.side` / `profile` /
+  `table_sha256` 三项齐备且 `pos_side == neg_side`，缺失或不一致**直接抛**
+  （不靠调用方口头保证）。
+
+#### 20.4.5 **诚实结论：本轮 τ 未达「有效」**
+
+`margin = 0.0001155138` **小于** `threshold = max(noise_floor, granularity) = 0.0009683371`
+（主因是**粒度** `0.0009683371` 比 margin 大 8.4 倍）⇒ `effective = False`。
+
+**倍数扫描（`factor_sweep`，离朱 R82 的 E-B4a 修复）** —— 把「换 factor 判定会不会翻」
+变成可核对的数，而不是只写一行公式：
+
+| factor | `factor × noise_floor` | `granularity_tau` | **threshold** | 主导项 | effective |
+| --- | --- | --- | --- | --- | --- |
+| 1.0 | 0.0001197755 | 0.0009683371 | **0.0009683371** | `granularity` | **False** |
+| **2.0**（默认） | 0.0002395511 | 0.0009683371 | **0.0009683371** | `granularity` | **False** |
+| 3.0 | 0.0003593266 | 0.0009683371 | **0.0009683371** | `granularity` | **False** |
+
+⇒ `verdict_stable = True`：factor 从 1 提到 3，`factor × noise_floor` 仍**小于**
+`granularity_tau`，**判定不翻**。这就是「factor=2.0 时 threshold 仍为 0.0009683371、
+effective 仍为 False」的现场数值证据。
+
+**这不是缺陷，是本轮如实报告的负结果**：在 `lexical-88` 题面自检索场景下，正负两总体的
+最高余弦分布**几乎完全重叠**（mean 0.8544 vs 0.8536、p05 0.6980 vs 0.6859），
+单靠一个全局 τ 无法把「未识别」与「已知」分开到超过观测分辨率。据此**不得**宣称
+「开集识别已可用」；该 τ 只能作为**参照值**，且必须随向量化器 / 键表变化重新标定。
+
+**同总体两率（`at_tau`，按 τ 现场算）**：负总体 2443 条中被误召回 **1339** 条
+（`false_recall_rate = 0.5480966025`）、未识别 **1104** 条
+（`unrecognized_rate = 0.4519033975`）；正总体 1057 条中被识别 **605** 条
+（`positive_recognized_rate = 0.5723746452`）。⇒ 两侧率都接近半数，进一步印证「分不开」。
+
+#### 20.4.6 B4 已**接线**到 robust 四件产物（离朱 R82 的 E-B4b 修复）
+
+修复前该档只在新产物（`open_set_tau*.json`）里，`robust_probe/run/calibration/report`
+**看不到任何 τ**（三件产物仍是 2026-10-06 的旧版）。修法：
+
+1. 新增 `robust_eval.open_set_score_inputs` / `open_set_tau_evidence`（进程级 memo，
+   键 = `(seed, holdout_pct)`；原始分数**不进产物**，只留标定结果与分布统计）；
+2. `RobustConfig` 新增 `open_set_tau`（默认 True）与 `open_set_holdout_pct`；
+3. `summarize_probe` 在 `open_set_tau=True` 时产出 `robust_probe.json.open_set_tau`；
+4. `run_evaluation` 在 QA 侧 `local-hash` 档追加一条
+   `unrecognized` 条目（`scope = "open_set_tau"`，含 `tau_reference` / `threshold` /
+   `applicable` / `rate_applicable` / `per_threshold` / `at_tau` / `unrecognized_tau`），
+   并在顶层 `unrecognized_tau` 记 `{profile: {tau, threshold, effective}}`；
+5. `cmd_robust_calibrate` 把 pos/neg 分布喂给 `calibrate_thresholds(unrecognized_scores=...)`
+   ⇒ `robust_calibration.json.unrecognized_tau` **applicable=True**；
+6. `render_markdown` 新增 **§4.1** 渲染该条目（此前它没有 `best_cosine`，会让渲染器
+   `KeyError` —— 现场踩到过并已修：按 `scope` 分开渲染）。
+
+**现场核验（四处逐项一致）**：
+
+| 产物 | 该档证据 | 现场值 |
+| --- | --- | --- |
+| `robust_probe.json` | `.open_set_tau.{applicable, calibration, factor_sweep, at_tau, scenario_sizes, population, score_stats, thresholds, vectorizer}` | `applicable=True`、`tau=0.8392274976`、`threshold=0.0009683371`、`effective=False` |
+| `robust_run.json` | `.unrecognized[]` 中 `scope="open_set_tau"` 一条 + 顶层 `.unrecognized_tau` | `tau_reference=0.8392274976`、`threshold=0.0009683371`、`applicable=True`、`rate_applicable=True`、`per_threshold={"open_set": 0.8392274976}` |
+| `robust_calibration.json` | `.unrecognized_tau` | `applicable=True`、`tau/threshold/effective` 同上 |
+| `robust_report.md` | **§4.1** 表 + 倍数扫描表 | 同上 + `verdict_stable=True` |
+
+**四件产物指纹（本轮改动后，旧 → 新）**：
+
+| 文件 | 旧值（2026-10-06） | 新值 | 原因 |
+| --- | --- | --- | --- |
+| `robust_probe.json` | 24515 B `3e8c5aefed85d1b0...` | **31368 B `0dbdd6a6678cda29...`** | 新增 `open_set_tau` 证据块 |
+| `robust_run.json` | 420416 B `4adb290e8e3fcea4...` | **429258 B `8ba92a4d7c6e1c90...`** | 新增 `open_set_tau` 未识别档条目 + 顶层 `unrecognized_tau` |
+| `robust_calibration.json` | 34312 B `ce7c6278da7124f2...` | **38310 B `61f42de1466c9492...`** | 新增 `unrecognized_tau` 块 |
+| `robust_report.json` | 456283 B `e39b74b6afb51731...` | **469058 B `885e37144ddbdb31...`** | 新增 §4.1 渲染 + 内嵌证据块 |
+| `robust_report.md` | 26262 B `b7929e5a8fb25dbc...` | **27582 B `3e9921cbe8c2dba6...`** | 新增 §4.1 与倍数扫描表 |
+| `open_set_tau.json` | 10625 B `3dee8d228aa4075f...` | **11630 B `e707cd57298e797c...`** | 新增 `factor_sweep` 块 |
+| `open_set_tau_report.json` | 10918 B `c442de67bd08583f...` | **11923 B `a1412b8fdccb72ee...`** | 新增 §2.3 倍数扫描节 |
+| `open_set_tau_report.md` | 6080 B `d3ff94b0cd52363a...` | **6930 B `52cea4d1e4d6c2ee...`** | 同上 |
+
+**robust 双跑取证（本轮现场重做，不是沿用旧日志）**：
+`robust run` 连跑两次（第二次写 `_det_b/`）⇒ `robust_run.json` 两次 **429258 B** /
+`8ba92a4d7c6e1c90...` **逐字节相同**；证据落 `robust_determinism_check.json`
+（`determinism_ok = True`、`n_common_files = 1`、`not_equal_files = []`）。
+旧的 `run_repro.log` 已替换为本次重跑的真实日志（原日志与当前产物不对应，不得沿用）。
+
+#### 20.4.7 产物
+
+`checkpoints/qa_learn/_verify/robust/`（**不落盘裸特征矩阵、不产 zip、无挂钟字段**）：
+此外还有 `open_set_tau.json`（11630 B `e707cd57...`）、`open_set_tau_report.{json,md}`、
+`robust_determinism_check.json`（904 B `2bb8c7a1...`）、
+`robust_{probe,run,calibration,report}.json` 四件（指纹见 20.4.6 表）与日志类派生件。
+
+#### 20.4.8 如实登记的局限
+
+> **D2 修正**：本节编号原误写为 `20.4.7`（与上节「产物」重号），现改为 `20.4.8`。
+> 全文 `#### 20.x.y` 标题编号的唯一性由脚本断言（见 §20.6 的编号唯一性校验记录）。
+
+1. 场景是**题面自检索**（键表 = 训练侧题面向量），**不是**「问题 -> 答案」闭环检索；
+   它只用来给「未识别」档标一个**可审计**的 τ，**不代表任务准确率**。
+2. 正/负两总体**样本量不同**（1057 vs 2443），1/n 粒度因此也不同（已分别给出）。
+3. 单 seed（42）；跨 seed / 跨抽稀比例**未测**。
+4. `τ` 只对本场景与本口径成立；换向量化器或键表必须**重新标定**
+   （`population.table_sha256` 变 ⇒ 禁止跨总体复用）。
+5. 噪声底用「对半拆分」近似；**未做** bootstrap 重采样（零新依赖约束下未引入）。
+
+### 20.5 轮 3 的两轮离朱复测与全部修复（R82 → R83 → R84）
+
+本轮共经历 **3 轮**离朱复测：R82（37 例，34 通过）→ R83（25 例，23 通过）→ 本轮修复后的确认轮。
+**缺陷全部为真缺陷，逐项修复如下。**
+
+#### 20.5.1 R82 报出的 3 项（已修，R83 逐项验收通过）
+
+| 编号 | 缺陷 | 修复 | R83 验收 |
+| --- | --- | --- | --- |
+| **E-B3a** | `feature_difference.evaluability` 是空对象，缺「可评估性」维度 | 新增 `evaluability` 子块 + `_evaluability_summary` 汇总 + 报告 §5.1 | 键集合 4 项、八字段齐备、现场值逐项命中 |
+| **E-B4a** | 报告只给 `threshold = max(factor×floor, granularity)` 公式，无 factor=2.0 的**数值** | 新增 `open_set_tau.factor_sweep`（factor∈{1,2,3}）+ 产物块 + 报告 §2.3 | 三行逐位命中、`verdict_stable=True`、合成输入自检证明非硬编码 |
+| **E-B4b** | B4 接线未落到 robust 四件产物（仍是 2026-10-06 旧版） | 见 20.4.6（probe / run / calibrate / report 四路接入） | 四处 τ/threshold **逐位一致**、报告 §4.1 到位 |
+
+#### 20.5.2 R83 报出的 3 项
+
+**E-B3b（一般，自洽性 —— 已修，**这是本轮的真逻辑错误**）**
+缺陷：`摘要` 支 `n_evaluable = 396`、`n_not_evaluable = 4`，但 `n_evaluable_expected = **400**`
+⇒ `evaluable_consistent = False`，与汇总 `all_non_anchor_consistent = True` 及本文档的
+「396/4 为期望值」**自相矛盾**。成因：期望值写成了 `n`，没扣掉 4 条与原文逐字节相同
+（生成器回退）的条数。
+
+修法（**注意这里有一个「恒真陷阱」**）：
+- ❌ 写成 `expected = n - n_text_identical` ⇒ 与 `n_evaluable` 的定义式**恒等** ⇒ **恒真断言**，不可取；
+- ✅ 取 `expected = n - fallback_to_original` —— 期望值来自**生成器自报的计数**
+  （`generator_counters[*].fallback_to_original`），而 `n_evaluable` 来自**文本比对**
+  ⇒ 两个**不同来源**才构成真正互证；
+- 新增字段 `n_evaluable_expected_source`（`anchor_definition` /
+  `generator_counters.fallback_to_original`），把来源显式写进产物。
+
+现场（n=400，全部 `evaluable_consistent = True`）：
+
+| 变体 | is_anchor | `n_evaluable` | `n_evaluable_expected` | 期望值来源 | `evaluable_consistent` |
+| --- | --- | --- | --- | --- | --- |
+| `原文` | True | 0 | 0 | `anchor_definition` | **True** |
+| `关键词` | False | 400 | 400 | `generator_counters.fallback_to_original` | **True** |
+| `摘要` | False | **396** | **396** | 同上 | **True** |
+| `自适应` | False | 400 | 400 | 同上 | **True** |
+
+**E-R1（一般，改动面/声明 —— **我方测试说明的前提有误，已登记澄清**）**
+缺陷（离朱观察）：`robust_run.json` 的 `cells` 由轮 2 记录的 **4 格**变为 **114 格**，
+与我方说明的「cells 结构与轮 2 不变」不符。
+**核实结论：这是说明书的错误前提，不是代码缺陷。** 轮 2 记录的那份 robust 产物是
+**2026-10-06 的陈旧版本**（早于此后数轮代码变更），本轮才是**首次按当前代码重跑**。
+现场 114 格的构成**完全可用 `grid` 推出、且结构自洽**：
+
+| 角色 | 格数 | 构成 |
+| --- | --- | --- |
+| `main` | **40** | 2 侧 × 2 编码器档 × （1 clean + 3 扰动 × 3 档）= 2×2×10 |
+| `noise_floor` | **54** | 2 编码器档 × 3 扰动 × 3 档 × **3 变体（两次独立随机绘制所需）** |
+| `qa_known` | **20** | 2 编码器档 × （1 clean + 3 扰动 × 3 档）= 2×10 |
+| **合计** | **114** | |
+
+且现场 24 条检查**全部通过**（`invariants.all_passed = true`）、`stability` 36 条、
+`robust run` **双跑逐字节相同**（429258 B `8ba92a4d...`）⇒ 114 是**当前代码的确定性输出**。
+**登记为**：轮 2 的 robust 产物陈旧（不得作为对照基线），本轮起以 114 格为准。
+
+**E-R2（一般，改动面声明不符 —— **我方说明书写错，已更正**）**
+缺陷（离朱观察）：`step2_run.py` 的 mtime 在本轮窗口内、且含本轮新增符号
+`open_set_score_inputs`，与我方说明的「step2_run.py 本轮无改动」不符。
+**核实结论：说明书写错。** `step2_run.py` 的 `cmd_robust_calibrate` 确实被本轮的
+E-B4b 修复改动（把 pos/neg 分布喂给 `calibrate_thresholds`）。
+
+**改动面（唯一口径，见 §20.6 的完整逐项表与 `git status` 实测）**：本轮**新增 4 个文件**
+（`qa_variants.py` / `qa_variants_run.py` / `open_set_tau.py` / `open_set_tau_run.py`）
++ **修改 5 个文件**（`qa_scale_run.py` / `robust_eval.py` / `step2_run.py` /
+`__init__.py` / `README.md`）= **共 9 个文件**。逐文件改动内容：
+
+| 文件 | 本轮改动 |
+| --- | --- |
+| `qa_variants.py` | 新增 `evaluability` 子块（E-B3a、E-B3b） |
+| `qa_variants_run.py` | `fallback_count` 接线、`_evaluability_summary`、报告 §5.1（E-B3a/E-B3b） |
+| `open_set_tau.py` | 新增 `factor_sweep`（E-B4a） |
+| `open_set_tau_run.py` | `factor_sweep` 落产物 + 报告 §2.3（E-B4a） |
+| `qa_scale_run.py` | P2：`render_markdown` 新增报告 §4.2 / §4.3 / §4.4 |
+| `robust_eval.py` | `open_set_score_inputs` / `open_set_tau_evidence` / `RobustConfig` 两字段 / probe·run·report 三路接入 / §4.1 渲染（E-B4b） |
+| **`step2_run.py`** | **`cmd_robust_calibrate` 喂 `unrecognized_scores`（E-B4b）** |
+| `__init__.py` | 登记 4 个新模块（I1） |
+| `README.md` | §18.13 (P1) / §19.8 (P2) / 第二十节（本轮全部） |
+
+> **`qa_scale_run.py` 在 `git status` 里显示为「未跟踪」而不是「修改」** —— 它是
+> **轮 1** 新建、至今未提交的文件；本轮对它做过 P2 改动，但仓库级快照只能把它归入
+> `??`。「未跟踪」是**提交状态**、不是「本轮没动过」。完整对齐见 §20.6。
+
+#### 20.5.3 本轮修复后的产物指纹（B3 侧更新；robust 侧见 20.4.6）
+
+| 文件 | 字节 | SHA256（前 16） |
+| --- | --- | --- |
+| `qa_variants_probe.json` | 9405 | `e36b55e4cc23ec1f` |
+| `qa_variants_eval.json` | **27863** | **`ed889854101c35d4`** |
+| `qa_variants_records.jsonl` | 711083 | `e53f0432f5bb2088` |
+| `keyword_vocab.json` | 1316 | `c5f299da333b7bd0` |
+| `determinism_check.json` | 2415 | `15109dc6c1f475e1` |
+| `qa_variants_report.json` | **41476** | **`b3f9e9e100b43e08`** |
+| `qa_variants_report.md` | **8109** | **`d621888e864f0e3a`** |
+
+#### 20.5.4 复测收敛与**执行环境的一处硬限制（如实登记）**
+
+离朱共复测 **3 轮**：R82（37 例 → 34 通过）→ R83（25 例 → 23 通过）→
+**R84（24 例 → 24 通过 / 0 失败）**；E-B3b / E-R1 / E-R2 均已闭环，R83 已验收三项**无回退**。
+
+**环境受限（离朱如实登记为「未执行」，不计为通过）**：`qa_variants_run eval` 的
+cp936 现场校验在离朱的**嵌套子进程**下无法完成 —— 子进程停滞（PID 存活、CPU 停在
+约 0.1 s、无产物落盘），这与本节 20.3.2 登记的「后台/嵌套执行会使子进程停滞」是
+**同一现象**。离朱已终止该子进程并改用 `probe` / `report` 两条路径验编码。
+
+**主会话补验（本条由力牧现场执行并如实粘贴结果）**：在主会话直接以
+`subprocess` 方式跑 `qa_variants_run eval --limit-questions 5`，结果
+`exit = 0`、`stdout = 633 bytes`、**`gbk_decodable = True`**、
+**`has_replacement_char = False`**，末行 `[eval] qa_variants_eval.json = 27648 B cca0dcdf9a463462`；
+该演练产物写在 `_verify/qa_variants/_enc_check/` 且**已删除**（不污染交付目录）。
+⇒ `eval` 路径的 cp936 编码在主会话**已现场证明**；离朱侧的限制仍如实保留登记，
+**不**把「离朱没验到」包装成「已验证」。
+
+### 20.6 本轮零回归与纪律
+
+- 上游四目录 `git status --porcelain -- n3d_qa n3d_shape n3d_sphere n3d_proto` **为空**；
+- `checkpoints/qa_learn/` 顶层 **9** 个 `qa_*.pt.zip`、`step2/` **9** 件、
+  `_verify/text_variants/` **12** 件、`dataset/` **17** 件：SHA256 + 字节**逐项不变**
+  （**B3 未改动文本侧任何既有产物**）；
+- 根 `requirements.txt` **未改**；零新增依赖（`keybert` / `jieba` 早在
+  `n3d_qa_learn/requirements-qa.txt` 中声明，本轮只复用）；
+- `python -m compileall -q n3d_qa_learn` 退码 **0**；
+- 单 seed（42）；B3 与 B4 的**双跑 / 重渲证据**见 §20.3.5（工作序与证据口径）与
+  §20.4.6（robust 侧双跑取证）；**产物指纹终值**见 §20.5.3（B3 侧）与 §20.4.6 / §20.4.7
+  （robust 侧）；
+- **本轮新增断言均带反例**：B3 = 四个切分反例（含暴露真缺陷的 `drop_one_row`）；
+  B4 = 6 条等号边界用例 + 1 条严格性对照；
+
+#### 20.6.1 改动面（**唯一口径**，与 §20.5.2 逐项对齐）
+
+**本轮（轮 3）实际动过的文件 = 9 个**：**新增 4 + 修改 5**。该数字是全篇**唯一**的改动面口径，
+§20.5.2 的逐文件表与本节逐项一致。
+
+| 类别 | 数量 | 清单 |
+| --- | --- | --- |
+| **新增** | **4** | `qa_variants.py` / `qa_variants_run.py` / `open_set_tau.py` / `open_set_tau_run.py` |
+| **修改** | **5** | `qa_scale_run.py`(P2) / `robust_eval.py`(B4 接线) / `step2_run.py`(B4 接线) / `__init__.py`(I1) / `README.md`(P1+P2+第二十节) |
+| **合计** | **9** | |
+
+**仓库级 `git status --porcelain -- n3d_qa_learn` 现场快照（跨轮累计未提交）**：
+
+```
+ M n3d_qa_learn/README.md
+ M n3d_qa_learn/__init__.py
+ M n3d_qa_learn/robust_eval.py
+ M n3d_qa_learn/step2_run.py
+?? n3d_qa_learn/merge_table.py
+?? n3d_qa_learn/merge_table_run.py
+?? n3d_qa_learn/open_set_tau.py
+?? n3d_qa_learn/open_set_tau_run.py
+?? n3d_qa_learn/qa_scale.py
+?? n3d_qa_learn/qa_scale_run.py
+?? n3d_qa_learn/qa_variants.py
+?? n3d_qa_learn/qa_variants_run.py
+```
+
+⇒ 仓库级快照是 **修改 4 + 未跟踪 8**。**与上面的「本轮 9 个」如何对齐（必须写清）**：
+
+| 文件 | 本轮动过？ | git 状态 | 说明 |
+| --- | --- | --- | --- |
+| `README.md` / `__init__.py` / `robust_eval.py` / `step2_run.py` | 是 | ` M` | 已跟踪文件，改动直接体现为 M |
+| `qa_variants.py` / `qa_variants_run.py` / `open_set_tau.py` / `open_set_tau_run.py` | 是（本轮新建） | `??` | 本轮新建 ⇒ 未跟踪 |
+| `qa_scale_run.py` | 是（P2） | `??` | **轮 1 新建、至今未提交** ⇒ 仓库级只能归入未跟踪 |
+| `qa_scale.py` / `merge_table.py` / `merge_table_run.py` | **否** | `??` | 分别建于轮 1 / 轮 C，**本轮未动** |
+
+**结论（口径唯一）**：`git status` 的 `??` 表示**提交状态**，不是「本轮没动过」——
+`qa_scale_run.py` 属此类。凡「本轮改动面」一律以 **新增 4 + 修改 5 = 9** 为准；
+凡「零代码改动」一律以**本轮仅改 `README.md`** 为准（第 4 轮即如此）。
+
+#### 20.6.2 编号唯一性校验（脚本断言，防再犯）
+
+D2 修正前 `#### 20.4.7` 出现两次（「产物」与「如实登记的局限」），后者已改为 `20.4.8`。
+下表是**本节的现场枚举断言结果**（脚本：对全篇 `#### 20.x.y` 标题做正则枚举并断言全局唯一）：
+
+<!-- HEADING_UNIQUENESS_ENUM:BEGIN -->
+**现场枚举结果**：全篇 `#### 20.x.y` 标题共 **19** 个，编号去重后 **19** 个，
+**重复项 = 空** ⇒ 「编号全局唯一」断言**通过**。
+
+| 编号 | 标题 |
+| --- | --- |
+| `20.3.1` | **绑定输出 = 答案，不是问题原文**（B3-2） |
+| `20.3.2` | 口径衔接与**如实登记的执行范围** |
+| `20.3.3` | 整组切分：三条不变量 + **四个反例**（B3-3） |
+| `20.3.4` | 变体后**特征确实变化**（B3-4） |
+| `20.3.5` | 产物与确定性（指纹指向 §20.5.3） |
+| `20.4.1` | 1a 遗留已实现，四处声明已同步订正（B4-1） |
+| `20.4.2` | 现场开集场景（**同总体、同口径、样本量差异如实报**） |
+| `20.4.3` | 标定结果与**边界归属**（B4-2） |
+| `20.4.4` | 噪声底与粒度：**同总体、同样本量、同口径**（B4-3） |
+| `20.4.5` | **诚实结论：本轮 τ 未达「有效」** |
+| `20.4.6` | B4 已**接线**到 robust 四件产物（离朱 R82 的 E-B4b 修复） |
+| `20.4.7` | 产物 |
+| `20.4.8` | 如实登记的局限（**D2 由 20.4.7 改此**） |
+| `20.5.1` | R82 报出的 3 项（已修，R83 逐项验收通过） |
+| `20.5.2` | R83 报出的 3 项 |
+| `20.5.3` | 本轮修复后的产物指纹（B3 侧更新；robust 侧见 20.4.6） |
+| `20.5.4` | 复测收敛与**执行环境的一处硬限制（如实登记）** |
+| `20.6.1` | 改动面（**唯一口径**，与 §20.5.2 逐项对齐） |
+| `20.6.2` | 编号唯一性校验（脚本断言，防再犯） |
+
+断言脚本（现场执行，可复算）：
+
+```python
+import io, re, collections
+lines = io.open('n3d_qa_learn/README.md', encoding='utf-8').read().splitlines()
+hs = [m.group(1) for m in
+      (re.match(r'^####\s+(20\.\d+\.\d+)\s', l) for l in lines) if m]
+cnt = collections.Counter(hs)
+assert [k for k, v in cnt.items() if v > 1] == [], '标题编号重复'
+```
+
+<!-- HEADING_UNIQUENESS_ENUM:END -->
+
+
 

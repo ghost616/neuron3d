@@ -27,7 +27,9 @@
 * **两侧分开报告**：文本侧 666 条查询为主判据依据；QA 侧 20 条为辅助并**显式标注
   统计意义弱**。
 * **「未识别」档**：以 ``train_unknown`` + ``test_unknown`` 作负样本，报未识别率与
-  误召回率；**不标定阈值**（阈值标定属第二步变体 B 的范围）。
+  误召回率；**该档的 τ 标定已实现**（轮 3 补齐 1a 遗留）—— 见
+  :func:`calibrate_thresholds` 的 ``unrecognized_tau`` 块，标定核心在
+  ``n3d_qa_learn.open_set_tau.calibrate_tau``。
 * **阈值现场标定**（两阶段）：先跑一次得实测落差，再按「观测噪声的约 2 倍」标定并
   回填报告；落差 ≤ 噪声水平 ⇒ 判定该扰动对本数据**无效**并如实登记。
 
@@ -822,7 +824,8 @@ def unrecognized_report(
     * ``τ`` 由现场标定给出（``thresholds`` 里按 key 取）；**未给 τ 时**
       ``未识别率`` / ``误召回率`` 如实标 ``applicable=False``（不臆造阈值）；
     * 另报**不依赖 τ** 的分位数与均值（τ 未标定时仍可读）；
-    * **不标定阈值**（本函数只读标定结果，标定属 :func:`calibrate_thresholds`）。
+    * **本函数只读标定结果**，不自己标定（标定入口 = :func:`calibrate_thresholds` 的
+      ``unrecognized_tau`` 块 / ``n3d_qa_learn.open_set_tau.calibrate_tau``）。
     """
     unknown = torch.from_numpy(np.ascontiguousarray(np.asarray(unknown_feats, dtype=np.float32)))
     m = int(unknown.shape[0])
@@ -845,8 +848,9 @@ def unrecognized_report(
             },
         },
         "threshold_standard": (
-            "未识别 ⇔ 最高余弦 < τ；误召回 ⇔ 最高余弦 >= τ。本档**不标定**阈值"
-            "（阈值标定属第二步变体 B 的范围），τ 由 calibrate 现场给出。"
+            "未识别 ⇔ 最高余弦 < τ；误召回 ⇔ 最高余弦 >= τ。本档的 τ **已实现标定**"
+            "（轮 3 补齐 1a 遗留）：见 :func:`calibrate_thresholds` 的 `unrecognized_tau` 块，"
+            "标定核心 = `n3d_qa_learn.open_set_tau.calibrate_tau`；本函数只消费其结果。"
         ),
     }
     tau_map = dict(thresholds or {})
@@ -1514,11 +1518,153 @@ def _granularity_boundary_evidence(
     }
 
 
+def open_set_score_inputs(
+    *, seed: int = ROBUST_SEED, holdout_pct: int = 20
+) -> Dict[str, Any]:
+    """开集标定的**原始输入**：``{positive, negative, population, sizes, vectorizer}``。
+
+    只给 ``calibrate_thresholds(unrecognized_scores=...)`` 用；**不写进任何产物**
+    （产物只保留标定结果与分布统计，见 :func:`open_set_tau_evidence`，避免 3500 个浮点
+    把 ``robust_run.json`` 撑大）。
+    """
+    key = (int(seed), int(holdout_pct))
+    cached = _OPEN_SET_INPUTS.get(key)
+    if cached is not None:
+        return cached
+    from . import open_set_tau_run as OTR
+
+    scenario = OTR.build_scenario(seed=int(seed), holdout_pct=int(holdout_pct))
+    out = {
+        "positive": list(scenario["positive"]),
+        "negative": list(scenario["negative"]),
+        "population": dict(scenario["population"]),
+        "sizes": dict(scenario["sizes"]),
+        "vectorizer": dict(scenario["vectorizer"]),
+        "score_stats": dict(scenario["score_stats"]),
+    }
+    _OPEN_SET_INPUTS[key] = out
+    return out
+
+
+def open_set_tau_evidence(
+    *, seed: int = ROBUST_SEED, holdout_pct: int = 20
+) -> Dict[str, Any]:
+    """**开集「未识别」档的 τ 现场标定 + 该档两率**（轮 3 · B4 接线，离朱 R82 E-B4b）。
+
+    为什么单独一个函数：``run_evaluation`` 与 ``cmd_robust_calibrate`` 都要用它，
+    且必须**只算一次**（现场 12727 题的向量化不便宜）。进程级 memo，键 =
+    ``(seed, holdout_pct)``。
+
+    **同总体纪律（B4-3）**：``unrecognized_rate`` / ``false_recall_rate`` 必须由
+    **与标定同一批负样本**算出（即 ``scenario.negative``），**不得**拿另一批查询
+    （如 QA 侧的 2893 条 unknown）套用本 τ —— 那正是历史缺陷。
+    """
+    key = (int(seed), int(holdout_pct))
+    cached = _OPEN_SET_CACHE.get(key)
+    if cached is not None:
+        return cached
+    from . import open_set_tau as OT
+    from . import open_set_tau_run as OTR
+
+    scenario = OTR.build_scenario(seed=int(seed), holdout_pct=int(holdout_pct))
+    cal = OT.calibrate_tau(
+        scenario["positive"], scenario["negative"],
+        population=scenario["population"], factor=1.0,
+    )
+    sweep = OT.factor_sweep(
+        scenario["positive"], scenario["negative"],
+        population=scenario["population"], factors=(1.0, float(THRESHOLD_FACTOR), 3.0),
+    )
+    out: Dict[str, Any] = {
+        "applicable": bool(cal.get("applicable")),
+        "calibration": cal,
+        "factor_sweep": sweep,
+        "scenario_sizes": dict(scenario["sizes"]),
+        "population": dict(scenario["population"]),
+        "score_stats": dict(scenario["score_stats"]),
+        "vectorizer": dict(scenario["vectorizer"]),
+        "thresholds": {},
+        "rule": (
+            "两率与 τ **同总体**：unrecognized_rate / false_recall_rate 由标定的"
+            "**同一批**负样本算出（`scenario.negative`，n 见 scenario_sizes）；"
+            "**不得**把本 τ 套到另一批查询上（禁止跨总体复用）。"
+        ),
+    }
+    if bool(cal.get("applicable")):
+        tau = float(cal["tau"])
+        neg = np.asarray(scenario["negative"], dtype=np.float64)
+        pos = np.asarray(scenario["positive"], dtype=np.float64)
+        recall = int((neg >= tau).sum())
+        out["thresholds"] = {"open_set": tau}
+        out["at_tau"] = {
+            "tau": float(tau),
+            "n_negative": int(neg.size),
+            "n_positive": int(pos.size),
+            "n_false_recall_negative": int(recall),
+            "unrecognized_rate_negative": float((neg.size - recall) / max(1, neg.size)),
+            "false_recall_rate_negative": float(recall / max(1, neg.size)),
+            "n_positive_recognized": int((pos >= tau).sum()),
+            "positive_recognized_rate": float(
+                (pos >= tau).sum() / max(1, pos.size)
+            ),
+        }
+    _OPEN_SET_CACHE[key] = out
+    return out
+
+
+#: 进程级 memo（键 = ``(seed, holdout_pct)``）。
+_OPEN_SET_CACHE: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+#: 进程级 memo：**原始分数输入**（仅给 calibrate 用，不进产物）。
+_OPEN_SET_INPUTS: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+
+def _unrecognized_tau_block(
+    unrecognized_scores: Optional[Dict[str, Any]], *, factor: float = 1.0
+) -> Dict[str, Any]:
+    """**开集「未识别」档的 τ 标定块**（轮 3 · B4-1 实现，1a 遗留项已补齐）。
+
+    输入结构（``unrecognized_scores``）
+    -----------------------------------
+    ``{"positive": [...], "negative": [...], "population": {"side": ..., "profile": ...,
+    "table_sha256": ...}}`` —— 正总体 = 已知问题的最高余弦（应被识别），
+    负总体 = 未知问题的最高余弦（应被拒识）。
+
+    返回
+    ----
+    Dict[str, Any]
+        :func:`n3d_qa_learn.open_set_tau.calibrate_tau` 的完整结果；未提供输入时返回
+        ``applicable=False`` + 可读理由（**不臆造 τ**）。
+    """
+    from . import open_set_tau as OT
+
+    if not unrecognized_scores:
+        return {
+            "applicable": False,
+            "reason": (
+                "未提供开集标定所需的 pos/neg 最高余弦分布（`unrecognized_scores`）；"
+                "本档**已实现**（见 `n3d_qa_learn.open_set_tau.calibrate_tau`），"
+                "不能凭单一侧的分位数臆造 τ。"
+            ),
+            "boundary_rule": str(OT.GUARD_BOUNDARY_RULE),
+            "noise_floor_rule": str(OT.NOISE_FLOOR_RULE),
+            "granularity_rule": str(OT.GRANULARITY_RULE),
+            "implementation": "n3d_qa_learn.open_set_tau.calibrate_tau",
+        }
+    return OT.calibrate_tau(
+        list(unrecognized_scores.get("positive", [])),
+        list(unrecognized_scores.get("negative", [])),
+        population=dict(unrecognized_scores.get("population", {})),
+        factor=float(factor),
+    )
+
+
 def calibrate_thresholds(
     run_result: Dict[str, Any],
     *,
     factor: float = THRESHOLD_FACTOR,
     primary_side: str = "text",
+    unrecognized_scores: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """两阶段阈值标定的**第二阶段**：由实测落差 + 噪声底现场标定阈值。
 
@@ -1737,6 +1883,11 @@ def calibrate_thresholds(
         ),
         "entries": entries,
         "primary_entries": primary,
+        # **轮 3 · B4-1：开集「未识别」档的 τ 标定（补齐 1a 遗留）**。
+        # 传入 `unrecognized_scores` 时，本块给出该档的 τ + 噪声底 + 粒度 + 守卫判定；
+        # 未传时标 `applicable=False` 并写明「需要 pos/neg 的最高余弦分布」
+        # （**不臆造阈值**，也不再把"属后续范围"当挡箭牌 —— 该档已实现，只是需要输入）。
+        "unrecognized_tau": _unrecognized_tau_block(unrecognized_scores, factor=factor),
         "n_effective": int(sum(1 for e in primary if e["effective"])),
         "n_entries_primary": int(len(primary)),
         "n_below_granularity_primary": int(
@@ -1830,6 +1981,11 @@ class RobustConfig:
     topk: int = TOPK
     batch_size: int = BATCH_SIZE
     out_dir: str = ""
+    #: **轮 3 · B4 接线**：是否在 run 阶段现场标定开集「未识别」档的 τ。
+    #: ``False`` 时该条目缺席（如实登记在 honest_notes 里）。
+    open_set_tau: bool = True
+    #: 开集场景的正总体抽稀比例（百分比；与 ``qa_scale`` 的留出比例**不同**概念）。
+    open_set_holdout_pct: int = 20
 
     def __post_init__(self) -> None:
         """构造期不变量（非法配置立即报错，不静默回落）。"""
@@ -1997,6 +2153,79 @@ def run_evaluation(cfg: RobustConfig, *, log: Any = None) -> Dict[str, Any]:
                     ),
                 }
             )
+            # **E-B4b 修复（离朱 R82）**：把开集 τ 的**现场标定 + 同总体两率**接进
+            # run 产物 —— 只在本侧的一个档上做（向量化成本），并在条目里显式标 profile，
+            # 使「τ 属于哪个键表 / 哪个向量化器」可被机器核对（禁止跨总体复用）。
+            if bool(getattr(cfg, "open_set_tau", True)) and str(profile) == str(
+                ET.PROFILE_LEXICAL
+            ):
+                try:
+                    ev = open_set_tau_evidence(
+                        seed=int(cfg.seed),
+                        holdout_pct=int(getattr(cfg, "open_set_holdout_pct", 20)),
+                    )
+                except Exception as exc:  # 如实登记，不静默跳过
+                    result["honest_notes"].append(
+                        "开集 τ 标定现场失败（"
+                        + type(exc).__name__ + ": " + str(exc)
+                        + "）；本产物**不含** unrecognized_tau 证据"
+                    )
+                    _log("[run] 开集 τ 标定失败：" + type(exc).__name__ + ": " + str(exc))
+                else:
+                    result["unrecognized"].append(
+                        {
+                            "side": "qa",
+                            "profile": str(profile),
+                            "scope": "open_set_tau",
+                            "report": {
+                                "threshold_standard": (
+                                    "未识别 ⇔ 最高余弦 < τ；误召回 ⇔ 最高余弦 >= τ。"
+                                    "本条目 = 开集 τ 的现场标定 + **同总体**两率。"
+                                ),
+                                "unrecognized_tau": ev,
+                                "per_threshold": dict(ev.get("thresholds", {})),
+                                "applicable": bool(ev.get("applicable")),
+                                "rate_applicable": bool(ev.get("applicable")),
+                                "tau_reference": (
+                                    None
+                                    if not ev.get("applicable")
+                                    else float(ev["calibration"]["tau"])
+                                ),
+                                "threshold": (
+                                    None
+                                    if not ev.get("applicable")
+                                    else float(ev["calibration"]["threshold"])
+                                ),
+                                "effective": (
+                                    None
+                                    if not ev.get("applicable")
+                                    else bool(ev["calibration"]["effective"])
+                                ),
+                                "at_tau": dict(ev.get("at_tau", {})),
+                                "rate_note": (
+                                    "两率与 τ 同总体（scenario.negative）；"
+                                    "禁止把本 τ 套到另一批查询上"
+                                ),
+                            },
+                        }
+                    )
+                    try:
+                        result.setdefault("unrecognized_tau", {})[str(profile)] = {
+                            "tau": (
+                                None if not ev.get("applicable")
+                                else float(ev["calibration"]["tau"])
+                            ),
+                            "threshold": (
+                                None if not ev.get("applicable")
+                                else float(ev["calibration"]["threshold"])
+                            ),
+                            "effective": (
+                                None if not ev.get("applicable")
+                                else bool(ev["calibration"]["effective"])
+                            ),
+                        }
+                    except Exception:  # pragma: no cover - 结构兜底
+                        pass
 
     # ---- 稳定性佐证（K 个**真实不同**的变体：均值 ± 极差）----
     result["stability"] = _stability_cells(cfg, log=_log)
@@ -2060,7 +2289,9 @@ def _honest_notes(result: Dict[str, Any]) -> List[str]:
             "该环境缺 `transformers` 时对应档如实登记为不可用（不静默跳过）。"
         )
     notes.append(
-        "「未识别」档的 τ **本批不标定**（属第二步变体 B 的范围）；报告只给不依赖 τ 的"
+        "「未识别」档的 τ **已实现标定**（轮 3 补齐 1a 遗留）：见 `calibrate_thresholds` 的"
+        "`unrecognized_tau` 块（核心 = `n3d_qa_learn.open_set_tau.calibrate_tau`，"
+        "含噪声底 / 粒度 / 严格大于的边界归属）；本产物此处另给不依赖 τ 的"
         "最高余弦分位数。"
     )
     notes.append(
@@ -2668,8 +2899,14 @@ def render_markdown(
     lines.append("")
     lines.append("| 侧 | 编码器档 | 负样本数 | 最高余弦均值 | 中位数 | 90% 分位 | 99% 分位 | 未识别率 | 误召回率 |")
     lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    # **E-B4b 修复（离朱 R82）**：``unrecognized`` 里现在有两类条目 ——
+    # ① ``scope == "clean"``：不依赖 τ 的分位数视图（本表）；② ``scope == "open_set_tau"``：
+    # 开集 τ 的标定 + **同总体**两率（下一张表）。两类结构不同，必须分开渲染，
+    # 否则 ② 没有 ``best_cosine`` 会让渲染器 KeyError（现场踩到过）。
     for u in run_result.get("unrecognized", []):
         rep = u["report"]
+        if str(u.get("scope", "clean")) != "clean" or "best_cosine" not in rep:
+            continue
         q = rep["best_cosine"]["quantiles"]
         ur = rep.get("unrecognized_rate")
         fr = rep.get("false_recall_rate")
@@ -2681,7 +2918,58 @@ def render_markdown(
             f"{'—' if fr is None else f'{fr:.6f}'} |"
         )
     lines.append("")
-    lines.append("> **本档不标定阈值**（阈值标定属第二步变体 B 的范围）；"
+    lines.append("### 4.1 开集 τ 的**现场标定**与**同总体**两率（`scope == open_set_tau`）")
+    lines.append("")
+    open_set_entries = [
+        u for u in run_result.get("unrecognized", [])
+        if str(u.get("scope", "")) == "open_set_tau"
+    ]
+    if open_set_entries:
+        lines.append("| 侧 | 编码器档 | τ | threshold | noise_floor | granularity | margin | effective | 负样本 n | 未识别率（同总体） | 误召回率（同总体） |")
+        lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |")
+        for u in open_set_entries:
+            rep = u["report"]
+            ev = rep.get("unrecognized_tau", {})
+            cal = ev.get("calibration", {})
+            at = rep.get("at_tau", {})
+
+            def _fmt(value: Any) -> str:
+                return "—" if value is None else f"{float(value):.10f}"
+
+            lines.append(
+                f"| {SIDE_LABELS.get(u['side'], u['side'])} | `{u['profile']}` | "
+                f"{_fmt(rep.get('tau_reference'))} | {_fmt(rep.get('threshold'))} | "
+                f"{_fmt(cal.get('noise_floor'))} | {_fmt(cal.get('granularity_tau'))} | "
+                f"{_fmt(cal.get('margin'))} | **{rep.get('effective')}** | "
+                f"{at.get('n_negative', '—')} | "
+                f"{_fmt(at.get('unrecognized_rate_negative'))} | "
+                f"{_fmt(at.get('false_recall_rate_negative'))} |"
+            )
+        lines.append("")
+        lines.append("| factor | `factor × noise_floor` | `granularity_tau` | threshold | 主导项 | effective |")
+        lines.append("| --- | ---: | ---: | ---: | --- | --- |")
+        sweep = (open_set_entries[0]["report"].get("unrecognized_tau") or {}).get(
+            "factor_sweep", {}
+        )
+        for row in sweep.get("rows", []):
+            if row.get("threshold") is None:
+                continue
+            lines.append(
+                f"| {float(row['factor']):.1f} | {float(row['noise_floor_term']):.10f} | "
+                f"{float(row['granularity_term']):.10f} | "
+                f"**{float(row['threshold']):.10f}** | `{row['binding_term']}` | "
+                f"**{row['effective']}** |"
+            )
+        lines.append("")
+        lines.append("- 判定不随 factor 变化：**" + str(sweep.get("verdict_stable")) + "**")
+        lines.append("- " + str(open_set_entries[0]["report"].get("rate_note", "")))
+    else:
+        lines.append("- 本产物**不含** `open_set_tau` 条目（`RobustConfig.open_set_tau=False` 或"
+                     "现场标定失败 —— 失败原因见 `honest_notes`）。")
+    lines.append("")
+    lines.append("> **本档的 τ 已实现标定**（轮 3 补齐 1a 遗留）：见 `calibrate` 产物的 "
+                 "`unrecognized_tau` 块（核心 = `n3d_qa_learn.open_set_tau.calibrate_tau`，"
+                 "含噪声底 / 粒度 / **严格大于**的边界归属）；"
                  "τ 未给定时未识别率 / 误召回率如实标「不依赖 τ 的分位数可读」。")
     lines.append("")
     lines.append("## 5. 稳定性佐证（K 变体：均值 ± 极差）")
@@ -2878,6 +3166,20 @@ def summarize_probe(
         "not_applicable": [TIER_ALT_QUESTION],
         "not_applicable_reason": TIER_ALT_QUESTION_NOTE,
     }
+    # **E-B4b 修复（离朱 R82）**：probe 也带上开集「未识别」档的 τ 现场标定证据 ——
+    # 使 probe / run / calibrate / report 四件产物**都有**该档的 τ 与判定，
+    # 不再出现「改动只落在新产物里、robust 三件产物看不到」的情形。
+    if bool(getattr(cfg, "open_set_tau", True)):
+        try:
+            out["open_set_tau"] = open_set_tau_evidence(
+                seed=int(cfg.seed),
+                holdout_pct=int(getattr(cfg, "open_set_holdout_pct", 20)),
+            )
+        except Exception as exc:  # 如实登记，不静默跳过
+            out.setdefault("probe_errors", []).append(
+                "开集 τ 标定现场失败（" + type(exc).__name__ + ": " + str(exc) + "）"
+            )
+            _log("[probe] 开集 τ 标定失败：" + type(exc).__name__ + ": " + str(exc))
     # [!] 耗时**不进产物**（只进日志）：见函数 docstring 的确定性说明。
     _log(f"[probe] 取证完成（耗时 {time.time() - t0:.1f}s，该耗时只进日志不入产物）")
     return out
