@@ -37,12 +37,26 @@ paraphrase（换词换语序）。因此本轮的结论只能说明「**把问�
 只读 import `n3d_qa.zh_features`（中文确定性特征）与 `n3d_qa_learn` 内既有模块；
 不修改 `entry_table.py` / `robust_eval.py`（1a 考卷）与 `variant_b.py`（第二步），
 不触碰任何上游模块的源码 / 产物 / `current_spec.md`。
+
+关键词抽取器**可插拔**（轮 5）
+------------------------------
+`build_keyword_backend(extractor=...)` 支持两支，由 :data:`KEYWORD_EXTRACTORS` 冻结枚举：
+
+* ``keybert``（**默认**，:data:`KEYWORD_EXTRACTOR_DEFAULT`）：历史实现，
+  仓库自有 bge-m3 嵌入 + 候选词余弦（**语义**口径），语义与产物逐字节不变；
+* ``tfidf``（新增）：jieba **词面统计**（:class:`TfidfKeywordExtractor`），
+  ``idf(w) = ln((1+N)/(1+df(w))) + 1``、``score = tf × idf``、
+  排序 ``(score desc, 词面 asc)``、``top_k = KEYWORD_TOP_K``，
+  候选集与 KeyBERT 支**同源**（:data:`TFIDF_CANDIDATE_RULE`）。
+
+两支**不等价**：TF-IDF 是词面统计、KeyBERT 是语义嵌入余弦，**结论不得混用**。
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -224,6 +238,58 @@ KEYWORD_MIN_CHARS: int = 1
 #: KeyBERT 后端（与 encoders 注册表同名）。
 KEYBERT_BACKEND_REPO_ENCODER: str = "repo-encoder"
 KEYBERT_BACKEND_SENTENCE_TRANSFORMERS: str = "sentence-transformers"
+
+# --- 关键词抽取器（**可插拔**：keybert 默认 / tfidf 新增）--------------------
+
+#: 抽取器名 `keybert`：现有实现（仓库自有 bge-m3 嵌入 + 候选词余弦），**语义不改**。
+KEYWORD_EXTRACTOR_KEYBERT: str = "keybert"
+
+#: 抽取器名 `tfidf`：新增实现（jieba 词面统计，见 :class:`TfidfKeywordExtractor`）。
+KEYWORD_EXTRACTOR_TFIDF: str = "tfidf"
+
+#: 允许的抽取器（**冻结、可枚举**；未知名立即报错，不静默回退）。
+KEYWORD_EXTRACTORS: Tuple[str, ...] = (
+    KEYWORD_EXTRACTOR_KEYBERT,
+    KEYWORD_EXTRACTOR_TFIDF,
+)
+
+#: 默认抽取器。**口径纪律**：不传 ``--keyword-extractor`` 时必须走这一支，
+#: 既有产物（`_verify/qa_variants/` 11 件、`_verify/text_variants/` 12 件）逐字节不变。
+KEYWORD_EXTRACTOR_DEFAULT: str = KEYWORD_EXTRACTOR_KEYBERT
+
+#: TF-IDF 后端的 ``kind``（与两支 KeyBERT 的 ``kind`` 并列取值，进产物取证）。
+TFIDF_BACKEND_KIND: str = "jieba-tfidf"
+
+#: TF-IDF 的 **IDF 公式**（**唯一来源**：本常量 / 产物 ``idf_formula`` / README 三处同源）。
+TFIDF_IDF_FORMULA: str = "idf(w) = ln((1 + N) / (1 + df(w))) + 1"
+
+#: TF-IDF 的 **df 口径**（**唯一来源**；N 与文档定义同源）。
+TFIDF_DF_RULE: str = (
+    "N = 本侧语料文档数；df(w) = 本侧语料中「含 w」的文档数；"
+    "文档 = 该侧一行文本（QA 侧 = 全部问题文本；文本侧 = 2665 行冻结文本行）；"
+    "w 与候选词同口径（jieba + KEYWORD_POS_KEEP 词性过滤 + 1~3 元 n-gram）"
+)
+
+#: TF-IDF 的 **tf / score / 排序**口径（**唯一来源**）。
+TFIDF_SCORE_RULE: str = (
+    "tf(w) = w 在该行文本中的出现次数（同一分词口径下的 n-gram 计数）；"
+    "score(w) = tf(w) * idf(w)；排序 (score desc, 词面 asc)；取 KEYWORD_TOP_K"
+)
+
+#: TF-IDF 的 **候选集**口径（**唯一来源**）：与 KeyBERT 支**同源**。
+TFIDF_CANDIDATE_RULE: str = (
+    "候选集与 KeyBERT 支同源：jieba 分词 + KEYWORD_POS_KEEP 词性过滤 + 1~3 元 n-gram + "
+    "单行候选上限 KEYWORD_MAX_CANDIDATES + 语料级 df 下限（QA 侧沿用 QA 口径 "
+    "min_doc_freq=20；文本侧沿用 KEYWORD_MIN_DOC_FREQ=2）；"
+    "枚举顺序 = 词面升序（与 sklearn CountVectorizer 的字典序一致），"
+    "故单行候选词表在截断前与 KeyBERT 支**逐项相同**"
+)
+
+#: TF-IDF 的依赖口径（**零新增依赖**，如实登记）。
+TFIDF_DEPENDENCY_NOTE: str = (
+    "仅用 jieba（既有可选依赖）与 Python 标准库 math：不使用 sklearn / scipy，"
+    "也不需要 numpy —— 本条口径**零新增依赖**"
+)
 
 #: 是否把「文档自身嵌入」也算作候选包含判定（KeyBERT 默认 True；固定 True 保证确定性口径）。
 #: ``doc_embeddings`` 口径（**现场核实**：keybert 0.9.0 的 ``doc_embeddings`` 形参是 ``np.ndarray``（文档嵌入数组），
@@ -942,6 +1008,380 @@ class SentenceTransformerEmbedder(_keybert_base_embedder()):
         return int(self.model.get_sentence_embedding_dimension())
 
 
+# ---------------------------------------------------------------------------
+# 可插拔抽取器 #2：jieba TF-IDF（词面统计；零新增依赖）
+# ---------------------------------------------------------------------------
+
+
+def _ngram_counts(tokens: Sequence[str]) -> Dict[str, int]:
+    """1~``KEYWORD_NGRAM_RANGE[1]`` 元 n-gram 的**出现次数**（键 = 词面以单空格拼接）。
+
+    **与 KeyBERT 支同源**：KeyBERT 支用
+    ``CountVectorizer(tokenizer=jieba_pos_tokenizer(), ngram_range=(1,3))`` 枚举同一批
+    n-gram（其内部同样是 ``' '.join(ngram)``）。本函数只用标准库复现同一批**键**。
+
+    参数
+    ----
+    tokens : Sequence[str]
+        jieba 分词 + 词性过滤后的词序列。
+
+    返回
+    ----
+    Dict[str, int]
+        ``{n-gram 词面: 出现次数}``；插入顺序 = n 元阶数升序 -> 起始位置升序（确定性）。
+    """
+    low = int(KEYWORD_NGRAM_RANGE[0])
+    high = int(KEYWORD_NGRAM_RANGE[1])
+    counts: Dict[str, int] = {}
+    n_tok = len(tokens)
+    for order in range(low, high + 1):
+        for start in range(0, n_tok - order + 1):
+            key = " ".join(str(tokens[start + pos]) for pos in range(order))
+            counts[key] = int(counts.get(key, 0)) + 1
+    return counts
+
+
+class TfidfKeywordExtractor:
+    """jieba **TF-IDF** 关键词抽取器（可插拔后端之一；**零新增依赖**）。
+
+    口径（**三处同源**：本 docstring / 产物字段 / README 第二十一节）
+    ----------------------------------------------------------------
+    * **候选集**（与 KeyBERT 支同源）：:data:`TFIDF_CANDIDATE_RULE`；
+    * **IDF**（在本侧语料上统计）：:data:`TFIDF_IDF_FORMULA`，df 口径见
+      :data:`TFIDF_DF_RULE`；
+    * **tf / score / 排序**：:data:`TFIDF_SCORE_RULE`；
+    * **回退**：候选为空或结果为空 ⇒ 回退原文并登记（沿用
+      :class:`VariantGenerator` 的 ``fallback_to_original`` / ``empty_source`` 计数，
+      口径与 KeyBERT 支一致）。
+
+    与 KeyBERT 支**不等价**（必须如实登记，不得混用结论）
+    ----------------------------------------------------
+    TF-IDF 只用「词频 × 语料文档频次」，是**词面统计**；KeyBERT 支用语义嵌入的
+    余弦相似度。二者同一输入会给出不同关键词，**不得**把某支的结论代入另一支。
+
+    确定性
+    ------
+    全流程无随机、不消耗全局 RNG：分词器由 jieba 词典查找（确定性），排序键为
+    ``(score desc, 词面 asc)``，``sorted`` 的稳定性也不被依赖（词面唯一 ⇒ 键唯一）。
+    """
+
+    def __init__(
+        self,
+        *,
+        min_doc_freq: int = KEYWORD_MIN_DOC_FREQ,
+        top_k: int = KEYWORD_TOP_K,
+        max_candidates: int = KEYWORD_MAX_CANDIDATES,
+        min_candidates: int = KEYWORD_MIN_CANDIDATES,
+        min_chars: int = KEYWORD_MIN_CHARS,
+        tokenizer: Optional[Callable[[str], List[str]]] = None,
+    ) -> None:
+        """构造（**不拟合**；语料侧统计在 :meth:`fit` 里做一次）。
+
+        参数
+        ----
+        min_doc_freq : int
+            语料级 df 下限（候选词保留条件 ``df >= min_doc_freq``）。
+            **fit 后修改本属性不生效**（轮 7 / D2b）：:meth:`fit` 会把满足该下限的词**固化**进
+            ``self._vocab``，候选过滤只读那份快照；要让新下限生效必须**重新** ``fit``。
+        top_k : int
+            输出关键词数（必须落在 ``[KEYWORD_MIN_TOP_K, KEYWORD_MAX_TOP_K]``）。
+        max_candidates : int
+            单行候选上限（与 KeyBERT 支同值）。
+        min_candidates : int
+            词表过滤到空时回退保留的候选数（与 KeyBERT 支同值）。
+        min_chars : int
+            结果最少字数（不足 ⇒ 回退原文）。
+        tokenizer : Optional[Callable[[str], List[str]]]
+            分词器；``None`` = :func:`jieba_pos_tokenizer`（主路径口径）。
+        """
+        if not (int(KEYWORD_MIN_TOP_K) <= int(top_k) <= int(KEYWORD_MAX_TOP_K)):
+            raise ValueError(
+                "关键词 top-k 必须落在 ["
+                + str(KEYWORD_MIN_TOP_K) + ", " + str(KEYWORD_MAX_TOP_K) + "]，当前 "
+                + str(top_k)
+            )
+        if int(min_doc_freq) < 1:
+            raise ValueError("min_doc_freq 必须 >= 1，当前 " + str(min_doc_freq))
+        self.min_doc_freq = int(min_doc_freq)
+        self.top_k = int(top_k)
+        self.max_candidates = int(max_candidates)
+        self.min_candidates = int(min_candidates)
+        self.min_chars = int(min_chars)
+        self._tokenizer = tokenizer
+        self._tokenize_fn: Optional[Callable[[str], List[str]]] = None
+        # 语料侧统计（fit 后填充）
+        self._df: Dict[str, int] = {}
+        self._n_docs = 0
+        self._idf: Dict[str, float] = {}
+        self._kept_words: List[str] = []
+        #: 语料级候选词表（``df >= min_doc_freq`` 的词集合）。**只有非空才过滤**
+        #: —— 与 :meth:`VariantGenerator.keyword_candidates` 的 ``if vocab:`` 逐字同源。
+        self._vocab: frozenset = frozenset()
+        #: 最近一次 :meth:`fit` 的取证块（未拟合时为 ``None``）；供
+        #: :attr:`VariantGenerator.keyword_fit_evidence` 读取（**不是**只写字段）。
+        self.evidence: Optional[Dict[str, Any]] = None
+        self._is_fitted = False
+        #: 打分侧计数（**只增不减**；供产物取证的「命中统计」）。
+        self.stats: Dict[str, int] = {
+            "n_scored_lines": 0,
+            "n_tokens_total": 0,
+            "n_candidates_total": 0,
+            "n_candidates_kept_total": 0,
+            "n_candidates_truncated_lines": 0,
+            "n_empty_candidate_lines": 0,
+            "n_terms_emitted": 0,
+        }
+
+    # -- 语料侧 -----------------------------------------------------------
+    @property
+    def is_fitted(self) -> bool:
+        """是否已完成语料侧 df / idf 统计。"""
+        return bool(self._is_fitted)
+
+    @property
+    def n_docs(self) -> int:
+        """语料文档数 N（未拟合时为 0）。"""
+        return int(self._n_docs)
+
+    def _tokenize(self, text: str) -> List[str]:
+        """**唯一**分词入口（惰性构造一次 jieba 词性过滤分词器）。"""
+        if self._tokenize_fn is None:
+            self._tokenize_fn = self._tokenizer or jieba_pos_tokenizer()
+        return list(self._tokenize_fn(str(text)))
+
+    def idf_of(self, word: str) -> float:
+        """``idf(w) = ln((1+N)/(1+df(w))) + 1``（**本模块唯一实现点**）。
+
+        ``df = 0`` 的兜底**只在两种情形**下可能出现（口径修正，I4）：
+        ① 本行文本**不在**拟合语料之内（直接 API 误用：语料与打分文本不是同一侧）；
+        ② 词表为空（退化语料 ⇒ 候选不过滤）且该词确实未在语料出现过。
+        生产调用里**不会**出现 ``df = 0``：``VariantGenerator`` 要求显式 ``keyword_corpus``
+        且拟合语料恒为被打分文本的超集（``--limit`` 只截断生成行数）⇒ 行内每个词的
+        ``df >= 1``。
+        """
+        if not self._is_fitted:
+            raise RuntimeError("TF-IDF 抽取器尚未 fit(...)：无法计算 idf")
+        cached = self._idf.get(str(word))
+        if cached is not None:
+            return float(cached)
+        df = int(self._df.get(str(word), 0))
+        return float(math.log((1.0 + float(self._n_docs)) / (1.0 + float(df))) + 1.0)
+
+    def fit(self, corpus: Sequence[str]) -> Dict[str, Any]:
+        """在本侧语料上统计 df / idf（**幂等**：同语料重拟合结果逐位相同）。
+
+        参数
+        ----
+        corpus : Sequence[str]
+            本侧语料（QA 侧 = 全部问题文本；文本侧 = 2665 行）—— **必须是整侧语料**，
+            用子集会让 N 与 df 同时缩小、口径偏离。（本函数不校验这一点，
+            由调用方在产物里登记 ``corpus_scope``。）
+
+        返回
+        ----
+        Dict[str, Any]
+            可 JSON 化的取证块（extractor / idf 公式 / N / df 口径 / 候选统计）。
+
+        副作用（轮 7 / D2c 显式登记）
+        -----------------------------
+        除返回值外，本函数**还会写实例状态**：① 固化语料侧统计 ``_df`` / ``_n_docs`` /
+        ``_kept_words`` / ``_idf`` 与候选词表快照 ``_vocab``（此后改 ``min_doc_freq``
+        不生效，须重新 ``fit``）；② 把**同一份**取证块写入实例属性 :attr:`evidence`，
+        供 :attr:`VariantGenerator.keyword_fit_evidence` 与调用方在不重拟合时**只读**消费。
+        """
+        texts = [str(t) for t in corpus]
+        if not texts:
+            raise ValueError(
+                "TF-IDF 语料为空：必须在**整侧语料**上统计 idf（QA 侧 = 全部问题文本，"
+                "文本侧 = 2665 行），不得用空语料拟合"
+            )
+        df: Dict[str, int] = {}
+        n_pairs = 0
+        for text in texts:
+            grams = _ngram_counts(self._tokenize(text))
+            n_pairs += int(len(grams))
+            for word in grams:
+                df[word] = int(df.get(word, 0)) + 1
+        n_docs = int(len(texts))
+        kept = sorted(w for w, freq in df.items() if int(freq) >= int(self.min_doc_freq))
+        self._df = df
+        self._n_docs = n_docs
+        self._kept_words = list(kept)
+        # 候选词表集合：**空集 = 不过滤**（退化语料），与 KeyBERT 支 `if vocab:` 同源。
+        self._vocab = frozenset(kept)
+        self._idf = {
+            w: float(math.log((1.0 + float(n_docs)) / (1.0 + float(df[w]))) + 1.0)
+            for w in kept
+        }
+        self._is_fitted = True
+        idf_values = [float(self._idf[w]) for w in kept]
+        evidence: Dict[str, Any] = {
+            "extractor": KEYWORD_EXTRACTOR_TFIDF,
+            "backend_kind": TFIDF_BACKEND_KIND,
+            "idf_formula": TFIDF_IDF_FORMULA,
+            "df_rule": TFIDF_DF_RULE,
+            "score_rule": TFIDF_SCORE_RULE,
+            "candidate_rule": TFIDF_CANDIDATE_RULE,
+            "dependency_note": TFIDF_DEPENDENCY_NOTE,
+            "n_docs": int(n_docs),
+            "min_doc_freq": int(self.min_doc_freq),
+            "top_k": int(self.top_k),
+            "max_candidates": int(self.max_candidates),
+            "ngram_range": [int(KEYWORD_NGRAM_RANGE[0]), int(KEYWORD_NGRAM_RANGE[1])],
+            "pos_keep": list(KEYWORD_POS_KEEP),
+            "n_candidate_pairs": int(n_pairs),
+            "n_distinct_candidates": int(len(df)),
+            "n_kept_candidates": int(len(kept)),
+            "idf_min": (float(min(idf_values)) if idf_values else 0.0),
+            "idf_max": (float(max(idf_values)) if idf_values else 0.0),
+            "idf_mean": (
+                float(sum(idf_values) / float(len(idf_values))) if idf_values else 0.0
+            ),
+            # 语料指纹：**只**依赖文本内容（不含路径 / 时间），用于「同一语料」可复算。
+            "corpus_sha256": sha256_bytes(
+                canonical_dumps({"corpus": texts, "n_docs": int(n_docs)})
+            ),
+        }
+        # 取证块**同时**留在实例上（`:attr:`evidence``）：供
+        # `VariantGenerator.keyword_fit_evidence` 与调用方在不重拟合的前提下读取。
+        self.evidence = evidence
+        return evidence
+
+    # -- 单行候选与打分 ---------------------------------------------------
+    def candidates(self, text: str) -> List[str]:
+        """单行候选词表（**与 KeyBERT 支同源**：同集合、同「词面升序」枚举顺序）。
+
+        **须先** :meth:`fit`（轮 7 / D2a 显式登记）
+        -------------------------------------------
+        未拟合时 ``self._vocab`` 为空 ⇒ 本方法**完全不过滤**（返回该行全部 n-gram 的词面升序前
+        ``max_candidates`` 个）；而 :meth:`extract_terms` 在未拟合时**抛** ``RuntimeError`` ——
+        两者对「未拟合」的语义**不一致**，属**既有实现**差异。本方法**不加** fail-closed 断言
+        （那属行为变更，须另行证明默认路径产物不变）；调用方请自行先 ``fit``。
+        """
+        return self._candidates_of(_ngram_counts(self._tokenize(text)))[0]
+
+    def _candidates_of(self, counts: Dict[str, int]) -> Tuple[List[str], int, bool]:
+        """由 n-gram 计数表给出 ``(候选词表, 过滤前候选数, 是否被上限截断)``。
+
+        语义**与** :meth:`VariantGenerator.keyword_candidates` **逐分支同源**（W1 修正）
+        ---------------------------------------------------------------------------
+        * **只有词表非空**（语料里存在 ``df >= min_doc_freq`` 的词）才做过滤；
+          词表为空（退化语料，如「5 行语料 + mdf=20」）⇒ **完全不过滤**；
+        * 词表非空但本行没有词命中 ⇒ 保留词面升序的前 ``min_candidates`` 个；
+        * 最后按 ``max_candidates`` 截断。
+
+        **W1 修的是什么**：此前写成「``kept`` 为空就回退前 ``min_candidates``」，
+        把「词表为空」与「词表非空但本行无命中」两种情形并成一条分支，导致退化语料上
+        与 KeyBERT 支候选数不同（现场：5 行 + mdf=20 ⇒ KeyBERT 15 vs TF-IDF 3），
+        「候选集同源」只在词表非空时成立。对齐后**无条件成立**。
+        """
+        word_list = sorted(counts)
+        n_before = int(len(word_list))
+        words = word_list
+        if self._vocab:
+            hit = [w for w in words if w in self._vocab]
+            words = hit if hit else words[: int(self.min_candidates)]
+        truncated = bool(len(words) > int(self.max_candidates))
+        return words[: int(self.max_candidates)], int(n_before), truncated
+
+    def extract_terms(self, text: str) -> List[Tuple[str, float]]:
+        """单行 ``[(词, score)]``（按 ``(score desc, 词面 asc)`` 取前 top_k）。
+
+        **只读**：不改变 ``VariantGenerator`` 的任何计数器；本函数只累加自身的
+        :attr:`stats`（打分侧统计，用于产物取证）。
+        """
+        if not self._is_fitted:
+            raise RuntimeError("TF-IDF 抽取器尚未 fit(...)：无法抽取关键词")
+        tokens = self._tokenize(text)
+        counts = _ngram_counts(tokens)
+        cand, n_before_filter, truncated = self._candidates_of(counts)
+        self.stats["n_scored_lines"] = int(self.stats["n_scored_lines"]) + 1
+        self.stats["n_tokens_total"] = int(self.stats["n_tokens_total"]) + int(len(tokens))
+        self.stats["n_candidates_total"] = int(self.stats["n_candidates_total"]) + int(
+            n_before_filter
+        )
+        self.stats["n_candidates_kept_total"] = int(
+            self.stats["n_candidates_kept_total"]
+        ) + int(len(cand))
+        if truncated:
+            self.stats["n_candidates_truncated_lines"] = (
+                int(self.stats["n_candidates_truncated_lines"]) + 1
+            )
+        if not cand:
+            self.stats["n_empty_candidate_lines"] = (
+                int(self.stats["n_empty_candidate_lines"]) + 1
+            )
+            return []
+        scored: List[Tuple[str, float]] = [
+            (str(w), float(counts[w]) * self.idf_of(str(w))) for w in cand
+        ]
+        scored.sort(key=lambda item: (-float(item[1]), str(item[0])))
+        top = scored[: int(self.top_k)]
+        self.stats["n_terms_emitted"] = int(self.stats["n_terms_emitted"]) + int(len(top))
+        return top
+
+    def stats_snapshot(self) -> Dict[str, Any]:
+        """打分侧计数快照（JSON 化；含逐行均值与命中率，供产物取证）。"""
+        n_lines = int(self.stats["n_scored_lines"])
+        denom = float(n_lines) if n_lines > 0 else 1.0
+        return {
+            "counters": {k: int(v) for k, v in sorted(self.stats.items())},
+            "mean_candidates_per_line": float(self.stats["n_candidates_total"] / denom),
+            "mean_kept_candidates_per_line": float(
+                self.stats["n_candidates_kept_total"] / denom
+            ),
+            "mean_terms_per_line": float(self.stats["n_terms_emitted"] / denom),
+            "empty_candidate_rate": float(
+                self.stats["n_empty_candidate_lines"] / denom
+            ),
+            "truncated_rate": float(self.stats["n_candidates_truncated_lines"] / denom),
+            "note": (
+                "命中统计口径：`n_candidates_total` = 词表过滤前逐行候选词条数之和；"
+                "`n_candidates_kept_total` = 过滤（df 下限）后之和；`n_terms_emitted` = "
+                "实际进入关键词支文本的词数之和；空候选与截断逐行计数。"
+            ),
+        }
+
+
+def build_tfidf_keyword_backend(
+    *,
+    keyword_top_k: int = KEYWORD_TOP_K,
+    min_doc_freq: int = KEYWORD_MIN_DOC_FREQ,
+) -> Dict[str, Any]:
+    """构造 **TF-IDF 关键词后端**（可插拔分支；零新增依赖）。
+
+    返回
+    ----
+    Dict[str, Any]
+        与 :func:`build_keyword_backend` 的 KeyBERT 分支**同形**的字典：
+        ``{"kind", "extractor", "model_object", "encoder", "note", "word_max_length",
+        "idf_formula", "score_rule", "min_doc_freq", "top_k", "dependencies"}``。
+        ``model_object`` 是**未拟合**的 :class:`TfidfKeywordExtractor`；
+        语料侧统计由调用方在**整侧语料**上 ``model_object.fit(...)`` 一次。
+    """
+    extractor = TfidfKeywordExtractor(
+        min_doc_freq=int(min_doc_freq), top_k=int(keyword_top_k)
+    )
+    return {
+        "kind": TFIDF_BACKEND_KIND,
+        "extractor": KEYWORD_EXTRACTOR_TFIDF,
+        "model_object": extractor,
+        "encoder": None,
+        "word_max_length": 0,
+        "idf_formula": TFIDF_IDF_FORMULA,
+        "df_rule": TFIDF_DF_RULE,
+        "score_rule": TFIDF_SCORE_RULE,
+        "candidate_rule": TFIDF_CANDIDATE_RULE,
+        "min_doc_freq": int(min_doc_freq),
+        "top_k": int(keyword_top_k),
+        "dependencies": TFIDF_DEPENDENCY_NOTE,
+        "note": (
+            "jieba TF-IDF 后端（可插拔分支；**词面统计**，与 KeyBERT 的语义嵌入余弦不等价）："
+            "idf 在**本侧语料**上统计，" + TFIDF_IDF_FORMULA + "；" + TFIDF_SCORE_RULE
+        ),
+    }
+
+
 def build_keyword_backend(
     encoder_name: str = ENCODER_NEIGHBOR_ENCODER,
     source: str = ENCODER_NEIGHBOR_SOURCE,
@@ -950,21 +1390,55 @@ def build_keyword_backend(
     allow_sentence_transformers_fallback: bool = True,
     cache_dir: str = "",
     use_cache: bool = True,
+    extractor: str = KEYWORD_EXTRACTOR_DEFAULT,
+    keyword_top_k: int = KEYWORD_TOP_K,
+    min_doc_freq: int = KEYWORD_MIN_DOC_FREQ,
 ) -> Dict[str, Any]:
-    """构造关键词支的编码后端（**优先复用仓库自有 bge-m3**）。
+    """构造关键词支的后端（**可插拔**：``keybert`` 默认 / ``tfidf`` 新增）。
+
+    参数
+    ----
+    encoder_name / source / role / allow_sentence_transformers_fallback /
+    cache_dir / use_cache
+        **仅 KeyBERT 支使用**；语义与历史逐字相同（不传 ``extractor`` 时行为不变）。
+    extractor : str
+        抽取器名，必须落在 :data:`KEYWORD_EXTRACTORS`；默认
+        :data:`KEYWORD_EXTRACTOR_DEFAULT`（= ``keybert``）。
+        **口径纪律**：默认档必须走 KeyBERT 支，既有产物逐字节不变。
+    keyword_top_k : int
+        **仅 TF-IDF 支使用**（KeyBERT 支的 top-k 由 ``VariantGenerator`` 取值）。
+    min_doc_freq : int
+        **仅 TF-IDF 支使用**：语料级 df 下限（QA 侧沿用 20，文本侧沿用 2）。
 
     返回
     ----
     Dict[str, Any]
-        `{"kind", "model_object", "encoder", "note"}`：
-        `kind = "repo-encoder"` 时 `model_object` 是本模块的薄适配器；
-        不可行且允许回退时 `kind = "sentence-transformers"`（**如实登记**）。
+        * ``extractor = "keybert"``：``{"kind", "extractor", "model_object", "encoder",
+          "note", "word_max_length"}``；``kind = "repo-encoder"`` 时 ``model_object``
+          是本模块的薄适配器；不可行且允许回退时 ``kind = "sentence-transformers"``
+          （**如实登记**）。
+        * ``extractor = "tfidf"``：见 :func:`build_tfidf_keyword_backend`
+          （``kind = "jieba-tfidf"``，``encoder = None``，``model_object`` 为
+          **未拟合**的 :class:`TfidfKeywordExtractor`）。
 
     异常
     ----
+    ValueError
+        未知抽取器名（**不静默回退到默认档**）。
     RuntimeError
-        两条路径都不可用时（可读报文；调用方据此退码非 0）。
+        KeyBERT 两支路径都不可用时（可读报文；调用方据此退码非 0）。
     """
+    name = str(extractor or KEYWORD_EXTRACTOR_DEFAULT).strip().lower()
+    if name not in KEYWORD_EXTRACTORS:
+        raise ValueError(
+            "未知关键词抽取器 " + repr(extractor) + "；允许值 = "
+            + str(list(KEYWORD_EXTRACTORS))
+        )
+    if name == KEYWORD_EXTRACTOR_TFIDF:
+        # **先分派再尝试编码器**：TF-IDF 支不需要 bge-m3，也不应触发 keybert 依赖判定。
+        return build_tfidf_keyword_backend(
+            keyword_top_k=int(keyword_top_k), min_doc_freq=int(min_doc_freq)
+        )
     primary_error = ""
     try:
         from .encoders import ENCODER_BGE_M3, EncoderConfig, build_vectorizer
@@ -981,6 +1455,7 @@ def build_keyword_backend(
         backend = RepoEncoderEmbedder(encoder)
         return {
             "kind": KEYBERT_BACKEND_REPO_ENCODER,
+            "extractor": KEYWORD_EXTRACTOR_KEYBERT,
             "model_object": backend,
             "encoder": encoder,
             # 取证取**编码器实际生效**的 max_length（而非回抄常量），
@@ -1018,6 +1493,7 @@ def build_keyword_backend(
     model = SentenceTransformer(str(source) if source else "BAAI/bge-m3")
     return {
         "kind": KEYBERT_BACKEND_SENTENCE_TRANSFORMERS,
+        "extractor": KEYWORD_EXTRACTOR_KEYBERT,
         "model_object": SentenceTransformerEmbedder(model),
         "encoder": None,
         "note": (
@@ -1063,6 +1539,13 @@ class VariantGenerator:
         （此时对关键词支与自适应支的请求会抛可读异常，绝不静默产出别的变体）。
     seed : int
         保留字段（本类全部路径都是确定性的；仅用于登记）。
+    vocab_path : str
+        语料级候选词表路径（**仅 KeyBERT 支消费**；空 = 缓存默认位置）。
+    keyword_corpus : Optional[Sequence[str]]
+        **仅 TF-IDF 支消费**：用于统计 idf 的**整侧语料**（QA 侧 = 全部问题文本；
+        文本侧 = 2665 行）。**必填（fail-closed，W2）**：``None`` / 空序列时，
+        TF-IDF 支的任一生成入口（批量 / 单行 / 自适应 short 档 / ``keyword_terms``）
+        都抛可读 :class:`VariantContractError`；**不会**退回「当前批次 / 单行」拟合。
     """
 
     def __init__(
@@ -1074,6 +1557,7 @@ class VariantGenerator:
         keyword_backend: Optional[Dict[str, Any]] = None,
         seed: int = TEXT_VARIANTS_SEED,
         vocab_path: str = "",
+        keyword_corpus: Optional[Sequence[str]] = None,
     ) -> None:
         self.defs = variant_definitions(
             keyword_top_k=keyword_top_k,
@@ -1089,6 +1573,13 @@ class VariantGenerator:
         #: probe 会把它指向本次产物目录下的 ``keyword_vocab.json``，
         #: 使词表成为**可审计产物**（warning 12），并避免 ``--limit`` 演练污染全量词表。
         self.vocab_path = str(vocab_path)
+        #: **仅 TF-IDF 支**：用于统计 idf 的整侧语料（``None`` = 未显式指定）。
+        #: **fail-closed（W2）**：TF-IDF 支**必须**显式给出；未给出时
+        #: :meth:`_tfidf_extractor` 直接抛可读 ``VariantContractError``，
+        #: 不再退回「当前批次 / 单行」拟合。
+        self.keyword_corpus: Optional[List[str]] = (
+            None if keyword_corpus is None else [str(t) for t in keyword_corpus]
+        )
         self._kw_model: Any = None
         self._tokenizer: Optional[Callable[[str], List[str]]] = None
         self._word_emb: Optional[Dict[str, np.ndarray]] = None
@@ -1098,6 +1589,70 @@ class VariantGenerator:
             name: {"generated": 0, "fallback_to_original": 0, "empty_source": 0}
             for name in VARIANT_ORDER
         }
+
+    # -- 抽取器分派（**可插拔**：keybert 默认 / tfidf）----------------------
+    @property
+    def keyword_extractor_name(self) -> str:
+        """当前关键词抽取器名（``keybert`` / ``tfidf``；无后端时为空串）。
+
+        **向后兼容**：旧后端字典没有 ``extractor`` 键 ⇒ 返回 ``keybert``，
+        与历史行为逐位相同。
+        """
+        if not isinstance(self.keyword_backend, dict):
+            return ""
+        return str(
+            self.keyword_backend.get("extractor", KEYWORD_EXTRACTOR_KEYBERT)
+        ).lower()
+
+    @property
+    def keyword_extractor(self) -> Any:
+        """当前关键词后端对象（``keybert`` 支为薄适配器 / ``tfidf`` 支为抽取器）；无后端为 ``None``。"""
+        if not isinstance(self.keyword_backend, dict):
+            return None
+        return self.keyword_backend.get("model_object")
+
+    @property
+    def keyword_fit_evidence(self) -> Optional[Dict[str, Any]]:
+        """TF-IDF 语料侧拟合取证（**读** :attr:`TfidfKeywordExtractor.evidence`）。
+
+        未拟合或非 TF-IDF 支时返回 ``None`` —— 该属性是**只读视图**，
+        不再由生成器自己写入（I3：删掉只写不读的字段）。
+        """
+        if self.keyword_extractor_name != KEYWORD_EXTRACTOR_TFIDF:
+            return None
+        extractor = self.keyword_extractor
+        return None if extractor is None else getattr(extractor, "evidence", None)
+
+    def _tfidf_extractor(self) -> Any:
+        """取（必要时**拟合一次**）TF-IDF 抽取器（本模块**唯一**拟合点）。
+
+        **fail-closed（W2，本轮选定方案 + 理由）**
+        -------------------------------------------
+        idf 必须在**整侧语料**上统计；构造期没给 ``keyword_corpus`` 时**直接报错**，
+        不再退回「当前批次 / 单行」拟合。理由：退回分支会把 ``corpus_scope =
+        current_batch`` 这种**口径偏离**只写进内存属性，而生产代码从不读取该属性
+        ⇒ 偏离进不了产物、等于**静默偏离**；且「单行语料」下 N=1、df 恒为 1，
+        idf 退化成常数，结论不可用于任何跨侧比较。选择报错可让误用在入口处暴露
+        （``VariantContractError`` → CLI 退码 1、报文可读）。
+        """
+        if self.keyword_backend is None:
+            raise TextVariantDependencyError(
+                "本实例未装配关键词后端（keyword_backend=None）；"
+                "关键词支与自适应支不可用。请用 build_keyword_backend(...) 构造后再传。"
+            )
+        if not self.keyword_corpus:
+            raise VariantContractError(
+                "TF-IDF 关键词支缺少拟合语料：必须在构造 VariantGenerator 时显式传入 "
+                "`keyword_corpus`（整侧语料：QA 侧 = 全部问题文本，文本侧 = 2665 行冻结文本行）。"
+                "**不会**退回「当前批次 / 单行」拟合 —— 那会让 N 与 df 随之缩小（口径偏离）。"
+            )
+        extractor = self.keyword_backend["model_object"]
+        if not bool(getattr(extractor, "is_fitted", False)):
+            # 拟合语料**只**来自显式 keyword_corpus；批次文本不参与。
+            extractor.fit(list(self.keyword_corpus))
+            if isinstance(getattr(extractor, "evidence", None), dict):
+                extractor.evidence["corpus_scope"] = "explicit_keyword_corpus"
+        return extractor
 
     # -- 关键词支 ---------------------------------------------------------
     def _keyword_model(self) -> Any:
@@ -1183,13 +1738,18 @@ class VariantGenerator:
         return np.asarray([self._word_emb[w] for w in words], dtype=np.float32)
 
     def keyword_variants_batch(self, texts: Sequence[str]) -> List[str]:
-        """**批量**生成关键词支文本。
+        """**批量**生成关键词支文本（按 ``keyword_backend["extractor"]`` 分派）。
 
-        评分口径（与 keybert 0.9.0 的 cosine 分支逐字同源）
-        ------------------------------------------------
+        KeyBERT 支的评分口径（与 keybert 0.9.0 的 cosine 分支逐字同源）
+        ----------------------------------------------------------------
         ``distances = cosine_similarity(doc_embedding, candidate_embeddings)``；
         取分数降序的前 ``top_k``（**并列不重排**，保持候选顺序 = 文档频次序）。
         文档与候选词均经仓库自有编码器（CLS pooling + L2 归一化），故余弦 = 内积。
+
+        TF-IDF 支的口径（**词面统计**，与 KeyBERT 不等价）
+        --------------------------------------------------
+        见 :class:`TfidfKeywordExtractor` / :data:`TFIDF_SCORE_RULE`：
+        ``score = tf × idf``、排序 ``(score desc, 词面 asc)``、同一 top-k 与同一回退规则。
         """
         if self.keyword_backend is None:
             # **缺依赖/缺后端必须在入口处可读报错**：
@@ -1202,6 +1762,8 @@ class VariantGenerator:
                 "请用 build_keyword_backend(...) 构造后再传。"
             )
         items = [str(t) for t in texts]
+        if self.keyword_extractor_name == KEYWORD_EXTRACTOR_TFIDF:
+            return self._keyword_variants_batch_tfidf(items)
         out: List[str] = []
         # 第一趟：全量候选词（确定性）+ 它们的嵌入（大批，一次算全）
         candidates_all = [self.keyword_candidates(t) for t in items]
@@ -1245,6 +1807,26 @@ class VariantGenerator:
                     out.append(joined)
         return out
 
+    def _keyword_variants_batch_tfidf(self, items: Sequence[str]) -> List[str]:
+        """TF-IDF 支的批量路径（**逐行词面统计**，无编码器前向）。
+
+        **回退口径与 KeyBERT 支一致**：候选为空 / 结果为空串 / 结果过短
+        (``< KEYWORD_MIN_CHARS``) / 结果与原文逐字相同 ⇒ 原文，并计入
+        ``fallback_to_original``（空文本另计 ``empty_source``）。
+        """
+        extractor = self._tfidf_extractor()
+        out: List[str] = []
+        for raw in items:
+            terms = [str(word) for word, _score in extractor.extract_terms(raw)]
+            joined = " ".join(terms)
+            if joined == "" or len(joined) < int(KEYWORD_MIN_CHARS) or joined == raw:
+                self._record_fallback(raw)
+                out.append(raw)
+            else:
+                self.counters[VARIANT_KEYWORD]["generated"] += 1
+                out.append(joined)
+        return out
+
     def _record_fallback(self, raw: str) -> None:
         """登记一次「回退原文」（空文本另计 ``empty_source``）。"""
         if raw.strip() == "":
@@ -1252,13 +1834,25 @@ class VariantGenerator:
         self.counters[VARIANT_KEYWORD]["fallback_to_original"] += 1
 
     def keyword_terms(self, text: str) -> Tuple[List[str], List[float]]:
-        """单行的关键词词表 + 分数（**只读**，不改变任何计数器）。
+        """单行的关键词词表 + 分数（**只读**：不改变 :class:`VariantGenerator` 的计数器）。
+
+        **计数口径限定（轮 7 / D2d）**：本方法**不改变** ``VariantGenerator.counters``
+        （``generated`` / ``fallback_to_original`` / ``empty_source``）；但 TF-IDF 分支会经由
+        :meth:`TfidfKeywordExtractor.extract_terms` **累加抽取器自身的** :attr:`stats`
+        （候选数 / 截断 / 空候选 / 输出词数等**打分统计**）—— 那是取证计数、不是逐支生成计数，
+        两者不是同一本账，故「不改变任何计数器」的原措辞过宽，已按此限定。
 
         实现口径与 :meth:`keyword_variants_batch` 的批量路径**逐字同源**：
         同一份候选词、同一公式（归一化嵌入的内积 = 余弦）、同一 top-k 选取。
+        TF-IDF 支同源：同一 :meth:`TfidfKeywordExtractor.extract_terms` 口径
+        （``score = tf × idf``、``(score desc, 词面 asc)``）。
         本方法只用于取证 / 调试，主路径一律走批量。
         """
         raw = str(text)
+        if self.keyword_extractor_name == KEYWORD_EXTRACTOR_TFIDF:
+            extractor = self._tfidf_extractor()
+            pairs = extractor.extract_terms(raw)
+            return [str(w) for w, _s in pairs], [float(s) for _w, s in pairs]
         cand = self.keyword_candidates(raw)
         if not cand:
             return [], []
@@ -3614,6 +4208,18 @@ __all__ = [
     "KEYWORD_ENCODER_MAX_LENGTH",
     "KEYWORD_TOP_K",
     "KEYWORD_USE_MMR",
+    "KEYWORD_EXTRACTOR_DEFAULT",
+    "KEYWORD_EXTRACTOR_KEYBERT",
+    "KEYWORD_EXTRACTOR_TFIDF",
+    "KEYWORD_EXTRACTORS",
+    "TFIDF_BACKEND_KIND",
+    "TFIDF_CANDIDATE_RULE",
+    "TFIDF_DEPENDENCY_NOTE",
+    "TFIDF_DF_RULE",
+    "TFIDF_IDF_FORMULA",
+    "TFIDF_SCORE_RULE",
+    "TfidfKeywordExtractor",
+    "build_tfidf_keyword_backend",
     "NEGATIVE_KINDS",
     "NEGATIVE_SETTINGS",
     "NON_ANCHOR_VARIANTS",

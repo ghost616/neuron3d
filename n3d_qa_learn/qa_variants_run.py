@@ -155,7 +155,11 @@ def _resolve_product_dir(explicit: str) -> str:
 
 
 def _build_generator(
-    texts: Sequence[str], out_dir: str, *, min_doc_freq: int = 0
+    texts: Sequence[str],
+    out_dir: str,
+    *,
+    min_doc_freq: int = 0,
+    extractor: str = "",
 ) -> Tuple[Any, Dict[str, Any]]:
     """装配 4 支变体生成器（**复用** ``text_variants.VariantGenerator``）。
 
@@ -163,18 +167,104 @@ def _build_generator(
     --------
     1. 语料级候选词表在**本产物目录**构建（``qa_variants/keyword_vocab.json``），
        **不碰**文本侧的 ``keyword_vocab.json``（那 12 件产物必须逐字节不变）；
-    2. 关键词后端沿用 ``text_variants.build_keyword_backend``（仓库自有 bge-m3）；
+       **仅 KeyBERT 支**落该词表；TF-IDF 支不落词表文件（改落 ``keyword_idf.json``）；
+    2. 关键词后端沿用 ``text_variants.build_keyword_backend``：KeyBERT 支用仓库自有
+       bge-m3（``repo-encoder``）；**TF-IDF 支**用 jieba 词面统计（``jieba-tfidf``），
+       不构造编码器、不需要 keybert；
     3. 生成口径（top-k / 摘要上限 / 回退规则）全部沿用第三步的冻结常量；
     4. **词表文档频次下限**是唯一的显式偏离：默认取
        :data:`n3d_qa_learn.qa_variants.QA_VOCAB_MIN_DOC_FREQ`（= 20，理由见该常量），
-       并在产物里登记 ``vocab_caliber_deviation``。
+       并在产物里登记 ``vocab_caliber_deviation``（TF-IDF 支为 ``min_doc_freq``）；
+    5. **抽取器可插拔**（轮 5）：``extractor="keybert"``（默认）走历史 KeyBERT 路径，
+       证据的**键与取值与历史逐字相同**（零回归的代码侧保证）；
+       ``extractor="tfidf"`` 走 jieba TF-IDF（语料侧 idf 统计落
+       ``keyword_idf.json``，证据多 ``keyword_extractor`` / ``extractor_evidence`` 两块）；
+    6. **TF-IDF 支的语料 fail-closed（轮 6 / W2）**：idf 必须在本侧语料上统计，
+       故 ``texts`` **不能为空**（空则 ValueError，可读报文）；语料同时显式传给
+       ``VariantGenerator(keyword_corpus=...)``，生成器侧不再允许「退化到批次拟合」。
     """
     import n3d_qa_learn.qa_variants as QV
     import n3d_qa_learn.text_variants as TV
 
     mdf = int(min_doc_freq) if int(min_doc_freq) > 0 else int(QV.QA_VOCAB_MIN_DOC_FREQ)
-    backend = TV.build_keyword_backend(allow_sentence_transformers_fallback=True)
+    extractor_name = str(extractor or TV.KEYWORD_EXTRACTOR_DEFAULT).strip().lower()
+    if extractor_name not in TV.KEYWORD_EXTRACTORS:
+        raise ValueError(
+            "未知关键词抽取器 " + repr(extractor) + "；允许值 = "
+            + str(list(TV.KEYWORD_EXTRACTORS))
+        )
     vocab_path = os.path.join(str(out_dir), "keyword_vocab.json")
+    if extractor_name == TV.KEYWORD_EXTRACTOR_TFIDF:
+        # --- TF-IDF 支（**词面统计**）：语料侧 idf 只在一处统计，落 keyword_idf.json ---
+        corpus = [str(t) for t in texts]
+        if not corpus:
+            raise ValueError(
+                "TF-IDF 支的 idf 语料为空：必须在**本侧语料**（QA 侧 = 全部问题文本）上"
+                "统计 idf，不得用空语料生成（N 与 df 会全部退化）"
+            )
+        backend = TV.build_keyword_backend(
+            extractor=TV.KEYWORD_EXTRACTOR_TFIDF,
+            keyword_top_k=int(TV.KEYWORD_TOP_K),
+            min_doc_freq=int(mdf),
+        )
+        fit_ev = backend["model_object"].fit(corpus)
+        fit_ev["corpus_scope"] = "explicit_keyword_corpus"
+        fit_ev["corpus_n_texts"] = int(len(corpus))
+        fit_ev["corpus_scope_note"] = (
+            "QA 侧 idf 语料 = 本次生成的全部问题文本（" + str(len(corpus)) + " 条）；"
+            "``--limit-questions`` 会让 N 随之缩小，属**口径偏离**并在此显式登记"
+        )
+        idf_path = os.path.join(str(out_dir), "keyword_idf.json")
+        _write_json(
+            idf_path,
+            {
+                "schema_version": str(TV.TEXT_VARIANTS_SCHEMA_VERSION),
+                "backend_kind": str(backend.get("kind", "")),
+                "extractor": str(extractor_name),
+                "corpus": "qa_questions（本模块自建；**不**复用文本行侧词表）",
+                "idf_formula": str(TV.TFIDF_IDF_FORMULA),
+                "df_rule": str(TV.TFIDF_DF_RULE),
+                "score_rule": str(TV.TFIDF_SCORE_RULE),
+                "candidate_rule": str(TV.TFIDF_CANDIDATE_RULE),
+                "dependency_note": str(TV.TFIDF_DEPENDENCY_NOTE),
+                "min_doc_freq": int(mdf),
+                "evidence": fit_ev,
+            },
+        )
+        generator = TV.VariantGenerator(
+            keyword_backend=backend, vocab_path="", keyword_corpus=corpus
+        )
+        evidence: Dict[str, Any] = {
+            "backend_kind": str(backend.get("kind", "")),
+            "backend_note": str(backend.get("note", "")),
+            "word_max_length": int(backend.get("word_max_length", 0)),
+            "keyword_extractor": str(extractor_name),
+            "extractor_evidence": fit_ev,
+            "extractor_evidence_path": str(idf_path),
+            "extractor_evidence_sha256": _sha256_file(idf_path),
+            "vocab_min_doc_freq": int(mdf),
+            "text_side_min_doc_freq": int(TV.KEYWORD_MIN_DOC_FREQ),
+            "idf_corpus": "qa_questions（自建；不复用文本行侧词表）",
+            "vocab_caliber_deviation": str(QV.VOCAB_CALIBER_DEVIATION),
+            "variant_order": list(TV.VARIANT_ORDER),
+            "keyword_top_k": int(generator.keyword_top_k),
+            "summary_max_sentences": int(generator.summary_max_sentences),
+            "summary_max_chars": int(generator.summary_max_chars),
+            "generator_manifest": generator.definition_manifest(),
+            "reused_module": "n3d_qa_learn.text_variants.VariantGenerator",
+            "reuse_rule": (
+                "**复用**第三步的生成器实现与冻结常量；只换输入语料（QA 问题文本）、"
+                "抽取器（tfidf；词面统计口径见 `extractor_evidence`）与**语料级 df 下限**"
+                "（" + str(mdf) + "，见 `vocab_caliber_deviation`）。"
+                "**不改动**文本行侧产出路径与其 12 件既有产物。"
+            ),
+        }
+        return generator, evidence
+    # --- KeyBERT 支（**默认档**；证据键与历史逐字相同 ⇒ 产物逐字节不变）-----
+    backend = TV.build_keyword_backend(
+        allow_sentence_transformers_fallback=True,
+        extractor=TV.KEYWORD_EXTRACTOR_KEYBERT,
+    )
     vocab_evidence = TV.build_keyword_vocabulary(list(texts), min_doc_freq=int(mdf), write=False)
     parent = os.path.dirname(os.path.abspath(vocab_path))
     if parent:
@@ -224,6 +314,56 @@ def _build_generator(
         ),
     }
     return generator, evidence
+
+
+def _attach_extractor_stats(
+    generator: Any, gen_ev: Dict[str, Any], *, generated: bool
+) -> None:
+    """把 **TF-IDF 打分侧统计**（候选词与命中统计）挂进生成器取证。
+
+    仅 ``extractor = tfidf`` 生效（KeyBERT 档**不改**任何证据键 ⇒ 零回归）。
+    ``generated=False``（probe 不生成变体）时只登记「未产生」，**不臆造 0 值**。
+    """
+    import n3d_qa_learn.text_variants as TV
+
+    if str(gen_ev.get("keyword_extractor", "")) != TV.KEYWORD_EXTRACTOR_TFIDF:
+        return
+    evidence = gen_ev.get("extractor_evidence")
+    if not isinstance(evidence, dict):
+        return
+    if not generated:
+        evidence["scoring"] = {
+            "applicable": False,
+            "note": "probe 只做规模与依赖取证、**不生成变体** ⇒ 打分侧（命中）统计在 eval 产物里",
+        }
+        return
+    backend = getattr(generator, "keyword_backend", None)
+    extractor = backend.get("model_object") if isinstance(backend, dict) else None
+    snapshot = extractor.stats_snapshot() if extractor is not None else {}
+    snapshot["applicable"] = True
+    # 两个**来源不同**的计数并列给出，便于互证（不是恒等式）。
+    snapshot["generator_counters"] = {
+        str(k): dict(v) for k, v in sorted(getattr(generator, "counters", {}).items())
+    }
+    evidence["scoring"] = snapshot
+
+
+def _gen_evidence(
+    texts: Sequence[str],
+    out_dir: str,
+    args: argparse.Namespace,
+    *,
+    generated: bool,
+) -> Dict[str, Any]:
+    """装配生成器并把 ``--keyword-extractor`` 贯通（**唯一**取参点）。
+
+    返回值即产物里的 ``generator`` 取证块（KeyBERT 档与历史逐字相同）。
+    """
+    generator, evidence = _build_generator(
+        texts, out_dir, extractor=str(getattr(args, "keyword_extractor", "") or "")
+    )
+    _attach_extractor_stats(generator, evidence, generated=bool(generated))
+    return evidence
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +442,9 @@ def cmd_probe(args: argparse.Namespace) -> int:
         },
         "extractive_note": str(QV.EXTRACTIVE_NOTE),
         "group_split_rule": str(QV.GROUP_SPLIT_RULE),
-        "generator": _build_generator([u.question_text for u in units], out_dir)[1],
+        "generator": _gen_evidence(
+            [u.question_text for u in units], out_dir, args, generated=False
+        ),
     }
     sha, size = _write_json(os.path.join(out_dir, "qa_variants_probe.json"), doc)
     _log(
@@ -410,8 +552,14 @@ def cmd_eval(args: argparse.Namespace) -> int:
         corpus, question_texts=texts, limit_questions=int(limit_q)
     )
     _log("[eval] 问题单元 %d 个；开始生成 4 支变体" % int(len(units)))
-    generator, gen_ev = _build_generator([u.question_text for u in units], out_dir)
+    generator, gen_ev = _build_generator(
+        [u.question_text for u in units],
+        out_dir,
+        extractor=str(getattr(args, "keyword_extractor", "") or ""),
+    )
     variants = QV.generate_qa_variants(units, generator)
+    # 生成完成后才把 TF-IDF 打分侧（命中）统计挂进取证（仅 tfidf 档生效）。
+    _attach_extractor_stats(generator, gen_ev, generated=True)
     order = [str(v) for v in TV.VARIANT_ORDER]
     records = QV.variant_records(
         units, variants, variant_order=order, holdout_pct=int(holdout_pct), seed=int(seed)
@@ -768,13 +916,64 @@ def render_markdown(rep: Dict[str, Any]) -> str:
     lines.append("- 复用实现：" + str(ge["reused_module"]))
     lines.append("- 后端：" + str(ge["backend_kind"]) + "；`word_max_length` = "
                  + str(ge["word_max_length"]))
-    lines.append("- 词表：" + str(ge["vocab_path"]) + "（" + str(ge["vocab_n_words"])
-                 + " 词 / 候选 " + str(ge["vocab_n_distinct"]) + "）；SHA256 = `"
-                 + str(ge["vocab_sha256"]) + "`")
+    if ge.get("vocab_path"):
+        lines.append("- 词表：" + str(ge["vocab_path"]) + "（" + str(ge["vocab_n_words"])
+                     + " 词 / 候选 " + str(ge["vocab_n_distinct"]) + "）；SHA256 = `"
+                     + str(ge["vocab_sha256"]) + "`")
+    else:
+        lines.append("- 词表：**不适用**（`tfidf` 档不落候选词表文件；df 下限直接在本侧语料上"
+                     "统计，取证见 6.1 的 `keyword_idf.json`）")
     lines.append("- " + str(ge["reuse_rule"]))
     lines.append("- 逐支计数（generated / fallback_to_original / empty_source）：`"
                  + str(ev["generator_counters"]) + "`")
     lines.append("")
+    import n3d_qa_learn.text_variants as TV
+
+    if str(ge.get("keyword_extractor", "")) == TV.KEYWORD_EXTRACTOR_TFIDF:
+        xev = ge.get("extractor_evidence") or {}
+        scoring_ev = xev.get("scoring") or {}
+        lines.append("### 6.1 TF-IDF 口径取证（**词面统计**，与 KeyBERT 的语义抽取不等价）")
+        lines.append("")
+        lines.append("- 抽取器：**`tfidf`**（backend kind = `" + str(ge["backend_kind"])
+                     + "`）；依赖口径：" + str(xev.get("dependency_note", "")))
+        lines.append("- **IDF 公式**：`" + str(xev.get("idf_formula", "")) + "`")
+        lines.append("- **df 口径**：" + str(xev.get("df_rule", "")))
+        lines.append("- **tf / 打分 / 排序**：" + str(xev.get("score_rule", "")))
+        lines.append("- **候选集**：" + str(xev.get("candidate_rule", "")))
+        lines.append("- **N（语料文档数）** = " + str(xev.get("n_docs"))
+                     + "（语料口径 = `" + str(xev.get("corpus_scope", "")) + "`）；"
+                     "df 下限 `min_doc_freq` = " + str(xev.get("min_doc_freq")))
+        lines.append("- 候选词统计：过滤前候选词条数（逐行累加）**"
+                     + str(xev.get("n_candidate_pairs")) + "**；唯一候选词 **"
+                     + str(xev.get("n_distinct_candidates")) + "**；过 df 下限保留 **"
+                     + str(xev.get("n_kept_candidates")) + "**；IDF 区间 ["
+                     + ("%.6f" % float(xev.get("idf_min", 0.0))) + ", "
+                     + ("%.6f" % float(xev.get("idf_max", 0.0))) + "]（均值 "
+                     + ("%.6f" % float(xev.get("idf_mean", 0.0))) + "）")
+        lines.append("- 语料指纹 `corpus_sha256` = `" + str(xev.get("corpus_sha256", ""))
+                     + "`；取证文件 `" + str(ge.get("extractor_evidence_path", ""))
+                     + "`（SHA256 = `" + str(ge.get("extractor_evidence_sha256", "")) + "`）")
+        if bool(scoring_ev.get("applicable", False)):
+            cnt = scoring_ev.get("counters") or {}
+            lines.append("- **命中统计**（打分侧，逐行累加）：参与打分行数 "
+                         + str(cnt.get("n_scored_lines")) + "；候选词条数 "
+                         + str(cnt.get("n_candidates_total")) + "；过 df 下限保留 "
+                         + str(cnt.get("n_candidates_kept_total")) + "；实际输出的词数 "
+                         + str(cnt.get("n_terms_emitted")) + "；空候选行 "
+                         + str(cnt.get("n_empty_candidate_lines")) + "；被上限截断行 "
+                         + str(cnt.get("n_candidates_truncated_lines")))
+            lines.append("- 逐行均值：候选 " + ("%.6f" % float(scoring_ev.get("mean_candidates_per_line", 0.0)))
+                         + " / 保留 " + ("%.6f" % float(scoring_ev.get("mean_kept_candidates_per_line", 0.0)))
+                         + " / 输出 " + ("%.6f" % float(scoring_ev.get("mean_terms_per_line", 0.0)))
+                         + "；空候选率 " + ("%.6f" % float(scoring_ev.get("empty_candidate_rate", 0.0)))
+                         + "；截断率 " + ("%.6f" % float(scoring_ev.get("truncated_rate", 0.0))))
+        else:
+            lines.append("- 命中统计：本次运行未产生打分侧统计"
+                         "（`probe` 不生成变体；命中统计在 `eval` 产物里给出）")
+        # **I6**：口径说明**只输出一次**（此前 else 分支已经打印过一次 note，
+        # 下面又无条件再打印一次 ⇒ probe 渲染出的报告里同一句出现两遍）。
+        lines.append("- " + str(scoring_ev.get("note", "")))
+        lines.append("")
     lines.append("## 7. 确定性证据")
     lines.append("")
     det = rep.get("determinism")
@@ -803,6 +1002,11 @@ def render_markdown(rep: Dict[str, Any]) -> str:
     lines.append("2. 本轮**不训练**、不做检索评测：只交付数据与可量化的特征差异统计。")
     lines.append("3. 单 seed（" + str(sc["seed"]) + "）；跨 seed 未测。")
     lines.append("4. 切分口径沿用轮 1；本轮不重复报告宏观指标。")
+    if str((ev.get("generator") or {}).get("keyword_extractor", "")) == TV.KEYWORD_EXTRACTOR_TFIDF:
+        lines.append("5. **关键词支为 `tfidf`（词面统计）**：idf 只用 tf 与语料 df，"
+                     "与 KeyBERT 的语义嵌入余弦**不等价**；本产物只能与**同抽取器**的"
+                     "产物比较，**不得**把 tfidf 档的数字代入 `_verify/qa_variants/`"
+                     "（keybert 档）的结论，也不宣称 tfidf 更优 —— 本轮目标是**跑通全量口径**。")
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -824,6 +1028,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         "qa_variants_eval.json",
         "qa_variants_records.jsonl",
         "keyword_vocab.json",
+        "keyword_idf.json",
     ):
         p = os.path.join(out_dir, name)
         if os.path.isfile(p):
@@ -930,6 +1135,14 @@ def build_parser() -> argparse.ArgumentParser:
                        help="测试集留出比例（百分比整数，默认 20）")
         p.add_argument("--limit-questions", type=int, default=0,
                        help="小批演练：只取前 N 个问题（0 = 全量）")
+        if str(name) in ("probe", "eval"):
+            # **W3**：该开关**只有 probe / eval 消费**（二者会装配生成器）；
+            # `report` 只读已落盘产物、不生成变体 ⇒ 不挂该开关，
+            # 传了由 argparse 报 unrecognized arguments 并退码 2（不静默忽略）。
+            p.add_argument("--keyword-extractor", default="",
+                           help="关键词抽取器（keybert=默认 / tfidf=新增 jieba TF-IDF；"
+                                "空 = 默认 keybert，走历史路径、产物逐字节不变）。"
+                                "**仅 probe / eval 接受**（report 不生成变体）")
         if str(name) == "eval":
             p.add_argument("--repro-dir", default="",
                            help="对照产物目录：给定时产出双跑逐字节一致证据")

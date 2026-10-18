@@ -158,17 +158,47 @@ def _resolve_product_dir(explicit: str) -> str:
 
 
 def _build_generator(
-    args: argparse.Namespace, *, vocab_path: str = ""
+    args: argparse.Namespace, *, vocab_path: str = "", corpus_texts: Sequence[str] = ()
 ) -> Tuple[Any, Dict[str, Any]]:
     """构造变体生成器（含关键词后端可用性取证）。
+
+    参数
+    ----
+    args : argparse.Namespace
+        命令行参数（``--keyword-extractor`` / ``--keyword-top-k`` /
+        ``--summary-max-*`` / ``--enc-cache-dir`` / ``--no-st-fallback``）。
+    vocab_path : str
+        语料级候选词表路径（**仅 KeyBERT 支消费**）。
+    corpus_texts : Sequence[str]
+        **仅 TF-IDF 支消费**：用于统计 idf 的整侧语料（= 2665 行冻结文本行）。
+        传子集属口径偏离，调用方必须显式登记。
 
     返回
     ----
     Tuple[Any, Dict[str, Any]]
         `(generator, backend_evidence)`。
+
+    口径
+    ----
+    ``--keyword-extractor`` 为空 / ``keybert`` 时走历史 KeyBERT 路径，
+    **证据键与取值逐字不变**（既有 12 件产物逐字节不变）；
+    ``tfidf`` 时走 jieba 词面统计（``kind = jieba-tfidf``），证据额外带
+    ``keyword_extractor`` / ``extractor_evidence``（含 IDF 公式、N、df 口径、候选统计）。
     """
     import n3d_qa_learn.text_variants as TV
 
+    extractor = str(
+        getattr(args, "keyword_extractor", "") or TV.KEYWORD_EXTRACTOR_DEFAULT
+    ).strip().lower()
+    if extractor not in TV.KEYWORD_EXTRACTORS:
+        raise ValueError(
+            "未知关键词抽取器 " + repr(getattr(args, "keyword_extractor", ""))
+            + "；允许值 = " + str(list(TV.KEYWORD_EXTRACTORS))
+        )
+    if extractor == TV.KEYWORD_EXTRACTOR_TFIDF:
+        return _build_tfidf_generator(
+            args, vocab_path=vocab_path, corpus_texts=corpus_texts
+        )
     fallback = not bool(getattr(args, "no_st_fallback", False))
     try:
         backend = TV.build_keyword_backend(
@@ -209,6 +239,85 @@ def _build_generator(
         keyword_backend=backend,
         vocab_path=str(vocab_path),
     )
+    return generator, evidence
+
+
+def _build_tfidf_generator(
+    args: argparse.Namespace, *, vocab_path: str = "", corpus_texts: Sequence[str] = ()
+) -> Tuple[Any, Dict[str, Any]]:
+    """**TF-IDF 支**的生成器装配（可插拔分支；**不加载 bge-m3、不需要 keybert**）。
+
+    语料侧 idf 在此**一次性**统计（整侧语料），并落 ``keyword_idf.json`` 取证
+    （写进本次产物目录；**不碰**文本侧既有 12 件产物，因为调用方会给独立 ``--out-dir``）。
+
+    **fail-closed（轮 6 / W2）**：``corpus_texts`` 为空时**直接报错**（退码 2 的可读报文），
+    不再退回「用本次生成行拟合」—— 那会让 N 与 df 随之缩小，且偏离进不了产物。
+    """
+    import n3d_qa_learn.text_variants as TV
+
+    top_k = int(getattr(args, "keyword_top_k", 0) or TV.KEYWORD_TOP_K)
+    backend = TV.build_keyword_backend(
+        extractor=TV.KEYWORD_EXTRACTOR_TFIDF,
+        keyword_top_k=int(top_k),
+        min_doc_freq=int(TV.KEYWORD_MIN_DOC_FREQ),
+    )
+    corpus = [str(t) for t in corpus_texts]
+    if not corpus:
+        raise ValueError(
+            "TF-IDF 支必须显式传入**整侧语料**（n3d_qa 冻结文本行全量）作为 idf 语料；"
+            "当前为空 —— 不得用本次生成行 / 单行拟合"
+        )
+    fit_ev = backend["model_object"].fit(corpus)
+    fit_ev["corpus_scope"] = "explicit_keyword_corpus"
+    fit_ev["corpus_n_texts"] = int(len(corpus))
+    fit_ev["corpus_scope_note"] = (
+        "文本侧 idf 语料 = n3d_qa 冻结文本行全量（" + str(len(corpus)) + " 行）；"
+        "``--limit`` 只截断**生成**的行数、**不**缩小 idf 语料"
+    )
+    generator = TV.VariantGenerator(
+        keyword_top_k=int(top_k),
+        summary_max_sentences=int(
+            getattr(args, "summary_max_sentences", TV.SUMMARY_MAX_SENTENCES)
+            or TV.SUMMARY_MAX_SENTENCES
+        ),
+        summary_max_chars=int(
+            getattr(args, "summary_max_chars", TV.SUMMARY_MAX_CHARS)
+            or TV.SUMMARY_MAX_CHARS
+        ),
+        keyword_backend=backend,
+        vocab_path=str(vocab_path),
+        keyword_corpus=corpus,
+    )
+    evidence: Dict[str, Any] = {
+        "kind": str(backend.get("kind", "")),
+        "note": str(backend.get("note", "")),
+        "encoder_dim": 0,
+        "word_max_length": int(backend.get("word_max_length", 0)),
+        "keyword_extractor": TV.KEYWORD_EXTRACTOR_TFIDF,
+        "extractor_evidence": fit_ev,
+        "idf_formula": str(TV.TFIDF_IDF_FORMULA),
+        "score_rule": str(TV.TFIDF_SCORE_RULE),
+        "min_doc_freq": int(TV.KEYWORD_MIN_DOC_FREQ),
+    }
+    if vocab_path:
+        idf_path = os.path.join(os.path.dirname(os.path.abspath(vocab_path)), "keyword_idf.json")
+        _write_json(
+            idf_path,
+            {
+                "schema_version": str(TV.TEXT_VARIANTS_SCHEMA_VERSION),
+                "backend_kind": str(backend.get("kind", "")),
+                "extractor": str(TV.KEYWORD_EXTRACTOR_TFIDF),
+                "corpus": "text_lines（n3d_qa 冻结文本行全量）",
+                "idf_formula": str(TV.TFIDF_IDF_FORMULA),
+                "df_rule": str(TV.TFIDF_DF_RULE),
+                "score_rule": str(TV.TFIDF_SCORE_RULE),
+                "candidate_rule": str(TV.TFIDF_CANDIDATE_RULE),
+                "dependency_note": str(TV.TFIDF_DEPENDENCY_NOTE),
+                "min_doc_freq": int(TV.KEYWORD_MIN_DOC_FREQ),
+                "evidence": fit_ev,
+            },
+        )
+        evidence["extractor_evidence_path"] = str(idf_path)
     return generator, evidence
 
 
@@ -304,7 +413,9 @@ def cmd_probe(args: argparse.Namespace) -> int:
          + " 行全量构建；n_words = " + str(vocab_info["n_words"])
          + "；fingerprint = " + str(vocab_info["fingerprint"])[:16] + "...）")
 
-    generator, backend_ev = _build_generator(args, vocab_path=vocab_path)
+    generator, backend_ev = _build_generator(
+        args, vocab_path=vocab_path, corpus_texts=[str(r.text) for r in full_rows]
+    )
     # **fix 4（R68）**：现场实测关键词编码器的截断情形（最长若干行文本），
     # 把 `truncation_observed` 落进 `keyword_backend` 取证（随 variants_meta.json
     # 与 probe_summary.json 一并落盘）。`encoder` 只存在于生成器内部的后端字典里，
@@ -1426,6 +1537,19 @@ def cmd_textvariants(args: argparse.Namespace) -> int:
         )
         return 1
     sub = str(getattr(args, "textvariants_cmd", "") or "probe")
+    # **W3：`--keyword-extractor` 只有 `probe` 消费**。
+    # 独立入口（`text_variants_run`）用真子解析器，非 probe 子命令**根本没有**该开关
+    # ⇒ argparse 直接报 unrecognized arguments 并退码 2；而 `step2_run textvariants`
+    # 是单一子命令、由 `_add_textvariants_all_arguments` 把 probe 的参数并入同一解析器，
+    # 故**必须在此显式拦截**，否则非 probe 子命令会静默忽略该开关（同一缺陷的第二个入口）。
+    extractor_arg = str(getattr(args, "keyword_extractor", "") or "").strip()
+    if extractor_arg and sub != "probe":
+        _log(
+            "[textvariants] 子命令 " + repr(sub) + " 不接受 --keyword-extractor"
+            "（只有 probe 会生成变体，其它子命令只读已落盘产物 / 做检索评测）。"
+            "当前 = " + repr(extractor_arg) + "；请去掉该开关，或改用 probe。"
+        )
+        return 2
     handlers = {
         "probe": cmd_probe,
         "gate": cmd_gate,
@@ -1544,6 +1668,15 @@ def _add_textvariants_arguments(
                    help="小批演练：只取前 N 行（0 = 全量）")
     p.add_argument("--keyword-top-k", type=int, default=0,
                    help="关键词支 top-k（0 = 冻结默认 3）")
+    if str(subcommand) in ("", "probe"):
+        # **W3**：该开关**只有 probe 消费**（只有它生成变体），故只挂在 probe 上；
+        # 其它子命令拿到非默认值时必须**显式报错**，不得静默忽略
+        # —— 独立入口由 argparse 的 unrecognized arguments 拒（退码 2），
+        # `step2_run textvariants` 由 `cmd_textvariants` 的显式守卫拒（退码 2）。
+        p.add_argument("--keyword-extractor", default="",
+                       help="关键词抽取器（keybert=默认 / tfidf=新增 jieba TF-IDF；"
+                            "空 = 默认 keybert，走历史路径、产物逐字节不变）。"
+                            "**仅 probe 接受**（其余子命令不生成变体）")
     p.add_argument("--summary-max-sentences", type=int, default=0,
                    help="摘要支句数上限（0 = 冻结默认；**仅 probe 生效**）")
     p.add_argument("--summary-max-chars", type=int, default=0,

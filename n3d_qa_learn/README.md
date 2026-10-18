@@ -6367,4 +6367,477 @@ assert [k for k, v in cnt.items() if v > 1] == [], '标题编号重复'
 <!-- HEADING_UNIQUENESS_ENUM:END -->
 
 
+## 二十一、轮 5：关键词抽取器可插拔（KeyBERT / jieba TF-IDF）+ TF-IDF 全量跑
+
+把「关键词支」的**抽取器**从写死的 KeyBERT 改成**可插拔**：新增 jieba TF-IDF 后端，
+并用它把 QA 侧**全量 12727 题 × 4 支**跑通。**默认仍是 KeyBERT**，且默认路径的既有产物
+**逐字节不变**。本轮**不训练、不评测模型**，只交付「可切换的抽取器 + 全量口径的变体产物」。
+
+### 21.1 可插拔口径（唯一实现点）
+
+* 抽取器枚举与默认档：`text_variants.KEYWORD_EXTRACTORS = ("keybert", "tfidf")`、
+  `KEYWORD_EXTRACTOR_DEFAULT = "keybert"`；未知名**立即 `ValueError`**（不静默回退）。
+* 工厂：`text_variants.build_keyword_backend(..., extractor=..., keyword_top_k=..., min_doc_freq=...)`
+  —— `extractor="tfidf"` **先分派**到 `build_tfidf_keyword_backend(...)`，
+  因此 TF-IDF 支**不加载 bge-m3、不触发 keybert 依赖判定**；返回字典与 KeyBERT 支**同形**
+  （`kind` / `extractor` / `model_object` / `encoder` / `note` / `word_max_length` + TF-IDF 口径字段）。
+* 生成器：`VariantGenerator.keyword_corpus`（整侧语料，仅供 TF-IDF 支）、
+  `keyword_extractor_name` 属性（**旧后端字典无 `extractor` 键时按 `keybert` 处理** ⇒ 向后兼容）、
+  分派点唯一（`keyword_variants_batch` 内一行 if）。
+* CLI（**轮 6 / W3 收口后的精确口径**）：`--keyword-extractor`（默认空 = `keybert`）
+  只挂在**真正消费它的子命令**上 ——
+  * `qa_variants_run`：**`probe` 与 `eval`** 接受（二者都装配生成器）；
+    `report` **不接受**（只读已落盘产物），传了由 argparse 报 `unrecognized arguments` 并退码 2；
+  * `text_variants_run`：**只有 `probe`** 接受（只有它生成变体）；`gate` / `eval` / `report`
+    **不接受**（独立入口由 argparse 拒、退码 2；`step2_run textvariants` 这条单子命令入口
+    由 `cmd_textvariants` 的显式守卫拒、退码 2 —— 见 §22.3 的 W3 现场证据）。
+  任何「非消费子命令收到非默认值」的情形都**显式报错**，不存在静默忽略。
+* 生成器侧 `keyword_corpus` 是**必填**（fail-closed，轮 6 / W2）：TF-IDF 支未给整侧语料时
+  抛可读 `VariantContractError`，**不会**退回「当前批次 / 单行」拟合（见 §22.2）。
+* **零回归的代码侧保证**：KeyBERT 分支的**代码路径与证据键/取值**均未改动
+  （证据块只在 `tfidf` 档追加 `keyword_extractor` / `extractor_evidence`），
+  故不传开关时 `_verify/qa_variants/` 11 件与 `_verify/text_variants/` 12 件产物**逐字节不变**（21.6 现场取证）。
+
+### 21.2 TF-IDF 口径（**三处同源**：代码 docstring / 产物字段 / 本节）
+
+常量唯一来源在 `text_variants`：`TFIDF_IDF_FORMULA` / `TFIDF_DF_RULE` /
+`TFIDF_SCORE_RULE` / `TFIDF_CANDIDATE_RULE` / `TFIDF_DEPENDENCY_NOTE` /
+`TFIDF_BACKEND_KIND = "jieba-tfidf"`。产物侧落到 `keyword_backend.extractor_evidence`
+与 `keyword_idf.json`；README 就是本节。
+
+| 项 | 口径（逐字与常量一致） |
+| --- | --- |
+| 候选集 | **与 KeyBERT 支同源**：jieba 分词 + `KEYWORD_POS_KEEP` 词性过滤 + 1~3 元 n-gram + 单行候选上限 `KEYWORD_MAX_CANDIDATES=32` + 语料级 df 下限（QA 侧沿用 `QA_VOCAB_MIN_DOC_FREQ=20`，文本侧沿用 `KEYWORD_MIN_DOC_FREQ=2`）；枚举顺序 = 词面升序（与 sklearn `CountVectorizer.get_feature_names_out()` 的字典序一致） |
+| N | 本侧语料文档数：**QA 侧 = 全部问题文本**（本轮 12727）；**文本侧 = 2665 行** |
+| df(w) | 本侧语料中「含 w」的文档数（w 与候选词同口径，同一分词器、同一 n-gram 范围） |
+| idf | `idf(w) = ln((1 + N) / (1 + df(w))) + 1` |
+| tf | `tf(w)` = w 在该行文本中的出现次数（同一分词口径下的 n-gram 计数） |
+| score | `score(w) = tf(w) × idf(w)` |
+| 排序 | `(score desc, 词面 asc)`（确定性；词面唯一 ⇒ 键唯一），取 `KEYWORD_TOP_K = 3` |
+| 回退 | 候选为空 / 结果为空 / 过短（`< KEYWORD_MIN_CHARS`）/ 与原文逐字相同 ⇒ 回退原文并计数（沿用 B3 现规则） |
+| 依赖 | **仅 jieba（既有可选依赖）+ Python 标准库 `math`**：不用 sklearn / scipy，也不需要 numpy ⇒ **零新增依赖** |
+
+**候选集同源的现场验证**（不是「声称」）：对全量问题按步长抽样 200 条，逐条比对
+「本实现的 `_ngram_counts` 键集合」与「KeyBERT 支实际使用的
+`CountVectorizer(tokenizer=jieba_pos_tokenizer(), ngram_range=(1,3), token_pattern=None)`
+的 `get_feature_names_out()`」——**候选集不一致 0/200**；
+再过 df 下限 + 上限截断后与 `keyword_candidates` 口径逐项比对 ——**不一致 0/200**。
+另有两条不动点互证：`n_docs = 12727`、`n_distinct_candidates = 163690`、
+`n_kept_candidates = 2849`，与轮 3 记录的「QA 语料唯一候选词 163690 / mdf=20 保留 2849」
+**逐项相同**（同一语料、同一枚举口径）。
+
+**IDF 公式与打分的可复算**：对 6 个词用公式独立重算 `idf`（容差 `1e-12`）⇒ 全部相等；
+对首行独立重算 `score = tf × idf` 并按 `(score desc, 词面 asc)` 取前 3 ⇒ **逐位相同**。
+
+**退化语料上的同源（轮 6 / W1 修正，口径必须写清）**：候选过滤与 KeyBERT 支**逐分支同源** ——
+只有当**语料级词表非空**（存在 `df >= min_doc_freq` 的词）才做过滤；词表为空（例：5 行语料 +
+`mdf=20`）时**两侧都完全不过滤**；词表非空但本行无命中时才回退前 `KEYWORD_MIN_CANDIDATES` 个。
+此前 TF-IDF 侧把「词表为空」并进了「无命中」那条分支，使退化语料上两侧候选数不同
+（现场：5 行 × 4 词 ⇒ KeyBERT 9/行、TF-IDF 旧口径 3/行），**「同源」只在词表非空时成立**；
+对齐后**无条件成立**（现场 5 行 × 9 候选，两侧合计 45 = 45，逐项同序相同；旧口径合计 15）。
+
+### 21.3 全量跑的规模、耗时与门槛判断（任务 3a/3b）
+
+**先做计时探针**（写临时目录，事后清理），据此判断全量单批是否 < 600 s：
+
+| 探针 | 问题数 | 前台耗时 |
+| --- | --- | --- |
+| 计时探针 | 200 | **77.0 s** |
+| 计时探针（加测） | 1000 | **83.7 s** |
+
+两点拟合出的固定成本约 73 s、边际约 **0.0084 s/题**（200→1000 题仅增加 6.7 s）⇒ 全量外推
+≈ 180 s，**远低于 600 s** ⇒ **单批即可完成**，因此 **未实现也不需要 `--offset` 分批续跑**
+（3c 的「若单批超 600 s」分支未触发；切分始终按 `question_id` 整组，单一批次下不存在
+「分批引入泄漏」的问题）。
+
+**全量实跑**（`--keyword-extractor tfidf`，新目录 `checkpoints/qa_learn/_verify/qa_variants_tfidf_full/`，
+**不改动** 既有 `_verify/qa_variants/`）。
+**解释器口径（I1）**：下表与 §21.8 的命令一律用
+`E:\neuron3d\.venv\Scripts\python.exe -m ...`；若照抄成裸 `python -m ...`，须**先激活 `.venv`**
+（本机裸 `python` 缺 `jieba` / `keybert`，会直接 `ModuleNotFoundError`）。
+
+> 下表 4 行命令**逐行**给出完整解释器（`<同上>` 仅指上一行已给出的同一目录实参，
+> 不是省略解释器）；§21.8 的代码块同样是 7/7 行都带完整 venv 路径。
+
+| 步骤 | 命令 | 退码 | 前台耗时 |
+| --- | --- | --- | --- |
+| `probe` | `E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.qa_variants_run probe --keyword-extractor tfidf --out-dir checkpoints/qa_learn/_verify/qa_variants_tfidf_full` | 0 | **99.9 s** |
+| `eval`（第 1 跑） | `E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.qa_variants_run eval --keyword-extractor tfidf --out-dir checkpoints/qa_learn/_verify/qa_variants_tfidf_full` | 0 | **164.2 s** |
+| `eval`（第 2 跑，带 `--repro-dir`） | `E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.qa_variants_run eval --keyword-extractor tfidf --out-dir checkpoints/qa_learn/_verify/qa_variants_tfidf_full --repro-dir checkpoints/qa_learn/_verify/qa_variants_tfidf_full/_repro` | 0 | **162.2 s** |
+| `report` | `E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.qa_variants_run report --out-dir checkpoints/qa_learn/_verify/qa_variants_tfidf_full`（连跑两次验证可重渲） | 0 | < 1 s |
+
+规模：**12727 问题 × 4 支 = 50908 条变体记录**；交互证言：逐任务问题数
+`{'blank': 2469, 'choice': 8043, 'judge': 784, 'solve': 1404, 'triviaqa': 27}`；
+按侧：训练 **10284 问题 / 41136 行**、测试 **2443 问题 / 9772 行**；绑定输出（答案展示文本）
+与问题原文逐字节相等的条数 = **0**（口径未退化）。
+
+### 21.4 4 支的特征变化统计（逐支 vs 原文支）
+
+向量化器：`lexical-88` / `role=question` / `dim=88` / 指纹 `d4a4881aaa8dfa8c…`（与 B3 同源）。
+
+| 变体 | n | 文本同原文 | 特征裸字节同原文 | 余弦 min | 余弦 mean | 余弦 p50 | 余弦<1 | 判定 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `原文` | 12727 | 12727 / 12727 | 12727 / 12727 | 1.000000 | 1.000000 | 1.000000 | 0 | False（锚点，应然） |
+| `关键词` | 12727 | **3 / 12727** | **3 / 12727** | 0.057154 | 0.518301 | 0.521455 | 12724 | **True** |
+| `摘要` | 12727 | **69 / 12727** | **70 / 12727** | 0.133279 | 0.867680 | 0.898296 | 12657 | **True** |
+| `自适应` | 12727 | **3 / 12727** | **3 / 12727** | 0.000000 | 0.664105 | 0.686204 | 12724 | **True** |
+
+**如实报告哪些变体与原文一致**（逐字节相同）：关键词 **3/12727**、摘要 **69/12727**、
+自适应 **3/12727**、原文 12727/12727；三支非锚点的 `n_feature_bitwise_identical` 均为 3 / 70 / 3
+（**无「文本变了特征没变」的大面积情形**，唯一下述 1 条）。
+
+两处**必须如实登记的细节**（本轮现场排查结论，均非本轮代码引入）：
+
+1. **摘要支「文本不同但特征相同」= 1 条**：文本同原文 69 条，但裸字节同原文 **70** 条
+   ⇒ 有 1 条变体文本与原文不同、其 `lexical-88` 特征却逐字节相同（哈希桶碰撞，B3 口径已预见并有
+   `n_feature_bitwise_identical` 专抓该情形）。
+2. **自适应支余弦 = 0 的 2 条**：该 2 行的问题原文以引号开头（多行文本），自适应支落到
+   `short` 档并经子句/兜底截断后只剩 **1 个字符 `\u201c`**（左双引号）⇒ 其 `lexical-88` 特征为
+   **零向量**（空文本零向量契约），`feature_difference_report` 的零范数分支把余弦记作 `0.0`
+   （口径：`na>0 且 nb>0` 才做除法）。**这是既有实现的口径行为**，与抽取器切换无关；
+   本轮如实登记、不把它当作「特征变化」的证据（该支另有 12722 条余弦 ∈ (0, 1) 支撑判定）。
+
+`evaluability` 互证（**两个来源不同，非恒真**）：原文 0/0、关键词 **12724/12724**（生成器
+`fallback_to_original = 3`）、摘要 **12658/12658**（回退 69）、自适应 **12724/12724**（回退 3），
+四支 `evaluable_consistent` 全 True。
+
+**与 KeyBERT 支的同批对比（如实登记，不包装）**：在**前 400 题**上用同一命令各跑一次
+（keybert 档 = 轮 3 的 `_verify/qa_variants/qa_variants_eval.json`，tfidf 档 = 本轮临时探针）：
+
+| 变体 | keybert 文本同/裸字节同 | tfidf 文本同/裸字节同 | keybert cos min/mean/p50 | tfidf cos min/mean/p50 |
+| --- | --- | --- | --- | --- |
+| `关键词` | 0 / 0 | 0 / 0 | 0.069747 / **0.393480** / 0.398590 | 0.069747 / **0.374872** / 0.365645 |
+| `摘要` | 4 / 4 | 4 / 4 | 0.401767 / 0.876336 / 0.901670 | **逐位相同** |
+| `自适应` | 0 / 0 | 0 / 0 | 0.200517 / 0.681775 / 0.708414 | **逐位相同** |
+
+读法与**不得越界**的结论：只有在 `关键词` 支上两档有差异（tfidf 的 cos 均值/中位**更低** =
+变体离原文更远），而 `摘要`（不依赖抽取器）与 `自适应`（这 400 题全部落在 `mid`/`long` 档）
+在两档下**每一项逐位相同** —— 这反向证明「替换抽取器**只影响关键词支**」。
+「cos 更低」**不构成「更好」或「更差」**：本轮的指标只是「变体与原文的特征距离」，
+**不是**任务指标（不训练、不做检索评测）。**不得**据此宣称 TF-IDF 优于 KeyBERT，
+也**不得**把两档数字互相代入。
+
+### 21.5 整组切分三条不变量 + 反例翻面证据
+
+| 不变量 | 通过 | 现场计数 |
+| --- | --- | --- |
+| `rows_disjoint_and_union_complete` | **True** | 训练行 41136 / 测试行 9772 / 合计 50908；交集 0；并集 50908；并集完整 True |
+| `questions_disjoint_and_union_complete` | **True** | 训练问题 10284 / 测试问题 2443 / 合计 12727；交集 0 |
+| `every_question_wholly_on_one_side` | **True** | 跨侧问题数 0 |
+
+反例（**证明断言非恒真**，全部在内存副本上做、真实产物不被改动）：
+
+| 反例 | 目标不变量 | 破坏前 | 破坏后 | 断言如期触发 |
+| --- | --- | --- | --- | --- |
+| `flip_one_variant_half_question` | `every_question_wholly_on_one_side` | True | False | **True** |
+| `duplicate_one_row` | `rows_disjoint_and_union_complete` | True | False | **True** |
+| `drop_one_row` | `rows_disjoint_and_union_complete` | True | False | **True** |
+| `drop_one_question_group` | `questions_disjoint_and_union_complete` | True | False | **True** |
+
+### 21.6 确定性、产物取证与零回归
+
+**双跑逐字节一致**（真实产物目录 + 真实工作序 `probe → eval → 拷内容产物到 _repro/ → eval --repro-dir → report`）：
+共有文件 **4**、逐字节相同 **True**、不相等 **[]**；证据文件 `determinism_check.json`
+**排除自身**与两件后置可重渲报告（`qa_variants_report.{json,md}`）⇒ 无自指哈希回路、不含时间戳/耗时。
+`report` 连跑两次的 `.json` / `.md` **逐字节相同**（见下表指纹）。
+
+| 产物（`_verify/qa_variants_tfidf_full/`） | 字节 | SHA256 前 16 位 |
+| --- | --- | --- |
+| `qa_variants_probe.json` | 12918 | `bc3c4add0b4ed212` |
+| `qa_variants_eval.json` | 31899 | `06c6e2ad895b3eb4` |
+| `qa_variants_records.jsonl` | 22706291 | `1479bb8273aa1e4e` |
+| `keyword_idf.json` | 3339 | `b043a62f7f956dbc` |
+| `determinism_check.json` | 2716 | `28c2d745ede9f011` |
+| `qa_variants_report.json` | 49476 | `7ec5193cc9e3d683` |
+| `qa_variants_report.md` | 11045 | `56b2237c42a1a90f` |
+| `probe.log` / `eval.log` / `eval_repro.log` / `report.log` | 235 / 840 / 922 / 111 | 日志类派生件，不参与内容指纹比对 |
+
+> **本表是终值（轮 6 复跑后）**。轮 5 交付时的两个不同值是
+> `determinism_check.json` **2699 `30c94046c50986e3`** 与 `qa_variants_report.json` **49458 `21804b5496211fbb`**；
+> 二者变化**不是行为变化**，逐字段原因见 §22.4（`determinism_check.json` 只变「目录状态取证」两个字段、
+> `qa_variants_report.json` 只随其内嵌的该证据块变化）。其余 5 件（含 `report.md`）在轮 6 复跑后
+> **字节完全相同**。
+
+**TF-IDF 取证字段**（`keyword_backend.extractor_evidence` 与 `keyword_idf.json` 两处同源）：
+**extractor** = `tfidf`、**idf 公式** = `ln((1+N)/(1+df(w)))+1`、**N = 12727**、
+**df 口径** = `TFIDF_DF_RULE` 原文、语料口径 `explicit_keyword_corpus`、`min_doc_freq = 20`、
+**候选词统计**：过滤前逐行候选词条数 **603882**、唯一候选词 **163690**、过 df 下限保留 **2849**、
+IDF 区间 **[1.430686, 7.407037]**（均值 6.572984）、语料指纹
+`corpus_sha256 = 5b0c71377dd2721520d81f940388df81508935970d9c13c814f7f658086cfa15`；
+**命中统计**（打分侧逐行累加）：参与打分行数 12727、候选词条数 603882、过 df 下限保留 274111、
+实际输出词数 37826、空候选行 3、被上限截断行 3545；逐行均值 候选 47.448888 / 保留 21.537754 /
+输出 2.972107；空候选率 0.000236、截断率 0.278542。
+
+**零回归（逐字节取证，非声明）**：
+
+* 基线快照（改动前）与终态快照（全量跑之后）逐项比对 **433 个文件**
+  （`_verify/qa_variants/` 11 件含 `_repro/`、`_verify/text_variants/` 12 件含其各子目录、
+  `step2/` 9 件、`dataset/` 17 件、根 `requirements.txt`、`n3d_qa_learn/requirements-qa.txt`）
+  ⇒ `CHANGED = []`、`ADDED = []`、`REMOVED = []`；顶层 9 个 `qa_*.pt.zip` 的 SHA256/字节
+  逐项不变。
+* **默认路径 A/B 现场对照**（不传开关 vs 显式 `--keyword-extractor keybert`，同目录先后两跑）：
+  QA `probe` 的 `qa_variants_probe.json` **两次同一 SHA256**
+  （`450f46a006e0561237dd4f63db705855875c3f50ad1bbf5749375fecede77dd3`）；
+  QA `eval` 的 `qa_variants_eval.json` **两次同一 SHA256**
+  （`71b62a2fa00937a04661c5913f463b67b191da8cea3c811eeaeab7ee31979524`），
+  `qa_variants_records.jsonl` 亦然（`equal=True`）；
+  文本侧 `probe` 的 `variants.jsonl` / `variants_meta.json` / `keyword_vocab.json`
+  **两次各自同一 SHA256**（`variants.jsonl` =
+  `826e3c6723cb57ac7470dcb10c2f62fc462a868ebcebe3cc12b7e65fb028fedf`）
+  ⇒ 「不传开关 == 显式 keybert == 历史路径」在**产物字节层面**成立。
+* 上游四目录 `git status --porcelain -- n3d_qa n3d_shape n3d_sphere n3d_proto` ⇒ **空**。
+* 零新增依赖：根 `requirements.txt` 与 `n3d_qa_learn/requirements-qa.txt` 均**未改**（指纹见 21.6 快照）；
+  TF-IDF 实现只用 jieba + 标准库 `math`。`python -m compileall -q n3d_qa_learn` 退码 **0**。
+
+### 21.7 如实登记的局限（**不得包装**）
+
+1. **TF-IDF 是词面统计，与 KeyBERT 的语义抽取不等价**：前者只用 `tf × 语料 df`，后者用语义嵌入余弦；
+   同一输入会给出不同关键词（21.4 的 400 题对比即为证据）。**两档的结论不得混用**，
+   任何「哪支更好」的判断都需要**任务指标**（检索 / 命中率），本轮**没有**该项。
+2. **本轮目标是跑通全量口径，不宣称 TF-IDF 更优**：`qa_variants_tfidf_full/` 的数字只能与
+   **同抽取器、同语料规模**的产物比较；不得代入 `_verify/qa_variants/`（keybert 档、400 题）的结论。
+3. **`_verify/qa_variants/` 仍是 400 题口径**：KeyBERT 全量需 4~7 小时（单题约 1 s、且本环境
+   后台/嵌套执行会停滞），故 **KeyBERT 侧没有全量产物**，全量只做了 tfidf 档。
+4. 单 seed（42）、单切分；`--limit-questions` 会让 idf 语料（N）与 df 同时缩小 ⇒ **属口径偏离**，
+   已在 `corpus_scope` 与 `corpus_n_texts` 显式登记（本轮全量跑为 N=12727 的整侧口径）。
+5. 4 支变体仍是**抽取式 / 词面级**变换，不是语义 paraphrase；摘要支为「信息减少」。
+6. `自适应` 支的 2 条余弦 0.0 与 `摘要` 支的 1 条「文本不同但特征相同」已在 21.4 逐条说明，
+   **不代表**变体质量，也不影响「特征确实变化」的判定。
+7. **未做**：文本侧（2665 行）的 tfidf **全量**产物（本轮只做了 `--limit 20` 的入口贯通演练，
+   写临时目录后清理，不改动既有 12 件产物）；跨 seed / 跨留出比例的极差。
+8. **关键词支输出可能出现重复词**（可读性现象、**不是缺陷**，轮 6 / I7 登记）：候选集含 1~3 元
+   n-gram 且**互相重叠**（如 `平面`、`平面 垂直`、`垂直`），而排序规则钉死为
+   「候选同源 + `(score desc, 词面 asc)` 取前 3」，故同一行可能出现
+   `平面 平面 平面 平面 平面 垂直` 这类**词面重复**（不同 n-gram 各自命中、但字符 `平面` 反复出现）。
+   该现象由**钉死规则**决定：本轮不改写规则，只如实登记；要消除它必须改口径（例如对输出做词面去重后
+   再补足 top-k），那会改变全量档产物，**不在本轮范围**。
+
+### 21.8 命令清单（本轮现场执行）
+
+```text
+# 解释器口径（I1）：以下命令一律用 venv 解释器；裸 `python` 缺 jieba/keybert
+#   E:\neuron3d\.venv\Scripts\python.exe
+# 等价写法：先激活 .venv（E:\neuron3d\.venv\Scripts\Activate.ps1）再直接用 `python -m ...`
+
+# 计时探针（临时目录，事后清理）
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.qa_variants_run eval --limit-questions 200  --keyword-extractor tfidf --out-dir <tmp>
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.qa_variants_run eval --limit-questions 1000 --keyword-extractor tfidf --out-dir <tmp>
+
+# 全量（新目录；不碰 _verify/qa_variants/）
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.qa_variants_run probe  --keyword-extractor tfidf --out-dir checkpoints/qa_learn/_verify/qa_variants_tfidf_full
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.qa_variants_run eval   --keyword-extractor tfidf --out-dir checkpoints/qa_learn/_verify/qa_variants_tfidf_full
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.qa_variants_run eval   --keyword-extractor tfidf --out-dir <同上> --repro-dir <同上>/_repro
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.qa_variants_run report --out-dir checkpoints/qa_learn/_verify/qa_variants_tfidf_full
+
+# 文本侧入口贯通演练（临时目录，事后清理）
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.text_variants_run probe --keyword-extractor tfidf --limit 20 --no-encoder-neighbors --out-dir <tmp>
+```
+
+### 21.9 变更面（本轮）
+
+* 修改 3 个代码文件：`n3d_qa_learn/text_variants.py`（抽取器常量 / `_ngram_counts` /
+  `TfidfKeywordExtractor` / `build_tfidf_keyword_backend` / `build_keyword_backend` 的 `extractor` 分支 /
+  `VariantGenerator` 的 `keyword_corpus` 与 TF-IDF 分派）、
+  `n3d_qa_learn/qa_variants_run.py`（`--keyword-extractor`、`_build_generator` 的 tfidf 分支与
+  `keyword_idf.json`、`_attach_extractor_stats`、报告 §6.1、指纹清单加 `keyword_idf.json`）、
+  `n3d_qa_learn/text_variants_run.py`（`--keyword-extractor`、`_build_tfidf_generator`、
+  `probe` 传整侧语料）。
+* 修改 1 个文档文件：`n3d_qa_learn/README.md`（本节）。
+* `__init__.py` **无需登记**：本轮**没有新增模块文件**（新符号只落在既有模块内，
+  并按包内惯例登记在 `text_variants.__all__`），故包级 `__all__` 不变。
+
+### 21.10 离朱轮 5 测试与 4 条观察项的处置（**如实登记**）
+
+离朱测试结果：**36 / 36 PASS、FAIL 0、ERROR 0**（单元 18 + CLI 契约 10 + 编译 1 + 产物可复算与零回归 7；
+E2E 不适用——本模块无 UI，其「接口面」以 CLI 契约形式覆盖）。
+测试期间的产物二次快照与「35 个 step2/dataset/zip 文件 SHA256 + 字节前后不变」均一致。
+4 条**观察项**（不构成失败）的处置与**现状口径**：
+
+| 编号 | 现象 | 处置 |
+| --- | --- | --- |
+| **O2** | 「tfidf 不需要 keybert」在**运行期**成立（屏蔽 keybert + sklearn 的进程里 `build_keyword_backend("tfidf") → fit → extract_terms` 全链路成功），但 `text_variants` **导入期**仍会 `try: from keybert.backend import BaseEmbedder`（缺失回退 `object`，不阻断导入） | **补限定语（本节）**：本模块导入期对 keybert 存在**可选导入**（R67 起的既有设计，缺失不阻断「摘要 / 难负例 / 特征门禁 / 零训练检索」）；`tfidf` 分支在**运行期**不使用 keybert、不构造 bge-m3。故 §21.1 的「不触发 keybert 依赖判定」指**运行期**，不得读成「导入期完全不触碰 keybert」 |
+| **O3** | 工厂返回字典的键是 `extractor`，两个 CLI 落盘的 `keyword_backend` 证据块用的键是 `keyword_extractor`（`extractor_evidence.extractor` 亦为 `tfidf`） | **明示差异（本节）**：消费方按 `keyword_backend["keyword_extractor"]` 取值；工厂字典只用于**构造期分派**，不进产物。两处同义但不同名，**不是**同一字段的两种写法 |
+| **O1** | `keyword_terms()` 在 `keyword_backend=None` 且**候选为空**时返回 `([], [])`，不抛 `TextVariantDependencyError`（同一实例的 `keyword_variants_batch` / `keyword_variant` / `adaptive_variant` / 有候选的 `keyword_terms` 均正确抛错） | **登记不修（含理由）**：`keyword_terms` 是**只读取证 / 调试**方法（主路径一律走批量），候选为空时「没有可返回的词」是**如实结果**、不需要模型调用；该早退分支是**既有实现**（不是本轮引入），本轮**未改动**它——因为把它改成抛错会改变既有可观测行为，而它不影响任何产物；主生成路径的 fail-closed 语义（不得静默把原文当关键词支结果）**已经成立** |
+| **O4** | 某次列举里出现 0 字节 `run.log`（不在 `_verify/qa_variants/` 的 11 件清单内） | **现场定位**：该 0 字节文件在 `checkpoints/qa_learn/_verify/qa_variants_full/run.log`（**另一个旧失败目录**），mtime `2026-10-18 08:56:58`，**早于本轮首次命令（09:08:32）**，不是本轮产物；`_verify/qa_variants/` 现场恰 **11 件**、`run.log` 不存在、全部 mtime ≤ `2026-10-17 14:38:56`，7 件内容产物 SHA256 与 §20.5.3 登记值逐项一致 |
+
+**本轮全部命令的日志落点纪律**：`qa_variants_tfidf_full/` 下的 `probe.log` / `eval.log` /
+`eval_repro.log` / `report.log` 一律由 `--log-file` **写在本产物目录内**（不写进既有 11 件目录），
+临时演练目录（`_r5_*`）与临时脚本目录 `tmp_r5/` 已全部删除。
+
+## 二十二、轮 6：抽取器口径收口（W1/W2/W3 + 9 项 info 快修）
+
+**本轮只做收口、不新增功能**：3 项 warning（口径声明与实际行为不一致）+ 7 项 info。
+全量档 tfidf 产物**行为零变化**（22.4 用「真跑一次 eval」逐项 SHA256 作证）。
+改动面：`text_variants.py` / `qa_variants_run.py` / `text_variants_run.py` / 本 README。
+
+### 22.1 W1 · 退化语料下的「候选集同源」**无条件成立**
+
+* **缺陷**：既有 `VariantGenerator.keyword_candidates` 是 `if vocab:` 才过滤（**词表为空则完全不过滤**）；
+  而新增 TF-IDF 的 `_candidates_of` 在 `kept` 为空时回退 `words[:min_candidates]`。两者把
+  「词表为空」与「词表非空但本行无命中」并成了同一条分支 ⇒ 退化语料（例：5 行语料 + `mdf=20`，
+  此时**没有任何词**能达到 df 下限）上两侧候选数不同，「同源」只在词表非空时成立。
+* **修法**：`_candidates_of` 对齐成 `if self._vocab:` 语义 —— **只有词表非空才过滤**；
+  词表非空但本行无命中才回退前 `KEYWORD_MIN_CANDIDATES` 个；末尾仍按 `KEYWORD_MAX_CANDIDATES`
+  截断。`fit` 同时固化 `self._vocab = frozenset(kept)`。**口径常量文本未改**（`TFIDF_CANDIDATE_RULE`
+  的「同源 + 单行候选词表在截断前逐项相同」在修正后对**所有**语料都为真），故产物字段不变。
+* **退化语料现场用例**（5 行 × 4 词、`mdf=20` ⇒ `n_docs=5`、`n_distinct_candidates=15`、
+  `n_kept_candidates=0`、词表为空）：
+
+  | 行 | KeyBERT 支候选数 | TF-IDF 候选数 | 旧 TF-IDF 口径 | 顺序逐项一致 |
+  | --- | --- | --- | --- | --- |
+  | 苹果香蕉橙子葡萄 | 9 | 9 | 3 | **True** |
+  | 香蕉橙子葡萄西瓜 | 9 | 9 | 3 | **True** |
+  | 橙子葡萄西瓜苹果 | 9 | 9 | 3 | **True** |
+  | 葡萄西瓜苹果香蕉 | 9 | 9 | 3 | **True** |
+  | 西瓜苹果香蕉橙子 | 9 | 9 | 3 | **True** |
+  | **合计** | **45** | **45** | **15** | 5/5 |
+
+  ⇒ 修正后两侧**合计 45 = 45**、逐行 `kb_cand == tf_cand`（含顺序）全 True；
+  **旧口径 15**（每行 3 个）即为 W1 所述缺陷的现场复现。
+
+### 22.2 W2 · 未预拟合**不得**静默用批次/单行拟合（fail-closed）
+
+* **缺陷**：未显式给 `keyword_corpus` 时，`_tfidf_extractor` 会用当前批次（甚至单行）拟合 idf，
+  并把 `corpus_scope = current_batch` 写进 `self.keyword_fit_evidence` —— 但**生产代码从不读取
+  该属性**，口径偏离进不了产物。
+* **选定方案 = fail-closed（不保留回退），理由三条**：
+  ① 「偏离只写在内存属性、进不了产物」等价于**静默偏离**，与全项目「口径必须可审计」冲突；
+  ② 单行语料下 `N=1`、`df` 恒为 1 ⇒ idf 退化成常数，任何基于它的结论都不可用于跨侧比较，
+     留着比报错更危险；③ 报错能让误用在**入口**暴露（`VariantContractError` → CLI **退码 1**、
+     报文可读），且不影响任何正常路径（两个 CLI 都在生成前显式 `fit`）。
+* **实现**：`_tfidf_extractor()` 去掉 `corpus_fallback` 形参；`keyword_corpus` 为空即抛
+  `VariantContractError`（报文含「keyword_corpus」）。批量路径、`keyword_variant`、
+  `keyword_terms` **三个入口同规**。两个 CLI 侧同时补**前置**可读报文
+  （`_build_generator` / `_build_tfidf_generator` 在语料为空时报错），保证不会走到模型加载。
+* **现场证据**：`keyword_variants_batch` / `keyword_variant` / `keyword_terms` 三入口
+  全部 `VariantContractError`，报文含 `keyword_corpus`（3/3），`keyword_fit_evidence` 为 `None`
+  （未拟合即未产生任何「隐式拟合」取证）。
+
+### 22.3 W3 · CLI 开关不得静默忽略
+
+* **缺陷**：`--keyword-extractor` 曾挂在 `text_variants_run` 的 probe/gate/eval/report **全部**子命令，
+  但只有 `cmd_probe` 消费 ⇒ 其余三个子命令**静默忽略**该开关。
+* **修法**：参数表按子命令挂载 ——
+  * `text_variants_run`：**只有 `probe`** 定义该开关（`_add_textvariants_arguments` 内
+    `if subcommand in ("", "probe")`）；`gate` / `eval` / `report` 根本不接受，argparse 报
+    `unrecognized arguments` 并**退码 2**（无 Traceback）。
+  * `step2_run textvariants` 是**单一**子命令、由 `_add_textvariants_all_arguments` 把 probe 的参数
+    并入同一解析器 ⇒ 另加**显式守卫**：`cmd_textvariants` 在 `sub != "probe"` 且开关非空时
+    打印可读报文并**退码 2**（防「同一缺陷的第二个入口」）。
+  * `qa_variants_run` 同规收紧：只有 **`probe` / `eval`** 接受（二者都装配生成器），`report` 不接受。
+* **现场证据**（退码非 0 + 可读报文 + 无 Traceback）：
+
+  | 命令 | 结果 |
+  | --- | --- |
+  | `text_variants_run eval --keyword-extractor tfidf` | **exit 2**，`error: unrecognized arguments: --keyword-extractor tfidf` |
+  | `text_variants_run report --keyword-extractor keybert` | **exit 2**，同上（**非默认值也一样拒**） |
+  | `qa_variants_run report --keyword-extractor tfidf` | **exit 2**，同上 |
+  | `step2_run textvariants eval --keyword-extractor tfidf` | **exit 2**（argparse 先拒 `eval` 位置参数，见下方如实登记） |
+  | 直接调用 `cmd_textvariants(Namespace(textvariants_cmd="eval", keyword_extractor="tfidf"))` | **返回 2**，报文「子命令 'eval' **不接受** --keyword-extractor（只有 probe 会生成变体…）」 |
+
+* **如实登记一条既有缺陷（本轮不改、不属本轮范围）**：`step2_run` 的 `textvariants` 子解析器
+  **没有** `textvariants_cmd` 位置参数（只有 `set_defaults(textvariants_cmd="probe")`），因此
+  `step2_run textvariants {gate|eval|report}` 这种写法现况下会直接被 argparse 判为
+  `unrecognized arguments`（实际只能跑 probe）。这与 `step2_run.py` 的 docstring 描述不一致，
+  属**上一轮遗留**；本轮只保证「一旦该入口恢复非 probe 子命令，`--keyword-extractor` 会被显式守卫拒」，
+  其现场证据就是上表最后一行（直接调用）。
+
+### 22.4 全量档 tfidf 产物：**真跑一次 eval 逐项比对**（不得只声称）
+
+三项改动对全量档（`N=12727`、`mdf=20`、词表非空 2849、CLI 预拟合）应无行为变化 —— **实测如此**。
+下表是 **7 件内容产物**（另有 4 件日志派生件 `probe.log` / `eval.log` / `eval_repro.log` / `report.log`
+不参与内容指纹比对，其中 `report.log` 因记录报告指纹而随 `report.json` 变化）：
+
+| 产物 | 轮 5 交付值 | 轮 6 复跑值 | 结论 |
+| --- | --- | --- | --- |
+| `qa_variants_eval.json` | 31899 `06c6e2ad895b3eb4` | **31899 `06c6e2ad895b3eb4`** | **逐字节不变**（eval 164.0 s，退码 0） |
+| `qa_variants_records.jsonl` | 22706291 `1479bb8273aa1e4e` | **相同** | **逐字节不变** |
+| `keyword_idf.json` | 3339 `b043a62f7f956dbc` | **相同** | **逐字节不变** |
+| `qa_variants_probe.json` | 12918 `bc3c4add0b4ed212` | **相同**（本轮未重跑 probe） | **逐字节不变** |
+| `qa_variants_report.md` | 11045 `56b2237c42a1a90f` | **相同**（report 重渲后） | **逐字节不变** |
+| `determinism_check.json` | 2699 `30c94046c50986e3` | 2716 `28c2d745ede9f011` | **+17 B，原因见下（非行为变化）** |
+| `qa_variants_report.json` | 49458 `21804b5496211fbb` | 49476 `7ec5193cc9e3d683` | **+18 B，随上一行变化（非行为变化）** |
+
+**变化原因（逐字段，不是「口径漂移」）**：
+`determinism_check.json` 里有三个**记录目录状态**的字段 —— `n_files_before_exclusion`
+（枚举时的文件数）与 `a_only_files`（只存在于主目录的文件）。轮 5 生成该证据时，主目录里还**只有**
+probe/eval 的产物与 3 个日志（`{a:7, b:4}`、`a_only` 3 个日志）；本轮复跑发生在同一目录**已有**
+轮 5 的 `report.log` / `report.json` / `report.md` 之后（`{a:11, b:4}`、`a_only` 4 个日志）——
+17 B 的差值恰为 `a_only_files` 多一项 `report.log` 的 JSON 长度。
+**受控实验作证**（同代码同数据、只换「目录里是否已有报告产物」，各 5 题小批）：
+干净目录 2655 B / `{a:7,b:4}` / `a_only=3 个日志`；先跑 `report` 再重跑双跑的目录 2672 B /
+`{a:11,b:4}` / `a_only=4 个日志` —— **差值同为 +17 B**，且两者的判定字段
+`n_common_files=4` / `determinism_ok=true` / `not_equal_files=[]` **完全一致**。
+`qa_variants_report.json` 的 +18 B 只因它**内嵌**该证据块（`report.determinism == determinism_check` 现场为 True），
+`report.md` 则**不内嵌**该块 ⇒ 保持逐字节不变。
+
+### 22.5 info 快修（I1~I7）
+
+| 编号 | 内容 | 落地 |
+| --- | --- | --- |
+| **I1** | 命令缺解释器、照抄不可复现 | §21.3 的**表前注记 + 表内 4 行命令全部**改为带完整 venv 解释器（`<同上>` 只指目录实参），§21.8 代码块 **7/7 行**同样带完整路径，并注明「或激活 `.venv` 后用 `python`」 |
+| **I2** | 三处字面量 `"tfidf"` | `qa_variants_run.py` 三处（`_attach_extractor_stats` / `render_markdown` §6.1 / §8 第 5 条）改为引用 `TV.KEYWORD_EXTRACTOR_TFIDF`（枚举改名不会再漏改） |
+| **I3** | 死字段 `self._tfidf`（只写不读） | **删除**；改为只读属性 `keyword_extractor`（返回后端对象）供 `_tfidf_extractor` / 取证使用。同批把「只写不读」的 `keyword_fit_evidence` 也改成**只读属性**（读 `TfidfKeywordExtractor.evidence`，由 `fit` 落值）⇒ 生成器不再有只写字段 |
+| **I4** | `idf_of` docstring 与实现不符 | 改述为「`df=0` 只在本行**不在**拟合语料内（直接 API 误用）或词表为空的兜底分支出现；生产调用里拟合语料恒为被打分文本的**超集**（`--limit` 只截断生成行数）⇒ 行内每词 `df>=1`」 |
+| **I5** | `_build_generator` docstring 第 2 条只写 KeyBERT | 补 TF-IDF 分支（`jieba-tfidf`、不构造编码器、不需要 keybert），并新增第 6 条「TF-IDF 语料 fail-closed」；关键字 1 也补「词表仅 KeyBERT 支落」 |
+| **I6** | `render_markdown` 重复追加 `scoring_ev.note` | else 分支改为一条**自述**语句，口径说明**统一在分支外只输出一次**；`applicable=True` 分支的输出**逐字符不变**（故全量档 `report.md` 与轮 5 逐字节相同） |
+| **I7** | 关键词支输出可能重复词 | §21.7 新增第 8 条：现场样例 `平面 平面 平面 平面 平面 垂直`，由「候选同源 + `(score desc, 词面 asc)` 取前 3」的**钉死规则**产生（重叠 n-gram 各自命中），属**可读性现象、不是缺陷**；消除它必须改口径且会改动全量档产物，不在本轮范围 |
+
+### 22.6 验收（现场逐项）
+
+* **默认路径零回归**：`_verify/qa_variants/` **11 件**与 `_verify/text_variants/` **12 件**逐项比对
+  字节 + SHA256（19 件走登记值、4 件日志走现场值）⇒ **mismatch = []**；两目录件数 11 / 12，
+  最大 mtime 分别为 `2026-10-17 14:38:56` / `2026-10-13 23:37:16`（均早于本轮）。
+* **全量档**：见 22.4（5 件逐字节不变、2 件变化逐字段归因 + 受控实验）。
+* **退化语料用例**：见 22.1（合计 45 = 45，旧口径 15）。
+* **W3 报错路径**：见 22.3（exit 2 / 返回 2 + 可读报文 + 无 Traceback）。
+* 上游四目录 `git status --porcelain -- n3d_qa n3d_shape n3d_sphere n3d_proto` ⇒ **空**；
+  根 `requirements.txt` 与 `n3d_qa_learn/requirements-qa.txt` **未改**；**零新增依赖**；
+  `compileall` 退码 **0**。
+* **三处同源**：`_candidates_of` / `VariantGenerator` / `idf_of` 的 docstring、产物字段
+  （`TFIDF_*` 常量文本本轮未改）、本节 22.1~22.6 三者一致；所有数字均现场统计。
+
+### 22.7 离朱轮 6 测试登记（沿 §21.10 的登记惯例）
+
+| 轮次 | 用例数 | PASS | FAIL | ERROR | 结论 |
+| --- | --- | --- | --- | --- | --- |
+| **r6**（首测） | 25 | **24** | **1** | 0 | 功能项全部通过；唯一 FAIL 为**文档级** I1 |
+| **r6b**（修复后复测） | 20 | **20** | **0** | 0 | 全通过，上一轮 FAIL 已闭环 |
+
+**r6 的唯一失败项与修复动作（逐项）**
+
+| 失败项 | 现场（r6 报告） | 修复动作 | r6b 复验 |
+| --- | --- | --- | --- |
+| **D1b · I1 字面要求未落地** | `README §21.3` 命令表 4 行中**仅 `probe` 行**带完整 venv 解释器，`eval`（第 1 跑）/ `eval`（第 2 跑）/ `report` 三行仍是 `<venv-python> -m ...` 占位符；§22.5 的 I1 行又只写「改表头」，与「表…逐行」不一致 | ① §21.3 命令表 **4 行全部**改为带完整 `E:\neuron3d\.venv\Scripts\python.exe -m ...`，表前加注记「下表 4 行命令逐行给出完整解释器；§21.8 代码块 7/7 行同样带完整路径」并明确 `<同上>` 只指**目录实参**；② §22.5 的 I1 行改述为「表前注记 + 表内 4 行命令全部 + §21.8 7/7 行」；③ §22.4 表前补件数口径「7 件内容产物（另有 4 件日志派生件不参与内容指纹比对）」 | PASS：表 4/4 行含完整解释器、全文 `<venv-python>` 计数 **0**、§21.8 7/7 行完整、注记与 I1 行措辞一致、`<同上>` 只出现在 `--out-dir` / `--repro-dir` 实参位 |
+| （同批处置的观察项 **O2**） | W3 守卫报文含 Markdown 强调符 `**不接受**`，精确子串断言会失配 | 报文改为**纯文本** `不接受 --keyword-extractor`（逻辑与退码不变） | PASS：运行时输出 `**` 计数 **0**，`cmd_textvariants(gate/eval/report × tfidf)` **3/3 返回 2** 且含精确子串，无 Traceback |
+
+**r6b 的关键现场值**（与 §22 前文数字同源）：W1 退化语料 **45 = 45**（旧口径 15）、W2 三入口
+**3/3** `VariantContractError`、W3 参数落点不变（qa `report` 2/2 与 text `gate/eval/report` 6/6
+均 exit 2 + `unrecognized arguments`；两个 `probe` 带 tfidf 均 exit 0 且产物
+`keyword_extractor=tfidf`、文本侧 idf `N=2665` 不受 `--limit` 影响）、`compileall` 退码 0、
+套件期间 **30** 个受监控产物（11 + 12 + 7）SHA256/字节前后不变。
+
+**r6b 如实登记的观察项（均不阻塞、本轮/后续处置）**
+
+| 编号 | 现象 | 处置 |
+| --- | --- | --- |
+| O1 | §21.8 仍用 `--out-dir <同上>` / `--repro-dir <同上>/_repro` 指代目录 | 注记已澄清「`<同上>` 仅指目录实参」；如追求「逐行照抄即可运行」可后续展开 |
+| O2（轮 6b 侧） | 轮 6b 的 `qa_variants_probe.json` 为 **12,800 B**（轮 6 为 12,801 B） | 只因临时 `--out-dir` 名短 1 字符（探针产物内嵌输出目录字符串）⇒ **非行为变化**，交付产物逐字节不变 |
+| O3 | §22.4 的受控实验（干净目录 2655 B vs 已有报告目录 2672 B）未在测试侧复跑 | 已核对登记值与算术自洽（`2716−2699=17`、`49476−49458=18`），实验本身为开发侧现场值 |
+| O4 | `step2_run textvariants` 的非 probe 子命令未走 CLI 复现（按 §22.3 的如实登记，该入口现况被 argparse 先拒） | 守卫用**直接调用** `cmd_textvariants` 验证（3/3 返回 2）；入口缺陷留待后续轮次 |
+| O5 | 源码注释里仍保留 Markdown 强调（如「必须在此显式拦截」） | 注释属文档风格、不进入运行时日志；运行时 `**` 计数 0 已由 O2 用例独立证明 |
+
+**轮 7（本轮）补做的两处一致性校验**（只读、不重跑产物，脚本现场执行）：
+
+1. **交叉引用可解析**：脚本枚举全文 `§21.x` / `§22.x` 引用 **24 处**（逐目标计数
+   `21.1×1 / 21.3×3 / 21.7×1 / 21.8×7 / 21.10×1 / 22.2×2 / 22.3×3 / 22.4×4 / 22.5×2`），
+   9 个去重目标**全部命中现有节标题** ⇒ **未解析 = 0**。（修前有 3 处指向一个**从未创建的节**
+   ——原文把轮 6 的收口写在 §22，指针却指向「第 21 节的第 11 小节」；现已分别改为
+   §22.3（W3 现场证据）、§22.2（W2 fail-closed）、§22.4（逐字段原因）。**本节刻意不写出那个
+   不存在的编号**，以免枚举脚本把它当成真实引用。）
+2. **docstring-only 证明**：把 `text_variants.py` 的 AST **去掉所有 docstring** 后与本轮改动前的
+   备份逐字比较 ⇒ `code_ast_identical = True`（即本轮对代码文件只改了注释，**零行为变化**）。
+
+
+
 
