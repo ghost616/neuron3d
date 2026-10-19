@@ -91,6 +91,36 @@
   并给出**恰好等于阈值的现场搜索用例**（全部判无效）与**抬高 margin 的严格性对照**
   （判有效 ⇒ 判据非恒假）；入口 ``python -m n3d_qa_learn.open_set_tau_run
   {calibrate|report}``，产物一律写 ``checkpoints/qa_learn/_verify/robust/``。
+* :mod:`n3d_qa_learn.answer_merge` / :mod:`n3d_qa_learn.answer_merge_run`：
+  **轮 8 答案表同义归并（离线、可审计、默认关闭）** —— 把统一答案表里「同一实体的拼写
+  变体」在**数据层**收敛为单一 canonical 类，用来隔离 QA 侧不可学的**标签噪声**成因。
+  四条规则逐条可追溯并进产物：**R1a** 保守文本归一（小写 / 空白折叠 / 去装饰性标点）、
+  **R1c** 包裹式括号剥离（剥离后非空且主体字母不变才剥）、**R2** 小型冻结同义表
+  （每条带依据，未采纳候选也留痕）、**R3** 禁并项硬约束（含数字或运算符的答案只做大小写
+  与空白归一；否定差异不合并）、**R4** 安全阀（簇内 > 4 或 display 差异过大仍合并但标
+  high-risk 进人工复核清单）。``qa_scale.build_scale_corpus(merge_map=...)`` 为**默认关闭**
+  的可选参数（`None` 时与轮 1 逐位不变）；入口
+  ``python -m n3d_qa_learn.answer_merge_run {probe|eval|report}``，产物一律写
+  ``checkpoints/qa_learn/_verify/answer_merge/``
+  （``merge_map.jsonl`` / ``audit.md`` / ``before_after.json`` / ``determinism_check.json``；
+  **不产 zip、不落盘裸特征矩阵、无挂钟字段**）。**零训练**：只给确定性参照基线与
+  **结构决策门**，不宣称「已可学」。
+* :mod:`n3d_qa_learn.qa_scoped` / :mod:`n3d_qa_learn.qa_scoped_run`：
+  **轮 9 类集收缩（A 口径）+ 零训练可学性下限** —— 轮 8 已证明「归并只消标签噪声、不增样本
+  总量」（281 类下每类训练问题中位数仍 5.0），故本轮**不动答案表、只收缩类集**：按「每类
+  **问题数** >= 门槛（默认 10）」筛出 **82 类**，语料用轮 1 的「金标全在保留类内」规则收到
+  **12005 问题 / 47495 行**（门槛口径问题-类关联 12374、覆盖 12073 —— 四个「问题数」口径
+  分开报）。**归并关闭**（答案归并的 2 个 high-risk 簇语义有误，未解决前不得启用）。
+  零训练**原型质心**基线：每类原型 = 训练侧问题特征（`lexical-88`，D=88）均值再 L2 归一化，
+  测试侧余弦 argmax；同口径多数类基线对照 + **决策门**（macro 需高 +10pp）→ 现场
+  proto macro 0.241276 vs 基线 0.012987（delta +0.228289，**过门**），但 micro 反而更低
+  （0.121055 vs 0.183312）且 34/77 个类 recall=0 ⇒ 结论是「下限成立、覆盖面有限」，
+  **不宣称已学会**。入口 ``python -m n3d_qa_learn.qa_scoped_run {probe|eval}``，产物一律写
+  ``checkpoints/qa_learn/_verify/qa_scoped/``（``qa_scoped_corpus.json`` /
+  ``qa_scoped_prototype.json`` / ``qa_scoped_gate.json`` / ``determinism_check.json``；
+  **不产 zip、不落盘裸特征矩阵、无挂钟字段**；三件内容产物在全新目录逐字节相同）。
+  ``qa_scale.build_scale_corpus(min_class_questions=...)`` 为**默认关闭**的可选参数
+  （``0`` 时与轮 1 逐位不变）。
 
 上游边界
 --------
@@ -128,6 +158,10 @@ __all__ = [
     "qa_variants_run",
     "open_set_tau",
     "open_set_tau_run",
+    "answer_merge",
+    "answer_merge_run",
+    "qa_scoped",
+    "qa_scoped_run",
     "cli",
 ]
 

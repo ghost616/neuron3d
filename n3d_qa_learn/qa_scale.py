@@ -58,7 +58,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
 # 冻结常量
@@ -396,6 +396,9 @@ class ScaleCorpus:
         本轮口径下每类的**正样本条数**（取自冻结表 ``count`` 字段；用于确定性排序与基线）。
     class_global_index : List[int]
         本地类别下标 -> **冻结表里的全局类别下标**（截断后二者不同，必须显式可查）。
+        **轮 8 口径**：``merge_map`` 开启时该项是 **canonical 下标**（见
+        ``source["merge"]`` 与 ``source["index_space"]``）—— 归并后「本地 -> 全局」是
+        1:多关系，完整簇成员只能从 ``merge_map.jsonl`` / ``MergePlan`` 查，不得从本字段反推。
     class_pos : Dict[int, int]
         全局类别下标 -> 本地下标（**截断后被排除的类不在其中**；查不到即该行不在本轮范围内）。
     pairs : List[QAPair]
@@ -456,10 +459,109 @@ class ScaleCorpus:
         }
 
 
+def _median_int(values: Sequence[int]) -> float:
+    """整数序列的中位数（偶数长度取中间两值均值；零新依赖）。"""
+    arr = sorted(int(x) for x in values)
+    size = int(len(arr))
+    if size == 0:
+        return 0.0
+    if size % 2 == 1:
+        return float(arr[size // 2])
+    return (float(arr[size // 2 - 1]) + float(arr[size // 2])) / 2.0
+
+
+def _canonicalize_answer_table(
+    table: Sequence[Mapping[str, Any]],
+    merge_map: Mapping[int, int],
+    merge_labels: Optional[Mapping[int, Sequence[str]]],
+) -> Tuple[List[Dict[str, Any]], Dict[int, int], Dict[str, Any]]:
+    """按**归并映射**把冻结表重建为 canonical 表（轮 8；默认路径**不**经过本函数）。
+
+    参数
+    ----
+    table : Sequence[Mapping[str, Any]]
+        冻结表条目（现场字段 = ``['count', 'display', 'index', 'key',
+        'raw_variants', 'sources']``）。
+    merge_map : Mapping[int, int]
+        **已校验**的映射（原全局下标 -> canonical 下标，见
+        :func:`n3d_qa_learn.answer_merge.validate_merge_map`）。
+    merge_labels : Optional[Mapping[int, Sequence[str]]]
+        canonical 下标 -> ``(canonical_key, canonical_display)``；``None`` 时按「成员内
+        ``(-count, key)`` 最小者」取代表（确定性兜底，仍可复算）。
+
+    返回
+    ----
+    Tuple[List[Dict[str, Any]], Dict[int, int], Dict[str, Any]]
+        ``(canonical_table, candidate_map, merge_source)``。canonical 表与冻结表**同形**
+        （``index`` / ``key`` / ``display`` / ``count``）⇒ 下游代码零改动；``candidate_map``
+        用于改写 ``pairs[].candidate_index``；``merge_source`` 进 ``source["merge"]``。
+
+    关键不变量（违反即抛）
+    ---------------------
+    1. 映射取值的集合必须稠密（由 ``validate_merge_map`` 保证）；
+    2. 每个 canonical 必须至少有一个成员（空簇即抛）；
+    3. canonical 的 ``count`` = 成员 ``count`` 之和（**归并不得增删样本**）。
+    """
+    n_canonical = int(len(set(int(v) for v in merge_map.values())))
+    members: List[List[int]] = [[] for _ in range(n_canonical)]
+    for original in sorted(int(k) for k in merge_map.keys()):
+        members[int(merge_map[int(original)])].append(int(original))
+    rows: List[Dict[str, Any]] = []
+    for canonical in range(n_canonical):
+        group = members[int(canonical)]
+        if not group:
+            raise ValueError(
+                "归并映射产生的 canonical " + str(canonical) + " 没有任何成员；拒绝继续"
+            )
+        if merge_labels is not None:
+            label = tuple(merge_labels[int(canonical)])
+            key = str(label[0])
+            display = str(label[1])
+        else:
+            representative = sorted(
+                group,
+                key=lambda g: (-int(table[int(g)]["count"]), str(table[int(g)]["key"])),
+            )[0]
+            key = str(table[int(representative)]["key"])
+            display = str(table[int(representative)]["display"])
+        rows.append(
+            {
+                "index": int(canonical),
+                "key": key,
+                "display": display,
+                "count": int(sum(int(table[int(g)]["count"]) for g in group)),
+                "merged_member_indices": [int(g) for g in group],
+            }
+        )
+    merge_source: Dict[str, Any] = {
+        "enabled": True,
+        "n_original_classes": int(len(table)),
+        "n_canonical_classes": int(n_canonical),
+        "n_reductions": int(len(table) - n_canonical),
+        "merge_map_sha256": sha256_text(
+            _canonical_json({str(k): int(v) for k, v in sorted(merge_map.items())})
+        ),
+        "index_space": "canonical",
+        "labels_rule": (
+            "canonical_key / canonical_display 由 merge_labels 显式给出（来自 "
+            "answer_merge 的归一化结果）；未给出时按「簇内 (-count, key) 最小者」取代表"
+        ),
+        "rule": (
+            "归并**只消标签噪声、不增加样本总量**：canonical 的 count = 成员 count 之和，"
+            "问题数与行数一个不增；pairs[].candidate_index 与 question_gold 一律改写为 "
+            "canonical 下标（与 class_pos 的键空间一致）。上游 n3d_qa 产物**只读**。"
+        ),
+    }
+    return rows, {int(k): int(v) for k, v in merge_map.items()}, merge_source
+
+
 def build_scale_corpus(
     product_dir: str = DEFAULT_PRODUCT_DIR,
     *,
     max_classes: int = 0,
+    min_class_questions: int = 0,
+    merge_map: Optional[Mapping[int, int]] = None,
+    merge_labels: Optional[Mapping[int, Sequence[str]]] = None,
 ) -> ScaleCorpus:
     """由冻结产物构建扩容语料。
 
@@ -471,6 +573,24 @@ def build_scale_corpus(
         类别数上限（``0`` = 全量 298）。截断规则 = **按 ``(-count, key)`` 降序取前 N**
         （与 ``data.build_answer_space`` 的确定性档位同一排序键），目的是让
         「C=10 重建」与「C=298 全量」成为**同一总体上的同一规则**，唯一变量是类别数上限。
+    min_class_questions : int
+        **轮 9 · A 口径的类集门槛**（``0`` = 不过滤，**与轮 1 逐位不变**）。只保留
+        「**问题数** >= 该门槛」的类别；口径是**每类的问题数**（该类的不同
+        ``question_id`` 个数，同一问题只计一次），**不是**正样本行数、也不是冻结表
+        ``count``；门槛判定用**筛选前**（全量类集、全部问题）的计数。与 ``max_classes``
+        同时给定时顺序固定为「**先按门槛剔除，再按 ``(-count, key)`` 截断**」，并写入
+        ``source["class_scope"]``。
+    merge_map : Optional[Mapping[int, int]]
+        **轮 8 · 答案表同义归并映射**（原全局下标 -> canonical 下标）。**默认 ``None``
+        = 现状口径**（与轮 1 逐位不变）。给定时：按 canonical 聚合 ``count``、重建
+        ``answer_keys`` / ``answer_display`` / ``class_pos``，并把 ``pairs[].candidate_index``
+        与 ``question_gold`` 改写成 canonical 下标（见 :func:`_canonicalize_answer_table`）。
+        映射由 :func:`n3d_qa_learn.answer_merge.build_merge_plan` 生成、经
+        :func:`n3d_qa_learn.answer_merge.validate_merge_map` 校验（fail-closed）。
+        **轮 9 口径声明**：A 口径**不使用**归并（high-risk 两簇语义未解决），两者不要一起开。
+    merge_labels : Optional[Mapping[int, Sequence[str]]]
+        canonical 下标 -> ``(canonical_key, canonical_display)``；``merge_map`` 为
+        ``None`` 时**必须**也为 ``None``（否则抛 ``ValueError``）。
 
     返回
     ----
@@ -482,22 +602,35 @@ def build_scale_corpus(
     1. 冻结表 ``index`` 必须恰为 ``0..C-1``（由 :func:`load_answer_table` 保证）；
     2. 每一行的 ``candidate_answer_index`` 必须落在 ``[0, C_full)``（越界即抛）；
     3. 每个问题的正确类集合**非空**（否则该问题在所有任务上都没有正确答案）；
-    4. 每个问题只属于**一个**任务（同 ``question_id`` 出现两个 ``task`` 即抛）。
+    4. 每个问题只属于**一个**任务（同 ``question_id`` 出现两个 ``task`` 即抛）；
+    5. （轮 8）归并映射的定义域/值域与 ``merge_labels`` 必须彼此一致；归并不变量
+       「canonical count 之和 == 原表 count 之和」由 :func:`_canonicalize_answer_table`
+       与调用方共同保证；
+    6. （轮 9）类集门槛按**问题数**口径判定；筛选后保留类集非空，且**金标全部落在保留类内**
+       的问题才进语料（含越界金标的问题**整体**排除，不偷偷把「答案不在表内」变成「在表内」）。
     """
     table = load_answer_table(str(product_dir))
     full_c = int(len(table))
-    if int(max_classes) > 0:
-        order = sorted(
-            range(full_c),
-            key=lambda i: (-int(table[i]["count"]), str(table[i]["key"])),
+    # ---- 轮 8：可选归并（**默认关闭**；关闭时下面的代码路径与轮 1 逐位相同） ----------
+    scope_table: Sequence[Mapping[str, Any]] = table
+    scope_c = int(full_c)
+    candidate_map: Optional[Dict[int, int]] = None
+    merge_source: Dict[str, Any] = {}
+    if merge_map is None and merge_labels is not None:
+        raise ValueError(
+            "merge_labels 只在 merge_map 给定时才允许（否则它没有任何作用对象）；"
+            "拒绝静默忽略"
         )
-        keep = sorted(int(i) for i in order[: int(max_classes)])
-    else:
-        keep = list(range(full_c))
-    answer_keys = [str(table[i]["key"]) for i in keep]
-    answer_display = [str(table[i]["display"]) for i in keep]
-    class_row_counts = [int(table[i]["count"]) for i in keep]
-    class_pos = {int(g): pos for pos, g in enumerate(keep)}
+    if merge_map is not None:
+        import n3d_qa_learn.answer_merge as AM
+
+        normalized_map = AM.validate_merge_map(
+            merge_map, n_original=int(full_c), merge_labels=merge_labels
+        )
+        scope_table, candidate_map, merge_source = _canonicalize_answer_table(
+            table, normalized_map, merge_labels
+        )
+        scope_c = int(len(scope_table))
     pairs = load_all_pairs(str(product_dir))
     # **逐行任务回填**（见 load_all_pairs 的口径说明）：pairs 文件的 task 列恒为 'all'，
     # 真实任务在 npz 的 meta.task_of_row，二者逐行同序。
@@ -525,6 +658,73 @@ def build_scale_corpus(
                 f"行 {pair.row_index} 的 candidate_answer_index = {pair.candidate_index} "
                 f"越出统一答案表范围 [0, {full_c})；拒绝在越界下标上建答案空间"
             )
+    # ---- 轮 8：把行与金标一律改写到 canonical 下标（**默认路径 candidate_map is None**）----
+    if candidate_map is not None:
+        # ① 折叠前的口径核查：原表内 (question_id, candidate) 是否唯一 ——
+        #    只有唯一，后面的「金标对折叠数」才能**只**归因于归并。
+        seen_pairs: Dict[Tuple[str, int], int] = {}
+        n_duplicate_rows_before = 0
+        dup_before_by_label: Dict[int, int] = {0: 0, 1: 0}
+        for pair in pairs:
+            dup_key = (str(pair.question_id), int(pair.candidate_index))
+            if dup_key in seen_pairs:
+                n_duplicate_rows_before += 1
+                label_key = int(pair.label)
+                dup_before_by_label[label_key] = dup_before_by_label.get(label_key, 0) + 1
+            else:
+                seen_pairs[dup_key] = int(pair.row_index)
+        gold_raw: set = set()
+        gold_merged: set = set()
+        seen_after: Dict[Tuple[str, int], int] = {}
+        n_duplicate_rows_after = 0
+        n_positive_rows = 0
+        for pair in pairs:
+            canonical = int(candidate_map[int(pair.candidate_index)])
+            after_key = (str(pair.question_id), int(canonical))
+            if after_key in seen_after:
+                n_duplicate_rows_after += 1
+            else:
+                seen_after[after_key] = int(pair.row_index)
+            if int(pair.label) == 1:
+                n_positive_rows += 1
+                gold_raw.add((str(pair.question_id), int(pair.candidate_index)))
+                gold_merged.add((str(pair.question_id), int(canonical)))
+        merge_source["n_duplicate_rows_before_merge"] = int(n_duplicate_rows_before)
+        merge_source["n_duplicate_rows_before_merge_by_label"] = {
+            str(k): int(v) for k, v in sorted(dup_before_by_label.items())
+        }
+        merge_source["n_duplicate_rows_after_merge"] = int(n_duplicate_rows_after)
+        merge_source["n_positive_rows"] = int(n_positive_rows)
+        merge_source["n_gold_pairs_before_merge"] = int(len(gold_raw))
+        merge_source["n_gold_pairs_after_merge"] = int(len(gold_merged))
+        merge_source["n_gold_pairs_collapsed"] = int(len(gold_raw) - len(gold_merged))
+        merge_source["gold_rows_unique_premise"] = bool(
+            int(n_positive_rows) == int(len(gold_raw))
+        )
+        merge_source["duplicate_row_note"] = (
+            "归并会把「同一问题的两个变体类金标」变成两行指向同一 canonical 的等价行；"
+            "本轮**不去重**（故行数口径与归并前一致，仍为 50865 行），只逐项计数。"
+            "重复行与原行同真值、同类，micro / macro **不受影响**（分子分母同倍变化）；"
+            "但 unit='row' 的逐类计数会含重复，比较时须以 unit='question' 为主。"
+            "**现场发现（如实登记）**：冻结的问答对文件里 (question_id, candidate) 本来"
+            "就**不唯一**（n_duplicate_rows_before_merge 远大于 0，按 label 的分解见 "
+            "n_duplicate_rows_before_merge_by_label）—— 该现象**不是**归并造成的；"
+            "金标侧（label=1）是否唯一由 gold_rows_unique_premise 现场判定，"
+            "只有它为 True 时 n_gold_pairs_collapsed 才能**只**归因于归并。"
+        )
+        # ② 改写为 canonical 下标（此后 pairs / question_gold / class_pos 同一空间）
+        pairs = [
+            QAPair(
+                row_index=int(p.row_index),
+                row_id=str(p.row_id),
+                pair_id=str(p.pair_id),
+                question_id=str(p.question_id),
+                task=str(p.task),
+                candidate_index=int(candidate_map[int(p.candidate_index)]),
+                label=int(p.label),
+            )
+            for p in pairs
+        ]
     question_gold: Dict[str, List[int]] = {}
     question_task: Dict[str, str] = {}
     question_rows: Dict[str, List[int]] = {}
@@ -551,13 +751,82 @@ def build_scale_corpus(
         )
     for qid, gold in question_gold.items():
         gold.sort()
+    # ---- 轮 9：类集筛选（按最小「问题数」门槛 + 可选截断；两者都关 ⇒ 全量，逐位同轮 1） ----
+    # 口径（**必须显式**）：每类的「问题数」= 该类的**问题**个数（同一问题只计一次，
+    # 用 (question_id, class) 去重），**不是**正样本行数。二者在场下恰好相等
+    # （冻结对的 label=1 侧 (question_id, candidate) 唯一），但口径按「问题数」钉死。
+    class_question_sets: List[set] = [set() for _ in range(int(scope_c))]
+    for pair in pairs:
+        if int(pair.label) == 1:
+            class_question_sets[int(pair.candidate_index)].add(str(pair.question_id))
+    class_question_counts_all = [int(len(s)) for s in class_question_sets]
+    keep = list(range(int(scope_c)))
+    n_classes_before_scope = int(len(keep))
+    if int(min_class_questions) > 0:
+        keep = [
+            int(i)
+            for i in keep
+            if int(class_question_counts_all[int(i)]) >= int(min_class_questions)
+        ]
+    if int(max_classes) > 0:
+        order = sorted(
+            keep,
+            key=lambda i: (-int(scope_table[i]["count"]), str(scope_table[i]["key"])),
+        )
+        keep = sorted(int(i) for i in order[: int(max_classes)])
+    keep = sorted(int(i) for i in keep)
+    if not keep:
+        raise ValueError(
+            "类集筛选后**没有任何类**被保留（min_class_questions="
+            + str(int(min_class_questions))
+            + " / max_classes="
+            + str(int(max_classes))
+            + "）；该口径不可评测，拒绝继续"
+        )
+    answer_keys = [str(scope_table[i]["key"]) for i in keep]
+    answer_display = [str(scope_table[i]["display"]) for i in keep]
+    class_row_counts = [int(scope_table[i]["count"]) for i in keep]
+    class_pos = {int(g): pos for pos, g in enumerate(keep)}
+    class_scope_source: Dict[str, Any] = {}
+    if int(min_class_questions) > 0:
+        kept_set = set(int(i) for i in keep)
+        class_scope_source = {
+            "enabled": True,
+            "min_class_questions": int(min_class_questions),
+            "count_unit": "questions",
+            "n_classes_before": int(n_classes_before_scope),
+            "n_classes_after": int(len(keep)),
+            "kept_class_question_counts": {
+                "min": int(min(class_question_counts_all[i] for i in keep)),
+                "median": float(_median_int([class_question_counts_all[i] for i in keep])),
+                "max": int(max(class_question_counts_all[i] for i in keep)),
+                "total": int(sum(class_question_counts_all[i] for i in keep)),
+            },
+            "count_rule": (
+                "门槛口径 = **每类的「问题数」**：该类的不同 question_id 个数（同一问题只计一次），"
+                "**不是**正样本行数、也不是冻结表 count；门槛判定用**筛选前**（全量类集、"
+                "全部问题）的计数，故 `kept_class_question_counts` 是 pre-scope 值；"
+                "语料内实际每类问题数见 class_question_counts（post-scope，因含越界金标的问题"
+                "被整体排除而略小）。"
+            ),
+            "n_question_class_incidences_kept": int(
+                sum(class_question_counts_all[i] for i in keep)
+            ),
+            "n_questions_covered_any_kept": int(
+                sum(
+                    1
+                    for gold in question_gold.values()
+                    if any(int(g) in kept_set for g in gold)
+                )
+            ),
+        }
     # ---- 类别截断时的**问题级作用域过滤**（C=10 重建的核心语义） --------------------
     # 截断到 C 类后，金标**全部落在保留类之内**的问题才属于本轮口径；金标含被截断类的
     # 问题必须**整体**排除（不能只删掉越界的那部分金标 —— 那会把「答案不在表内」偷偷
     # 变成「答案在表内」，是口径污染）。全量口径（max_classes=0）下本步不做任何过滤。
     n_questions_before_scope_filter = int(len(question_task))
     n_questions_out_of_scope = 0
-    if int(max_classes) > 0:
+    if int(max_classes) > 0 or int(min_class_questions) > 0:
         keep_qids: List[str] = []
         for qid in sorted(question_task.keys()):
             gold = question_gold.get(qid, [])
@@ -567,8 +836,11 @@ def build_scale_corpus(
         n_questions_out_of_scope = int(n_questions_before_scope_filter - len(keep_qids))
         if not keep_qids:
             raise ValueError(
-                f"类别截断到 {max_classes} 类后**没有任何问题**的金标落在保留类内；"
-                "该口径不可评测，拒绝继续"
+                "类集筛选（max_classes="
+                + str(int(max_classes))
+                + " / min_class_questions="
+                + str(int(min_class_questions))
+                + "）后**没有任何问题**的金标落在保留类内；该口径不可评测，拒绝继续"
             )
         old_rows: set = set()
         for qid in keep_qids:
@@ -632,6 +904,22 @@ def build_scale_corpus(
             "与 data.build_answer_space 的确定性排序键一致"
         ),
     }
+    # **轮 8**：只在归并开启时追加 ``merge`` 键 —— 默认档的 ``source`` 逐字节不变。
+    # **轮 9**：只在类集筛选开启时追加 ``class_scope`` 键（同理，默认档不加任何键）。
+    if class_scope_source:
+        class_scope_source["n_questions_excluded_by_scope_filter"] = int(
+            n_questions_out_of_scope
+        )
+        class_scope_source["n_questions_after_scope_filter"] = int(len(question_gold))
+        source["class_scope"] = dict(class_scope_source)
+    if candidate_map is not None:
+        source["merge"] = dict(merge_source)
+        source["index_space"] = "canonical"
+        source["index_space_rule"] = (
+            "归并开启后，``pairs[].candidate_index`` / ``question_gold`` / ``class_pos`` 的键"
+            "**全部**是 canonical 下标（0..C'-1）；``class_global_index`` 因此是 canonical "
+            "下标而非冻结表全局下标，簇成员只能从 merge_map.jsonl / MergePlan 查。"
+        )
     return ScaleCorpus(
         answer_keys=answer_keys,
         answer_display=answer_display,

@@ -6838,6 +6838,390 @@ probe/eval 的产物与 3 个日志（`{a:7, b:4}`、`a_only` 3 个日志）；�
 2. **docstring-only 证明**：把 `text_variants.py` 的 AST **去掉所有 docstring** 后与本轮改动前的
    备份逐字比较 ⇒ `code_ast_identical = True`（即本轮对代码文件只改了注释，**零行为变化**）。
 
+## 二十三、轮 8：答案表同义归并（离线、可审计、默认关闭）
+
+把「同一实体的拼写变体」在**数据层**收敛为单一 canonical 类，用来隔离 QA 侧不可学的
+**标签噪声**成因。**只改数据口径的离线对照：不碰上游 `n3d_qa`、不改模型、不做任何训练。**
+新增 `answer_merge.py`（规则 + 簇 + 审计）+ `answer_merge_run.py`（`probe` / `eval` /
+`report` 三入口）；`qa_scale.build_scale_corpus` 增加**可选**参数
+`merge_map` / `merge_labels`（**默认 `None` = 现状口径**）。
+
+### 23.1 触发背景（现场统计，非估计）
+
+统一答案表（`checkpoints/qa_learn/dataset/answer_table.jsonl`，298 行）里有一批类**从问题
+文本上无从区分**：`america(us)` / `america(usa)` / `america(unitedstates)` /
+`america(country)`，`china(peking)` / `china(prc)` / `china(people'srepublic)` /
+`(thepeople'srepublicof)china`，`canada` / `canada.`，`regned'espanha` / `regnedespanha` …
+同一批问题会同时命中多个变体 ⇒ **这些类的 macro 贡献恒为 0**，不是模型学不会，而是标签
+本身不可区分。
+
+### 23.2 四条规则（唯一实现 = `answer_merge.py`，规则编号进产物）
+
+| 规则编号 | 内容 | 现场命中（按受影响的原始类数） |
+| --- | --- | --- |
+| `R1a-case-ws` | 小写 + 去首尾空白 + 折叠内部空白 | **0**（冻结表的 key 已全为小写、无首尾空白） |
+| `R1a-decoration` | 去**纯装饰性标点**（逗号 / 句点 / 撇号 / 引号，集合 = `,.'"’‘“”` + 反引号 + `´`） | **14** |
+| `R1c-paren` | 剥离包裹式括号及其内容：**剥离后非空**且**主体字母部分不变**才剥离（`america(us) -> america`）；括号内容含数字/运算符、括号不配平、剥离后为空（如 `(us)`）或剩纯标点时**不剥离** | **9** |
+| `R2-synonym` | 小型**冻结**同义表（`us`/`usa` → `united states`、`united states of america` → `united states`、`uk`/`u k` → `united kingdom`），每条带 `basis`（依据） | **0 条命中**（本语料无任何类归一化后等于 alias ⇒ 只作守门，仍逐条落审计） |
+| `R3-restricted` | **禁并项**：含数字或运算符的答案**只做大小写与空白归一**（不删符号、不剥括号、不拼接数字） | **134**（进入受限模式的类数） |
+| `R3-negation` | **禁并项**：否定词元签名不同（`not/no/non/never/none/非/否/不/无/未`）不合并 | **阻断 0 对**（如实登记） |
+| `R4-high-risk` | 安全阀：簇内成员 > 4 或 display 相似度下界 < 0.5 ⇒ **仍合并**但标 `high_risk` 进人工复核清单 | **2 簇** |
+
+- 运算符集合（R3）= `+-*/=^<>%±∞≤≥≠⊥√![]{}:`；**不含** `.` `,` 引号 —— 它们是 R1a 的
+  装饰性标点，不是运算符。这条边界是「`canada.` 可以并入 `canada`、而 `al-pakistan`
+  不能并入 `alpakistan`」的**唯一**依据。
+- **未采纳的同义候选**（禁止随意扩张的留痕，逐条带否决理由）：
+  `great britain` → `united kingdom`（真子集，不是同义）；
+  `england` → `united kingdom`（构成国 ≠ 主权国家）；
+  `america` → `united states`（歧义：可指美洲大陆）；
+  `peking` → `beijing`（历史名称而非拼写变体）。
+
+### 23.3 归并结果（现场实测）
+
+**298 → 281 类（减 17，5.70%）**；多成员簇 **10** 个、覆盖 **27** 个原始类；high-risk **2** 簇；
+计划指纹（`MergePlan.fingerprint`）= `59b1c9c2d87b3b3043972ea35a0bcc552eba5cface00ca4419ae34ca39359f72`。
+
+| 簇 canonical | canonical key | 规模 | count 合计 | high-risk | display 相似度下界 | 成员（原 index） |
+| --- | --- | --- | --- | --- | --- | --- |
+| 111 | `america` | **6** | 18 | **是** | 0.4242 | 242 / 244 / 245 / 246 / 247 / 248 |
+| 118 | `americastophat` | 2 | 6 | 否 | 0.9412 | 243 / 256 |
+| 120 | `americaunitedstatesof` | 2 | 6 | 否 | 0.9796 | 249 / 258 |
+| 139 | `canada` | 2 | 6 | 否 | 0.9231 | 274 / 276 |
+| 143 | `canadas` | 2 | 6 | 否 | 0.8750 | 275 / 280 |
+| 149 | `china` | **5** | 15 | **是** | 0.2174 | 232 / 286 / 288 / 289 / 290 |
+| 152 | `chinapeoplesrepublic` | 2 | 6 | 否 | 0.9565 | 295 / 296 |
+| 153 | `chinapeoplesrepublicof` | 2 | 6 | 否 | 0.9434 | 291 / 297 |
+| 187 | `regnedespanha` | 2 | 10 | 否 | 0.9333 | 194 / 196 |
+| 188 | `regnedespanya` | 2 | 10 | 否 | 0.9333 | 195 / 197 |
+
+**high-risk 复核清单（2 簇，仍被合并，须人工复核后才可进训练口径）**
+
+- 簇 111 `america`（规模 6 > 4 且 display 相似度下界 0.4242 < 0.5，原因是
+  `['cluster_size_gt_4', 'display_divergence']`）：`AMERICA` / `America (country)` /
+  `America (United States)` / `America (United States of)` / `America (US)` / `America (USA)`。
+- 簇 149 `china`（规模 5 > 4 且相似度下界 0.2174）：`CHINA` / `(The People's Republic of) China` /
+  `China (Peking)` / `China (People's Republic)` / `China (PRC)`。
+
+口径：归并**不增删样本** —— 簇 `count` 合计 = 成员 `count` 之和（现场逐簇核对，全表合计
+**13468 = 13468**）；问题数与行数一个不增。
+
+### 23.4 误并反例（验收硬要求，现场断言 4 条全部保持独立）
+
+| 答案 A | index | canonical | 答案 B | index | canonical | 保持独立 | 为什么必须独立 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `1` | 4 | 39 | `-1` | 11 | 26 | **是** | R3：含数字 ⇒ 符号不得删除 |
+| `1/2` | 19 | 42 | `12` | 20 | 51 | **是** | R3：`/` 是运算符 ⇒ 不得删除、不得拼成 12 |
+| `(1,0)` | 127 | 18 | `1,0` | 131 | 41 | **是** | R3：含数字 ⇒ 不得剥括号、不得删逗号 |
+| `1` | 4 | 39 | `−1`（U+2212） | 115 | 219 | **是** | R3 附加项：不同码位不得做码位折叠 |
+
+**断言非恒真**（现场两条反证）：① 伪造 `index_map` 把 4 与 11 指向同一 canonical ⇒
+`assert_no_merge_pairs` 抛 `AssertionError`；② **真正关掉 R3**（让含数字的答案也走装饰标点
+移除 + 清空运算符集合）后重跑，`1` 与 `-1` 的 canonical 变为 **25 / 25**（被合并），断言
+**抛错**。两条都通过 ⇒ 该断言不是装饰性的。
+
+**「漏并」诊断（不参与归并）**：若再叠加「变音符折叠 + 去全部空白」，会**额外并掉 6 类**
+（预测 C = 275）；其中 **1 组违反 R3** —— `['1,0', '10']` 会被并成一组（去逗号 + 去空格后
+都是 `10`）⇒ 该放宽口径**不可采纳**；剔除它后额外并 5 类（预测 C = 276）。
+**这就是本轮是 281 而不是任务书举例的 277 的原因**：R1 明确不含变音符折叠、也不做「去全部
+空白」，差额是**刻意保留的保守性**，不是遗漏（另有 `españa`/`espana`/`espańa`、
+`canadá`/`canada` 等组靠变音符折叠才会并的类，已逐条列在 `audit.md` 第 7 节）。
+
+### 23.5 归并前后对照（**零训练**，同 seed 42 / 同 20% 按比例留出 / 同 `(-count, key)` 排序键）
+
+| 指标 | 归并前 | 归并后 | 差 |
+| --- | --- | --- | --- |
+| 类别数 C | 298 | **281** | -17 |
+| 问题数 / 行数 | 12727 / 50865 | 12727 / 50865 | 0 / 0 |
+| 训练问题数 / 测试问题数 | 10284 / 2443 | 10284 / 2443 | 0 / 0 |
+| 训练行数 / 测试行数 | 41083 / 9782 | 41083 / 9782 | 0 / 0 |
+| 每类样本中位数（训练侧问题数，**决策门主口径**） | 5.0 | 5.0 | 0.0 |
+| 每类样本 min / max（同口径） | 1 / 1816 | 1 / 1816 | 0 / 0 |
+| 每类样本中位数（冻结表 count 口径） | 6.0 | 6.0 | 0.0 |
+| 测试侧零样本类数 | 51 | 51 | 0 |
+| 测试侧有样本类数 | 247 / 298 | 230 / 281 | -17 |
+| 基线 `constant_majority` micro（测试侧） | 0.196074 | 0.196074 | 0 |
+| 基线 `constant_majority` macro（测试侧） | 0.003610 | 0.003846 | +0.000236 |
+
+- 切分**逐位相同**（`train_questions` / `test_questions` / `train_rows` / `test_rows` 四项
+  现场断言通过）⇒ 前后差异**只**来自归并。
+- **结构改善真实存在但量级有限**：训练侧只有 1 条问题的类 **14 → 8**；训练问题 <= 4 条的类
+  **133 → 116**（`structurally_improved = True`）；但**中位数不变**。
+- macro 上升**不得**读成「模型变好」：C 从 298 降到 281 ⇒ 均匀基线 `1/C` 变大，
+  这条基线必然上升（产物里 `note` 已写死这句话）。
+
+### 23.6 结构决策门（**只判结构，不判可学**）
+
+| 判据 | 现场 | 结论 |
+| --- | --- | --- |
+| ① 归并后「每类样本数中位数 >= 10」（主口径 = 训练侧问题数） | 归并后 = **5.0** | **不通过** |
+| ② 测试侧零样本类是否**显著下降**（`after < before` 且相对降幅 >= 10% 且绝对减少 >= 1 类） | **51 → 51**，相对降幅 0.0000 | **不通过** |
+| `structural_gate_passed` | **False** | 需 P2 上游放量 |
+
+判定（产物 `before_after.json.decision_gate.verdict` 原文）：结构门未通过：每类样本数中位数
+仍 < 10（主口径单位 = `train_by_question`，归并后 = 5.0）；测试零样本类未显著下降（51 -> 51）。
+**结论只到结构层**：QA 侧仍不可学需靠上游放量（P2），不是再改模型。
+`not_claimed` = 可学性 / 模型能力 / 跨 seed 稳定性（三项**均未声明**）。
+
+### 23.7 **口径变更声明（引用本模块任何数字前必读）**
+
+1. **归并后类数 = 281，不再是 298** ⇒ 第十九节（轮 1 `qa_scale`）的全部「C=298」结论
+   **不再直接适用**；引用参数（阈值、macro、覆盖、零样本类、基线）时必须以
+   `checkpoints/qa_learn/_verify/answer_merge/before_after.json` 的 `after` 块为准。
+2. **归并是默认关闭的**：`build_scale_corpus(merge_map=None)`（默认）**不进入**任何归并分支，
+   `source` 里**不会**多出 `merge` / `index_space` 键。现场证据（分三档，逐档给数）：
+   - **`probe` / `eval`**：全新目录重跑即与交付**逐字节相同**（这两件不依赖任何既有文件）——
+     `qa_scale_probe.json` 9252 B `4b2683ea…`、`qa_scale_eval.json` 119973 B `7faeda90…`。
+   - **`report`（同一份双跑证据在场时）**：把交付的 `determinism_check.json` 复制进新目录再跑
+     `report`，`qa_scale_report.json` 136406 B `fc1037d7…` / `qa_scale_report.md` 13773 B
+     `3a960828…` 与交付**逐字节相同**；且两个**目录名不同**的复现目录之间也逐字节相同 ⇒
+     `report` 的差异**只**取决于证据文件内容，与目录名无关。
+   - **`report`（全新目录、无证据文件）**：会少掉「双跑证据」整块（现场
+     `qa_scale_report.json` **133614 B**、`.md` **13116 B**，md 195 行 vs 交付 203 行），
+     这是**轮 1 已登记的口径**（`report` 是双跑证据的渲染器，`a_dir` / `b_dir` 原样串会经
+     `determinism_check.json` 进产物 —— 见 §19 的「已知非确定性来源」），**不是本轮引入的
+     差异**：`qa_scale_run.py` 本轮**零改动**（`git status` 可证），且改它必然改动交付的
+     `qa_scale_report.{json,md}` ⇒ 与本轮「既有产物一律不动」硬约束冲突，故**不修**。
+   `_verify/qa_scale/` 下 9 件（含 `_repro/`）SHA256/字节/mtime 全程未变。
+3. **归并只消标签噪声、不增加样本总量**：问题数 / 行数与归并前完全相同（12727 / 50865）。
+   它不会把「每类 5 条」变成「每类 10 条」—— 因此**本轮结论只能是「结构有所改善但仍不
+   可学」，需 P2 上游放量**；任何把它包装成「已可学」的表述都与本节的现场数字矛盾。
+
+### 23.8 产物、命令与验收（全部现场执行）
+
+产物一律写 `checkpoints/qa_learn/_verify/answer_merge/`（`--out-dir` 也只允许写在该根之下）：
+
+| 文件 | 字节 | SHA256（前 16） | 职责 |
+| --- | --- | --- | --- |
+| `merge_map.jsonl` | 222070 | `682a742aa9ec36c6` | 逐类映射（`record_type=class`，298 行）+ 逐簇成员与依据（`record_type=cluster`，281 行） |
+| `audit.md` | 25884 | `1ba1d2ba8ed83e37` | 人工复核表（含 high-risk 单独章节 / R2 同义表 / R3 阻断清单 / 放宽诊断 / 前后对照 / 决策门） |
+| `before_after.json` | 35737 | `c89cef103b3d1b15` | 归并前后零训练对照 + 确定性参照基线 + 结构决策门 |
+| `determinism_check.json` | 2451 | `0bf96d66377cd121` | 双跑逐字节一致证据 |
+| `probe.log` / `eval.log` / `report.log` | 819 / 526 / 139 | — | UTF-8（无 BOM）运行日志 |
+
+```powershell
+# 工作序（真实产物目录 + 真实工作序；第二步落到 _repro/ 作为对照目录）
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.answer_merge_run probe  --out-dir checkpoints/qa_learn/_verify/answer_merge --log-file checkpoints/qa_learn/_verify/answer_merge/probe.log
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.answer_merge_run eval   --out-dir checkpoints/qa_learn/_verify/answer_merge --log-file checkpoints/qa_learn/_verify/answer_merge/eval.log
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.answer_merge_run report --out-dir checkpoints/qa_learn/_verify/answer_merge --log-file checkpoints/qa_learn/_verify/answer_merge/report.log
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.answer_merge_run probe  --out-dir checkpoints/qa_learn/_verify/answer_merge/_repro --log-file checkpoints/qa_learn/_verify/answer_merge/_repro/probe.log
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.answer_merge_run eval   --out-dir checkpoints/qa_learn/_verify/answer_merge/_repro --log-file checkpoints/qa_learn/_verify/answer_merge/_repro/eval.log
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.answer_merge_run report --out-dir checkpoints/qa_learn/_verify/answer_merge/_repro --log-file checkpoints/qa_learn/_verify/answer_merge/_repro/report.log
+# 双跑对账 + 落 determinism_check.json
+E:\neuron3d\.venv\Scripts\python.exe -m n3d_qa_learn.answer_merge_run report --out-dir checkpoints/qa_learn/_verify/answer_merge --repro-dir checkpoints/qa_learn/_verify/answer_merge/_repro --log-file checkpoints/qa_learn/_verify/answer_merge/report.log
+```
+
+**双跑证据（现场）**：比对 3 件内容产物（`merge_map.jsonl` / `before_after.json` / `audit.md`），
+`n_common_files = 3`、`determinism_ok = True`、`not_equal_files = []`、
+`excluded_files = ["determinism_check.json"]`（**证据文件自身被排除** ⇒ 无自指哈希回路；
+它记录的是三件产物的哈希，而这三件的内容不含它的哈希）。全部产物**无挂钟字段**；
+唯一路径依赖是证据文件里 `a_dir` / `b_dir` 的原样串（与轮 1 同源，已在其 `note` 里登记）。
+
+**验收现场（自写脚本 58 项逐项 PASS）**
+
+| 项 | 现场结果 |
+| --- | --- |
+| 归并关闭 ⇒ 默认路径逐字节不变 | `probe` / `eval` 在**全新目录**重跑即逐字节相同；`report` 在**同一份双跑证据**在场时逐字节相同（两个不同目录名之间亦相同）；无证据文件时少掉证据整块属轮 1 已登记口径（见 23.7 第 2 条三档）；`_verify/qa_scale/` 9 件未变 |
+| 归并映射逐条可追溯 | 298 条 class 记录 `answer_index` 稠密且与 `MergePlan` 逐项一致；281 条 cluster 记录中每簇成员 `count` 之和 = `total_count`；多成员簇全部带 `rule_ids`；high-risk 恰为 `[111, 149]` |
+| 误并反例 3 条 | 现场断言保持独立（+1 条 U+2212 附加项；另附 2 条「非恒真」反证） |
+| 上游四目录 | `git status --porcelain -- n3d_qa n3d_shape n3d_sphere n3d_proto` → **空** |
+| 两份 requirements | 根 `requirements.txt` 与 `n3d_qa_learn/requirements-qa.txt` SHA256 未变；**零新增依赖**（只用标准库 + 既有 numpy） |
+| 单 seed / 双跑逐字节一致 | 真实产物目录 + 真实工作序，`determinism_ok = True` |
+| `compileall -q n3d_qa_learn` | 退码 **0** |
+| cp936 控制台 stdout | `probe` 737 B、`eval` 445 B（两者均为**合法 GBK** 且**不是**合法 UTF-8）；`report` 46 B 纯 ASCII（两种解码都合法，不作额外断言） |
+| 产物卫生 | 无 `.npy/.npz/.pt/.zip`；`merge_map.jsonl` / `before_after.json` / `audit.md` 内无 ISO 时间戳、无绝对路径 |
+| 语料重建自洽 | 归并口径 `sum(canonical count) = 13468` 与冻结表一致；`n_questions/n_pairs` 不变；`question_gold` / `candidates` 全部落在 `[0, 281)`；`merge_labels` 缺 `merge_map` 时**拒绝**（`ValueError`） |
+| 归并映射校验 fail-closed | 缺键 / 值域不稠密 / `merge_labels` 与值域不一致 **3/3 抛错** |
+
+**改动面（现场枚举）**：新增 `n3d_qa_learn/answer_merge.py`、`n3d_qa_learn/answer_merge_run.py`；
+修改 `n3d_qa_learn/qa_scale.py`（`build_scale_corpus` 增可选参数 + `_canonicalize_answer_table`）、
+`n3d_qa_learn/__init__.py`（模块登记）、`n3d_qa_learn/README.md`（本节）。
+其余 `n3d_qa_learn/*.py` 与 `checkpoints/` 下既有产物**零改动**（现场逐文件 SHA256 比对）。
+
+### 23.9 如实登记的局限（不得包装）
+
+1. **归并只消标签噪声，不增加样本总量**：每类中位数仍 5.0 < 10 ⇒ 结构门**不通过**，
+   QA 侧仍不可学；出路是 P2 上游放量，不是继续调模型。
+2. **测试零样本类没有下降**（51 → 51）：哈希比例抽稀不保证每类都有测试样本，归并也没改变
+   这一点（现场 10 个簇的成员在测试侧的覆盖同进同出）。
+3. **单 seed（42）、单留出比例（20%）**：无跨 seed / 跨比例极差；结论是单点对照。
+4. **零训练**：所有指标都是确定性参照基线（`constant_majority` / `row_argmax`），
+   **不代表任何模型能力**；决策门只到结构层。
+5. **R2 同义表本语料 0 命中**：它只是守门机制，命中记录为空是**如实结果**，不是漏测。
+6. **归并会把「同一问题的两个变体类金标」折叠**：现场金标对 **13468 → 13413**（折叠 55 条，
+   `gold_rows_unique_premise = True`）；行**不去重**（故 `unit='row'` 的逐类计数含重复，
+   比较以 `unit='question'` 为主）。
+7. **上游产物既有性质（不是本轮造成的，如实登记）**：冻结问答对里 `(question_id, candidate)`
+   本来就不唯一 —— 现场 **label=0 重复行 9479 条**（按 label 分解 `{'0': 9479, '1': 0}`），
+   金标侧（label=1）唯一。该重复不影响 micro / macro（分子分母同倍变化），但会让
+   `unit='row'` 的绝对行数高于「不同候选数」。
+8. **`281` 与任务书举例的 `277` 的差额不是遗漏**：见 23.4 的放宽诊断 —— 差额来自
+   变音符折叠 / 去空格这条**未采纳**的口径，且其中一组会违反 R3。
+9. **轮 1 遗留的观察项（本轮登记、不修，理由见 23.7 第 2 条）**：`qa_scale` 的 `report` 是
+   「`probe + eval + determinism_check.json`」的渲染器 ⇒ ① 在没有证据文件的目录上重渲会少掉
+   证据整块（现场 `qa_scale_report.json` 133614 B / `.md` 13116 B，md 195 行 vs 203 行）；
+   ② 在**残留旧证据**的目录上重渲，会把**上一轮**的目录路径与双跑指纹写进报告，且没有告警
+   （交付目录现场 `n_files_before_exclusion.a` 已是 **9**，即含历史残留）。两处都是轮 1 的既有
+   行为；本轮**不修**（改它必然改动交付的 `qa_scale_report.{json,md}`，与「既有产物一律不动」
+   冲突），已作为**后续轮次的候选修法**登记：report/md 不内嵌原始路径串、`n_files_before_exclusion`
+   改为「本次运行产物清单」、缺证据时写显式键而非静默省略 + 证据比 `eval.json` 旧时告警。
+   本轮新增的 `answer_merge` 已按该方向实现（三件内容产物在全新目录逐字节相同）。
+
+## 二十四、轮 9：类集收缩（A 口径：>= 10 题/类）+ 零训练可学性下限 + 轮 8 三条 warning 修复
+
+轮 8 的结论是「归并只消标签噪声、**不增样本总量**」：281 类下每类训练问题中位数仍 5.0、
+测试零样本类仍 51，结构门未过。本轮换一条路 —— **不动答案表、只收缩类集**：真实分布里
+本来就有一批「够厚」的类（`>= 10 题/类`），把语料收缩到它们身上，才有了「QA 侧样本量是否
+够学」的现实前提；并给出**零训练的可学性下限**（类质心原型分类器），用来判断「连不做任何
+训练的原型分类都分不开」还是「下限已经成立」。
+
+**新增** `qa_scoped.py`（语料收缩 + 原型质心基线 + 决策门）+ `qa_scoped_run.py`（`probe` /
+`eval`）；**修改** `qa_scale.py`（`build_scale_corpus` 增 `min_class_questions`）、
+`answer_merge_run.py`（W1/W2/W3 三条修复）、`__init__.py`、本 README。
+
+### 24.1 A 口径定义（**引用任何数字前必读**）
+
+- **A 口径 = 仅筛选类集，归并关闭**。轮 8 的答案归并有 2 个 high-risk 簇语义有误
+  （`china(Peking)` 并进 `china`；`america(US)` / `america(USA)` 并进有歧义的 `america`）——
+  **在 high-risk 未解决前不得启用归并**；`qa_scoped` 不接受 `merge_map`，本轮也不与
+  轮 8 的 281 类口径混用任何结论。
+- **门槛口径 = 每类的「问题数」**：该类的不同 `question_id` 个数（同一问题只计一次），
+  **不是**正样本行数、也不是冻结表 `count`。门槛用**筛选前**（全量类集、全部问题）的计数判定。
+- 语料用轮 1 的规则：**金标全部落在保留类内**的问题才进语料（含越界金标的问题**整体**
+  排除 —— 不把「答案不在表内」偷偷变成「答案在表内」）。
+- 切分沿用轮 1：20% 按比例留出、`question_id` **整组**、单 seed 42、边界归属 = 严格小于。
+
+### 24.2 A 口径的现场数字（**四个「问题数」口径必须分开引用**）
+
+| 口径 | 现场值 | 含义 |
+| --- | --- | --- |
+| 类数 | **82**（298 起） | 保留下来的类 |
+| **问题-类关联数** | **12374** | 门槛口径的「合计」= Σ 每类问题数（多金标问题会重复计入）⇒ **与任务书的 12374 一致** |
+| 覆盖到的**不同问题** | **12073** | 「金标至少命中一个保留类」的问题数 |
+| **语料内问题数（可评测）** | **12005** | 金标**全部**落在保留类内 ⇒ 真正进语料的问题数（排除 722 = 654 全越界 + 68 部分越界） |
+| 语料内行数 | **47495** | 冻结 50865 行中属于保留问题的那部分 |
+| 每类问题数（**门槛口径**，pre-scope） | min **10** / median **21.0** / max **2240** | 与任务书「中位 21」一致 |
+| 每类问题数（**语料内**，post-scope） | min **3** / median **20.5** / max **2240** | 整组排除让个别类掉到门槛以下 —— **口径事实，不是缺陷**（见 24.5 第 3 条） |
+| 切分 | 训练 **9692** 问题 / **38361** 行；测试 **2313** 问题 / **9134** 行 | 测试问题占比 **0.192670**、测试行占比 **0.192315** |
+| 切分不变量 | **四条全成立** | 行不交且并集完整 / 问题不交且并集完整 / **组内行不跨两侧** / **问题 id 侧与行侧一致**（后两条用 `corpus.question_rows` 反查行归属） |
+| 测试侧覆盖 | **77 / 82** 类有测试问题，**5** 类零测试样本 | macro 分母 = 77（零测试类不进分母） |
+
+### 24.3 零训练**原型质心**基线（3a）+ 决策门（3b）
+
+- 分类器：每类原型 = 该类**训练侧**问题特征的算术平均再 L2 归一化；测试侧按余弦 argmax 预测
+  （平票取最小类下标）。**不做任何梯度更新、不加载任何模型**。
+- 特征档：`lexical-88`（词面哈希 + 长度特征，D=88，口径指纹 `d4a4881a…`），12005 条题面、
+  零范数 **0** 条；**特征矩阵只在内存**（产物里 `persisted = false`）。
+
+| 口径（**问题级**，同一批 2313 个测试问题、同一 macro 分母 77） | micro | macro | macro_all_classes |
+| --- | --- | --- | --- |
+| **原型质心** | **0.121055** | **0.241276** | 0.226564 |
+| 多数类基线（`constant_majority`，一律答训练侧问题数最多的类） | 0.183312 | 0.012987 | — |
+| 差值 | **−0.062257** | **+0.228289** | — |
+
+**决策门结论：过门**（`delta_macro = +0.228289 >= 0.10`）—— 但**结论必须与限定条件一起引用**
+（`qa_scoped_gate.json.quality_caveats`，共 3 条）：
+
+1. **原型 micro 低于多数类基线**（0.1211 < 0.1833）：基线把全部预测压在单一超大类上，
+   micro 靠大类刷出来；原型把预测摊到各类。故本条判据用 **macro**（逐类 recall 的算术平均），
+   不被超大类主导 —— 但「micro 更差」这个事实必须一起报，不得只报 macro。
+2. **77 个有测试问题的类里 34 个 recall = 0**（recall 分位：p25 = **0.000**、median = **0.100**、
+   p75 = 0.338）⇒ macro 由**可分类**支撑，**覆盖面有限，不是「全类可分」**。
+3. `macro`（分母 77）与 `macro_all_classes`（分母 82，零测试类按 0 计 = 0.226564）**不同量纲**，
+   引用时必须写明分母。
+
+**行级参照（与轮 1 连续性，不可与上表直接比较）**：`deterministic_baseline_metrics(side='test')`
+给出 `constant_majority` micro 0.206233 / macro 0.0125（范围内 80 类）。这是**行级**口径，
+与原型的问题级 macro 不同量纲 —— 只作参照，**不得**代入判据。
+
+**后续建议（本轮不改结论）**：① 换语义特征档（`bge-m3`，D=1024）**按同一口径**重测
+（同 seed / 同留出 / 同问题级 macro 分母）；② 继续上游放量（每类问题数再翻倍）；
+③ 复核 A 口径门槛是否过松/过紧。**不得**把「过门」包装成「已学会」。
+
+### 24.4 与 C=298 / C=281 口径的关系（**口径边界**）
+
+| 口径 | 类数 | 问题数 | 行数 | 每类问题中位数 | 状态 |
+| --- | --- | --- | --- | --- | --- |
+| 轮 1 · C=298 全量 | 298 | 12727 | 50865 | 5.0（训练侧） | 结构门未过（零训练基线 macro 0.0036） |
+| 轮 8 · C=281 归并 | 281 | 12727 | 50865 | 5.0（训练侧） | 结构门未过；**high-risk 未解决前不得启用** |
+| **轮 9 · A 口径 C=82** | **82** | **12005** | **47495** | **21.0（门槛口径）/ 20.5（语料内）** | 零训练原型下限**已成立**（带 3 条限定） |
+
+三条口径的**总体不同**（类集不同、问题集不同）⇒ 任何指标**不得跨口径相减或排名**；
+「82 类的 macro」与「298 类的 macro」不是同一件事（后者被 51 个零测试类与大量 5 题类稀释）。
+
+### 24.5 如实登记的局限
+
+1. **类集收缩不增加任何样本**：只是把类与问题一起缩小到子集（问题 12727 → 12005、行
+   50865 → 47495）；它提高的是**每类密度**，不是总量。
+2. **零训练 ≠ 模型能力**：原型基线只有质心与余弦，**没有任何可学习参数**；过门只说明
+   「下限成立」，不说明 N3D 后端能学到这个水平，也不说明「已学会」。
+3. **门槛与语料内计数不同口径**：门槛保证的是 **pre-scope** 每类 >= 10；整组排除后
+   **post-scope** 最小类只有 **3** 个问题（该类的其余问题带有被剔除类的金标）。若要求
+   「语料内每类也 >= 门槛」，需要**再迭代筛一轮** —— 本轮不做，如实登记。
+4. **单 seed（42）、单留出比例（20%）**、单特征档（`lexical-88`）：无跨 seed / 跨档极差；
+   换档或换 seed 必须整口径重跑后才可比较。
+5. **micro 与 macro 结论相反**（见 24.3 第 1 条）：本轮的判据是 macro，但 micro 的退化必须
+   同时报告，不能只挑对自己有利的那个。
+6. **34/77 个类 recall=0**：说明多数类别的原型在词面特征空间里被别的类「盖住」；
+   这不支持「全类可学」，只支持「一部分类可分」。
+
+### 24.6 轮 8 三条 warning 的修复（W1/W2/W3，**各有「反例会失败」的现场证据**）
+
+| 编号 | 旧缺陷 | 修复 | 反例证据（现场） |
+| --- | --- | --- | --- |
+| **W1** | `merged == train + test` 的逐类断言**恒真**（`merged` 由 `zip(train, test)` 算出再比对） | 新增 `all_side_class_counts`（**不看 split**、直接对全部问题/全部行按类计数）作为独立来源，断言改成 `side_a + side_b == all_side`；另加 `side_sum_counterexample` 自检（改动某侧某类 +1 ⇒ 必须抛错，抛不出来就**拒绝出数**） | 现场：`question` 单位 `side_a(10849) + side_b(2619) == all_side(13468)` 通过；把测试侧某个类 +1 后**抛 `AssertionError`**（报文含逐类明细 `side_a / side_b / all_side`）；`row` 单位同样抛错。A 口径语料下 `side_a + side_b == all_side = 12264` || **W2** | `determinism_ok = len(files) > 0 and not not_equal` —— 只要有**一件**可比就为 True | 改成 `len(files) == len(expected) and not not_equal`；缺件登记到 `missing_files`；另加 `determinism_missing_file_probe`（临时目录里删一件再跑同一函数）并把结果写进 `determinism_check.json` | 现场：齐备时 `True`；**删掉 `audit.md` 后 `determinism_ok=False`、`missing_files=["audit.md"]`**（`qa_scoped` 同样：删 `qa_scoped_gate.json` ⇒ False）；正式产物 `n_expected_files=3 / n_common_files=3 / missing_files=[]` |
+| **W3** | `--out-dir` 只要求落在 `_verify/` 之下（可写进 `_verify/qa_scale` **覆盖别轮交付产物**）；`--log-file` **完全没有守卫** | 根目录收窄到本模块自己的 `_verify/answer_merge/`（`qa_scoped` 同理收窄到 `_verify/qa_scoped/`）；`--log-file` 施加**同等**守卫；两者都在**建目录之前**校验，越界 **退码 2** + 可读报文、**不创建任何目录** | 现场：`--out-dir .../qa_scale` ⇒ **rc 2**（旧判据会放行：`before_after.json.out_dir_and_log_guard_evidence` 里 `changed=True` 的用例共 **4** 条）；`--log-file .../qa_scale/probe.log` ⇒ **rc 2** 且新目录未创建；`qa_scale` 9 件哈希未变；守卫自身接受 `_verify/answer_merge` 与 `_verify/answer_merge/_repro` |
+
+**轮 8 产物已按修复重跑刷新**（同一工作序）：`merge_map.jsonl` 222070 B `682a742a…`（**未变**）、
+`audit.md` 25884 B `1ba1d2ba…`（**未变** —— 它不渲染这两块新证据）、`before_after.json`
+**45516 B `39f37436…`**（W1 的双向自检 + W3 取证块）、`determinism_check.json`
+**3181 B `ad3f95b1…`**（W2 自检与 `missing_files` 口径）。
+
+### 24.6.1 复测发现的两处「断言覆盖不足」及其修复（离朱 R1 / R2）
+
+离朱第 1 轮复测 32/34，两条失败都出在**我方的断言/自检覆盖**上（数据本身没错），已修：
+
+| 编号 | 现场问题 | 根因 | 修复与现场证据 |
+| --- | --- | --- | --- |
+| **R1** | 规格要求的「注入恒真断言 ⇒ `side_sum_counterexample` 返回 `raised=False`」**做不到**（实测恒为 True） | 旧 helper 把断言**写死**：复制 `side_b` 后某类 +1 再跑同一断言，增量必然破坏 `a+b==all` ⇒ `raised` 恒 True，因此调用点 `if not raised: raise` 是**不可达死代码**，无法识别它声称要识别的「恒真」 | 给 `side_sum_counterexample` 增 `assertion` 注入参数，新增 `tautological_side_sum_check`（把 `all_counts` 现场算成 `side_a+side_b` 的**故意恒真**断言）；`_corpus_block` 对 question / row 单位**各跑两个方向**：真实断言 ⇒ `raised=True`、恒真断言 ⇒ `raised=False`，两者都成立才记 `discriminating=True`，任一不成立即 `AssertionError` 拒绝出数；空序列改为 `applicable=False`（不再 IndexError）。**现场**：`before_after.json` 的 `counterexample.raised=True / assertion_name="assert_side_sum_equals_all" / discriminating=True`，`vacuous_assertion_probe.raised=False / assertion_name="tautological_side_sum_check"` |
+| **R2** | 把某测试问题的 **4 行整组挪进训练侧**（问题 id 列表不动）时 `verify_split_invariants` **不抛错**，仍报三条全 True | 旧第三条只检查「问题 id 是否只出现在一侧列表」—— 两个列表本就按 id 切成不相交列表 ⇒ **天然恒真**，与 docstring 不符 | 改为**用 `corpus.question_rows` 反查行归属**，并把不变量拆成**四条**：③组内行不跨两侧 ④**问题 id 所在侧与其行所在侧一致**（④ 才是整组挪行的照妖镜）。**现场**：正例四条全 True（12005 个问题逐个反查、跨侧 0 / 无行 0 / id 侧不一致 0）；负例三种**全部抛错**——① 整组挪行（离朱构造：`007fccc8…` 的 4 行 test→train）⇒ 报 `question_side_matches_row_side` 并给出 `declared_side=test / row_side=train`；② 组内拆开（只挪一半行）⇒ 报 `every_question_wholly_on_one_side`；③ 问题 id 重复 ⇒ 报 `questions_disjoint` |
+
+**产物指纹随之刷新**：`qa_scoped_corpus.json` **7718 B `afca7c80…`**（新增第四条不变量的字段）、
+`qa_scoped_prototype.json` 6605 B `1fe56f33…`（未变）、`qa_scoped_gate.json` 3074 B
+`b37a4fff…`（未变）、`qa_scoped/determinism_check.json` **2718 B `8720c74f…`**
+（内嵌 corpus 哈希变化）、`answer_merge/before_after.json` **45516 B `39f37436…`**、
+`answer_merge/determinism_check.json` **3181 B `ad3f95b1…`**。
+
+### 24.7 命令、产物与验收
+
+```powershell
+$py = 'E:\neuron3d\.venv\Scripts\python.exe'
+# A 口径语料（82 类）+ 切分不变量
+& $py -m n3d_qa_learn.qa_scoped_run probe --out-dir checkpoints/qa_learn/_verify/qa_scoped --log-file checkpoints/qa_learn/_verify/qa_scoped/probe.log
+# 原型基线 + 多数类基线 + 决策门
+& $py -m n3d_qa_learn.qa_scoped_run eval  --out-dir checkpoints/qa_learn/_verify/qa_scoped --log-file checkpoints/qa_learn/_verify/qa_scoped/eval.log
+# 双跑对账（第二套目录 + 证据）
+& $py -m n3d_qa_learn.qa_scoped_run probe --out-dir checkpoints/qa_learn/_verify/qa_scoped/_repro --log-file checkpoints/qa_learn/_verify/qa_scoped/_repro/probe.log
+& $py -m n3d_qa_learn.qa_scoped_run eval  --out-dir checkpoints/qa_learn/_verify/qa_scoped/_repro --log-file checkpoints/qa_learn/_verify/qa_scoped/_repro/eval.log
+& $py -m n3d_qa_learn.qa_scoped_run eval  --out-dir checkpoints/qa_learn/_verify/qa_scoped --repro-dir checkpoints/qa_learn/_verify/qa_scoped/_repro --log-file checkpoints/qa_learn/_verify/qa_scoped/eval.log
+```
+
+| 产物（`checkpoints/qa_learn/_verify/qa_scoped/`） | 字节 | SHA256（前 16） | 职责 |
+| --- | --- | --- | --- |
+| `qa_scoped_corpus.json` | 7718 | `afca7c80…` | 语料摘要（A 口径定义 / 四个问题数口径 / 分布 / 切分与**四条**不变量 / 覆盖） |
+| `qa_scoped_prototype.json` | 6605 | `1fe56f33…` | 原型基线结果（特征口径 / 原型支撑分布 / 预测诊断 / micro+macro+每类 recall 分布 / 行级参照） |
+| `qa_scoped_gate.json` | 3074 | `b37a4fff…` | 决策门判定（基线 / 原型 / 差值 / 是否过门 / 3 条限定 / 未声明项） |
+| `determinism_check.json` | 2718 | `8720c74f…` | 双跑逐字节一致证据（三件齐备才算过 + 删一件的反例） |
+
+**验收现场（自写脚本 73 项，唯一失败项是脚手架文件自身的 git 状态误报）**：默认口径（筛选关闭 +
+归并关闭）下 `qa_scale` 的 `probe` / `eval` **在全新目录即逐字节相同**（9252 `4b2683ea…`、
+119973 `7faeda90…`），`report` 在同一份双跑证据在场时逐字节相同（136406 `fc1037d7…`、
+13773 `3a960828…`）；`qa_scoped` 三件内容产物在**两套全新目录**之间、以及与交付之间
+**逐个逐字节相同**；`compileall -q n3d_qa_learn` 退码 0；`qa_scoped` 的 `probe` 379 B /
+`eval` 351 B stdout 为**合法 GBK 且非合法 UTF-8**；上游四目录 `git status --porcelain` 为空；
+两份 requirements 未改（`f69450d5…` / `ac59f4d6…`）；产物无 `.npy/.npz/.pt/.zip`、
+无 ISO 时间戳、无绝对路径（`determinism_check.json` 的 4 个目录字段为其登记例外）。
+
+
 
 
 
