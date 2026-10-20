@@ -79,22 +79,40 @@ ROLE_QUESTION: str = "question"
 #: 决策门阈值：原型 macro 需比多数类基线高出至少这么多（+10pp）。
 GATE_MARGIN: float = 0.10
 
-#: 决策门口径文本（**唯一来源**；产物与文档同源）。
-GATE_RULE: str = (
+#: 分层敏感性的**固定四档**（按「该类测试侧问题数」分层；轮 10 · W1）。
+STRATIFICATION_THRESHOLDS: Tuple[int, ...] = (1, 2, 5, 10)
+
+#: 决策门口径文本**模板**（唯一来源；类数 / 阈值由运行参数拼接，**禁止**写死类数）。
+#: 轮 10 · I2：旧实现把「82 类」硬编码进文本，非默认参数下会与数据自相矛盾。
+GATE_RULE_TEMPLATE: str = (
     "决策门（**只判零训练下的可学性下限**）：原型质心分类器的**问题级 macro** 必须比"
     "同一口径的多数类基线（constant_majority）高出 >= %.2f（+%.0fpp）才算过门。"
-    "不过门 ⇒ 在当前特征档下「82 类闭集分类」的可学前提**未建立**，须如实登记并给后续建议；"
+    "不过门 ⇒ 在当前特征档下「%d 类闭集分类」的可学前提**未建立**，须如实登记并给后续建议；"
     "过门也**只**说明「零训练下限成立」，**不得**宣称「已学会」。"
-    % (GATE_MARGIN, GATE_MARGIN * 100.0)
 )
 
-#: A 口径与归并的关系声明（**进产物**）。
-CALIBER_STATEMENT: str = (
-    "A 口径 = 仅按「每类问题数 >= %d」筛选类集，**归并关闭**。轮 8 的答案归并有 2 个 "
-    "high-risk 簇语义有误（china(Peking) -> china；america(US)/(USA) -> 有歧义的 america），"
-    "**在 high-risk 未解决前不得启用归并**；本模块不接受 merge_map，也不与轮 8 的 281 类口径"
-    "混用结论。" % DEFAULT_MIN_CLASS_QUESTIONS
-)
+
+def gate_rule(n_classes: int, margin: float = GATE_MARGIN) -> str:
+    """决策门口径文本（类数与阈值由**运行参数**拼接，不写死任何类数）。"""
+    return GATE_RULE_TEMPLATE % (float(margin), float(margin) * 100.0, int(n_classes))
+
+
+def caliber_statement(min_class_questions: int) -> str:
+    """A 口径与归并的关系声明（**进产物**；门槛由运行参数拼接）。"""
+    return (
+        "A 口径 = 仅按「每类问题数 >= %d」筛选类集，**归并关闭**。轮 8 的答案归并有 2 个 "
+        "high-risk 簇语义有误（china(Peking) -> china；america(US)/(USA) -> 有歧义的 america），"
+        "**在 high-risk 未解决前不得启用归并**；本模块不接受 merge_map，也不与轮 8 的 281 类口径"
+        "混用结论。" % int(min_class_questions)
+    )
+
+
+def feature_profile_note(profile: str, dim: int) -> str:
+    """特征档说明（档名与维度 `D` 由运行参数拼接，不写死 `lexical-88` / `D=88`）。"""
+    return (
+        "本轮特征档 = %s（D=%d）；换档须**重跑同一口径**（同 seed / 同留出 / 同问题级 "
+        "macro 分母）后才可比较，不得跨档混用结论。" % (str(profile), int(dim))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -528,22 +546,180 @@ def majority_predictions(
 
 
 # ---------------------------------------------------------------------------
+# 轮 10 · W1：按「测试样本量」分层的敏感性登记（**不重新定义门**）
+# ---------------------------------------------------------------------------
+
+
+def stratified_sensitivity(
+    *,
+    prototype_predictions: Sequence[int],
+    majority_predictions: Sequence[int],
+    questions: Sequence[str],
+    gold_local: Mapping[str, Sequence[int]],
+    n_classes: int,
+    margin: float = GATE_MARGIN,
+) -> Dict[str, Any]:
+    """**按测试样本量分层**的 macro / 差值表（官方口径与分层口径**并列**，不另立门）。
+
+    为什么必须做这一层：官方判据是「**全部有测试问题的类等权 macro**」，它给每类**同权** ——
+    只有 1 个测试问题的类（其 recall 只能是 0 或 1）与有 100 个测试问题的类权重相同，
+    因此「过门」可能由大量**极小测试类**的 ±1 抖动撑起。本函数把同一批判测按
+    「该类测试侧问题数 >= k」（k ∈ :data:`STRATIFICATION_THRESHOLDS`）分层后重算同一口径的
+    macro 与差值，**如实并列**，不修改决策门的定义、也不挑对自己有利的层。
+
+    参数
+    ----
+    prototype_predictions : Sequence[int]
+        原型质心分类器的预测（与 ``questions`` 同序）。
+    majority_predictions : Sequence[int]
+        同口径多数类基线的预测（与 ``questions`` 同序）。
+    questions : Sequence[str]
+        被测问题（测试侧）。
+    gold_local : Mapping[str, Sequence[int]]
+        问题 id -> 本语料类下标集合（金标）。
+    n_classes : int
+        类数 ``C``。
+    margin : float
+        门的阈值（只用于标注「该层是否达到 +margin」，**不**参与判定）。
+
+    返回
+    ----
+    Dict[str, Any]
+        ``thresholds`` / ``rows``（每档：``min_test_questions``、``n_classes``、
+        ``prototype_macro``、``majority_macro``、``delta_macro``、``reaches_margin``）/
+        ``official``（= ``min_test_questions = 1`` 那一档，即官方口径）/ ``statement``
+        （结论的**固定表述**，数值由运行参数拼接）/ ``rule`` / ``not_gate_redefinition``。
+
+    异常
+    ------
+    ValueError
+        两侧预测长度与 ``questions`` 不一致，或某档没有任何类。
+    """
+    qs = [str(q) for q in questions]
+    proto_pred = [int(x) for x in prototype_predictions]
+    major_pred = [int(x) for x in majority_predictions]
+    if not (len(qs) == len(proto_pred) == len(major_pred)):
+        raise ValueError(
+            "分层统计的输入长度不一致：问题 %d / 原型预测 %d / 多数类预测 %d"
+            % (len(qs), len(proto_pred), len(major_pred))
+        )
+    # 逐类测试问题数与两套预测的命中数（与 question_level_metrics 同一统计口径：
+    # 多金标问题对它命中的每个金标类都计入分母，命中才计入分子）
+    per_class_total = [0] * int(n_classes)
+    per_class_hit_proto = [0] * int(n_classes)
+    per_class_hit_major = [0] * int(n_classes)
+    for qid, pred_p, pred_m in zip(qs, proto_pred, major_pred):
+        for cls in sorted({int(x) for x in gold_local[str(qid)]}):
+            per_class_total[int(cls)] += 1
+            if int(pred_p) == int(cls):
+                per_class_hit_proto[int(cls)] += 1
+            if int(pred_m) == int(cls):
+                per_class_hit_major[int(cls)] += 1
+    rows: List[Dict[str, Any]] = []
+    for threshold in STRATIFICATION_THRESHOLDS:
+        keep = [
+            int(c)
+            for c in range(int(n_classes))
+            if int(per_class_total[int(c)]) >= int(threshold)
+        ]
+        if not keep:
+            raise ValueError(
+                "分层 min_test_questions >= %d 后没有任何类（C=%d）；分层表无法给出该档"
+                % (int(threshold), int(n_classes))
+            )
+        recalls_proto = [
+            float(per_class_hit_proto[c]) / float(per_class_total[c]) for c in keep
+        ]
+        recalls_major = [
+            float(per_class_hit_major[c]) / float(per_class_total[c]) for c in keep
+        ]
+        proto_macro = float(sum(recalls_proto) / len(recalls_proto))
+        major_macro = float(sum(recalls_major) / len(recalls_major))
+        delta = float(proto_macro - major_macro)
+        rows.append(
+            {
+                "min_test_questions": int(threshold),
+                "n_classes": int(len(keep)),
+                "n_test_questions_in_scope": int(
+                    sum(int(per_class_total[c]) for c in keep)
+                ),
+                "prototype_macro": proto_macro,
+                "majority_macro": major_macro,
+                "delta_macro": delta,
+                "reaches_margin": bool(delta >= float(margin)),
+                "note": (
+                    "该层 delta 达到 +%.0fpp（门仍按官方口径判定，本层只作敏感性登记）"
+                    % (float(margin) * 100.0)
+                    if bool(delta >= float(margin))
+                    else "该层 delta **不足 +%.0fpp** ⇒ 该层「可学前提未建立」，"
+                    "必须与官方口径一起引用" % (float(margin) * 100.0)
+                ),
+            }
+        )
+    official = dict(rows[0])
+    by_threshold = {int(r["min_test_questions"]): r for r in rows}
+    five = by_threshold.get(5)
+    ten = by_threshold.get(10)
+
+    def _pp(value: float) -> str:
+        return "%+.2fpp" % (float(value) * 100.0)
+
+    ten_text = (
+        "（不足 +%.0fpp）" % (float(margin) * 100.0)
+        if ten is not None and not bool(ten["reaches_margin"])
+        else "（达到 +%.0fpp）" % (float(margin) * 100.0)
+    )
+    statement = (
+        "官方「全部有测试类等权 macro」口径（min_test>=1，%d 类）下 %s 过门；"
+        "分层后 >=2 测试样本类 %s（%d 类）、>=5 测试样本类 %s（%d 类）、"
+        ">=10 测试样本类 %s（%d 类）%s。**门只按官方口径判定**，分层表是敏感性登记，"
+        "**不得**据此重新定义门以求通过。"
+        % (
+            int(official["n_classes"]),
+            _pp(official["delta_macro"]),
+            _pp(by_threshold[2]["delta_macro"]) if 2 in by_threshold else "n/a",
+            int(by_threshold[2]["n_classes"]) if 2 in by_threshold else 0,
+            _pp(five["delta_macro"]) if five is not None else "n/a",
+            int(five["n_classes"]) if five is not None else 0,
+            _pp(ten["delta_macro"]) if ten is not None else "n/a",
+            int(ten["n_classes"]) if ten is not None else 0,
+            ten_text,
+        )
+    )
+    return {
+        "unit": "question",
+        "thresholds": [int(x) for x in STRATIFICATION_THRESHOLDS],
+        "rows": rows,
+        "official": official,
+        "statement": statement,
+        "rule": (
+            "分层 = 按「该类**测试侧**问题数 >= k」筛类后，重算**同一问题级口径**的 macro"
+            "（分母 = 该层类数）与差值；与官方口径（min_test>=1，即全部有测试问题的类）"
+            "**并列**报告。层的划分只用于暴露「等权 macro 被极小测试类放大」的可能，"
+            "不改变判据、不改变切分、不重新选层。"
+        ),
+        "not_gate_redefinition": True,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 切分不变量（现场复核）
 # ---------------------------------------------------------------------------
 
 
 def verify_split_invariants(corpus: Any, split: Any) -> Dict[str, Any]:
-    """复核轮 1 的**三条切分不变量**（问题组级切分；违反即抛）。
+    """复核轮 1 的**四条切分不变量**（问题组级切分；违反即抛）。
 
     1. ``train_rows`` 与 ``test_rows`` 不相交、并集 = 全部行下标；
     2. ``train_questions`` 与 ``test_questions`` 不相交、并集 = 全部问题；
     3. **每个问题的全部行必须落在同一侧** —— 逐个问题用 ``corpus.question_rows``
-       把该问题的行集合与两侧行集合求交后判定。
+       把该问题的行集合与两侧行集合求交后判定；
+    4. **问题 id 所在侧与其行所在侧一致** —— 同一条反查里比对「声明的侧」与「行实际的侧」。
 
     **轮 9 离朱 R2 修复（第 3 条旧实现恒真）**：旧版只检查「问题 id 是否只出现在一侧
     列表里」—— 而两个列表本就是按问题 id 切成的不相交列表，这条**天然恒真**；
     于是「把某测试问题的行挪进训练侧、问题 id 列表不动」这种破坏**不会被发现**
-    （离朱现场构造、旧实现返回三条全 True）。修复后改为**用行归属反查**：某问题的行若
+    （离朱现场构造、旧实现返回「当时那三条」全 True）。修复后改为**用行归属反查**：某问题的行若
     同时出现在两侧、或两侧都没有，都算违反。
 
     异常
@@ -676,6 +852,36 @@ def gold_local_map(corpus: Any) -> Dict[str, List[int]]:
 # ---------------------------------------------------------------------------
 
 
+def class_row_counts_from_corpus(corpus: Any) -> List[int]:
+    """**真正的 post-scope 正样本行数**（按 ``label == 1`` 逐行统计；轮 10 · W3）。
+
+    为什么需要这个独立来源：``ScaleCorpus.class_row_counts`` 取的是**冻结答案表**的
+    ``count`` 字段（全量语料的累计计数，不随作用域过滤变化），而 A 口径下语料只保留了
+    「金标全部落在保留类内」的问题 —— 两者在**类集有筛选时**并不相等（现场冻结表合计
+    12374、语料内正样本行 12264）。名字与语义必须对齐，故本函数从 ``corpus.pairs``
+    现场逐行数，且口径与
+    :func:`n3d_qa_learn.qa_scale.side_class_counts` 的 ``unit='row'`` **完全一致**
+    （只数 ``label == 1`` 的行，按该类在本语料的局部下标落位）。
+
+    参数
+    ----
+    corpus : Any
+        :meth:`build_scoped_corpus` 给出的语料（``pairs`` / ``class_pos``）。
+
+    返回
+    ----
+    List[int]
+        长度 = ``corpus.n_classes`` 的逐类正样本行数（局部类下标顺序）。
+    """
+    counts = [0] * int(corpus.n_classes)
+    for pair in corpus.pairs:
+        if int(pair.label) == 1:
+            pos = corpus.class_pos.get(int(pair.candidate_index))
+            if pos is not None:
+                counts[int(pos)] += 1
+    return counts
+
+
 def build_scoped_corpus(
     product_dir: str = DEFAULT_PRODUCT_DIR,
     *,
@@ -725,11 +931,28 @@ def build_scoped_corpus(
     q_test = QS.side_class_counts(corpus, split, side="test", unit="question")
     r_train = QS.side_class_counts(corpus, split, side="train", unit="row")
     r_test = QS.side_class_counts(corpus, split, side="test", unit="row")
+    # 轮 10 · W3：post-scope 正样本行数的**独立来源**（直接数 corpus.pairs 的 label==1），
+    # 并与「训练侧 + 测试侧」的 row 口径逐类对账 —— 两侧来自 split，全侧不来自 split，
+    # 两者一致才说明这个字段的语义真的是「语料内正样本行数」。
+    row_counts_post_scope = class_row_counts_from_corpus(corpus)
+    side_sum_by_row = [int(a) + int(b) for a, b in zip(r_train, r_test)]
+    if side_sum_by_row != [int(x) for x in row_counts_post_scope]:
+        bad = [
+            (i, int(side_sum_by_row[i]), int(row_counts_post_scope[i]))
+            for i in range(len(side_sum_by_row))
+            if int(side_sum_by_row[i]) != int(row_counts_post_scope[i])
+        ]
+        raise AssertionError(
+            "post-scope 正样本行数与 side_class_counts(train)+side_class_counts(test) 逐类不一致"
+            "（前几个 = " + str(bad[:5]) + "）；两种口径对不上，拒绝出数"
+        )
+    frozen_row_total = int(sum(int(x) for x in corpus.class_row_counts))
+    post_scope_row_total = int(sum(row_counts_post_scope))
     document: Dict[str, Any] = {
         "version": str(QA_SCOPED_VERSION),
         "caliber": {
             "name": "A",
-            "statement": str(CALIBER_STATEMENT),
+            "statement": caliber_statement(int(min_class_questions)),
             "min_class_questions": int(min_class_questions),
             "count_unit": "questions",
             "merge_enabled": False,
@@ -766,9 +989,29 @@ def build_scoped_corpus(
             "class_question_counts_post_scope": QS.class_size_distribution(
                 corpus.class_question_counts
             ),
-            "class_row_counts_post_scope": QS.class_size_distribution(
+            # 轮 10 · W3（名实对齐）：旧版把这个键写成 class_row_counts_post_scope，但它
+            # 装的其实是**冻结答案表 count**（全量语料累计计数，不随作用域过滤变化）。
+            # 现改为名实一致的 class_row_counts_frozen_table，并另给真正 post-scope 的字段。
+            "class_row_counts_frozen_table": QS.class_size_distribution(
                 corpus.class_row_counts
             ),
+            "class_row_counts_post_scope": QS.class_size_distribution(
+                row_counts_post_scope
+            ),
+            "class_row_counts_caliber": {
+                "frozen_table_total": int(frozen_row_total),
+                "post_scope_total": int(post_scope_row_total),
+                "difference": int(frozen_row_total - post_scope_row_total),
+                "rule": (
+                    "两个「行数」口径必须分开引用：**frozen_table** = 冻结答案表 "
+                    "`count` 字段（全量语料的累计计数，不随作用域过滤变化）；"
+                    "**post_scope** = 语料内 `label == 1` 的正样本行（按行现场统计，"
+                    "与 side_class_counts 的 row 口径逐类相等，两侧之和 == 全侧）。"
+                    "门槛与类集筛选会整组排除含越界金标的问题 ⇒ 两者相差 %d 行"
+                    "（差量即被排除问题携带的正样本行）。"
+                    % int(frozen_row_total - post_scope_row_total)
+                ),
+            },
             "answer_keys_head": [str(x) for x in corpus.answer_keys[:5]],
             "answer_keys_sha256": QS.sha256_text(_canonical_json(list(corpus.answer_keys))),
         },
@@ -866,6 +1109,14 @@ def evaluate_prototype(
         gold_local=gold,
         n_classes=int(corpus.n_classes),
     )
+    # 轮 10 · W1：同一批预测按「测试样本量」分层重算（与官方口径并列，不另立门）
+    stratified = stratified_sensitivity(
+        prototype_predictions=predicted["predictions"],
+        majority_predictions=bonus["predictions"],
+        questions=split.test_questions,
+        gold_local=gold,
+        n_classes=int(corpus.n_classes),
+    )
     row_reference = QS.deterministic_baseline_metrics(corpus, split, side="test")
     prototype_document: Dict[str, Any] = {
         "version": str(QA_SCOPED_VERSION),
@@ -891,6 +1142,18 @@ def evaluate_prototype(
             "n_classes": int(corpus.n_classes),
             "n_train_questions_used": int(prototypes["n_train_questions_used"]),
             "prototype_support_distribution": _quantiles(prototypes["counts"]),
+            "prototype_support_min": int(min(int(x) for x in prototypes["counts"])),
+            "post_scope_min_class_questions": int(min(corpus.class_question_counts)),
+            "support_note": (
+                "**原型支撑下界 = %d 条训练问题、post-scope 最小类 = %d 个问题**："
+                "门槛（min_class_questions）是 **pre-scope** 口径，整组排除后个别类会掉到门槛"
+                "以下；这些类的原型由极少样本决定，其 recall（以及等权 macro 里它那一票）"
+                "不稳定 —— 引用 macro 时必须同时看 W1 的分层表。"
+                % (
+                    int(min(int(x) for x in prototypes["counts"])),
+                    int(min(corpus.class_question_counts)),
+                )
+            ),
             "n_zero_norm_centroids": int(prototypes["n_zero_norm_centroids"]),
             "rule": str(prototypes["rule"]),
         },
@@ -929,7 +1192,16 @@ def evaluate_prototype(
             ),
         },
     }
-    gate_document = decision_gate(proto_metrics, majority_metrics, corpus=corpus)
+    gate_document = decision_gate(
+        proto_metrics,
+        majority_metrics,
+        corpus=corpus,
+        stratified=stratified,
+        prototype_support_min=int(min(int(x) for x in prototypes["counts"])),
+        post_scope_min_class_questions=int(min(corpus.class_question_counts)),
+        profile=str(features["profile"]),
+        dim=int(features["dim"]),
+    )
     return {
         "prototype_document": prototype_document,
         "gate_document": gate_document,
@@ -942,11 +1214,41 @@ def decision_gate(
     *,
     corpus: Any = None,
     margin: float = GATE_MARGIN,
+    stratified: Optional[Mapping[str, Any]] = None,
+    prototype_support_min: Optional[int] = None,
+    post_scope_min_class_questions: Optional[int] = None,
+    profile: str = DEFAULT_PROFILE,
+    dim: int = 0,
 ) -> Dict[str, Any]:
     """**决策门**：原型 macro 是否比同口径多数类基线高出 >= ``margin``（+10pp）。
 
     **只判零训练下的可学性下限**：不过门就如实给「特征空间不可分」的判断与后续建议，
     不粉饰；过门也只说明下限成立。
+
+    参数
+    ----
+    prototype_metrics / majority_metrics : Mapping[str, Any]
+        :func:`question_level_metrics` 给出的两套**同口径**问题级指标。
+    corpus : Any
+        语料（保留参数：门的判定只依赖两个指标，语料仅用于调用方溯源）。
+    margin : float
+        门的阈值（默认 +0.10）。
+    stratified : Optional[Mapping[str, Any]]
+        :func:`stratified_sensitivity` 的结果（轮 10 · W1）。**只并列登记**，不参与判定；
+        ``None`` 时写 ``applicable=False``，**不伪造**分层数字。
+    prototype_support_min : Optional[int]
+        原型支撑下界（每类训练问题数的最小值）；给定时写进 ``support_notes``。
+    post_scope_min_class_questions : Optional[int]
+        语料内每类问题数的最小值（post-scope）；给定时写进 ``support_notes``。
+    profile : str / dim : int
+        特征档名与维度 `D`（**由运行参数拼接**进 ``feature_profile_note``，不写死）。
+
+    返回
+    ----
+    Dict[str, Any]
+        决策门文档：``gate_rule``（类数/阈值运行时拼接）/ 两侧 macro、micro / ``delta_macro`` /
+        ``passed`` / ``quality_caveats`` / ``verdict`` / ``stratified_sensitivity`` /
+        ``support_notes`` / ``feature_profile_note`` / ``not_claimed``。
     """
     proto_macro = float(prototype_metrics["macro"])
     base_macro = float(majority_metrics["macro"])
@@ -985,12 +1287,19 @@ def decision_gate(
     else:
         verdict = (
             "未过门：原型质心基线的问题级 macro = %.6f，同口径多数类基线 = %.6f，"
-            "差值 = %.6f < %.2f（不足 +%.0fpp）⇒ **在当前特征档下 82 类闭集分类的可学前提"
+            "差值 = %.6f < %.2f（不足 +%.0fpp）⇒ **在当前特征档下 %d 类闭集分类的可学前提"
             "未建立**；这不是「模型不行」，而是「连零训练的原型分类都分不开」⇒ 特征空间不可分"
             "（micro/macro 同时偏低即为证据）。后续建议：①换语义特征档（bge-m3，D=1024）重测"
             "同一口径；②继续上游放量（每类问题数再翻倍）；③复核 A 口径门槛是否过松/过紧。"
             "**不得**把本结果包装成「已可学」。"
-            % (proto_macro, base_macro, delta, float(margin), float(margin) * 100.0)
+            % (
+                proto_macro,
+                base_macro,
+                delta,
+                float(margin),
+                float(margin) * 100.0,
+                int(n_classes),
+            )
         )
     caveats: List[str] = []
     if float(proto_micro - base_micro) < 0.0:
@@ -1025,9 +1334,35 @@ def decision_gate(
                 float(prototype_metrics.get("macro_all_classes", 0.0)),
             )
         )
+    support_notes: List[str] = []
+    if prototype_support_min is not None:
+        support_notes.append(
+            "**原型支撑下界 = %d 条训练问题**（每类训练问题数的最小值）：门槛是 **pre-scope** "
+            "口径，个别类整组排除后训练侧只剩这么多 ⇒ 该类原型的 recall（在等权 macro 里"
+            "占**整整一票**）由极少样本决定，必须与分层敏感性表一起读。"
+            % int(prototype_support_min)
+        )
+    if post_scope_min_class_questions is not None:
+        support_notes.append(
+            "**post-scope 最小类 = %d 个问题**（语料内每类问题数的最小值）：类集门槛只保证"
+            "**筛选前**每类 >= 门槛，整组排除后并不保证语料内仍达标；"
+            "要求「语料内每类也 >= 门槛」需再迭代筛一轮（本轮不做，如实登记）。"
+            % int(post_scope_min_class_questions)
+        )
+    stratified_block: Dict[str, Any] = (
+        dict(stratified)
+        if stratified is not None
+        else {
+            "applicable": False,
+            "rule": (
+                "未提供预测序列 ⇒ 分层表不适用；调用方须用 stratified_sensitivity() 现场算，"
+                "**不得**手写分层数字"
+            ),
+        }
+    )
     return {
         "version": str(QA_SCOPED_VERSION),
-        "gate_rule": str(GATE_RULE),
+        "gate_rule": gate_rule(int(n_classes), float(margin)),
         "margin": float(margin),
         "baseline": {
             "name": "constant_majority",
@@ -1048,16 +1383,16 @@ def decision_gate(
         "passed": bool(passed),
         "quality_caveats": caveats,
         "verdict": str(verdict),
+        "stratified_sensitivity": stratified_block,
+        "support_notes": support_notes,
         "not_claimed": [
             "已学会 / 模型能力（零训练、未评测任何模型）",
             "N3D 后端可学到该上限（本轮不涉及任何后端训练）",
             "跨 seed / 跨留出比例稳定性（单 seed 42、单 20%）",
+            "分层敏感性表**不是**新的判定口径（门只按官方「全部有测试类等权 macro」判定）",
         ],
         "n_classes": int(n_classes),
-        "feature_profile_note": (
-            "本轮特征档 = lexical-88（词面哈希 + 长度特征，D=88）；换档须**重跑同一口径**"
-            "（同 seed / 同留出 / 同问题级 macro 分母）后才可比较，不得跨档混用结论。"
-        ),
+        "feature_profile_note": feature_profile_note(str(profile), int(dim)),
     }
 
 
@@ -1074,11 +1409,15 @@ __all__ = [
     "DEFAULT_PROFILE",
     "ROLE_QUESTION",
     "GATE_MARGIN",
-    "GATE_RULE",
-    "CALIBER_STATEMENT",
+    "STRATIFICATION_THRESHOLDS",
+    "GATE_RULE_TEMPLATE",
+    "gate_rule",
+    "caliber_statement",
+    "feature_profile_note",
     "build_question_matrix",
     "build_scoped_corpus",
     "class_prototypes",
+    "class_row_counts_from_corpus",
     "decision_gate",
     "evaluate_prototype",
     "gold_local_map",
@@ -1086,5 +1425,6 @@ __all__ = [
     "majority_predictions",
     "predict_by_cosine",
     "question_level_metrics",
+    "stratified_sensitivity",
     "verify_split_invariants",
 ]

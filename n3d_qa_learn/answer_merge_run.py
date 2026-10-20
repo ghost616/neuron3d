@@ -161,6 +161,35 @@ def out_root() -> str:
     return os.path.join(str(QS.VERIFY_ROOT), "answer_merge")
 
 
+def repo_root() -> str:
+    """仓库根目录（本包所在目录的父目录）。
+
+    **轮 10 · W2**：``before_after.json`` 是「内容产物」，与
+    ``determinism_check.json``（已被排除在逐字节比对集合外）不同 —— 前者**不得**含绝对
+    路径。故取证块里的候选路径一律写成**相对仓库根**的形式（以本函数给出的根为基准，
+    与当前工作目录无关），既能定位、又不会把机器相关前缀写进产物。
+    """
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def repo_relative(path: str) -> str:
+    """把路径改写为「相对仓库根 + 正斜杠」的形式（**不含任何绝对路径前缀**）。"""
+    return os.path.relpath(os.path.abspath(str(path)), repo_root()).replace("\\", "/")
+
+
+def looks_absolute(path: str) -> bool:
+    """判断一个路径字符串是否**形如绝对路径**（盘符 / 前导斜杠 / UNC）。
+
+    用于对「内容产物不含绝对路径」这条声明做**现场自检**（不是口头保证）。
+    """
+    text = str(path)
+    if not text:
+        return False
+    if text.startswith("/") or text.startswith("\\\\"):
+        return True
+    return bool(len(text) > 1 and text[1] == ":")
+
+
 def _guard_out_dir(out_dir: str) -> str:
     """守卫产物目录：**只允许**写在 ``checkpoints/qa_learn/_verify/answer_merge/`` 之下。
 
@@ -239,21 +268,50 @@ def guard_evidence() -> Dict[str, Any]:
         new_ok = norm == root or norm.startswith(root + os.sep)
         rows.append(
             {
-                "path": norm.replace("\\", "/"),
+                # **轮 10 · W2**：路径一律写「相对仓库根」（旧版写的是绝对路径，
+                # 与本文件「内容产物不含绝对路径」的声明冲突）。
+                "path": repo_relative(norm),
                 "old_guard_would_accept": bool(old_ok),
                 "new_guard_accepts": bool(new_ok),
                 "changed": bool(old_ok != new_ok),
             }
         )
+    rendered = (
+        [str(r["path"]) for r in rows]
+        + [repo_relative(root), repo_relative(verify_root)]
+    )
+    absolute_like = [text for text in rendered if looks_absolute(text)]
+    if absolute_like:
+        raise AssertionError(
+            "W2 自检失败：取证块仍含形如绝对路径的串（前几个 = "
+            + str(absolute_like[:3])
+            + "）；内容产物不得含绝对路径，拒绝出数"
+        )
     return {
-        "out_root": root.replace("\\", "/"),
-        "old_root": verify_root.replace("\\", "/"),
+        "out_root": repo_relative(root),
+        "old_root": repo_relative(verify_root),
+        "path_form": (
+            "**相对仓库根**（`answer_merge_run.repo_relative()`：以本包所在目录的父目录为基准，"
+            "正斜杠分隔）；本块在 `before_after.json` 内 ⇒ **不得**出现盘符/前导斜杠/UNC。"
+        ),
         "cases": rows,
         "n_changed": int(sum(1 for r in rows if bool(r["changed"]))),
+        "n_absolute_like_paths": int(len(absolute_like)),
+        "absolute_path_scan": {
+            "scanned_strings": int(len(rendered)),
+            "hits": [str(x) for x in absolute_like],
+            "rule": (
+                "对 `cases[].path` 与两个根目录串逐条做「形如绝对路径」判定"
+                "（盘符 `X:` / 前导 `/` / UNC）；命中即抛 AssertionError —— "
+                "本块是内容产物的一部分，声明必须由现场自检保证。"
+            ),
+        },
         "rule": (
             "W3 收窄根目录：旧守卫（`_verify/` 任意子目录）会放行 `_verify/qa_scale` 等**别轮交付目录**，"
             "新守卫（`_verify/answer_merge/`）一律拒绝；`changed=True` 的用例即证据。"
             "另外 `--log-file` 旧版**完全无守卫**、现在与产物目录同等（越界退码 2、不建目录）。"
+            "**轮 10 · W2**：本块的路径全部为相对仓库根形式，绝对路径命中数见 "
+            "`n_absolute_like_paths`（当前 = 0）。"
         ),
     }
 
@@ -1157,7 +1215,12 @@ def determinism_block(out_dir: str, repro_dir: str) -> Dict[str, Any]:
             "`a_dir` / `b_dir` 保留命令原样串（Windows 下 \\ 与 / 的字形差异会被保留）；"
             "另给 `*_normalized` 供机器判定。**这两个原样串会进本文件内容** ⇒ 本文件在"
             "「绝对路径不同」的运行之间不逐字节相同；同路径同参重跑才逐字节相同。"
-            "这是「不落盘挂钟字段」之外的**唯一**已知非确定性来源，已显式登记。"
+            "这与「不落盘挂钟字段」并列，是本模块**唯一**的已知非确定性来源，已显式登记。"
+            "**轮 10 · W2 起，这条非确定性只存在于本文件**：本文件被排除在逐字节比对集合外，"
+            "而三件内容产物（`merge_map.jsonl` / `before_after.json` / `audit.md`）**不含任何"
+            "路径串** —— `before_after.json.out_dir_and_log_guard_evidence` 的路径已改为"
+            "**相对仓库根**，并由 `n_absolute_like_paths = 0` 现场自检（盘符 / 前导斜杠 / UNC "
+            "命中即抛）。"
         ),
         "files": files,
         "n_common_files": int(len(files)),
@@ -1777,6 +1840,12 @@ def cmd_report(args: argparse.Namespace) -> int:
                 str(probe["missing_files_when_missing"]),
             )
         )
+        if not bool(probe["determinism_ok_when_complete"]):
+            raise AssertionError(
+                "W2 自检失败：**齐备态**（三件内容产物都复制进临时目录）determinism_ok 应为 "
+                "True，实际为 False ⇒ 判据在默认路径上就不可用（两侧同时缺件会被误判），"
+                "拒绝出数"
+            )
         if bool(probe["determinism_ok_when_missing"]):
             raise AssertionError(
                 "W2 自检失败：删掉一件产物后 determinism_ok 仍为 True ⇒ 修复无效，拒绝出数"

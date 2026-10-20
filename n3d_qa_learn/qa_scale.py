@@ -588,6 +588,8 @@ def build_scale_corpus(
         映射由 :func:`n3d_qa_learn.answer_merge.build_merge_plan` 生成、经
         :func:`n3d_qa_learn.answer_merge.validate_merge_map` 校验（fail-closed）。
         **轮 9 口径声明**：A 口径**不使用**归并（high-risk 两簇语义未解决），两者不要一起开。
+        **轮 10 · I4 互斥守卫**：``merge_map`` 非 ``None`` 且 ``min_class_questions > 0``
+        时**直接抛 ``ValueError``**（不再只是「别一起开」的口头约定）。
     merge_labels : Optional[Mapping[int, Sequence[str]]]
         canonical 下标 -> ``(canonical_key, canonical_display)``；``merge_map`` 为
         ``None`` 时**必须**也为 ``None``（否则抛 ``ValueError``）。
@@ -609,6 +611,20 @@ def build_scale_corpus(
     6. （轮 9）类集门槛按**问题数**口径判定；筛选后保留类集非空，且**金标全部落在保留类内**
        的问题才进语料（含越界金标的问题**整体**排除，不偷偷把「答案不在表内」变成「在表内」）。
     """
+    # ---- 轮 10 · I4：**互斥守卫** —— 「既归并又按门槛筛选」的口径误用必须当场拒绝 ----
+    # 理由：归并把类改写到 canonical 下标空间，而 min_class_questions 的门槛计数是
+    # **筛选前**的全量类集口径；两者同时启用时，既无法判断门槛落在原表还是 canonical 表上，
+    # 也会把轮 8（归并）与轮 9（A 口径，明确「归并关闭」）的结论混成一套数。
+    if merge_map is not None and int(min_class_questions) > 0:
+        raise ValueError(
+            "merge_map（轮 8 答案表归并）与 min_class_questions（轮 9 · A 口径类集门槛）"
+            "**不允许同时启用**：归并后的 canonical 下标空间与「筛选前全量类集」的门槛计数"
+            "分属两套口径（A 口径明确「归并关闭」），同时启用会让两层结论互相污染。"
+            "请分两轮分别跑：先归并（merge_map）或先按门槛筛选（min_class_questions），"
+            "当前 merge_map 非 None 且 min_class_questions = "
+            + str(int(min_class_questions))
+            + "。"
+        )
     table = load_answer_table(str(product_dir))
     full_c = int(len(table))
     # ---- 轮 8：可选归并（**默认关闭**；关闭时下面的代码路径与轮 1 逐位相同） ----------
@@ -893,15 +909,22 @@ def build_scale_corpus(
         "n_questions_out_of_scope": int(n_questions_out_of_scope),
         "n_questions_after_scope_filter": int(len(question_gold)),
         "scope_filter_rule": (
-            "类别截断到 max_classes 时，**金标全部落在保留类之内**的问题才属于本轮口径；"
-            "金标含被截断类的问题**整体**排除（不能只删越界的那部分金标 —— 那会把"
-            "「答案不在表内」偷偷变成「答案在表内」）。全量口径（max_classes=0）不做过滤，"
-            "故 n_questions_out_of_scope 恒为 0。行下标在过滤后**重新编号**为 0..M-1 连续，"
+            "**max_classes > 0 或 min_class_questions > 0 时都做问题级作用域过滤**：只有"
+            "「金标全部落在保留类之内」的问题才属于本轮口径；金标含被筛选掉类的问题"
+            "**整体**排除（不能只删越界的那部分金标 —— 那会把「答案不在表内」偷偷变成"
+            "「答案在表内」）。保留类由 min_class_questions（每类问题数门槛，先按门槛剔除）"
+            "和/或 max_classes（按 (-count, key) 截断）共同决定，因此**门槛筛选同样可能**"
+            "让问题越界：n_questions_out_of_scope 每次运行现场统计，随门槛/截断参数变化"
+            "（A 口径下非 0）；**只有两者都不启用**（默认档）才不进入本步过滤，"
+            "n_questions_out_of_scope = 0。行下标在过滤后**重新编号**为 0..M-1 连续，"
             "保证「语料行号」只有一套。"
         ),
         "selection_rule": (
-            "类别截断按 (-count, key) 降序取前 max_classes（max_classes=0 表示全量）；"
-            "与 data.build_answer_space 的确定性排序键一致"
+            "保留类 = 先按 min_class_questions 剔除「每类问题数 < 门槛」的类（口径 = 该类"
+            "的不同 question_id 个数，一问只计一次），再按 (-count, key) 降序取前 "
+            "max_classes（max_classes=0 表示不截断）；与 data.build_answer_space 的确定性"
+            "排序键一致。两者同时给定时顺序固定为「先门槛、后截断」，组合语义见 "
+            "scope_filter_rule。"
         ),
     }
     # **轮 8**：只在归并开启时追加 ``merge`` 键 —— 默认档的 ``source`` 逐字节不变。

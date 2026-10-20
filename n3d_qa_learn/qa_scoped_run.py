@@ -5,9 +5,10 @@
 子命令与产物（**一个子命令只负责一组产物**）
 --------------------------------------------
 * ``probe`` —— 只做**语料取证**：按 A 口径（``min_class_questions`` 题/类）重建语料与切分，
-  复核三条切分不变量，落 ``qa_scoped_corpus.json``（语料摘要 / 类别分布 / 覆盖 / 留出比例）。
-* ``eval`` —— **零训练原型基线**（类质心余弦 argmax）+ 同口径多数类基线 + **决策门**，
-  落 ``qa_scoped_prototype.json`` 与 ``qa_scoped_gate.json``；给 ``--repro-dir`` 时额外落
+  复核**四条**切分不变量，落 ``qa_scoped_corpus.json``（语料摘要 / 类别分布 / 覆盖 / 留出比例）。
+* ``eval`` —— **零训练原型基线**（类质心余弦 argmax）+ 同口径多数类基线 + **决策门**
+  （含轮 10 · W1 的**分层敏感性表**），落 ``qa_scoped_prototype.json`` 与
+  ``qa_scoped_gate.json``；给 ``--repro-dir`` 时额外落
   ``determinism_check.json``（双跑逐字节一致证据）。
 
 **不训练任何模型**：原型只是训练侧问题特征的质心；产物**不落盘裸特征矩阵**、不产 zip、
@@ -169,7 +170,7 @@ def _resolve_product_dir(explicit: str) -> str:
 
 
 def cmd_probe(args: argparse.Namespace) -> int:
-    """语料取证（**不评测**）：A 口径语料 + 切分 + 三条不变量，落 ``qa_scoped_corpus.json``。"""
+    """语料取证（**不评测**）：A 口径语料 + 切分 + 四条不变量，落 ``qa_scoped_corpus.json``。"""
     import n3d_qa_learn.qa_scoped as S
 
     out_dir = _guard_out_dir(str(getattr(args, "out_dir", "") or ""))
@@ -207,7 +208,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     )
     _log(
         "[probe] 切分：训练问题 %d / 测试问题 %d / 训练行 %d / 测试行 %d；"
-        "测试问题占比 %.6f；三条不变量 = %s"
+        "测试问题占比 %.6f；四条不变量 = %s"
         % (
             int(doc["split"]["n_train_questions"]),
             int(doc["split"]["n_test_questions"]),
@@ -219,6 +220,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
                     doc["split"]["invariants"]["rows_disjoint_and_union_complete"],
                     doc["split"]["invariants"]["questions_disjoint_and_union_complete"],
                     doc["split"]["invariants"]["every_question_wholly_on_one_side"],
+                    doc["split"]["invariants"]["question_side_matches_row_side"],
                 ]
             ),
         )
@@ -293,6 +295,20 @@ def cmd_eval(args: argparse.Namespace) -> int:
         "[eval] 决策门：delta_macro=%+.6f >= %.2f ? -> %s"
         % (float(gate_doc["delta_macro"]), float(gate_doc["margin"]), str(gate_doc["passed"]))
     )
+    stratified = dict(gate_doc.get("stratified_sensitivity", {}))
+    for row in stratified.get("rows", []):
+        _log(
+            "[eval] 分层敏感性 min_test>=%d：类 %d / 原型 macro %.6f / 多数类 macro %.6f / "
+            "delta %+.6f（%s）"
+            % (
+                int(row["min_test_questions"]),
+                int(row["n_classes"]),
+                float(row["prototype_macro"]),
+                float(row["majority_macro"]),
+                float(row["delta_macro"]),
+                "达到门槛" if bool(row["reaches_margin"]) else "不足门槛",
+            )
+        )
     _log(
         "[eval] 零 recall 类 %d / 有测试问题的类 %d；特征档 %s（D=%d，零范数 %d）"
         % (
@@ -331,6 +347,12 @@ def cmd_eval(args: argparse.Namespace) -> int:
                 str(probe["missing_files_when_missing"]),
             )
         )
+        if not bool(probe["determinism_ok_when_complete"]):
+            raise AssertionError(
+                "双跑自检失败：**齐备态**（三件内容产物都复制进临时目录）determinism_ok 应为 "
+                "True，实际为 False ⇒ 判据在默认路径上就不可用（两侧同时缺件会被误判），"
+                "拒绝出数"
+            )
         if bool(probe["determinism_ok_when_missing"]):
             raise AssertionError(
                 "双跑自检失败：删掉一件产物后 determinism_ok 仍为 True ⇒ 判据恒真，拒绝出数"
@@ -569,8 +591,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
     helps = {
-        "probe": "语料取证：A 口径语料 + 切分 + 三条不变量（落 qa_scoped_corpus.json）",
-        "eval": "零训练原型基线 + 同口径多数类基线 + 决策门（落两件产物，可附双跑证据）",
+        "probe": "语料取证：A 口径语料 + 切分 + 四条不变量（落 qa_scoped_corpus.json）",
+        "eval": "零训练原型基线 + 同口径多数类基线 + 决策门 + 分层敏感性表（落两件产物，可附双跑证据）",
     }
     for name in QA_SCOPED_COMMANDS:
         p = sub.add_parser(name, help=helps[str(name)])
