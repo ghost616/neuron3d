@@ -1048,3 +1048,23 @@ R51 确认 **F1/F2/F3 三处修复全部收口**：F1 —— R50 检不出的三
 - **I3 四条不变量统一**：`qa_scoped.py` / `qa_scoped_run.py` 的 docstring、`probe` 日志（四条布尔值全打印）、`--help` / 子命令 help 统一为四条；`module_definition` 与本节同步。
 - **受影响的 `answer_merge` 产物重新基线**：`before_after.json` **46106 B `384fdc65…`**（旧 45516 / `39f37436…`）、`determinism_check.json` **3608 B `0e1e620b…`**（旧 3181 / `ad3f95b1…`）；`merge_map.jsonl`（222070 B `682a742a…`）与 `audit.md`（25884 B `1ba1d2ba…`）**未变**。
 - **默认口径逐字节不变（现场）**：`min_class_questions=0`、`merge_map=None` 下全新目录跑 `qa_scale` 的 `probe` / `eval` ⇒ **9252 B `4b2683eaaf4827d4`** / **119973 B `7faeda901cd33feb`**，与轮 1 登记值逐位相同（本轮只改 `source` 文本，而 `qa_scale` 产物不内嵌 `source`）。
+## A 口径上的可学变换与双判据（轮 11）
+
+A 口径（82 类）上的**第一次「上模型」**：在同一批冻结 `lexical-88`（D=88）特征上训练**可学 D->D 变换 M**（恒等初始化 M=I），接**冻结**类质心原型，打分 = tau × L2 归一化余弦（tau 可学），损失 = multi-positive CE；回答「特征瓶颈还是模型瓶颈」。**产物不产 zip、不落盘裸特征矩阵、无挂钟字段**；零新增依赖。
+
+**口径（不得重新调参）**：类集 A 口径 82 类、训练 9692 问题 / 38361 行、测试 2313 / 9134、单 seed 42、单特征档、切分与轮 9 逐位相同；基线复算须**逐位等于**轮 9/10 冻结值（prototype macro `0.2412763685865515` / micro `0.12105490704712495`；majority macro `0.012987012987012988` / micro `0.18331171638564633`），不等即 `ValueError` 停止并报差异。
+
+**双判据（同时满足才过门）**：`macro > 0.241276` **且** `micro >= 0.183312`；**禁止**用 gap/sigma、对齐度、有效秩等代理量替代（历史两次证否）。**停止准则**只用训练侧损失（每 50 步相对变化 < 0.5%，上限 3000 步），现场 **600 步收敛**（0.2808%）。
+
+**step 0 硬证据**：`M=I`、`tau=1` 时测试侧 argmax 与 numpy 原型基线 **0 / 2313 不同**，`macro`/`micro` **float 完全相等**，torch↔numpy 余弦最大绝对差 `3.40e-08`（门限 1e-5）；任一不成立即 `AssertionError` 拒绝出数。
+
+**现场结果（未过门，如实登记）**：测试侧 `macro 0.21200882533893275`（< 0.241276，**未达到**）、`micro 0.2801556420233463`（>= 0.183312，**达到**）⇒ `passed = false`；`macro_all_classes 0.19908145794021737`、零召回 **37/77**。分层四档（model / 原型 / Δ vs 原型 / Δ vs 多数类）：`>=1` 77 类 `0.212009 / 0.241276 / −0.029268 / +0.199022`；`>=2` 68 类 `−0.018435`；`>=5` 37 类 `0.224991 / 0.186800 / +0.038191`；`>=10` 20 类 `0.178496 / 0.104093 / +0.074403`。逐类：提升 19 / 下降 18 / 不变 40，新学到 10、丢失 13，正增量合计 `+4.127735`、负增量 `−6.381335`。训练侧（仅诊断）：loss `4.302104 → 1.618322`，step 550 训练 macro `0.559581`、micro `0.376702`；`tau 79.567`、`||M−I||_F 20.483`、参数 7745。**判断（标注为判断）**：词面特征上零训练原型与可学线性变换都达不到双判据，可学变换把 micro 与 `>=5 / >=10` 层抬起却拉低 1~4 题小类的等权 recall ⇒ 更像**特征（与样本支撑）瓶颈**；建议换 bge-m3 语义档（D=1024）同口径重测。**过门时的固定措辞已预先写进 README 26.6 / gate 的 pass 分支，本轮回填「未触发」。**
+
+**对外接口**：`qa_learn_d.py` 的 `load_dataset` / `LearnableTransform` / `multi_positive_ce` / `step0_equivalence` / `train_transform`（含收敛停止）/ `per_class_stats` / `stratified_rows` / `evaluate_model` / `class_delta_document` / `gate_document` / `baseline_document` / `config_document` / `run_experiment`；CLI `python -m n3d_qa_learn.qa_learn_d_run {probe|run}`，产物只写 `checkpoints/qa_learn/_verify/qa_learn_d/`（`qa_learn_d_baseline/config/step0/curve/eval/class_delta/gate.json` + `determinism_check.json` + `qa_learn_d_probe.json`），`--out-dir` / `--log-file` 越界退码 2 且不建目录。
+
+**轮 10 三条遗留（与本轮同文件，已修）**：0a README 断链「24.8.9」→「24.7 产物表 / 25.9」；0b `qa_scoped_run` / `answer_merge_run` 的 `path_dependence_note` 改为「内容产物**不含绝对 / 机器相关路径串**（相对 `product_dir` 仍登记）」，副作用是两份 `determinism_check.json` 刷新（`qa_scoped` 2863 B `e7d9b5f6…`、`answer_merge` 3744 B `ec904456…`），内容产物逐字节不变；0c `stratified_sensitivity` 空档改 `applicable = False`（不抛 `ValueError`）、`statement` 档位与 `STRATIFICATION_THRESHOLDS` 联动、`evaluate_prototype` 显式 `margin` 透传并在 docstring 登记耦合点。
+
+**验收现场**：七件内容产物同参双跑逐字节一致（`determinism_ok=True`、`missing_files=[]`、删 `qa_learn_d_gate.json` ⇒ False）；`probe` 200 步 **30.9 s < 600 s**；默认口径 `qa_scale`（9252 `4b2683ea…` / 119973 `7faeda90…`）、`qa_scoped` 三件（8619 `c0dd28da…`、7043 `535d766f…`、6476 `bd51375f…`）、`answer_merge` 三件（222070 `682a742a…`、46106 `384fdc65…`、25884 `1ba1d2ba…`）**逐字节不变**；`compileall -q n3d_qa_learn` 退码 0；新 CLI stdout 为合法 GBK 且非合法 UTF-8；上游四目录 `git status` 空；两份 requirements 未改。
+
+**局限**：单 seed / 单特征档 / 单留出比例；可学部分只有 D->D 线性变换 + 温度，**不是** N3D 骨干，结论不得外推成「N3D 学不会」；未做正则 / 未按测试集早停（训练侧 macro 0.56 vs 测试 0.21 的过拟合已登记，不用于判定）；`>=5 / >=10` 层提升与官方口径下降必须并列引用；micro 提升主要来自往大类倾斜，不得只挑单边报「变好 / 变差」。
+

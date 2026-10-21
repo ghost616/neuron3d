@@ -411,7 +411,9 @@ def determinism_block(out_dir: str, repro_dir: str) -> Dict[str, Any]:
         "path_dependence_note": (
             "`a_dir` / `b_dir` 保留命令原样串；**它们会进本文件内容** ⇒ 本文件在"
             "「绝对路径不同」的运行之间不逐字节相同，同路径同参重跑才逐字节相同"
-            "（与轮 1 / 轮 8 登记同源）。三件内容产物本身不含任何路径串。"
+            "（与轮 1 / 轮 8 登记同源）。三件内容产物本身**不含绝对 / 机器相关路径串**"
+            "（相对 `product_dir` 仍按原样登记，如 `checkpoints/qa_learn/dataset` —— "
+            "它相对仓库根、与机器无关）。"
         ),
         "files": files,
         "n_common_files": int(len(files)),

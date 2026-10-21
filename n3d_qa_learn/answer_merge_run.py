@@ -1217,8 +1217,10 @@ def determinism_block(out_dir: str, repro_dir: str) -> Dict[str, Any]:
             "「绝对路径不同」的运行之间不逐字节相同；同路径同参重跑才逐字节相同。"
             "这与「不落盘挂钟字段」并列，是本模块**唯一**的已知非确定性来源，已显式登记。"
             "**轮 10 · W2 起，这条非确定性只存在于本文件**：本文件被排除在逐字节比对集合外，"
-            "而三件内容产物（`merge_map.jsonl` / `before_after.json` / `audit.md`）**不含任何"
-            "路径串** —— `before_after.json.out_dir_and_log_guard_evidence` 的路径已改为"
+            "而三件内容产物（`merge_map.jsonl` / `before_after.json` / `audit.md`）"
+            "**不含绝对 / 机器相关路径串**（相对 `product_dir` 仍按原样登记，如 "
+            "`checkpoints/qa_learn/dataset`，它相对仓库根、与机器无关）"
+            " —— `before_after.json.out_dir_and_log_guard_evidence` 的路径已改为"
             "**相对仓库根**，并由 `n_absolute_like_paths = 0` 现场自检（盘符 / 前导斜杠 / UNC "
             "命中即抛）。"
         ),

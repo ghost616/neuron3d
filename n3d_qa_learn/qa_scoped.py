@@ -588,12 +588,16 @@ def stratified_sensitivity(
         ``thresholds`` / ``rows``（每档：``min_test_questions``、``n_classes``、
         ``prototype_macro``、``majority_macro``、``delta_macro``、``reaches_margin``）/
         ``official``（= ``min_test_questions = 1`` 那一档，即官方口径）/ ``statement``
-        （结论的**固定表述**，数值由运行参数拼接）/ ``rule`` / ``not_gate_redefinition``。
+        （结论的**固定表述**，数值与档位字面都由运行参数/``STRATIFICATION_THRESHOLDS``
+        拼接）/ ``rule`` / ``not_gate_redefinition``。
+        **轮 11 · 0c**：某档没有任何类（该层为空）时，该档改为 ``applicable = False``
+        并给出 ``rule``，**不再抛 ValueError** —— 「空层」是数据事实，不是契约违例；
+        但不适用档**不得**伪造 macro/delta 数值，``official`` 也随之为不适用。
 
     异常
     ------
     ValueError
-        两侧预测长度与 ``questions`` 不一致，或某档没有任何类。
+        两侧预测长度与 ``questions`` 不一致（口径契约）。
     """
     qs = [str(q) for q in questions]
     proto_pred = [int(x) for x in prototype_predictions]
@@ -623,10 +627,19 @@ def stratified_sensitivity(
             if int(per_class_total[int(c)]) >= int(threshold)
         ]
         if not keep:
-            raise ValueError(
-                "分层 min_test_questions >= %d 后没有任何类（C=%d）；分层表无法给出该档"
-                % (int(threshold), int(n_classes))
+            # 轮 11 · 0c：空层**不抛错**（它是数据事实），但也不伪造数值。
+            rows.append(
+                {
+                    "min_test_questions": int(threshold),
+                    "applicable": False,
+                    "n_classes": 0,
+                    "rule": (
+                        "该档没有任何类（该类测试侧问题数 >= %d 的类集为空）⇒ 本档不适用；"
+                        "不参与判据，也不伪造 macro / delta" % int(threshold)
+                    ),
+                }
             )
+            continue
         recalls_proto = [
             float(per_class_hit_proto[c]) / float(per_class_total[c]) for c in keep
         ]
@@ -656,36 +669,44 @@ def stratified_sensitivity(
                 ),
             }
         )
-    official = dict(rows[0])
+    official = dict(rows[0]) if rows and rows[0].get("n_classes") else {
+        "applicable": False,
+        "rule": "官方口径不适用：没有任何类有测试问题（全部测试问题为空）",
+    }
     by_threshold = {int(r["min_test_questions"]): r for r in rows}
-    five = by_threshold.get(5)
-    ten = by_threshold.get(10)
 
     def _pp(value: float) -> str:
         return "%+.2fpp" % (float(value) * 100.0)
 
-    ten_text = (
-        "（不足 +%.0fpp）" % (float(margin) * 100.0)
-        if ten is not None and not bool(ten["reaches_margin"])
-        else "（达到 +%.0fpp）" % (float(margin) * 100.0)
-    )
-    statement = (
-        "官方「全部有测试类等权 macro」口径（min_test>=1，%d 类）下 %s 过门；"
-        "分层后 >=2 测试样本类 %s（%d 类）、>=5 测试样本类 %s（%d 类）、"
-        ">=10 测试样本类 %s（%d 类）%s。**门只按官方口径判定**，分层表是敏感性登记，"
-        "**不得**据此重新定义门以求通过。"
-        % (
-            int(official["n_classes"]),
-            _pp(official["delta_macro"]),
-            _pp(by_threshold[2]["delta_macro"]) if 2 in by_threshold else "n/a",
-            int(by_threshold[2]["n_classes"]) if 2 in by_threshold else 0,
-            _pp(five["delta_macro"]) if five is not None else "n/a",
-            int(five["n_classes"]) if five is not None else 0,
-            _pp(ten["delta_macro"]) if ten is not None else "n/a",
-            int(ten["n_classes"]) if ten is not None else 0,
-            ten_text,
+    # 档位字面与 STRATIFICATION_THRESHOLDS **联动**（轮 11 · 0c）：第一档是官方口径，
+    # 其后的档位按常量顺序拼出；某档不适用则写明「不适用」，不写数值。
+    parts: List[str] = []
+    for threshold in [int(x) for x in STRATIFICATION_THRESHOLDS][1:]:
+        row = by_threshold.get(int(threshold))
+        if row is None or not int(row.get("n_classes", 0)):
+            parts.append(">=%d 测试样本类不适用（该层为空）" % int(threshold))
+            continue
+        part = ">=%d 测试样本类 %s（%d 类）" % (
+            int(threshold),
+            _pp(row["delta_macro"]),
+            int(row["n_classes"]),
         )
-    )
+        if not bool(row["reaches_margin"]):
+            part += "（不足 +%.0fpp）" % (float(margin) * 100.0)
+        parts.append(part)
+    layered = "、".join(parts) if parts else "（无分层档）"
+    if bool(official.get("applicable", True)) and int(official.get("n_classes", 0)):
+        statement = (
+            "官方「全部有测试类等权 macro」口径（min_test>=1，%d 类）下 %s 过门；"
+            "分层后 %s。**门只按官方口径判定**，分层表是敏感性登记，"
+            "**不得**据此重新定义门以求通过。"
+            % (int(official["n_classes"]), _pp(official["delta_macro"]), layered)
+        )
+    else:
+        statement = (
+            "官方「全部有测试类等权 macro」口径**不适用**（没有任何类有测试问题）；"
+            "分层后 %s。**门不因分层结果重新定义**。" % layered
+        )
     return {
         "unit": "question",
         "thresholds": [int(x) for x in STRATIFICATION_THRESHOLDS],
@@ -1058,8 +1079,16 @@ def evaluate_prototype(
     split: Any,
     product_dir: str = DEFAULT_PRODUCT_DIR,
     profile: str = DEFAULT_PROFILE,
+    margin: float = GATE_MARGIN,
 ) -> Dict[str, Any]:
     """零训练**原型质心基线** + 同口径多数类基线 + 决策门（3a/3b/3c）。
+
+    **轮 11 · 0c（margin 耦合点，显式登记）**：门的阈值只有一个来源 —— 形参 ``margin``
+    默认取 :data:`GATE_MARGIN`（+0.10）。本函数把它**显式透传**给
+    :func:`stratified_sensitivity` 与 :func:`decision_gate`：前者只用它标注「该层是否达到
+    +margin」（不参与判定），后者用它判定 ``passed``。因此「分层表里的达标标注」与
+    「门的判定」在**同一 margin 值**上耦合；改 ``margin`` 会同时改这两处（且会改
+    ``qa_scoped_gate.json`` 的文本），这一点写死在此，不再依赖默认值隐式传递。
 
     参数
     ----
@@ -1069,6 +1098,8 @@ def evaluate_prototype(
         冻结产物目录（读问题文本）。
     profile : str
         特征档（默认 ``lexical-88``）。
+    margin : float
+        决策门阈值（默认 :data:`GATE_MARGIN` = +0.10）；**唯一**的 margin 来源。
 
     返回
     ----
@@ -1116,6 +1147,7 @@ def evaluate_prototype(
         questions=split.test_questions,
         gold_local=gold,
         n_classes=int(corpus.n_classes),
+        margin=float(margin),
     )
     row_reference = QS.deterministic_baseline_metrics(corpus, split, side="test")
     prototype_document: Dict[str, Any] = {
@@ -1196,6 +1228,7 @@ def evaluate_prototype(
         proto_metrics,
         majority_metrics,
         corpus=corpus,
+        margin=float(margin),
         stratified=stratified,
         prototype_support_min=int(min(int(x) for x in prototypes["counts"])),
         post_scope_min_class_questions=int(min(corpus.class_question_counts)),
@@ -1232,7 +1265,8 @@ def decision_gate(
     corpus : Any
         语料（保留参数：门的判定只依赖两个指标，语料仅用于调用方溯源）。
     margin : float
-        门的阈值（默认 +0.10）。
+        门的阈值（默认 +0.10）。**轮 11 · 0c**：本函数与 :func:`stratified_sensitivity` 的
+        margin 是**同一个值**，由 :func:`evaluate_prototype` 显式透传（不再各自吃默认值）。
     stratified : Optional[Mapping[str, Any]]
         :func:`stratified_sensitivity` 的结果（轮 10 · W1）。**只并列登记**，不参与判定；
         ``None`` 时写 ``applicable=False``，**不伪造**分层数字。
